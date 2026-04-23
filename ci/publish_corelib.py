@@ -7,7 +7,7 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from ci.version import resolve_version
+from version import resolve_version
 
 
 ROOT = Path(__file__).resolve().parents[1]

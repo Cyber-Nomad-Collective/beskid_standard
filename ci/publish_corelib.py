@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 
@@ -53,6 +57,53 @@ def _parse_pack_resolved_version(output: str) -> str:
     )
 
 
+def _upsert_corelib_package(base_url: str, api_key: str) -> None:
+    """Ensure the beskid_corelib package exists for this API key (POST /api/packages upsert)."""
+    root = base_url.rstrip("/") + "/"
+    url = urllib.parse.urljoin(root, "api/packages")
+    payload = {
+        "name": "beskid_corelib",
+        "description": "Beskid standard library (corelib) distributed via pckg.",
+        "category": "Library",
+        "repositoryUrl": None,
+        "websiteUrl": "https://beskid-lang.org",
+        "tags": ["corelib", "standard-library"],
+        "isPublic": True,
+        "submitForReview": False,
+        "reviewReason": None,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "X-API-Key": api_key,
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise SystemExit(
+            f"Failed to upsert beskid_corelib metadata (HTTP {exc.code}): {detail or exc.reason}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SystemExit(f"Failed to reach pckg at {url}: {exc.reason}") from exc
+
+    try:
+        parsed = json.loads(body)
+    except json.JSONDecodeError:
+        print(f"[publish] upsert: unexpected non-JSON response: {body[:500]!r}")
+        return
+    if not parsed.get("success", True):
+        raise SystemExit(f"Upsert beskid_corelib failed: {parsed.get('message', body)}")
+    print("[publish] ensured beskid_corelib package metadata (upsert ok)")
+
+
 def _ensure_cli() -> Path:
     override = os.environ.get("BESKID_CLI_BIN", "").strip()
     if override:
@@ -72,7 +123,7 @@ def _ensure_cli() -> Path:
 
 
 def main() -> None:
-    _require("BESKID_PCKG_API_KEY")
+    api_key = _require("BESKID_PCKG_API_KEY")
     base_url = os.environ.get("BESKID_PCKG_BASE_URL", "https://pckg.beskid-lang.org").strip()
 
     manifest = CORELIB_SOURCE / "Project.proj"
@@ -87,6 +138,8 @@ def main() -> None:
         )
 
     project_version = _corelib_version(manifest_content)
+
+    _upsert_corelib_package(base_url, api_key)
 
     cli_bin = _ensure_cli()
     # Fixed path: pack resolves semver internally (patch bump over package.json baseline

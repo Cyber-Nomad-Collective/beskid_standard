@@ -14,6 +14,8 @@ REQUIRED_FILES = [
     "src/Core/Results.bd",
     "src/Core/ErrorHandling.bd",
     "src/Core/String.bd",
+    "src/Testing/Contracts.bd",
+    "src/Testing/Assertions.bd",
     "src/System/IO.bd",
     "src/Prelude.bd",
 ]

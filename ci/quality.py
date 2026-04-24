@@ -1,4 +1,4 @@
-"""Quality checks for beskid_corelib source layout."""
+"""Quality checks for the Beskid corelib source layout (directory beskid_corelib, package id corelib)."""
 
 from __future__ import annotations
 
@@ -42,8 +42,8 @@ def main() -> None:
 
     content = MANIFEST.read_text(encoding="utf-8")
     name = _project_field(content, "name")
-    if name != "beskid_corelib":
-        raise SystemExit(f"Project name must be beskid_corelib, got: {name!r}")
+    if name != "corelib":
+        raise SystemExit(f"Project name must be corelib, got: {name!r}")
 
     version = _project_field(content, "version")
     if not version:
@@ -57,7 +57,7 @@ def main() -> None:
     if 'target "CoreLib"' not in content:
         raise SystemExit('Project.proj must declare `target "CoreLib"` (canonical default library target)')
 
-    print(f"quality OK: beskid_corelib manifest version {version}")
+    print(f"quality OK: corelib manifest version {version}")
 
 
 if __name__ == "__main__":

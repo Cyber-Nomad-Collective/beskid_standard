@@ -1,4 +1,4 @@
-"""Pack and publish beskid_corelib package to pckg."""
+"""Pack and publish the Beskid corelib package (`corelib`) to pckg."""
 
 from __future__ import annotations
 
@@ -18,6 +18,7 @@ CLI_DOWNLOAD_URL = (
     "https://github.com/Cyber-Nomad-Collective/beskid_compiler/releases/download/"
     "cli-latest/beskid-linux-amd64"
 )
+PACKAGE_ID = "corelib"
 
 
 def _require(name: str) -> str:
@@ -57,20 +58,32 @@ def _parse_pack_resolved_version(output: str) -> str:
     )
 
 
+def _default_icon_url(base_url: str) -> str:
+    override = os.environ.get("BESKID_CORELIB_ICON_URL", "").strip()
+    if override:
+        return override
+    root = base_url.rstrip("/") + "/"
+    return urllib.parse.urljoin(root, "package-icons/corelib.svg")
+
+
 def _upsert_corelib_package(base_url: str, api_key: str) -> None:
-    """Ensure the beskid_corelib package exists for this API key (POST /api/packages upsert)."""
+    """Ensure the corelib package exists for this API key (POST /api/packages upsert)."""
     root = base_url.rstrip("/") + "/"
     url = urllib.parse.urljoin(root, "api/packages")
     payload = {
-        "name": "beskid_corelib",
-        "description": "Beskid standard library (corelib) distributed via pckg.",
+        "name": PACKAGE_ID,
+        "description": (
+            "Beskid standard library: prelude, collections, filesystem helpers, and runtime "
+            "contracts. Published from compiler/corelib/beskid_corelib."
+        ),
         "category": "Library",
-        "repositoryUrl": None,
+        "repositoryUrl": "https://github.com/Cyber-Nomad-Collective/beskid_compiler/tree/main/compiler/corelib/beskid_corelib",
         "websiteUrl": "https://beskid-lang.org",
-        "tags": ["corelib", "standard-library"],
+        "tags": ["corelib", "stdlib", "beskid", "standard-library"],
         "isPublic": True,
         "submitForReview": False,
         "reviewReason": None,
+        "iconUrl": _default_icon_url(base_url),
     }
     data = json.dumps(payload).encode("utf-8")
     req = urllib.request.Request(
@@ -89,7 +102,7 @@ def _upsert_corelib_package(base_url: str, api_key: str) -> None:
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
         raise SystemExit(
-            f"Failed to upsert beskid_corelib metadata (HTTP {exc.code}): {detail or exc.reason}"
+            f"Failed to upsert {PACKAGE_ID} metadata (HTTP {exc.code}): {detail or exc.reason}"
         ) from exc
     except urllib.error.URLError as exc:
         raise SystemExit(f"Failed to reach pckg at {url}: {exc.reason}") from exc
@@ -100,8 +113,8 @@ def _upsert_corelib_package(base_url: str, api_key: str) -> None:
         print(f"[publish] upsert: unexpected non-JSON response: {body[:500]!r}")
         return
     if not parsed.get("success", True):
-        raise SystemExit(f"Upsert beskid_corelib failed: {parsed.get('message', body)}")
-    print("[publish] ensured beskid_corelib package metadata (upsert ok)")
+        raise SystemExit(f"Upsert {PACKAGE_ID} failed: {parsed.get('message', body)}")
+    print(f"[publish] ensured {PACKAGE_ID} package metadata (upsert ok)")
 
 
 def _ensure_cli() -> Path:
@@ -132,9 +145,9 @@ def main() -> None:
 
     manifest_content = manifest.read_text(encoding="utf-8")
     project_name = _project_field(manifest_content, "name")
-    if project_name != "beskid_corelib":
+    if project_name != PACKAGE_ID:
         raise SystemExit(
-            f"Project.proj name must be 'beskid_corelib' for publishing, got {project_name!r}"
+            f"Project.proj name must be {PACKAGE_ID!r} for publishing, got {project_name!r}"
         )
 
     project_version = _corelib_version(manifest_content)
@@ -144,7 +157,7 @@ def main() -> None:
     cli_bin = _ensure_cli()
     # Fixed path: pack resolves semver internally (patch bump over package.json baseline
     # and/or .beskid/pckg-version-state.json); do not pass --version so we match that.
-    artifact = ROOT / "beskid_corelib-pack.bpk"
+    artifact = ROOT / "corelib-pack.bpk"
     if artifact.exists():
         artifact.unlink()
 
@@ -158,7 +171,7 @@ def main() -> None:
         + [
             "pack",
             "--package",
-            "beskid_corelib",
+            PACKAGE_ID,
             "--source",
             str(CORELIB_SOURCE),
             "--output",
@@ -181,7 +194,7 @@ def main() -> None:
         common
         + [
             "upload",
-            "beskid_corelib",
+            PACKAGE_ID,
             "--version",
             resolved_version,
             "--artifact",
@@ -190,7 +203,7 @@ def main() -> None:
         check=True,
         cwd=ROOT,
     )
-    print(f"Published beskid_corelib {resolved_version} to {base_url}")
+    print(f"Published {PACKAGE_ID} {resolved_version} to {base_url}")
 
     if os.environ.get("CI_KEEP_ARTIFACT", "").strip().lower() not in {"1", "true", "yes"}:
         artifact.unlink(missing_ok=True)

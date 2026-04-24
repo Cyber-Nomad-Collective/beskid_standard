@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -56,6 +57,15 @@ def _parse_pack_resolved_version(output: str) -> str:
         "Could not parse resolved version from `beskid pckg pack` output; "
         f"expected a line starting with {prefix!r}.\nOutput:\n{output}"
     )
+
+
+def _parse_pckg_published_version(output: str) -> str | None:
+    prefix = "PCKG_PUBLISHED_VERSION="
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        if line.startswith(prefix):
+            return line[len(prefix) :].strip()
+    return None
 
 
 def _default_icon_url(base_url: str) -> str:
@@ -155,8 +165,8 @@ def main() -> None:
     _upsert_corelib_package(base_url, api_key)
 
     cli_bin = _ensure_cli()
-    # Fixed path: pack resolves semver internally (patch bump over package.json baseline
-    # and/or .beskid/pckg-version-state.json); do not pass --version so we match that.
+    # Pack resolves semver for package.json inside the artifact; upload omits multipart
+    # `version` so the registry assigns the next semver (see `PublishPackageVersionEndpoint`).
     artifact = ROOT / "corelib-pack.bpk"
     if artifact.exists():
         artifact.unlink()
@@ -188,22 +198,32 @@ def main() -> None:
     if project_version != resolved_version:
         print(
             f"[publish] Project.proj version={project_version!r}; "
-            f"pckg resolved pack/upload version {resolved_version!r}."
+            f"pckg resolved pack artifact version {resolved_version!r}."
         )
-    subprocess.run(
+    upload_result = subprocess.run(
         common
         + [
             "upload",
             PACKAGE_ID,
-            "--version",
-            resolved_version,
             "--artifact",
             str(artifact),
         ],
         check=True,
         cwd=ROOT,
+        capture_output=True,
+        text=True,
     )
-    print(f"Published {PACKAGE_ID} {resolved_version} to {base_url}")
+    upload_out = (upload_result.stdout or "") + (upload_result.stderr or "")
+    published_version = _parse_pckg_published_version(upload_out)
+    if not published_version:
+        raise SystemExit(
+            "upload finished but could not parse PCKG_PUBLISHED_VERSION= from Beskid CLI output; "
+            "update the parser or check registry connectivity."
+        )
+    print(upload_result.stdout or "", end="")
+    if upload_result.stderr:
+        print(upload_result.stderr, end="", file=sys.stderr)
+    print(f"Published {PACKAGE_ID} {published_version} to {base_url}")
 
     if os.environ.get("CI_KEEP_ARTIFACT", "").strip().lower() not in {"1", "true", "yes"}:
         artifact.unlink(missing_ok=True)

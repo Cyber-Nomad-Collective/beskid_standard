@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -15,7 +16,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CORELIB_SOURCE = ROOT / "beskid_corelib"
-CLI_DOWNLOAD_URL = (
+# Prebuilt Linux CLI (may lag source); prefer `BESKID_CLI_BIN` or CI-built binary.
+_DEFAULT_CLI_DOWNLOAD_URL = (
     "https://github.com/Cyber-Nomad-Collective/beskid_compiler/releases/download/"
     "cli-latest/beskid-linux-amd64"
 )
@@ -40,31 +42,19 @@ def _project_field(content: str, key: str) -> str | None:
     return None
 
 
-def _corelib_version(content: str) -> str:
-    version = _project_field(content, "version")
-    if not version:
-        raise SystemExit("Project.proj is missing version")
-    return version
-
-
-def _parse_pack_resolved_version(output: str) -> str:
-    prefix = "Resolved package version: "
-    for raw_line in output.splitlines():
-        line = raw_line.strip()
-        if line.startswith(prefix):
-            return line[len(prefix) :].strip()
-    raise SystemExit(
-        "Could not parse resolved version from `beskid pckg pack` output; "
-        f"expected a line starting with {prefix!r}.\nOutput:\n{output}"
-    )
-
-
 def _parse_pckg_published_version(output: str) -> str | None:
     prefix = "PCKG_PUBLISHED_VERSION="
     for raw_line in output.splitlines():
         line = raw_line.strip()
         if line.startswith(prefix):
             return line[len(prefix) :].strip()
+    # Human-readable summary line from beskid_pckg (same run as PCKG_PUBLISHED_VERSION=).
+    m = re.search(
+        r"(?m)^version:\s+(\S+)\s+\(registry-assigned\)\s*$",
+        output,
+    )
+    if m:
+        return m.group(1).strip()
     return None
 
 
@@ -140,7 +130,8 @@ def _ensure_cli() -> Path:
     out = ROOT / ".ci-tools" / "beskid"
     out.parent.mkdir(parents=True, exist_ok=True)
     if not out.is_file():
-        subprocess.run(["curl", "-fsSL", CLI_DOWNLOAD_URL, "-o", str(out)], check=True, cwd=ROOT)
+        url = os.environ.get("BESKID_CLI_DOWNLOAD_URL", "").strip() or _DEFAULT_CLI_DOWNLOAD_URL
+        subprocess.run(["curl", "-fsSL", url, "-o", str(out)], check=True, cwd=ROOT)
         out.chmod(0o755)
     return out
 
@@ -159,8 +150,6 @@ def main() -> None:
         raise SystemExit(
             f"Project.proj name must be {PACKAGE_ID!r} for publishing, got {project_name!r}"
         )
-
-    project_version = _corelib_version(manifest_content)
 
     _upsert_corelib_package(base_url, api_key)
 
@@ -193,32 +182,37 @@ def main() -> None:
         text=True,
         env=pack_env,
     )
-    combined_out = (pack_result.stdout or "") + (pack_result.stderr or "")
-    resolved_version = _parse_pack_resolved_version(combined_out)
-    if project_version != resolved_version:
-        print(
-            f"[publish] Project.proj version={project_version!r}; "
-            f"pckg resolved pack artifact version {resolved_version!r}."
-        )
+    print((pack_result.stdout or "") + (pack_result.stderr or ""), end="")
+
+    upload_cmd = common + [
+        "upload",
+        PACKAGE_ID,
+        "--artifact",
+        str(artifact),
+    ]
     upload_result = subprocess.run(
-        common
-        + [
-            "upload",
-            PACKAGE_ID,
-            "--artifact",
-            str(artifact),
-        ],
-        check=True,
+        upload_cmd,
+        check=False,
         cwd=ROOT,
         capture_output=True,
         text=True,
+        env={**os.environ},
     )
     upload_out = (upload_result.stdout or "") + (upload_result.stderr or "")
+    if upload_result.returncode != 0:
+        print(upload_out, end="", file=sys.stderr)
+        raise SystemExit(
+            f"`beskid pckg upload` failed (exit {upload_result.returncode}). "
+            "Ensure the CLI supports upload without --version (registry-assigned semver); "
+            "set BESKID_CLI_BIN to a current beskid build, or refresh cli-latest / "
+            "BESKID_CLI_DOWNLOAD_URL."
+        )
     published_version = _parse_pckg_published_version(upload_out)
     if not published_version:
+        print(upload_out, end="", file=sys.stderr)
         raise SystemExit(
-            "upload finished but could not parse PCKG_PUBLISHED_VERSION= from Beskid CLI output; "
-            "update the parser or check registry connectivity."
+            "Upload succeeded but could not read the registry-assigned version from CLI output "
+            "(expected PCKG_PUBLISHED_VERSION= or 'version: … (registry-assigned)')."
         )
     print(upload_result.stdout or "", end="")
     if upload_result.stderr:

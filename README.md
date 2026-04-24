@@ -23,7 +23,7 @@ Compiler tooling and tests use this canonical path, with `beskid_corelib` naming
   - `ci/version.py`
   - `ci/publish_corelib.py`
 - Required secret in this repository: `BESKID_PCKG_KEY` (workflow maps to `BESKID_PCKG_API_KEY`).
-- Publish workflow installs/downloads the Beskid CLI and runs `beskid pckg pack` + `beskid pckg upload`.
+- Publish workflow checks out `beskid_compiler`, builds `beskid_cli`, runs `beskid pckg pack` + `beskid pckg upload` with `BESKID_CLI_BIN` (falls back to downloading a release binary only when `BESKID_CLI_BIN` is unset, for example locally).
 
 ## Local verification
 

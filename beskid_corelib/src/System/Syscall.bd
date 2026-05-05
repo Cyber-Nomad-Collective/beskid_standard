@@ -1,23 +1,42 @@
-/// Cross-platform fd write (`syscall_write`) and reserved read surface.
-///
-/// Status: partial — `Write` implemented; `Read` stub.
+/// Cross-platform syscall facade for read and write primitives.
+/// Types are split under `System/Syscall/` with one type per file.
 
+use System.Syscall.SyscallError;
+
+/// Returns descriptor for standard output.
 pub i64 StdoutFd() {
     return 1;
 }
 
+/// Returns descriptor for standard input.
 pub i64 StdinFd() {
     return 0;
 }
 
+/// Returns descriptor for standard error.
 pub i64 StderrFd() {
     return 2;
 }
 
-pub i64 Write(i64 fd, string data) {
-    return __syscall_write(fd, data);
+/// Writes data to a descriptor.
+pub Core.Results.Result<i64, System.Syscall.SyscallError> Write(i64 fd, string data) {
+    if fd < 0 {
+        return Result::Error(SyscallError::InvalidFd(fd));
+    }
+    i64 written = __syscall_write(fd, data);
+    if written < 0 {
+        return Result::Error(SyscallError::IoFailure(written));
+    }
+    return Result::Ok(written);
 }
 
-pub i64 Read(i64 fd) {
-    __panic_str("Syscall.Read is not implemented");
+/// Reads up to max bytes from a descriptor.
+pub Core.Results.Result<string, System.Syscall.SyscallError> Read(i64 fd, i64 maxBytes) {
+    if fd != StdinFd() {
+        return Result::Error(SyscallError::UnsupportedReadFd(fd));
+    }
+    if maxBytes < 1 {
+        return Result::Error(SyscallError::InvalidReadLimit(maxBytes));
+    }
+    return Result::Ok(__syscall_read(fd, maxBytes));
 }

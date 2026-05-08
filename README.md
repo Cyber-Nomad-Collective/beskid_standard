@@ -4,14 +4,15 @@ This directory is the compiler-pinned core library source (submodule repository:
 
 ## Canonical source paths
 
-- `corelib/beskid_corelib`.
+- `compiler/corelib/beskid_corelib` from the superrepo root (`corelib/beskid_corelib` inside the compiler repo).
 
 Compiler tooling and tests use this canonical path, with `beskid_corelib` naming enforced in `Project.proj`.
 
 ## Project identity
 
-- `Project.proj` `project.name` must be `beskid_corelib`.
-- Release packaging publishes this project as package `beskid_corelib` to pckg.
+- Canonical source directory remains `compiler/corelib/beskid_corelib/` in aggregate workspaces.
+- `Project.proj` `project.name` is `corelib`.
+- Release packaging publishes this project to pckg under package identity `corelib`.
 
 ## CI/CD authority
 

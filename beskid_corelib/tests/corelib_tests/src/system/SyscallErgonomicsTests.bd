@@ -1,0 +1,93 @@
+/// Syscall ergonomic wrapper coverage.
+test syscall_resolve_descriptor_fd_maps_standard_streams {
+    StandardStream stdinStream = StandardStream::Stdin();
+    StandardStream stdoutStream = StandardStream::Stdout();
+    StandardStream stderrStream = StandardStream::Stderr();
+    i64 stdinFd = System.Syscall.ResolveDescriptorFd(Descriptor::Standard(stdinStream));
+    i64 stdoutFd = System.Syscall.ResolveDescriptorFd(Descriptor::Standard(stdoutStream));
+    i64 stderrFd = System.Syscall.ResolveDescriptorFd(Descriptor::Standard(stderrStream));
+    i64 rawFd = System.Syscall.ResolveDescriptorFd(Descriptor::Raw(123));
+
+    if stdinFd != System.Syscall.StdinFd() {
+        __panic_str("stdin descriptor mapping should match StdinFd");
+    }
+    if stdoutFd != System.Syscall.StdoutFd() {
+        __panic_str("stdout descriptor mapping should match StdoutFd");
+    }
+    if stderrFd != System.Syscall.StderrFd() {
+        __panic_str("stderr descriptor mapping should match StderrFd");
+    }
+    if rawFd != 123 {
+        __panic_str("raw descriptor should be returned unchanged");
+    }
+}
+
+test syscall_write_with_descriptor_supports_standard_stdout {
+    StandardStream stream = StandardStream::Stdout();
+    Core.Results.Result<i64, System.Syscall.SyscallError> result =
+        System.Syscall.WriteWith(
+            WriteRequest {
+                descriptor: Descriptor::Standard(stream),
+                data: "ergonomic-write"
+            }
+        );
+    match result {
+        Result::Ok(written) => {
+            if written < 1 {
+                __panic_str("WriteWith stdout should write at least one byte");
+            }
+        },
+        Result::Error(_) => __panic_str("WriteWith stdout should succeed"),
+    };
+}
+
+test syscall_read_with_rejects_unsupported_read_stream {
+    StandardStream stream = StandardStream::Stdout();
+    Core.Results.Result<string, System.Syscall.SyscallError> result =
+        System.Syscall.ReadWith(
+            ReadRequest {
+                descriptor: Descriptor::Standard(stream),
+                limit: ReadLimit::UpTo(4)
+            }
+        );
+    match result {
+        Result::Ok(_) => __panic_str("ReadWith stdout should be rejected"),
+        Result::Error(err) => match err {
+            SyscallError::UnsupportedReadFd(fd) => {
+                if fd != System.Syscall.StdoutFd() {
+                    __panic_str("UnsupportedReadFd should carry stdout fd");
+                }
+            },
+            _ => __panic_str("ReadWith stdout should return UnsupportedReadFd"),
+        },
+    };
+}
+
+test syscall_read_with_default_limit_maps_to_default_bytes {
+    i64 limit = System.Syscall.ResolveReadLimit(ReadLimit::Default());
+    if limit != System.Syscall.DefaultReadLimit() {
+        __panic_str("Default read limit should map to corelib default");
+    }
+}
+
+test syscall_read_with_invalid_limit_reports_error {
+    StandardStream stream = StandardStream::Stdin();
+    Core.Results.Result<string, System.Syscall.SyscallError> result =
+        System.Syscall.ReadWith(
+            ReadRequest {
+                descriptor: Descriptor::Standard(stream),
+                limit: ReadLimit::UpTo(0)
+            }
+        );
+    match result {
+        Result::Ok(_) => __panic_str("ReadWith zero limit should fail"),
+        Result::Error(err) => match err {
+            SyscallError::InvalidReadLimit(maxBytes) => {
+                if maxBytes != 0 {
+                    __panic_str("InvalidReadLimit should carry invalid maxBytes");
+                }
+            },
+            _ => __panic_str("ReadWith zero limit should return InvalidReadLimit"),
+        },
+    };
+}

@@ -4,15 +4,18 @@ This directory is the compiler-pinned core library source (submodule repository:
 
 ## Canonical source paths
 
-- `compiler/corelib/beskid_corelib` from the superrepo root (`corelib/beskid_corelib` inside the compiler repo).
+- Workspace root: `compiler/corelib/` (`Workspace.proj`, `packages/`, `beskid_corelib/`).
+- Published / CLI-embedded package: `compiler/corelib/beskid_corelib` (`project.name = corelib`) with path dependencies on `packages/foundation`, `packages/runtime`, and `packages/compiler-sdk` (Mod SDK `Beskid.Compiler.*` typed surfaces; syntax AST nodes live under `packages/compiler-sdk/src/Beskid/Compiler/Syntax/Nodes/`).
+- **Gap:** the aggregate `Prelude.bd` intentionally does **not** re-export `Beskid.Compiler.*` yet; including those `pub mod` lines in the prelude triggers a stack overflow in the reference semantic pipeline when combined with the rest of the prelude. Depend on `corelib_compiler_sdk` and import from `Beskid.Compiler.*` (see `packages/compiler-sdk/src/Prelude.bd`) until the compiler rule pipeline is fixed.
+- **Mod SDK `.bd` regeneration:** from the parent compiler workspace, run `./corelib/packages/compiler-sdk/regen_mod_sdk_surfaces.sh` after editing reflected `beskid_analysis` sources (see `packages/compiler-sdk/README.md`).
 
-Compiler tooling and tests use this canonical path, with `beskid_corelib` naming enforced in `Project.proj`.
+Compiler tooling discovers `corelib/beskid_corelib/Project.proj`; the parent workspace supplies resolver policy and future multi-member orchestration.
 
 ## Project identity
 
-- Canonical source directory remains `compiler/corelib/beskid_corelib/` in aggregate workspaces.
-- `Project.proj` `project.name` is `corelib`.
-- Release packaging publishes this project to pckg under package identity `corelib`.
+- Canonical aggregate package directory remains `compiler/corelib/beskid_corelib/`.
+- `Project.proj` `project.name` is `corelib` for the aggregate lib; sibling packages use `corelib_foundation`, `corelib_runtime`, and `corelib_compiler_sdk` internally.
+- Release packaging publishes the aggregate project to pckg under package identity `corelib` (include `packages/**` in the artifact tree so path dependencies resolve).
 
 ## CI/CD authority
 

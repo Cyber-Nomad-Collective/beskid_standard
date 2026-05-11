@@ -1,4 +1,4 @@
-"""Quality checks for the Beskid corelib source layout (directory beskid_corelib, package id corelib)."""
+"""Quality checks for the Beskid corelib workspace (aggregate `beskid_corelib` + `packages/*`)."""
 
 from __future__ import annotations
 
@@ -9,15 +9,18 @@ ROOT = Path(__file__).resolve().parents[1]
 CORELIB = ROOT / "beskid_corelib"
 MANIFEST = CORELIB / "Project.proj"
 PRELUDE = CORELIB / "src" / "Prelude.bd"
+FOUNDATION = ROOT / "packages" / "foundation"
+RUNTIME = ROOT / "packages" / "runtime"
 
+# Key hand-authored sources that must remain present after workspace splits.
 REQUIRED_FILES = [
-    "src/Core/Results.bd",
-    "src/Core/ErrorHandling.bd",
-    "src/Core/String.bd",
-    "src/Testing/Contracts.bd",
-    "src/Testing/Assertions.bd",
-    "src/System/IO.bd",
-    "src/Prelude.bd",
+    FOUNDATION / "src" / "Core" / "Results.bd",
+    FOUNDATION / "src" / "Core" / "ErrorHandling.bd",
+    FOUNDATION / "src" / "Core" / "String.bd",
+    FOUNDATION / "src" / "Testing" / "Contracts.bd",
+    FOUNDATION / "src" / "Testing" / "Assertions.bd",
+    RUNTIME / "src" / "System" / "IO.bd",
+    FOUNDATION / "src" / "Prelude.bd",
 ]
 
 
@@ -34,7 +37,7 @@ def _project_field(content: str, key: str) -> str | None:
 
 def main() -> None:
     if not CORELIB.is_dir():
-        raise SystemExit(f"Missing corelib directory: {CORELIB}")
+        raise SystemExit(f"Missing corelib package directory: {CORELIB}")
     if not MANIFEST.is_file():
         raise SystemExit(f"Missing manifest: {MANIFEST}")
     if not PRELUDE.is_file():
@@ -49,8 +52,7 @@ def main() -> None:
     if not version:
         raise SystemExit("Project.proj is missing version")
 
-    for relative in REQUIRED_FILES:
-        path = CORELIB / relative
+    for path in REQUIRED_FILES:
         if not path.is_file():
             raise SystemExit(f"Missing required file: {path}")
 

@@ -15,7 +15,7 @@ Compiler tooling discovers `corelib/beskid_corelib/Project.proj`; the parent wor
 
 - Canonical aggregate package directory remains `compiler/corelib/beskid_corelib/`.
 - `Project.proj` `project.name` is `corelib` for the aggregate lib; sibling packages use `corelib_foundation`, `corelib_runtime`, and `corelib_compiler_sdk` internally.
-- Release packaging publishes the aggregate project to pckg under package identity `corelib` (include `packages/**` in the artifact tree so path dependencies resolve).
+- Release packaging upserts and publishes **every workspace member** to pckg (`corelib`, `corelib_foundation`, `corelib_runtime`, `corelib_compiler_sdk`, `corelib_console`, `corelib_concurrency`) via `POST /api/workspaces/publish` (see `ci/publish_corelib.py` and root `workspace.package.json`).
 
 ## CI/CD authority
 
@@ -27,7 +27,7 @@ Compiler tooling discovers `corelib/beskid_corelib/Project.proj`; the parent wor
   - `ci/version.py`
   - `ci/publish_corelib.py`
 - Required secret in this repository: `BESKID_PCKG_KEY` (workflow maps to `BESKID_PCKG_API_KEY`).
-- Publish workflow checks out `beskid_compiler`, builds `beskid_cli`, runs `beskid pckg pack` + `beskid pckg upload` with `BESKID_CLI_BIN` (falls back to downloading a release binary only when `BESKID_CLI_BIN` is unset, for example locally).
+- Publish workflow checks out `beskid_compiler`, builds `beskid_cli`, generates per-member API docs with `beskid pckg pack`, then uploads the workspace bundle with `BESKID_CLI_BIN` (falls back to downloading a release binary only when `BESKID_CLI_BIN` is unset, for example locally).
 
 ## Public documentation
 

@@ -33,6 +33,7 @@ _SKIP_DIR_NAMES = frozenset(
         "bin",
         ".git",
         ".ci-tools",
+        ".ci-publish-pack",
         "__pycache__",
         ".pytest_cache",
         "node_modules",
@@ -244,33 +245,31 @@ def _validate_workspace_packages(workspace_root: Path) -> None:
             raise SystemExit(f"Missing README.md for {meta.registry_name}: {readme}")
 
 
-def _generate_member_docs(
-    cli_bin: Path,
-    base_url: str,
-    workspace_root: Path,
-) -> None:
-    pack_dir = workspace_root / ".ci-publish-pack"
-    pack_dir.mkdir(parents=True, exist_ok=True)
-    common = [str(cli_bin), "pckg", "--base-url", base_url]
+def _generate_member_docs(cli_bin: Path, workspace_root: Path) -> None:
+    """Run `beskid doc` for each workspace member so `.beskid/docs/api.json` exists in the bundle."""
     pack_env = {**os.environ, "BESKID_CORELIB_ROOT": str(workspace_root)}
 
     for source_rel in _DOC_GENERATION_ORDER:
         meta = next(m for m in WORKSPACE_PACKAGES if m.source_rel == source_rel)
         source = workspace_root / source_rel
-        artifact = pack_dir / f"{meta.registry_name}.bpk"
-        if artifact.exists():
-            artifact.unlink()
-        print(f"[publish] generating docs via pack for {meta.registry_name} ({source_rel})")
+        project = source / "Project.proj"
+        if not project.is_file():
+            raise SystemExit(f"Missing Project.proj for doc generation: {project}")
+
+        docs_out = source / ".beskid" / "docs"
+        if docs_out.is_dir():
+            shutil.rmtree(docs_out)
+        docs_out.mkdir(parents=True, exist_ok=True)
+
+        print(f"[publish] generating docs for {meta.registry_name} ({source_rel})")
         result = subprocess.run(
-            common
-            + [
-                "pack",
-                "--package",
-                meta.registry_name,
-                "--source",
-                str(source),
-                "--output",
-                str(artifact),
+            [
+                str(cli_bin),
+                "doc",
+                "--project",
+                str(project),
+                "--out",
+                str(docs_out),
             ],
             check=True,
             cwd=workspace_root,
@@ -282,7 +281,14 @@ def _generate_member_docs(
             print(result.stdout, end="")
         if result.stderr:
             print(result.stderr, end="", file=sys.stderr)
-        artifact.unlink(missing_ok=True)
+
+        api_json = docs_out / "api.json"
+        if not api_json.is_file():
+            raise SystemExit(
+                f"Doc generation did not produce {api_json} for {meta.registry_name}. "
+                "Fix compiler/analysis errors for that member before publishing."
+            )
+        print(f"[publish] wrote {api_json} ({api_json.stat().st_size} bytes)")
 
 
 def _should_skip_relative(rel_posix: str) -> bool:
@@ -415,7 +421,7 @@ def main() -> None:
         _upsert_package(base_url, api_key, meta)
 
     cli_bin = _ensure_cli()
-    _generate_member_docs(cli_bin, base_url, workspace_root)
+    _generate_member_docs(cli_bin, workspace_root)
 
     bundle_path = workspace_root / ".ci-publish-workspace.bundle.zip"
     _build_workspace_bundle(workspace_root, bundle_path)

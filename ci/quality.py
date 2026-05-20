@@ -19,7 +19,8 @@ REQUIRED_FILES = [
     FOUNDATION / "src" / "Core" / "String.bd",
     FOUNDATION / "src" / "Testing" / "Contracts.bd",
     FOUNDATION / "src" / "Testing" / "Assertions.bd",
-    RUNTIME / "src" / "System" / "IO.bd",
+    RUNTIME / "src" / "System" / "Input.bd",
+    RUNTIME / "src" / "System" / "Output.bd",
     FOUNDATION / "src" / "Prelude.bd",
 ]
 

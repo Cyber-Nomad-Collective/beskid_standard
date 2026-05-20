@@ -136,6 +136,30 @@ def _ensure_cli() -> Path:
     return out
 
 
+def _resolve_corelib_workspace_root() -> Path:
+    """
+    Resolve the directory expected by BESKID_CORELIB_ROOT.
+
+    It must point to a tree containing `beskid_corelib/Project.proj`, which is
+    now provided by the separated corelib workspace checkout in CI.
+    """
+    override = os.environ.get("BESKID_CORELIB_ROOT", "").strip()
+    if override:
+        root = Path(override).expanduser()
+        if not root.is_absolute():
+            root = (ROOT / root).resolve()
+    else:
+        root = ROOT
+
+    manifest = root / "beskid_corelib" / "Project.proj"
+    if not manifest.is_file():
+        raise SystemExit(
+            "BESKID_CORELIB_ROOT must point to a workspace tree containing "
+            f"`beskid_corelib/Project.proj`, got: {root}"
+        )
+    return root
+
+
 def main() -> None:
     api_key = _require("BESKID_PCKG_API_KEY")
     base_url = os.environ.get("BESKID_PCKG_BASE_URL", "https://pckg.beskid-lang.org").strip()
@@ -161,9 +185,10 @@ def main() -> None:
         artifact.unlink()
 
     common = [str(cli_bin), "pckg", "--base-url", base_url]
+    corelib_workspace_root = _resolve_corelib_workspace_root()
     pack_env = {
         **os.environ,
-        "BESKID_CORELIB_ROOT": str(ROOT / ".ci-cache" / "beskid_corelib"),
+        "BESKID_CORELIB_ROOT": str(corelib_workspace_root),
     }
     pack_result = subprocess.run(
         common

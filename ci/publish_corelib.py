@@ -289,6 +289,33 @@ def _generate_member_docs(cli_bin: Path, workspace_root: Path) -> None:
                 "Fix compiler/analysis errors for that member before publishing."
             )
         print(f"[publish] wrote {api_json} ({api_json.stat().st_size} bytes)")
+        _validate_api_json_library_tree(api_json, meta.registry_name)
+
+
+def _validate_api_json_library_tree(api_json: Path, package_name: str) -> None:
+    """Fail publish when api.json is a flat symbol list instead of a linked library tree."""
+    data = json.loads(api_json.read_text(encoding="utf-8"))
+    items = data.get("items") or []
+    if not items:
+        raise SystemExit(f"{api_json}: api.json has no items")
+    nav = data.get("navigationModel")
+    if nav != "graph-v1":
+        raise SystemExit(f"{api_json}: navigationModel must be graph-v1 (got {nav!r})")
+    roots = sum(1 for row in items if row.get("parentId") in (None, 0))
+    max_roots = 128
+    if roots > max_roots:
+        raise SystemExit(
+            f"{api_json}: api.json has {roots} graph roots (max {max_roots} for {package_name}). "
+            "Re-run beskid doc with a Beskid CLI that links module parentId edges."
+        )
+    for row in items:
+        kind = row.get("kind")
+        path = row.get("modulePath") or []
+        if kind == "module" and len(path) > 1 and row.get("parentId") in (None, 0):
+            qn = row.get("qualifiedName", "?")
+            raise SystemExit(
+                f"{api_json}: nested module {qn!r} must have parentId (library tree invariant)"
+            )
 
 
 def _should_skip_relative(rel_posix: str) -> bool:

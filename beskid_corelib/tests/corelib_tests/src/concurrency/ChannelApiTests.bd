@@ -17,8 +17,8 @@ test channel_create_unbounded_default {
         },
         Result::Error(_) => {
             Testing.Assertions.Fail("Receive should succeed");
-        },
-    }
+        }
+    };
 }
 
 test channel_bounded_options_factory {
@@ -31,6 +31,19 @@ test channel_bounded_options_factory {
     );
 }
 
+test channel_single_reader_writer_factories {
+    Channel<i64> readers = Channel<i64>.CreateWithOptions(ChannelOptions.SingleReader());
+    Channel<i64> writers = Channel<i64>.CreateWithOptions(ChannelOptions.SingleWriter());
+    Testing.Assertions.AssertTrue(
+        Core.Results.IsOk(readers.Send(1)),
+        "single-reader channel Send should succeed"
+    );
+    Testing.Assertions.AssertTrue(
+        Core.Results.IsOk(writers.Send(2)),
+        "single-writer channel Send should succeed"
+    );
+}
+
 test channel_try_receive_empty_returns_none {
     Channel<i64> ch = Channel<i64>.Create();
     Query.Contracts.Option<i64> got = ch.TryReceive();
@@ -38,6 +51,35 @@ test channel_try_receive_empty_returns_none {
         Option::None => {},
         Option::Some(_) => {
             Testing.Assertions.Fail("TryReceive on empty channel should be None");
+        }
+    };
+}
+
+test channel_close_drains_then_reports_closed {
+    Channel<i64> ch = Channel<i64>.CreateWithOptions(ChannelOptions.Bounded(1));
+    Testing.Assertions.AssertTrue(
+        Core.Results.IsOk(ch.Send(7)),
+        "bounded channel initial Send should succeed"
+    );
+    ch.Close();
+
+    Core.Results.Result<i64, ChannelError> drained = ch.Receive();
+    match drained {
+        Result::Ok(value) => {
+            Testing.Assertions.AssertEqualI64(7, value, "closed channel should drain queued value");
         },
-    }
+        Result::Error(_) => {
+            Testing.Assertions.Fail("closed channel should drain before reporting closed");
+        }
+    };
+
+    Core.Results.Result<i64, ChannelError> closed = ch.Receive();
+    Testing.Assertions.AssertTrue(
+        Core.Results.IsError(closed),
+        "closed drained channel should report an error"
+    );
+    Testing.Assertions.AssertTrue(
+        Core.Results.IsError(ch.Send(8)),
+        "send after close should report an error"
+    );
 }

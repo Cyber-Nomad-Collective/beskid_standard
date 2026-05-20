@@ -326,6 +326,12 @@ def _should_skip_relative(rel_posix: str) -> bool:
         return True
     if rel_posix.endswith(".bpk"):
         return True
+    # pckg rejects any `.beskid/*` except `.beskid/docs/` in published artifacts.
+    for i, part in enumerate(path.parts):
+        if part == ".beskid":
+            after = path.parts[i + 1 :]
+            if not after or after[0] != "docs":
+                return True
     return False
 
 

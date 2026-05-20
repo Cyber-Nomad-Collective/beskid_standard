@@ -4,7 +4,7 @@ Many APIs are still **staged**: types and function signatures are present for co
 
 ## Modules
 
-- [Array](./Array.md) — `ArrayIter`, iteration helpers (`Len` currently panics until array length builtin lands).
+- [Array](./Array.md) — `ArrayIter`, iteration helpers (`Len` via **`__array_len`**).
 - [List](./List.md) — `List<T>` with placeholder storage (`Get` surfaces errors).
 - [Map](./Map.md), [Set](./Set.md) — keyed/unordered shapes with logical counts.
 - [Queue](./Queue.md), [Stack](./Stack.md) — FIFO/LIFO shapes with counts only.

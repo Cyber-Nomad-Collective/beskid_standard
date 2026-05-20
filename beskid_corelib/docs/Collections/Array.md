@@ -1,6 +1,8 @@
-`Collections.Array` defines **`ArrayIter<T>`** and traversal helpers over **`T[]`**.
+`Collections.Array` defines **`ArrayIter<T>`** and iteration helpers over slice-like **`T[]`** values.
 
-## Types
+Slice-like arrays use the runtime **`BeskidArray`** layout; element count is read through the **`__array_len`** compiler builtin (not an OS syscall).
+
+## Type
 
 ```beskid
 pub type ArrayIter<T> {
@@ -11,12 +13,13 @@ pub type ArrayIter<T> {
 
 ## Functions
 
-| Function | Notes |
-|----------|-------|
-| `Len<T>(T[] values) -> i64` | Currently invokes **`__panic_str`** (“Array.Len is unavailable until array length builtin is exposed”) and returns `0` only after unreachable panic path—do not call in production until wired. |
-| `Iterate<T>(T[] values) -> ArrayIter<T>` | Builds an iterator at index `0` with `length = Len(values)`. |
+| Function | Behavior |
+|----------|----------|
+| `Len<T>(T[] values) -> i64` | Returns **`__array_len(values)`** (logical element count from the runtime header). |
+| `Iterate<T>(T[] values) -> ArrayIter<T>` | Iterator at index `0` with `length = Len(values)`. |
 | `HasNext<T>(ArrayIter<T> it) -> bool` | `it.index < it.length`. |
 
 ## Policy
 
-- Prefer language-level array semantics for bounds; once **`Len`** is runtime-backed, iterators stay consistent with that length.
+- Prefer language-level array semantics for bounds; iterators stay consistent with **`Len`** because both read the same runtime length.
+- **`Collections.Array`** is not re-exported from **`Prelude.bd`**; import the module explicitly when you need these helpers.

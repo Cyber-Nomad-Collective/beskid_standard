@@ -6,7 +6,7 @@ This section documents the **corelib** standard library shipped with the Beskid 
 |------|---------|
 | Core | `Core.Results`, `Core.ErrorHandling`, `Core.String` |
 | Testing | `Testing.Contracts`, `Testing.Assertions` |
-| System I/O | `System.Syscall`, `System.Syscall.StandardStream`, `System.Syscall.SyscallError`, `System.Syscall.WriteRequest`, `System.Syscall.ReadRequest`, `System.IO` |
+| System I/O | `System.Syscall`, stream helpers (`System.Input`, `System.Output`, `System.Error`), `Console` (`corelib_console`) |
 
 Other modules (`Collections.*`, `Query.*`, `System.FS`, `System.Path`, …) ship as separate compilation units under `src/`; import them explicitly when needed— they are not all pulled in through the prelude today.
 

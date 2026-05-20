@@ -4,7 +4,7 @@
 
 | Function | Behavior |
 |----------|----------|
-| `Fail(string message)` | Calls **`trigger_failure`**: prints the message via **`System.IO.PrintLine`**, then forces failure via division by zero after printing a dummy value (implementation detail; guarantees abnormal termination). |
+| `Fail(string message)` | Calls **`trigger_failure`**: prints the message via **`System.Output.WriteLine`**, then forces failure via division by zero after printing a dummy value (implementation detail; guarantees abnormal termination). |
 | `AssertTrue` / `AssertFalse` | Delegate to **`Fail`** when the condition is wrong. |
 | `AssertEqualI64` / `AssertEqualString` | Compare expected vs actual; **`Fail`** with interpolated diagnostics on mismatch. |
 | `AssertNotEqualI64` | **`Fail`** when both sides equal. |

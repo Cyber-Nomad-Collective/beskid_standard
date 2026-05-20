@@ -7,4 +7,4 @@
 
 ## Integration
 
-- Assertion functions use **`System.IO.PrintLine`** and intentional integer division by zero in a private **`trigger_failure`** path to stop the test—behavior matches the checked-in `Assertions.bd`.
+- Assertion functions use **`System.Output.WriteLine`** and intentional integer division by zero in a private **`trigger_failure`** path to stop the test—behavior matches the checked-in `Assertions.bd`.

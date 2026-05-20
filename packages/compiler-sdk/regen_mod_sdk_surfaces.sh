@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Regenerate layered `Beskid.Compiler.*` shapes from `beskid_analysis` via `beskid_ast_reflect_gen`.
+# Regenerate layered Mod SDK shapes from `beskid_analysis` via `beskid_ast_reflect_gen`.
 # Run from any cwd; requires the compiler workspace (parent of `crates/`).
 set -euo pipefail
 
 COMPILER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 cd "$COMPILER_ROOT"
 
-SDK_DIR="corelib/packages/compiler-sdk/src/Beskid/Compiler"
+SDK_BESKID_DIR="corelib/packages/compiler-sdk/src/Beskid"
+SDK_COMPILER_DIR="$SDK_BESKID_DIR/Compiler"
 
 run_gen() {
   cargo run -p beskid_ast_reflect_gen --quiet -- "$@"
@@ -27,11 +28,11 @@ stub() {
 
 write_syntax() {
   # Per-node `.bd` files under Syntax/Nodes/ plus thin Syntax.bd (see beskid_ast_reflect_gen::syntax_nodes).
-  run_gen --quiet --workspace "$COMPILER_ROOT" --emit-syntax-sdk "$SDK_DIR"
+  run_gen --quiet --workspace "$COMPILER_ROOT" --emit-syntax-sdk "$SDK_BESKID_DIR"
 }
 
 write_query() {
-  local out="$SDK_DIR/Query.bd"
+  local out="$SDK_COMPILER_DIR/Query.bd"
   {
     header
     stub
@@ -52,7 +53,7 @@ EOF
 }
 
 write_diagnostics() {
-  local out="$SDK_DIR/Diagnostics.bd"
+  local out="$SDK_COMPILER_DIR/Diagnostics.bd"
   {
     header
     stub
@@ -62,7 +63,7 @@ write_diagnostics() {
     cat <<'EOF'
 
 // Hand-maintained facade ------------------------------------------------------
-// Construction and reporting of compiler-native diagnostics from meta items.
+// Construction and reporting of compiler-native diagnostics from mod analyzers.
 
 // Diagnostics facade contract version aligned with platform-spec Beskid.Compiler.Diagnostics hub.
 pub string DiagnosticsFacadeVersion() {
@@ -72,8 +73,8 @@ EOF
   } >"$out"
 }
 
-write_emit() {
-  local out="$SDK_DIR/Emit.bd"
+write_typed_emitter() {
+  local out="$SDK_COMPILER_DIR/TypedEmitter.bd"
   {
     header
     stub
@@ -85,29 +86,61 @@ write_emit() {
 // Hand-maintained facade ------------------------------------------------------
 // Typed transforms and contributions (no raw-text emit contract).
 
-// Emit facade contract version aligned with platform-spec Beskid.Compiler.Emit hub.
-pub string EmitFacadeVersion() {
+// Typed emitter facade contract version aligned with platform-spec Beskid.Compiler.TypedEmitter hub.
+pub string TypedEmitterFacadeVersion() {
     return "0.2.0";
 }
 EOF
   } >"$out"
 }
 
-write_process() {
-  local out="$SDK_DIR/Process.bd"
+write_collect() {
+  local out="$SDK_COMPILER_DIR/Collect.bd"
   {
     header
     stub
-    run_gen --no-banner --no-reflect-stub --only-annotated \
-      --items ReflectSdkProcessHookKind \
-      crates/beskid_analysis/src/compiler_sdk_reflect.rs
     cat <<'EOF'
 
 // Hand-maintained facade ------------------------------------------------------
-// Named process contexts, lifecycle hooks, and Meta project orchestration metadata.
+// Contract entrypoints discovered from AOT-compiled Mod packages.
 
-// Process facade contract version aligned with platform-spec Beskid.Compiler.Process hub.
-pub string ProcessFacadeVersion() {
+pub type CollectRequest {}
+pub type CollectTargetSet {}
+pub type GenerationRequest {}
+pub type GeneratedSyntaxContribution {}
+pub type AnalysisRequest {}
+pub type AnalysisResult {}
+pub type AttributeGenerationRequest {}
+pub type AttributeDeclarationSet {}
+pub type FixError {}
+
+/// Declarative target collection and scope narrowing for a Mod instance.
+pub contract Collector {
+    CollectTargetSet Collect(CollectRequest request);
+}
+
+/// Incremental typed AST contribution entrypoint.
+pub contract Generator {
+    GeneratedSyntaxContribution Generate(GenerationRequest request);
+}
+
+/// Post-semantic diagnostic and rewrite-registration entrypoint.
+pub contract Analyzer {
+    AnalysisResult Analyze(AnalysisRequest request);
+}
+
+/// Typed replacement contract. TSourceNode and TTargetNode are SDK type parameters until contract generics are admitted by the grammar.
+pub contract Rewriter {
+    Result<TTargetNode, FixError> Rewrite(TSourceNode sourceNode);
+}
+
+/// Attribute declarations exported by Mod packages.
+pub contract AttributeGenerator {
+    AttributeDeclarationSet Attributes(AttributeGenerationRequest request);
+}
+
+// Collect facade contract version aligned with platform-spec Beskid.Compiler.Collect hub.
+pub string CollectFacadeVersion() {
     return "0.2.0";
 }
 EOF
@@ -115,7 +148,7 @@ EOF
 }
 
 write_compilation() {
-  local out="$SDK_DIR/Compilation.bd"
+  local out="$SDK_COMPILER_DIR/Compilation.bd"
   {
     header
     stub
@@ -125,7 +158,7 @@ write_compilation() {
     cat <<'EOF'
 
 // Hand-maintained facade ------------------------------------------------------
-// Handle for the current compilation instance (language-meta meta block scope).
+// Handle for the current compilation instance visible to Mod contracts.
 
 // Language / toolchain version token for versioned facades (Mod SDK + platform-spec alignment).
 pub string CompilerLanguageVersionToken() {
@@ -148,8 +181,8 @@ EOF
 write_syntax
 write_query
 write_diagnostics
-write_emit
-write_process
+write_typed_emitter
+write_collect
 write_compilation
 
-echo "Wrote Mod SDK surfaces under $COMPILER_ROOT/$SDK_DIR"
+echo "Wrote Mod SDK surfaces under $COMPILER_ROOT/corelib/packages/compiler-sdk/src/Beskid"

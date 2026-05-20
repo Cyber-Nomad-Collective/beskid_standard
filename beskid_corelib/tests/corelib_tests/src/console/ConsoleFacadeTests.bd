@@ -1,0 +1,51 @@
+/// Console facade: size query, resize hub, and message channel tick.
+use Console;
+use Console.ConsoleMessage;
+use Concurrency.Channel;
+
+test query_size_matches_terminal {
+    Console.ConsoleSize size = Console.QuerySize();
+    Testing.Assertions.AssertTrue(
+        size.columns >= 1 && size.rows >= 1,
+        "QuerySize should return positive terminal dimensions"
+    );
+}
+
+test start_seeds_resize_hub_last_size {
+    Console.OnResize mut hub = Console.OnResize {
+        lastSize: Console.ConsoleSize { columns: 0, rows: 0 },
+    };
+    Console.Start(hub);
+    Testing.Assertions.AssertTrue(
+        hub.lastSize.columns >= 1 && hub.lastSize.rows >= 1,
+        "Start should seed hub.lastSize from QuerySize"
+    );
+}
+
+test subscribe_on_resize_updates_last_size {
+    Console.OnResize mut hub = Console.OnResize {
+        lastSize: Console.ConsoleSize { columns: 0, rows: 0 },
+    };
+    unit(Console.ConsoleSize) handler = (Console.ConsoleSize size) => { return; };
+    Console.SubscribeOnResize(hub, handler);
+    Testing.Assertions.AssertTrue(
+        hub.lastSize.columns >= 1 && hub.lastSize.rows >= 1,
+        "SubscribeOnResize should set lastSize after initial fire"
+    );
+}
+
+test run_tick_hub_does_not_panic {
+    Console.OnResize mut hub = Console.OnResize {
+        lastSize: Console.ConsoleSize { columns: 0, rows: 0 },
+    };
+    Console.Start(hub);
+    Console.RunTickHub(hub);
+}
+
+test messages_channel_accepts_tick {
+    Channel<ConsoleMessage> messages = Console.MessagesChannel();
+    Testing.Assertions.AssertTrue(
+        Core.Results.IsOk(messages.Send(ConsoleMessage::Tick())),
+        "Tick Send should succeed"
+    );
+}

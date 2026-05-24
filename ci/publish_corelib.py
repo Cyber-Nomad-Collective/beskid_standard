@@ -290,6 +290,36 @@ def _generate_member_docs(cli_bin: Path, workspace_root: Path) -> None:
             )
         print(f"[publish] wrote {api_json} ({api_json.stat().st_size} bytes)")
         _validate_api_json_library_tree(api_json, meta.registry_name)
+        _validate_api_json_artifact_paths(api_json, meta.registry_name)
+
+
+def _validate_api_json_artifact_paths(api_json: Path, package_name: str) -> None:
+    """Fail publish when api.json paths are not artifact-relative (.bpk layout)."""
+    data = json.loads(api_json.read_text(encoding="utf-8"))
+    source = data.get("source") or ""
+    if _path_looks_absolute(source):
+        raise SystemExit(
+            f"{api_json}: source must be artifact-relative for {package_name}, got {source!r}"
+        )
+    for row in data.get("items") or []:
+        loc = row.get("location") or {}
+        file_path = loc.get("file") or ""
+        if file_path and _path_looks_absolute(file_path):
+            qn = row.get("qualifiedName", "?")
+            raise SystemExit(
+                f"{api_json}: location.file for {qn!r} must be artifact-relative, got {file_path!r}"
+            )
+
+
+def _path_looks_absolute(path: str) -> bool:
+    if not path or not path.strip():
+        return False
+    trimmed = path.strip()
+    if trimmed.startswith("/") or trimmed.startswith("\\\\"):
+        return True
+    if len(trimmed) >= 2 and trimmed[1] == ":":
+        return True
+    return "obj/beskid" in trimmed.replace("\\", "/")
 
 
 def _validate_api_json_library_tree(api_json: Path, package_name: str) -> None:

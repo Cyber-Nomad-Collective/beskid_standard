@@ -16,12 +16,12 @@ _TARGET_PATTERN = re.compile(r'^\s*target\s+"([^"]+)"\s*\{', re.MULTILINE)
 def ensure_cli() -> Path:
     override = os.environ.get("BESKID_CLI_BIN", "").strip()
     if override:
-        path = Path(override)
+        path = Path(override).expanduser()
         if not path.is_absolute():
-            path = ROOT / path
-        if not path.is_file():
-            raise SystemExit(f"BESKID_CLI_BIN does not exist: {path}")
-        return path
+            path = (ROOT / path).resolve()
+        if path.is_file():
+            return path
+        raise SystemExit(f"BESKID_CLI_BIN does not exist: {path}")
 
     if _MANAGED_CLI_BIN.is_file():
         return _MANAGED_CLI_BIN

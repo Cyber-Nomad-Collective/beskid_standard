@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+    tags:
+      - "v*"
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r ci/requirements.txt
+      - run: python -m nox --non-interactive -s quality
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Beskid CLI from release
+        run: bash ci/download_cli.sh
+      - name: Add CLI to PATH
+        run: echo "${HOME}/.beskid/bin" >> "${GITHUB_PATH}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r ci/requirements.txt
+      - name: Run corelib_tests (beskid test)
+        env:
+          BESKID_CLI_BIN: ${{ env.HOME }}/.beskid/bin/beskid
+        run: python -m nox --non-interactive -s test
+
+  publish:
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    needs:
+      - quality
+      - test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Install Beskid CLI from release
+        run: bash ci/download_cli.sh
+      - name: Add CLI to PATH
+        run: echo "${HOME}/.beskid/bin" >> "${GITHUB_PATH}"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python -m pip install --upgrade pip
+      - run: python -m pip install -r ci/requirements.txt
+      - name: Publish beskid_corelib to pckg
+        env:
+          BESKID_CLI_BIN: ${{ env.HOME }}/.beskid/bin/beskid
+          BESKID_CORELIB_ROOT: ${{ github.workspace }}
+          BESKID_PCKG_API_KEY: ${{ secrets.BESKID_PCKG_KEY }}
+          BESKID_PCKG_BASE_URL: https://pckg.beskid-lang.org
+        run: python -m nox --non-interactive -s publish_corelib

@@ -15,14 +15,21 @@ Compiler tooling discovers `corelib/beskid_corelib/Project.proj`; the parent wor
 
 - Canonical aggregate package directory remains `compiler/corelib/beskid_corelib/`.
 - `Project.proj` `project.name` is `corelib` for the aggregate lib; sibling packages use `corelib_foundation`, `corelib_runtime`, and `corelib_compiler_sdk` internally.
-- Release packaging upserts and publishes **every workspace member** to pckg (`corelib`, `corelib_foundation`, `corelib_runtime`, `corelib_compiler_sdk`, `corelib_console`, `corelib_concurrency`) via `POST /api/workspaces/publish` driven by centralized superrepo Dagger CI.
+- Release packaging upserts and publishes **every workspace member** to pckg (`corelib`, `corelib_foundation`, `corelib_runtime`, `corelib_compiler_sdk`, `corelib_console`, `corelib_concurrency`) via `POST /api/workspaces/publish` (see `ci/publish_corelib.py` and root `workspace.package.json`).
 
 ## CI/CD authority
 
-Corelib publish is centralized in the superrepo workflows and shared Dagger module:
+`beskid_standard` is the publish authority for corelib artifacts.
 
-- superrepo workflows under `.github/workflows/`
-- shared Dagger module under `beskid_infra/dagger/`
+- Standalone CI/Nox live in this repository:
+  - `.github/workflows/ci.yml`
+  - `noxfile.py`
+  - `ci/download_cli.sh` (wraps `https://beskid-lang.org/install.sh`, rolling `cli-latest`)
+  - `ci/run_corelib_tests.py` (`beskid test` for every target in `beskid_corelib/tests/corelib_tests`)
+  - `ci/version.py`
+  - `ci/publish_corelib.py`
+- Required secret in this repository: `BESKID_PCKG_KEY` (workflow maps to `BESKID_PCKG_API_KEY`).
+- CI runs static workspace checks (`quality`), then every `corelib_tests` target via `beskid test` (`test` job), then publish on `main`/tags. The CLI comes from GitHub releases via `ci/download_cli.sh`. Override the binary with `BESKID_CLI_BIN` or the release tag with `BESKID_RELEASE_TAG` (passed through to `install.sh`).
 
 ## Public documentation
 
@@ -30,4 +37,14 @@ Canonical prose lives next to the sources in **`beskid_corelib/docs/`** (packed 
 
 ## Local verification
 
-Use compiler workspace Cargo tests and the centralized Dagger CI functions.
+From this repository root:
+
+```bash
+python -m nox --non-interactive -s quality
+bash ci/download_cli.sh
+python -m nox --non-interactive -s test
+```
+
+Subset targets locally: `BESKID_CORELIB_TEST_TARGETS=SystemSyscallWriteTests,CoreResultsTests python -m nox --non-interactive -s test`.
+
+Compiler workspace Cargo tests (`projects::corelib` in `beskid_compiler`) complement these Beskid-side harness targets.

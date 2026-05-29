@@ -8,24 +8,25 @@ import os
 import shutil
 import subprocess
 import sys
+from pathlib import Path
+
+_CI_DIR = Path(__file__).resolve().parent
+if str(_CI_DIR) not in sys.path:
+    sys.path.insert(0, str(_CI_DIR))
+
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path, PurePosixPath
+from pathlib import PurePosixPath
 
-
-ROOT = Path(__file__).resolve().parents[1]
+from common import ROOT, ensure_cli
 WORKSPACE_MANIFEST = ROOT / "Workspace.proj"
 WORKSPACE_PACKAGE_JSON = ROOT / "workspace.package.json"
 REPOSITORY_BASE = (
     "https://github.com/Cyber-Nomad-Collective/beskid_compiler/tree/main/compiler/corelib"
-)
-_DEFAULT_CLI_DOWNLOAD_URL = (
-    "https://github.com/Cyber-Nomad-Collective/beskid_compiler/releases/download/"
-    "cli-latest/beskid-linux-amd64"
 )
 _SKIP_DIR_NAMES = frozenset(
     {
@@ -182,25 +183,6 @@ def _upsert_package(base_url: str, api_key: str, meta: WorkspacePackageMeta) -> 
     if not parsed.get("success", True):
         raise SystemExit(f"Upsert {meta.registry_name} failed: {parsed.get('message', body)}")
     print(f"[publish] ensured {meta.registry_name} package metadata (upsert ok)")
-
-
-def _ensure_cli() -> Path:
-    override = os.environ.get("BESKID_CLI_BIN", "").strip()
-    if override:
-        path = Path(override)
-        if not path.is_absolute():
-            path = ROOT / path
-        if not path.is_file():
-            raise SystemExit(f"BESKID_CLI_BIN does not exist: {path}")
-        return path
-
-    out = ROOT / ".ci-tools" / "beskid"
-    out.parent.mkdir(parents=True, exist_ok=True)
-    if not out.is_file():
-        url = os.environ.get("BESKID_CLI_DOWNLOAD_URL", "").strip() or _DEFAULT_CLI_DOWNLOAD_URL
-        subprocess.run(["curl", "-fsSL", url, "-o", str(out)], check=True, cwd=ROOT)
-        out.chmod(0o755)
-    return out
 
 
 def _resolve_corelib_workspace_root() -> Path:
@@ -483,7 +465,7 @@ def main() -> None:
     for meta in WORKSPACE_PACKAGES:
         _upsert_package(base_url, api_key, meta)
 
-    cli_bin = _ensure_cli()
+    cli_bin = ensure_cli()
     _generate_member_docs(cli_bin, workspace_root)
 
     bundle_path = workspace_root / ".ci-publish-workspace.bundle.zip"

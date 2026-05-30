@@ -106,6 +106,12 @@ def main() -> None:
     if 'target "CoreLib"' not in content:
         raise SystemExit('Project.proj must declare `target "CoreLib"` (canonical default library target)')
 
+    import subprocess
+    import sys
+
+    prelude_check = ROOT / "ci" / "check_prelude_units_parse.py"
+    subprocess.run([sys.executable, str(prelude_check)], check=True, cwd=ROOT)
+
     print(f"quality OK: corelib workspace manifest version {version}")
 
 

@@ -13,6 +13,17 @@ _MANAGED_CLI_BIN = Path.home() / ".beskid" / "bin" / "beskid"
 _TARGET_PATTERN = re.compile(r'^\s*target\s+"([^"]+)"\s*\{', re.MULTILINE)
 
 
+def workspace_cli_candidates() -> list[Path]:
+    """Prefer a locally built compiler workspace CLI when nested under `compiler/corelib`."""
+    compiler_root = ROOT.parent
+    if not (compiler_root / "Cargo.toml").is_file():
+        return []
+    return [
+        compiler_root / "target" / "release" / "beskid_cli",
+        compiler_root / "target" / "debug" / "beskid_cli",
+    ]
+
+
 def ensure_cli() -> Path:
     override = os.environ.get("BESKID_CLI_BIN", "").strip()
     if override:
@@ -22,6 +33,10 @@ def ensure_cli() -> Path:
         if path.is_file():
             return path
         raise SystemExit(f"BESKID_CLI_BIN does not exist: {path}")
+
+    for candidate in workspace_cli_candidates():
+        if candidate.is_file():
+            return candidate
 
     if _MANAGED_CLI_BIN.is_file():
         return _MANAGED_CLI_BIN

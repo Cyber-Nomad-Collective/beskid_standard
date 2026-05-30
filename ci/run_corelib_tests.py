@@ -38,10 +38,26 @@ def _selected_targets(all_targets: list[str]) -> list[str]:
 
 
 def _clear_stale_obj_trees() -> None:
+    if os.environ.get("BESKID_CLEAR_OBJ", "").strip() in ("1", "true", "yes"):
+        for obj_dir in (TESTS_PROJECT / "obj", TESTS_PROJECT.parent / "obj"):
+            if obj_dir.is_dir():
+                print(f"[test] removing stale artifacts {obj_dir}")
+                shutil.rmtree(obj_dir)
+        return
+    cache_dir = TESTS_PROJECT / "obj" / "beskid" / "cache"
     for obj_dir in (TESTS_PROJECT / "obj", TESTS_PROJECT.parent / "obj"):
-        if obj_dir.is_dir():
-            print(f"[test] removing stale artifacts {obj_dir}")
-            shutil.rmtree(obj_dir)
+        if not obj_dir.is_dir():
+            continue
+        for child in obj_dir.iterdir():
+            if child.name == "beskid":
+                continue
+            if child.is_dir():
+                print(f"[test] removing stale artifacts {child}")
+                shutil.rmtree(child)
+            elif child.is_file():
+                child.unlink(missing_ok=True)
+    if cache_dir.is_dir():
+        print(f"[test] preserving unit cache at {cache_dir}")
 
 
 def main() -> None:

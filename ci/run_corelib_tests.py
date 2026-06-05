@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -17,24 +16,6 @@ from common import ROOT, ensure_cli, parse_project_targets
 
 TESTS_PROJECT = ROOT / "beskid_corelib" / "tests" / "corelib_tests"
 TESTS_MANIFEST = TESTS_PROJECT / "Project.proj"
-_TARGET_FILTER = re.compile(r"^\s*([^,\s]+)\s*$")
-
-
-def _selected_targets(all_targets: list[str]) -> list[str]:
-    raw = os.environ.get("BESKID_CORELIB_TEST_TARGETS", "").strip()
-    if not raw:
-        return all_targets
-    wanted = {
-        match.group(1)
-        for part in raw.split(",")
-        if (match := _TARGET_FILTER.match(part.strip()))
-    }
-    missing = wanted - set(all_targets)
-    if missing:
-        raise SystemExit(
-            f"BESKID_CORELIB_TEST_TARGETS unknown targets: {', '.join(sorted(missing))}"
-        )
-    return [name for name in all_targets if name in wanted]
 
 
 def _clear_stale_obj_trees() -> None:
@@ -65,38 +46,37 @@ def main() -> None:
         raise SystemExit(f"Missing corelib_tests manifest: {TESTS_MANIFEST}")
 
     cli = ensure_cli()
-    targets = _selected_targets(parse_project_targets(TESTS_MANIFEST))
-    if not targets:
+    all_targets = parse_project_targets(TESTS_MANIFEST)
+    if not all_targets:
         raise SystemExit(f"No test targets found in {TESTS_MANIFEST}")
 
     _clear_stale_obj_trees()
-    print(f"[test] running {len(targets)} target(s) with {cli}")
-
-    failures: list[str] = []
-    for target in targets:
-        print(f"[test] beskid test --target {target}")
-        result = subprocess.run(
-            [
-                str(cli),
-                "test",
-                "--project",
-                str(TESTS_MANIFEST),
-                "--target",
-                target,
-                "--plain",
-            ],
-            cwd=TESTS_PROJECT,
-            check=False,
+    filter_raw = os.environ.get("BESKID_CORELIB_TEST_TARGETS", "").strip()
+    if filter_raw:
+        print(
+            f"[test] running filtered targets ({filter_raw}) with {cli} "
+            "(BESKID_CORELIB_TEST_TARGETS)"
         )
-        if result.returncode != 0:
-            failures.append(target)
+    else:
+        print(f"[test] running {len(all_targets)} target(s) with {cli}")
 
-    if failures:
-        raise SystemExit(
-            f"corelib_tests failed for {len(failures)} target(s): {', '.join(failures)}"
-        )
+    print("[test] beskid test --all-targets --plain")
+    result = subprocess.run(
+        [
+            str(cli),
+            "test",
+            "--project",
+            str(TESTS_MANIFEST),
+            "--all-targets",
+            "--plain",
+        ],
+        cwd=TESTS_PROJECT,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise SystemExit("corelib_tests failed")
 
-    print(f"[test] OK: {len(targets)} target(s) passed")
+    print(f"[test] OK: targets passed")
 
 
 if __name__ == "__main__":

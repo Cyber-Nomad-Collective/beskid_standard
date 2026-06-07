@@ -1,13 +1,18 @@
 /// Channel wrapper surface (language-owned `__channel_*` dispatch; ABI v4 std profile).
+use Concurrency.Channel;
+use Concurrency.ChannelOptions;
+use Core.Results;
+use Query.Contracts;
+use Testing.Assert;
 
 test channel_create_unbounded_default {
-    Concurrency.Channel<i64> ch = Concurrency.Channel<i64>.Create();
-    Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.ChannelError> sent = ch.Send(42);
+    Channel<i64> ch = Channel<i64>.Create();
+    Core.Results.Result<Channel.SendOk, ChannelError> sent = ch.Send(42);
     Testing.Assert.True(
         Core.Results.IsOk(sent),
         "Send should succeed on open channel"
     );
-    Core.Results.Result<i64, Concurrency.ChannelError> received = ch.Receive();
+    Core.Results.Result<i64, ChannelError> received = ch.Receive();
     match received {
         Result::Ok(value) => {
             Testing.Assert.Equal(value, 42, "Receive value mismatch");
@@ -19,9 +24,9 @@ test channel_create_unbounded_default {
 }
 
 test channel_bounded_options_factory {
-    Concurrency.ChannelOptions options = Concurrency.ChannelOptions.Bounded(4);
-    Concurrency.Channel<i64> ch = Concurrency.Channel<i64>.CreateWithOptions(options);
-    Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.ChannelError> sent = ch.Send(1);
+    ChannelOptions options = ChannelOptions.Bounded(4);
+    Channel<i64> ch = Channel<i64>.CreateWithOptions(options);
+    Core.Results.Result<Channel.SendOk, ChannelError> sent = ch.Send(1);
     Testing.Assert.True(
         Core.Results.IsOk(sent),
         "bounded channel Send should succeed"
@@ -29,8 +34,8 @@ test channel_bounded_options_factory {
 }
 
 test channel_single_reader_writer_factories {
-    Concurrency.Channel<i64> readers = Concurrency.Channel<i64>.CreateWithOptions(Concurrency.ChannelOptions.SingleReader());
-    Concurrency.Channel<i64> writers = Concurrency.Channel<i64>.CreateWithOptions(Concurrency.ChannelOptions.SingleWriter());
+    Channel<i64> readers = Channel<i64>.CreateWithOptions(ChannelOptions.SingleReader());
+    Channel<i64> writers = Channel<i64>.CreateWithOptions(ChannelOptions.SingleWriter());
     Testing.Assert.True(
         Core.Results.IsOk(readers.Send(1)),
         "single-reader channel Send should succeed"
@@ -42,8 +47,8 @@ test channel_single_reader_writer_factories {
 }
 
 test channel_try_receive_empty_returns_none {
-    Concurrency.Channel<i64> ch = Concurrency.Channel<i64>.Create();
-    Query.Contracts.Option<i64> got = ch.TryReceive();
+    Channel<i64> ch = Channel<i64>.Create();
+    Contracts.Option<i64> got = ch.TryReceive();
     match got {
         Option::None => {},
         Option::Some(_) => {
@@ -53,14 +58,14 @@ test channel_try_receive_empty_returns_none {
 }
 
 test channel_close_drains_then_reports_closed {
-    Concurrency.Channel<i64> ch = Concurrency.Channel<i64>.CreateWithOptions(Concurrency.ChannelOptions.Bounded(1));
+    Channel<i64> ch = Channel<i64>.CreateWithOptions(ChannelOptions.Bounded(1));
     Testing.Assert.True(
         Core.Results.IsOk(ch.Send(7)),
         "bounded channel initial Send should succeed"
     );
     ch.Close();
 
-    Core.Results.Result<i64, Concurrency.ChannelError> drained = ch.Receive();
+    Core.Results.Result<i64, ChannelError> drained = ch.Receive();
     match drained {
         Result::Ok(value) => {
             Testing.Assert.Equal(value, 7, "closed channel should drain queued value");
@@ -70,7 +75,7 @@ test channel_close_drains_then_reports_closed {
         }
     };
 
-    Core.Results.Result<i64, Concurrency.ChannelError> closed = ch.Receive();
+    Core.Results.Result<i64, ChannelError> closed = ch.Receive();
     Testing.Assert.True(
         Core.Results.IsError(closed),
         "closed drained channel should report an error"

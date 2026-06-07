@@ -2,16 +2,12 @@
 
 from __future__ import annotations
 
-import json
+import re
 from pathlib import Path
-
 
 ROOT = Path(__file__).resolve().parents[1]
 CORELIB = ROOT / "beskid_corelib"
-MANIFEST = CORELIB / "Project.proj"
-PRELUDE = CORELIB / "src" / "Prelude.bd"
-WORKSPACE_MANIFEST = ROOT / "Workspace.proj"
-WORKSPACE_PACKAGE_JSON = ROOT / "workspace.package.json"
+WORKSPACE_MANIFEST = ROOT / "CoreLib.bws"
 
 WORKSPACE_MEMBERS = (
     ("corelib", "beskid_corelib"),
@@ -22,7 +18,6 @@ WORKSPACE_MEMBERS = (
     ("corelib_concurrency", "packages/concurrency"),
 )
 
-# Key hand-authored sources that must remain present after workspace splits.
 REQUIRED_FILES = [
     ROOT / "packages/foundation/src/Core/Results.bd",
     ROOT / "packages/foundation/src/Core/ErrorHandling.bd",
@@ -31,8 +26,9 @@ REQUIRED_FILES = [
     ROOT / "packages/foundation/src/Testing/Assertions.bd",
     ROOT / "packages/runtime/src/System/Input.bd",
     ROOT / "packages/runtime/src/System/Output.bd",
-    ROOT / "packages/foundation/src/Prelude.bd",
 ]
+
+_MEMBER_BLOCK = re.compile(r'member\s+"([^"]+)"\s*\{([^}]*)\}', re.DOTALL)
 
 
 def _project_field(content: str, key: str) -> str | None:
@@ -46,42 +42,52 @@ def _project_field(content: str, key: str) -> str | None:
     return None
 
 
+def _member_package_map(workspace_text: str) -> dict[str, str]:
+    packages: dict[str, str] = {}
+    for _member_id, body in _MEMBER_BLOCK.findall(workspace_text):
+        package = _project_field(body, "package")
+        if package:
+            packages[package] = _project_field(body, "path") or ""
+    return packages
+
+
+def _discover_project_manifest(project_dir: Path) -> Path:
+    matches = sorted(project_dir.glob("*.bproj"))
+    if len(matches) != 1:
+        raise SystemExit(f"Expected exactly one `.bproj` in {project_dir}, found {len(matches)}")
+    return matches[0]
+
+
 def main() -> None:
     if not CORELIB.is_dir():
         raise SystemExit(f"Missing corelib package directory: {CORELIB}")
-    if not MANIFEST.is_file():
-        raise SystemExit(f"Missing manifest: {MANIFEST}")
-    if not PRELUDE.is_file():
-        raise SystemExit(f"Missing prelude: {PRELUDE}")
+    manifest = _discover_project_manifest(CORELIB)
     if not WORKSPACE_MANIFEST.is_file():
         raise SystemExit(f"Missing workspace manifest: {WORKSPACE_MANIFEST}")
-    if not WORKSPACE_PACKAGE_JSON.is_file():
-        raise SystemExit(f"Missing workspace publish metadata: {WORKSPACE_PACKAGE_JSON}")
 
-    content = MANIFEST.read_text(encoding="utf-8")
+    content = manifest.read_text(encoding="utf-8")
     name = _project_field(content, "name")
     if name != "corelib":
         raise SystemExit(f"Project name must be corelib, got: {name!r}")
 
+    project_type = _project_field(content, "type")
+    if project_type != "Aggregate":
+        raise SystemExit(f"Aggregate corelib manifest must set type = Aggregate, got: {project_type!r}")
+
     version = _project_field(content, "version")
     if not version:
-        raise SystemExit("Project.proj is missing version")
+        raise SystemExit(f"{manifest.name} is missing version")
 
     workspace_text = WORKSPACE_MANIFEST.read_text(encoding="utf-8")
     if _project_field(workspace_text, "name") != "corelib":
-        raise SystemExit("Workspace.proj workspace name must be corelib")
+        raise SystemExit("CoreLib.bws workspace name must be corelib")
 
-    workspace_package = json.loads(WORKSPACE_PACKAGE_JSON.read_text(encoding="utf-8"))
-    if workspace_package.get("schema") != "beskid.workspace.package.v1":
-        raise SystemExit("workspace.package.json schema must be beskid.workspace.package.v1")
-    members = workspace_package.get("members")
-    if not isinstance(members, dict):
-        raise SystemExit("workspace.package.json must declare members")
+    member_packages = _member_package_map(workspace_text)
+    if not member_packages:
+        raise SystemExit("CoreLib.bws must declare member blocks with package keys")
 
     for registry_name, source_rel in WORKSPACE_MEMBERS:
-        member_manifest = ROOT / source_rel / "Project.proj"
-        if not member_manifest.is_file():
-            raise SystemExit(f"Missing member manifest: {member_manifest}")
+        member_manifest = _discover_project_manifest(ROOT / source_rel)
         member_name = _project_field(member_manifest.read_text(encoding="utf-8"), "name")
         if member_name != registry_name:
             raise SystemExit(
@@ -89,28 +95,17 @@ def main() -> None:
             )
         readme = ROOT / source_rel / "README.md"
         if not readme.is_file():
-            raise SystemExit(f"Missing member README.md: {readme}")
-        member_id = next(
-            (key for key, value in members.items() if value.get("package") == registry_name),
-            None,
-        )
-        if member_id is None:
+            readme = ROOT / source_rel / "readme.md"
+        if not readme.is_file():
+            raise SystemExit(f"Missing member README for {registry_name}: {readme}")
+        if registry_name not in member_packages:
             raise SystemExit(
-                f"workspace.package.json is missing a member entry for registry package {registry_name!r}"
+                f"CoreLib.bws is missing a member entry for registry package {registry_name!r}"
             )
 
     for path in REQUIRED_FILES:
         if not path.is_file():
             raise SystemExit(f"Missing required file: {path}")
-
-    if 'target "CoreLib"' not in content:
-        raise SystemExit('Project.proj must declare `target "CoreLib"` (canonical default library target)')
-
-    import subprocess
-    import sys
-
-    prelude_check = ROOT / "ci" / "check_prelude_units_parse.py"
-    subprocess.run([sys.executable, str(prelude_check)], check=True, cwd=ROOT)
 
     print(f"quality OK: corelib workspace manifest version {version}")
 

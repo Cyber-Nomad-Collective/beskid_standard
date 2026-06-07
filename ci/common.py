@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 _CLI_INSTALL_SCRIPT = ROOT / "ci" / "download_cli.sh"
 _MANAGED_CLI_BIN = Path.home() / ".beskid" / "bin" / "beskid"
 _TARGET_PATTERN = re.compile(r'^\s*target\s+"([^"]+)"\s*\{', re.MULTILINE)
+_WORKSPACE_MANIFEST = ROOT / "CoreLib.bws"
 
 
 def workspace_cli_candidates() -> list[Path]:
@@ -51,6 +52,20 @@ def ensure_cli() -> Path:
             "Set BESKID_CLI_BIN to an existing beskid executable."
         )
     return _MANAGED_CLI_BIN
+
+
+def discover_project_manifest(project_dir: Path) -> Path:
+    matches = sorted(project_dir.glob("*.bproj"))
+    if len(matches) == 1:
+        return matches[0]
+    if not matches:
+        raise SystemExit(f"No `.bproj` manifest found in {project_dir}")
+    names = ", ".join(path.name for path in matches)
+    raise SystemExit(f"Expected exactly one `.bproj` in {project_dir}, found: {names}")
+
+
+def workspace_manifest_path() -> Path:
+    return _WORKSPACE_MANIFEST
 
 
 def parse_project_targets(manifest: Path) -> list[str]:

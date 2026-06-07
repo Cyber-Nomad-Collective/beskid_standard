@@ -22,9 +22,8 @@ import zipfile
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 
-from common import ROOT, ensure_cli
-WORKSPACE_MANIFEST = ROOT / "Workspace.proj"
-WORKSPACE_PACKAGE_JSON = ROOT / "workspace.package.json"
+from common import ROOT, discover_project_manifest, ensure_cli, workspace_manifest_path
+WORKSPACE_MANIFEST = workspace_manifest_path()
 REPOSITORY_BASE = (
     "https://github.com/Cyber-Nomad-Collective/beskid_compiler/tree/main/compiler/corelib"
 )
@@ -58,7 +57,7 @@ WORKSPACE_PACKAGES: tuple[WorkspacePackageMeta, ...] = (
         "corelib",
         "beskid_corelib",
         (
-            "Beskid standard library aggregate: prelude and re-exports of foundation, "
+            "Beskid standard library aggregate: path dependencies on foundation, "
             "runtime, console, concurrency, and compiler SDK packages."
         ),
         ("corelib", "stdlib", "beskid", "standard-library"),
@@ -194,37 +193,36 @@ def _resolve_corelib_workspace_root() -> Path:
     else:
         root = ROOT
 
-    manifest = root / "beskid_corelib" / "Project.proj"
+    manifest = discover_project_manifest(root / "beskid_corelib")
     if not manifest.is_file():
         raise SystemExit(
             "BESKID_CORELIB_ROOT must point to a workspace tree containing "
-            f"`beskid_corelib/Project.proj`, got: {root}"
+            f"`beskid_corelib/*.bproj`, got: {root}"
         )
-    if not (root / "Workspace.proj").is_file():
-        raise SystemExit(f"Workspace.proj not found under corelib root: {root}")
-    if not (root / "workspace.package.json").is_file():
-        raise SystemExit(f"workspace.package.json not found under corelib root: {root}")
+    if not WORKSPACE_MANIFEST.is_file():
+        raise SystemExit(f"CoreLib.bws not found under corelib root: {root}")
     return root
 
 
 def _validate_workspace_packages(workspace_root: Path) -> None:
-    workspace_text = (workspace_root / "Workspace.proj").read_text(encoding="utf-8")
+    workspace_text = WORKSPACE_MANIFEST.read_text(encoding="utf-8")
     workspace_name = _project_field(workspace_text, "name")
     if workspace_name != "corelib":
-        raise SystemExit(f"Workspace.proj name must be 'corelib', got {workspace_name!r}")
+        raise SystemExit(f"CoreLib.bws name must be 'corelib', got {workspace_name!r}")
 
     for meta in WORKSPACE_PACKAGES:
-        manifest = workspace_root / meta.source_rel / "Project.proj"
-        if not manifest.is_file():
-            raise SystemExit(f"Missing Project.proj for {meta.registry_name}: {manifest}")
+        member_dir = workspace_root / meta.source_rel
+        manifest = discover_project_manifest(member_dir)
         project_name = _project_field(manifest.read_text(encoding="utf-8"), "name")
         if project_name != meta.registry_name:
             raise SystemExit(
                 f"{manifest}: project.name must be {meta.registry_name!r}, got {project_name!r}"
             )
-        readme = workspace_root / meta.source_rel / "README.md"
+        readme = member_dir / "README.md"
         if not readme.is_file():
-            raise SystemExit(f"Missing README.md for {meta.registry_name}: {readme}")
+            readme = member_dir / "readme.md"
+        if not readme.is_file():
+            raise SystemExit(f"Missing README for {meta.registry_name}: {readme}")
 
 
 def _generate_member_docs(cli_bin: Path, workspace_root: Path) -> None:
@@ -234,9 +232,9 @@ def _generate_member_docs(cli_bin: Path, workspace_root: Path) -> None:
     for source_rel in _DOC_GENERATION_ORDER:
         meta = next(m for m in WORKSPACE_PACKAGES if m.source_rel == source_rel)
         source = workspace_root / source_rel
-        project = source / "Project.proj"
+        project = discover_project_manifest(source)
         if not project.is_file():
-            raise SystemExit(f"Missing Project.proj for doc generation: {project}")
+            raise SystemExit(f"Missing `.bproj` for doc generation: {source}")
 
         docs_out = source / ".beskid" / "docs"
         if docs_out.is_dir():

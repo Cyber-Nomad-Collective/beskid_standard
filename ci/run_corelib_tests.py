@@ -12,10 +12,10 @@ _CI_DIR = Path(__file__).resolve().parent
 if str(_CI_DIR) not in sys.path:
     sys.path.insert(0, str(_CI_DIR))
 
-from common import ROOT, ensure_cli, parse_project_targets
+from common import ROOT, discover_project_manifest, ensure_cli, parse_project_targets
 
 TESTS_PROJECT = ROOT / "beskid_corelib" / "tests" / "corelib_tests"
-TESTS_MANIFEST = TESTS_PROJECT / "Project.proj"
+TESTS_MANIFEST = discover_project_manifest(TESTS_PROJECT)
 
 
 def _clear_stale_obj_trees() -> None:
@@ -76,7 +76,7 @@ def main() -> None:
     if result.returncode != 0:
         raise SystemExit("corelib_tests failed")
 
-    print(f"[test] OK: targets passed")
+    print("[test] OK: targets passed")
 
 
 if __name__ == "__main__":

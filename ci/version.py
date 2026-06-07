@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = ROOT / "beskid_corelib" / "Project.proj"
+MANIFEST = ROOT / "beskid_corelib" / "corelib.bproj"
 
 TAG_RE = re.compile(r"^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$")
 
@@ -43,7 +43,7 @@ def _manifest_version_fallback() -> str:
     content = MANIFEST.read_text(encoding="utf-8")
     version = _project_field(content, "version")
     if not version:
-        raise SystemExit("Project.proj is missing version (fallback)")
+        raise SystemExit(f"{MANIFEST.name} is missing version (fallback)")
     return version
 
 

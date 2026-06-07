@@ -10,7 +10,7 @@ The **Core** modules hold types that almost every library touches: **`Core.Resul
 
 ## Conventions
 
-- Public APIs use `PascalCase`.
+- Public APIs follow platform-spec **Code style and naming**: **PascalCase** for types and callables, **lowerCamelCase** for fields and parameters.
 - Prefer **`Result<_, _>`** for recoverable failures at module boundaries where the sources already do so.
 
 ## Entry point

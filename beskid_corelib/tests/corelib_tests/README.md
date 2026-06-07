@@ -1,38 +1,55 @@
-# corelib_tests
+# corelib_tests import conventions
 
-Integration tests for the `corelib` package. The project path-depends on the aggregate
-`beskid_corelib` tree (`path = "../.."`) so tests compile against the same sources as the
-library.
+Each Lib target entry under `src/` is compiled with **import-closure** assembly: only modules referenced by explicit `use` lines are pulled from the `corelib` path dependency. Prelude re-exports in aggregate `Prelude.bd` are **not** auto-injected.
 
-## Running
+## Required imports
 
-From this directory (or via `cargo run -p beskid_cli -- test --project …` from `compiler/`):
+Every assertion-using entry:
 
-```bash
-beskid test
-beskid test --target CollectionsArrayTests
+```beskid
+use Testing.Assert;
 ```
 
-Requires a `beskid` CLI built from a compiler that skips `obj/` and `tests/` when
-materializing path dependencies (see `beskid_analysis` workspace materialization).
+Call assertions unqualified after import (`Assert.Equal`, `Assert.True`, …).
 
-## `ENAMETOOLONG` / polluted `obj/`
+When using `Result::Ok` / `Core.Results.*`:
 
-Older compilers copied `tests/corelib_tests/obj/` into materialized path dependencies,
-creating deeply nested paths and `File name too long (os error 63)`.
-
-After upgrading the CLI, remove stale artifact trees once:
-
-```bash
-rm -rf obj
-# optional: also clear aggregate test output under beskid_corelib
-rm -rf ../../tests/corelib_tests/obj ../../obj
+```beskid
+use Core.Results;
 ```
 
-Then rebuild and reinstall the CLI from `compiler/`:
+Add one or more **domain** imports for the API under test (examples):
+
+| Area | Typical `use` |
+|------|----------------|
+| Console formatting | `use Console.Format;` |
+| ANSI escape | `use Ansi.Escape;` |
+| Terminal platform | `use Platform.Terminal;` |
+| Concurrency | `use Concurrency.Channel;`, `use Concurrency.Hub;`, … |
+| System I/O | `use System.Input;`, `use System.Error;`, `use System.FS;`, `use System.Path;` |
+| Collections | `use Collections.Array;`, `use Collections.List;`, … |
+| Core bytes | `use Core.Bytes;` |
+
+## Normalizing imports
+
+From `compiler/`:
 
 ```bash
-cargo build -p beskid_cli --release
+python3 corelib/ci/normalize_corelib_test_imports.py
+python3 corelib/ci/normalize_corelib_test_imports.py --check  # CI drift guard
 ```
 
-Re-run `beskid test` from this directory.
+## Running tests
+
+```bash
+just corelib
+# or single target:
+./target/release/beskid_cli test --project corelib/beskid_corelib/tests/corelib_tests --target ConsoleFormatMarkdownTests --plain
+```
+
+Filter matrix during development:
+
+```bash
+export BESKID_CORELIB_TEST_TARGETS=ConsoleAnsiEscapeTests,ConsoleFormatMarkdownTests
+just corelib
+```

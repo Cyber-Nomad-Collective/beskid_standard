@@ -1,8 +1,9 @@
-/// Markdown-subset renderer for console markup.
+/// Markdown-subset renderer for console markup (parse via MarkupParser, render here).
 use Ansi.Osc;
 use Ansi.StyleChain;
 use Console.Format.Attributes;
-use Console.Format.Scan;
+use Console.Format.MarkupParser;
+use Core.Text.Cursor;
 
 pub string RenderPlain(string source) {
     return RenderInner(source, false);
@@ -13,142 +14,71 @@ pub string RenderStyled(string source) {
 }
 
 pub string RenderInner(string s, bool ansi) {
-    i64 n = Scan.Len(s);
+    i64 n = Core.String.Len(s);
     if n == 0 {
         return "";
     }
 
-    if Scan.StartsWith(s, "\\") {
-        if n > 1 {
-            string next = Scan.Slice(s, 1, 1);
-            if IsEscapableSigil(next) {
-                string rest = Scan.Slice(s, 2, n - 2);
-                return "${next}${RenderInner(rest, ansi)}";
-            }
+    MarkupParser.MarkupMatch m = MarkupParser.TryParse(s);
+    if m.consumed < 1 {
+        return "";
+    }
+
+    string tail = Cursor.Slice(Cursor.From(s), m.consumed, n - m.consumed);
+
+    if m.kind == MarkupParser.MarkupKind::Escape {
+        return "${m.body}${RenderInner(tail, ansi)}";
+    }
+    if m.kind == MarkupParser.MarkupKind::Literal {
+        return "${m.body}${RenderInner(tail, ansi)}";
+    }
+
+    string inner = RenderInner(m.body, ansi);
+
+    if m.kind == MarkupParser.MarkupKind::Bold {
+        if ansi {
+            inner = StyleChain.Apply(StyleChain.Bold(StyleChain.New()), inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
-
-    if Scan.StartsWith(s, "**") {
-        i64 close = Scan.IndexOfFrom(s, 2, "**");
-        if !(close < 0) {
-            string body = Scan.Slice(s, 2, close - 2);
-            string tail = Scan.Slice(s, close + 2, n - close - 2);
-            string inner = RenderInner(body, ansi);
-            if ansi {
-                inner = StyleChain.Apply(StyleChain.Bold(StyleChain.New()), inner);
-            }
-            return "${inner}${RenderInner(tail, ansi)}";
+    if m.kind == MarkupParser.MarkupKind::Italic {
+        if ansi {
+            inner = StyleChain.Apply(StyleChain.Italic(StyleChain.New()), inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
-
-    if Scan.StartsWith(s, "__") {
-        i64 close = Scan.IndexOfFrom(s, 2, "__");
-        if !(close < 0) {
-            string body = Scan.Slice(s, 2, close - 2);
-            string tail = Scan.Slice(s, close + 2, n - close - 2);
-            string inner = RenderInner(body, ansi);
-            if ansi {
-                inner = StyleChain.Apply(StyleChain.Underline(StyleChain.New()), inner);
-            }
-            return "${inner}${RenderInner(tail, ansi)}";
+    if m.kind == MarkupParser.MarkupKind::Underline {
+        if ansi {
+            inner = StyleChain.Apply(StyleChain.Underline(StyleChain.New()), inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
-
-    if Scan.StartsWith(s, "~~") {
-        i64 close = Scan.IndexOfFrom(s, 2, "~~");
-        if !(close < 0) {
-            string body = Scan.Slice(s, 2, close - 2);
-            string tail = Scan.Slice(s, close + 2, n - close - 2);
-            string inner = RenderInner(body, ansi);
-            if ansi {
-                inner = StyleChain.Apply(StyleChain.Strike(StyleChain.New()), inner);
-            }
-            return "${inner}${RenderInner(tail, ansi)}";
+    if m.kind == MarkupParser.MarkupKind::Strike {
+        if ansi {
+            inner = StyleChain.Apply(StyleChain.Strike(StyleChain.New()), inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
-
-    if Scan.StartsWith(s, "&[") {
-        i64 delim = Scan.IndexOfFrom(s, 2, "](");
-        if !(delim < 0) {
-            string attrs = Scan.Slice(s, 2, delim - 2);
-            i64 contentStart = delim + 2;
-            i64 closeParen = Scan.IndexOfFrom(s, contentStart, ")");
-            if !(closeParen < 0) {
-                string body = Scan.Slice(s, contentStart, closeParen - contentStart);
-                string tail = Scan.Slice(s, closeParen + 1, n - closeParen - 1);
-                string inner = RenderInner(body, ansi);
-                if ansi {
-                    StyleChain chain = Attributes.ApplyAttrList(StyleChain.New(), attrs);
-                    inner = StyleChain.Apply(chain, inner);
-                }
-                return "${inner}${RenderInner(tail, ansi)}";
-            }
+    if m.kind == MarkupParser.MarkupKind::AttrSpan {
+        if ansi {
+            StyleChain chain = Attributes.ApplyAttrList(StyleChain.New(), m.attrs);
+            inner = StyleChain.Apply(chain, inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
-
-    if Scan.StartsWith(s, "[") {
-        i64 delim = Scan.IndexOfFrom(s, 1, "](");
-        if !(delim < 0) {
-            string label = Scan.Slice(s, 1, delim - 1);
-            i64 urlStart = delim + 2;
-            i64 closeParen = Scan.IndexOfFrom(s, urlStart, ")");
-            if !(closeParen < 0) {
-                string url = Scan.Slice(s, urlStart, closeParen - urlStart);
-                string tail = Scan.Slice(s, closeParen + 1, n - closeParen - 1);
-                string inner = RenderInner(label, ansi);
-                if ansi {
-                    inner = Osc.Hyperlink(url, inner);
-                }
-                return "${inner}${RenderInner(tail, ansi)}";
-            }
+    if m.kind == MarkupParser.MarkupKind::PaletteTag {
+        if ansi {
+            StyleChain chain = Attributes.ApplyPaletteTag(StyleChain.New(), m.tagName);
+            inner = StyleChain.Apply(chain, inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
-
-    if Scan.StartsWith(s, "*") {
-        i64 close = Scan.IndexOfFrom(s, 1, "*");
-        if !(close < 0) {
-            string body = Scan.Slice(s, 1, close - 1);
-            string tail = Scan.Slice(s, close + 1, n - close - 1);
-            string inner = RenderInner(body, ansi);
-            if ansi {
-                inner = StyleChain.Apply(StyleChain.Italic(StyleChain.New()), inner);
-            }
-            return "${inner}${RenderInner(tail, ansi)}";
+    if m.kind == MarkupParser.MarkupKind::Link {
+        if ansi {
+            inner = Osc.Hyperlink(m.url, inner);
         }
+        return "${inner}${RenderInner(tail, ansi)}";
     }
 
-    string head = Scan.Slice(s, 0, 1);
-    string rest = Scan.Slice(s, 1, n - 1);
-    return "${head}${RenderInner(rest, ansi)}";
-}
-
-pub bool IsEscapableSigil(string c) {
-    if c == "*" {
-        return true;
-    }
-    if c == "_" {
-        return true;
-    }
-    if c == "~" {
-        return true;
-    }
-    if c == "[" {
-        return true;
-    }
-    if c == "]" {
-        return true;
-    }
-    if c == "(" {
-        return true;
-    }
-    if c == ")" {
-        return true;
-    }
-    if c == "&" {
-        return true;
-    }
-    if c == "\\" {
-        return true;
-    }
-    return false;
+    return "${inner}${RenderInner(tail, ansi)}";
 }

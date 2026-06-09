@@ -24,8 +24,8 @@ REQUIRED_FILES = [
     ROOT / "packages/foundation/src/Core/String.bd",
     ROOT / "packages/foundation/src/Testing/Contracts.bd",
     ROOT / "packages/foundation/src/Testing/Assertions.bd",
-    ROOT / "packages/runtime/src/System/Input.bd",
-    ROOT / "packages/runtime/src/System/Output.bd",
+    ROOT / "packages/runtime/src/System/Input/Input.bd",
+    ROOT / "packages/runtime/src/System/Output/Output.bd",
 ]
 
 _MEMBER_BLOCK = re.compile(r'member\s+"([^"]+)"\s*\{([^}]*)\}', re.DOTALL)

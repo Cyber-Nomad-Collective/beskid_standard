@@ -11,8 +11,8 @@ Higher-level modules (`FS`, `Path`, `Environment`, `Process`, `Time`) largely ex
 | [Output](./Output.md) | **`Write`**, **`WriteLine`** → stdout via syscall |
 | [Error](./Error.md) | **`Write`**, **`WriteLine`** → stderr via syscall |
 | [FS](./FS.md) | **`FsError`**, **`ReadAllText`**, **`WriteAllText`**, **`Exists`** — file I/O returns errors except trivial cases |
-| [Path](./Path.md) | **`Combine`** concatenates; **`FileName`** / **`Extension`** return the argument unchanged (stubs) |
-| [Time](./Time.md) | **`Instant`**, **`Duration`**; **`NowUtc`** / **`MonotonicNow`** return zero ticks |
+| [Path](./Path.md) | POSIX-oriented **`Combine`**, **`FileName`**, **`Extension`**, **`IsAbsolute`** helpers |
+| [Time](./Time.md) | **`Instant`**, **`Duration`**, UTC civil types; clock reads via runtime nanosecond builtins |
 | [Environment](./Environment.md) | **`Get`** / **`TryGet`** / **`Set`** mostly errors or empty; **`CurrentDirectory`** returns `"."` |
 | [Process](./Process.md) | **`Id`** `0`; **`Exit`** only succeeds for code `0`; **`Run`** errors |
 

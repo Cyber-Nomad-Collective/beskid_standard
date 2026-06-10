@@ -65,21 +65,136 @@ EOF
   } >"$out"
 }
 
-write_typed_emitter() {
-  local out="$SDK_COMPILER_DIR/TypedEmitter.bd"
+write_emitter_kind() {
+  local out="$SDK_COMPILER_DIR/Emitter/Kind.bd"
   {
     header
     run_gen --no-banner --no-reflect-stub --only-annotated \
-      --items ReflectSdkEmitContributionKind \
+      --items ReflectSdkEmitContributionKind,ReflectSdkSyntaxContributionItem \
+      crates/beskid_analysis/src/compiler_sdk_reflect.rs
+  } >"$out"
+}
+
+write_internal_symbol() {
+  local out="$SDK_COMPILER_DIR/InternalSymbol.bd"
+  {
+    header
+    run_gen --no-banner --no-reflect-stub --only-annotated \
+      --items ReflectSdkInternalSymbolType \
       crates/beskid_analysis/src/compiler_sdk_reflect.rs
     cat <<'EOF'
 
 // Hand-maintained facade ------------------------------------------------------
-// Typed transforms and contributions (no raw-text emit contract).
+// Host reads [InternalSymbol] metadata when building mod.descriptor.json registrations.
 
-// Typed emitter facade contract version aligned with platform-spec Beskid.Compiler.TypedEmitter hub.
-pub string TypedEmitterFacadeVersion() {
+/// Describes how a mod entrypoint is exported for AOT host binding.
+pub enum InternalSymbolType {
+    Callable(InternalSymbolCallable),
+}
+
+/// Callable ABI shape: parameter types in Beskid type syntax (schema for marshaling).
+/// Return type is inferred from the annotated method signature.
+pub type InternalSymbolCallable {
+    Beskid.Compiler.Collect.GenerationRequest[] parameters,
+}
+
+/// Marks a contract entry method for native export and mod-host scheduling.
+pub attribute InternalSymbol(MethodDefinition) {
+    symbol: InternalSymbolType,
+}
+
+pub string InternalSymbolFacadeVersion() {
     return "0.2.0";
+}
+EOF
+  } >"$out"
+}
+
+write_workspace() {
+  local out="$SDK_COMPILER_DIR/Workspace.bd"
+  {
+    header
+    cat <<'EOF'
+
+// Hand-maintained facade ------------------------------------------------------
+// Active workspace summary for mod contract entrypoints.
+
+/// One resolved workspace member project visible to mod contracts.
+pub type WorkspaceMember {
+    string memberId,
+    string projectName,
+    string projectRoot,
+    string sourceRoot,
+}
+
+/// Active workspace summary: root path, members, and lockfile identity.
+pub type Workspace {
+    string rootPath,
+    WorkspaceMember[] members,
+    string lockHash,
+}
+
+pub string WorkspaceFacadeVersion() {
+    return "0.1.0";
+}
+EOF
+  } >"$out"
+}
+
+write_mod_package() {
+  local out="$SDK_COMPILER_DIR/ModPackage.bd"
+  {
+    header
+    cat <<'EOF'
+
+// Hand-maintained facade ------------------------------------------------------
+// Single loaded mod package introspection for mod contract entrypoints.
+
+/// One `(contractId, typeId, entrySymbol)` registration from a loaded mod descriptor.
+pub type ModContractRegistration {
+    string contractId,
+    string typeId,
+    string entrySymbol,
+}
+
+/// Introspection view of a single loaded mod package in the active compilation.
+pub type ModPackage {
+    string packageId,
+    string packageVersion,
+    string projectName,
+    string projectRoot,
+    string sourceRoot,
+    string manifestPath,
+    string descriptorPath,
+    string[] capabilities,
+    ModContractRegistration[] registrations,
+}
+
+pub string ModPackageFacadeVersion() {
+    return "0.1.0";
+}
+EOF
+  } >"$out"
+}
+
+write_mod_catalog() {
+  local out="$SDK_COMPILER_DIR/ModCatalog.bd"
+  {
+    header
+    cat <<'EOF'
+
+// Hand-maintained facade ------------------------------------------------------
+// Catalog of mod packages loaded for the active host compilation.
+
+use Beskid.Compiler.ModPackage;
+
+/// Catalog of mod packages loaded for the active host compilation.
+pub type ModCatalog {
+    ModPackage[] packages,
+}
+
+pub string ModCatalogFacadeVersion() {
+    return "0.1.0";
 }
 EOF
   } >"$out"
@@ -92,17 +207,50 @@ write_collect() {
     cat <<'EOF'
 
 // Hand-maintained facade ------------------------------------------------------
-// Contract entrypoints discovered from AOT-compiled Mod packages.
+// Mod packages import these contracts — do not redeclare locally.
 
-pub type CollectRequest {}
-pub type CollectTargetSet {}
-pub type GenerationRequest {}
-pub type GeneratedSyntaxContribution {}
-pub type AnalysisRequest {}
+use Beskid.Compiler.Compilation;
+use Beskid.Compiler.ModCatalog;
+use Beskid.Compiler.Workspace;
+use Beskid.Syntax.Nodes;
+
+pub type CollectRequest {
+    Beskid.Compiler.Compilation compilation,
+    Beskid.Compiler.Workspace workspace,
+    Beskid.Compiler.ModCatalog mods,
+}
+
+pub type CollectTargetSet {
+    string[] targetIds,
+}
+
+pub type GenerationRequest {
+    CollectRequest context,
+    CollectTargetSet targets,
+}
+
+pub type AnalysisRequest {
+    CollectRequest context,
+}
+
 pub type AnalysisResult {}
-pub type AttributeGenerationRequest {}
+pub type AttributeGenerationRequest {
+    CollectRequest context,
+}
 pub type AttributeDeclarationSet {}
 pub type FixError {}
+
+/// One top-level syntax item contributed by a Generator (typed AST, not source text).
+pub enum SyntaxContributionItem {
+    ContractDefinition(ContractDefinition definition),
+    TypeDefinition(TypeDefinition definition),
+    FunctionDefinition(FunctionDefinition definition),
+}
+
+/// Typed AST payload returned from `Generator.Generate`.
+pub type GeneratedSyntaxContribution {
+    SyntaxContributionItem[] items,
+}
 
 /// Declarative target collection and scope narrowing for a Mod instance.
 pub contract Collector {
@@ -129,9 +277,8 @@ pub contract AttributeGenerator {
     AttributeDeclarationSet Attributes(AttributeGenerationRequest request);
 }
 
-// Collect facade contract version aligned with platform-spec Beskid.Compiler.Collect hub.
 pub string CollectFacadeVersion() {
-    return "0.2.0";
+    return "0.3.0";
 }
 EOF
   } >"$out"
@@ -149,6 +296,16 @@ write_compilation() {
 // Hand-maintained facade ------------------------------------------------------
 // Handle for the current compilation instance visible to Mod contracts.
 
+/// Active host compilation summary passed to mod contract entrypoints.
+pub type Compilation {
+    string activeProjectName,
+    string activeProjectRoot,
+    string targetTriple,
+    u64 syntaxGenerationId,
+    string entrySourcePath,
+    string entrySourceName,
+}
+
 // Language / toolchain version token for versioned facades (Mod SDK + platform-spec alignment).
 pub string CompilerLanguageVersionToken() {
     return "0.2";
@@ -161,7 +318,7 @@ pub string SemanticSnapshotFamilyToken() {
 
 // Mod SDK compilation surface version (independent of user program language version).
 pub string ModSdkCompilationSurfaceVersion() {
-    return "0.2.0";
+    return "0.3.0";
 }
 EOF
   } >"$out"
@@ -170,7 +327,11 @@ EOF
 write_syntax
 write_query
 write_diagnostics
-write_typed_emitter
+write_emitter_kind
+write_internal_symbol
+write_workspace
+write_mod_package
+write_mod_catalog
 write_collect
 write_compilation
 

@@ -5,7 +5,7 @@ The public docs site under `site/website/src/content/docs/corelib/` holds short 
 ## Scope
 
 - Public module naming and surface aligned with `compiler/corelib/beskid_corelib/src`.
-- Runtime boundaries (`System.Syscall`, `System.Input` / `System.Output` / `System.Error`, `Console`) versus staged placeholders (`System.FS`, `System.Environment`, …).
+- Runtime boundaries (`Core.Syscall`, `Core.Input` / `Core.Output` / `Core.Error`, `Console`) versus staged placeholders (`Core.FS`, `Core.Environment`, …).
 - Error model (`Core.Results`, structured errors on system modules).
 
 These pages are **not** platform-spec nodes: cross-cutting policy fields (`specLevel`, `owner`, …) belong under `site/website/src/content/docs/platform-spec/` and are validated separately by trudoc.
@@ -14,9 +14,9 @@ These pages are **not** platform-spec nodes: cross-cutting policy fields (`specL
 
 - [Core](./Core/README.md): [Error-Handling](./Core/Error-Handling.md), [Results](./Core/Results.md), [String](./Core/String.md)
 - [Collections](./Collections/README.md): [Array](./Collections/Array.md), [List](./Collections/List.md), [Map](./Collections/Map.md), [Set](./Collections/Set.md), [Queue](./Collections/Queue.md), [Stack](./Collections/Stack.md)
-- [Query](./Query/README.md): [Contracts](./Query/Contracts.md), [Operators](./Query/Operators.md), [Execution](./Query/Execution.md)
-- [System](./System/README.md): [FS](./System/FS.md), [Path](./System/Path.md), [Time](./System/Time.md), [Environment](./System/Environment.md), [Process](./System/Process.md), [IO](./System/IO.md), [Syscall](./System/Syscall.md)
-- [Testing](./Testing/README.md): [Contracts](./Testing/Contracts.md), [Assertions](./Testing/Assertions.md)
+- [Query](./Query/README.md): [Operators](./Query/Operators.md), [Execution](./Query/Execution.md)
+- [Core](./Core/README.md) OS runtime: [Syscall](./Core/Syscall.md), [Input](./Core/Input.md), [Output](./Core/Output.md), [Error](./Core/Error.md), [FS](./Core/FS.md), [Path](./Core/Path.md), [Time](./Core/Time.md), [Environment](./Core/Environment.md), [Process](./Core/Process.md)
+- [Testing](./Testing/README.md): [Contracts](./Testing/Contracts.md), [Assert](./Testing/Assert.md)
 
 ## Naming direction
 

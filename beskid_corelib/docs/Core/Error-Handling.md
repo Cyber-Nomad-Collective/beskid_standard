@@ -1,4 +1,4 @@
-`Core.ErrorHandling` provides a small, serializable error description type for user-facing messages, separate from module-specific error enums (for example `System.FS.FsError`).
+`Core.ErrorHandling` provides a small, serializable error description type for user-facing messages, separate from module-specific error enums (for example `Core.FS.FsError`).
 
 ## Types and functions
 

@@ -4,18 +4,17 @@ This section documents the **corelib** standard library shipped with the Beskid 
 
 | Area | Modules |
 |------|---------|
-| Core | `Core.Results`, `Core.ErrorHandling`, `Core.String` |
+| Core | `Core.Results`, `Core.ErrorHandling`, `Core.String`, `Core.Syscall`, stream helpers (`Core.Input`, `Core.Output`, `Core.Error`) |
 | Testing | `Testing.Contracts`, `Testing.Assertions` |
-| System I/O | `System.Syscall`, stream helpers (`System.Input`, `System.Output`, `System.Error`), `Console` (`corelib_console`) |
+| Console | `Console` (`corelib_console`) |
 
-Other modules (`Collections.*`, `Query.*`, `System.FS`, `System.Path`, …) ship as separate compilation units under `src/`; import them explicitly when needed— they are not all pulled in through the prelude today.
+Other modules (`Collections.*`, `Query.*`, `Core.FS`, `Core.Path`, …) ship as separate compilation units under `src/`; import them explicitly when needed— they are not all pulled in through the prelude today.
 
 ## Documentation map
 
 - Core: [Core](./Core/README.md)
 - Collections: [Collections](./Collections/README.md)
 - Query: [Query](./Query/README.md)
-- System: [System](./System/README.md)
 - Testing: [Testing](./Testing/README.md)
 
 ## Relationship to tooling

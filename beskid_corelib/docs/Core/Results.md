@@ -12,7 +12,7 @@ pub enum Result<TValue, TError> {
 ## Usage
 
 - Return **`Result::Ok(...)`** for success and **`Result::Error(...)`** for failure.
-- System modules (`System.FS`, `System.Process`, `System.Syscall`, …) use this shape with domain-specific `TError` enums.
+- System modules (`Core.FS`, `Core.Process`, `Core.Syscall`, …) use this shape with domain-specific `TError` enums.
 - This is the preferred alternative to string-only error channels for recoverable failure at API boundaries.
 
 ## Helpers

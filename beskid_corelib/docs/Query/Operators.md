@@ -1,26 +1,32 @@
-`Query.Operators` defines **`QueryState<T>`** and several operators that transform it. The current implementation is a **scaffold**: it uses `i64` counts and `Query.Contracts.Option` markers to approximate pipeline behavior.
+`Query.Operators` defines **`QueryState<T>`** and array-backed combinators over `T[]` windows.
 
 ## Type
 
 ```beskid
 pub type QueryState<T> {
-    i64 count,
-    Query.Contracts.Option first,
+    T[] source,
+    i64 index,
+    i64 length,
+    Core.Optional.Option<T> first,
 }
 ```
 
-## Operators (current behavior)
+## Operators
 
 | Function | Role |
 |----------|------|
-| `Where` | If `predicate` is false, returns empty state; otherwise returns the input state. |
-| `Select` | If `state.count < 1`, returns empty. Otherwise uses a self-equality check on `sample` to decide whether to carry `count` forward and set `first` to `Some(1)` (placeholder projection). |
-| `Take` / `Skip` | Adjust `count` / `first` with simple boundary rules. |
-| `Count` | Returns `state.count`. |
-| `First` | Returns `Some(1)` or `None` based on `first` and `count` (not a true element payload yet). |
-| `CollectArray` | Returns `state.count` as a stand-in for materialized length. |
+| `FromArray<T>` | Build state from a source array (`index=0`, `length=Len(source)`). |
+| `Where` | Drop the window when `predicate` is false at the current position. |
+| `Select` | Project the current element using a `sample` value (staged projection). |
+| `Take` / `Skip` | Bound or advance the logical window. |
+| `Count` | Remaining element count (`length - index`). |
+| `First` | Optional first element for the current window. |
+| `ToList` | Materialize the remaining window into a new `T[]`. |
+| `Any` / `All` | Scan the window for any / all elements equal to a reference value. |
+| `OrderBy` | Sort an `i64` window ascending or descending (bubble sort, v1). |
+| `CollectArray` | Returns `Len(ToList(state))`. |
 
 ## Policy
 
-- Treat public names as stable; treat **semantics** as subject to change when real query execution lands.
-- Prefer domain-specific collection code for production until the pipeline is runtime-backed.
+- Import `Core.Optional` for optional query results; `Query.Contracts` is removed.
+- Prefer explicit `Collections.Array` helpers for production storage until query syntax lowering lands.

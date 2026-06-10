@@ -15,5 +15,5 @@
 
 ## Policy
 
-- No direct syscalls; see `System.Syscall` for fd I/O.
+- No direct syscalls; see `Core.Syscall` for fd I/O.
 - String conversion for text semantics uses `Core.Encoding.Utf8`.

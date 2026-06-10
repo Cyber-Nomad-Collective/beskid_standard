@@ -1,64 +1,64 @@
-/// FIFO queue shape; v1 tracks only logical `count`. Tier 2 until runtime ring-buffer storage ships;
-/// signatures are stable so authors can call parity helpers today.
+/// FIFO queue backed by ring buffer over `T[]` storage.
 /// @tier(supported)
-/// @par(T) Element type parameter.
+use Collections.Array;
+use Core.Results;
+
 pub type Queue<T> {
-    /// Number of logical elements.
+    T[] storage,
+    i64 head,
     i64 count,
+
+    pub i64 Count() {
+        return count;
+    }
+
+    pub bool IsEmpty() {
+        return count == 0;
+    }
+
+    pub Queue<T> Enqueue(T value) {
+        i64 capacity = Array.Len<T>(storage);
+        if capacity < 1 {
+            capacity = 4;
+            storage = Array.EnsureCapacity<T>(storage, capacity);
+        }
+        i64 tail = head + count;
+        if tail >= capacity {
+            tail = tail - capacity;
+        }
+        if count >= capacity {
+            capacity = capacity * 2;
+            storage = Array.EnsureCapacity<T>(storage, capacity);
+        }
+        T[] nextStorage = Array.Set<T>(storage, tail, value);
+        return Queue<T> { storage: nextStorage, head: head, count: count + 1 };
+    }
+
+    pub Queue<T> Dequeue() {
+        if count <= 0 {
+            return Queue<T> { storage: storage, head: head, count: 0 };
+        }
+        i64 capacity = Array.Len<T>(storage);
+        i64 nextHead = head + 1;
+        if capacity > 0 && nextHead >= capacity {
+            nextHead = 0;
+        }
+        return Queue<T> { storage: storage, head: nextHead, count: count - 1 };
+    }
+
+    pub Result<T, string> Peek() {
+        if count <= 0 {
+            return Result::Error("queue is empty");
+        }
+        i64 capacity = Array.Len<T>(storage);
+        i64 index = head;
+        if capacity > 0 && index >= capacity {
+            index = 0;
+        }
+        return Result::Ok(Array.Get<T>(storage, index));
+    }
 }
 
-/// Creates an empty queue.
-/// @tier(supported)
-/// @returns Queue with `count` zero.
 pub Queue<T> New<T>() {
-    return Queue<T> { count: 0 };
-}
-
-/// Returns the logical element count.
-/// @tier(supported)
-/// @arg(queue) Queue handle.
-/// @returns `count` field.
-pub i64 Count<T>(Queue<T> queue) {
-    return queue.count;
-}
-
-/// Returns true when the queue is empty.
-/// @tier(supported)
-/// @arg(queue) Queue handle.
-/// @returns `true` when `count == 0`.
-pub bool IsEmpty<T>(Queue<T> queue) {
-    return queue.count == 0;
-}
-
-/// Logical enqueue: returns a new queue with `count + 1`; storage is not yet wired so the value
-/// payload is not retained between calls.
-/// @tier(supported)
-/// @arg(queue) Source queue handle.
-/// @arg(value) Element to enqueue (observed only via count in v1).
-/// @returns Queue with `count` incremented.
-pub Queue<T> Enqueue<T>(Queue<T> queue, T value) {
-    return Queue<T> { count: queue.count + 1 };
-}
-
-/// Logical dequeue: returns a new queue with `count - 1` or zero when empty.
-/// @tier(supported)
-/// @arg(queue) Source queue handle.
-/// @returns Queue with `count` decremented; saturates at zero.
-pub Queue<T> Dequeue<T>(Queue<T> queue) {
-    if queue.count <= 0 {
-        return Queue<T> { count: 0 };
-    }
-    return Queue<T> { count: queue.count - 1 };
-}
-
-/// Returns the head element without removing it, or an error when empty / unbacked.
-/// Tier 3 until runtime ring-buffer storage ships; signature stays stable.
-/// @tier(unstable)
-/// @arg(queue) Queue handle.
-/// @returns `Error` while runtime storage is not yet wired.
-pub Core.Results.Result<T, string> Peek<T>(Queue<T> queue) {
-    if queue.count <= 0 {
-        return Result::Error("queue is empty");
-    }
-    return Result::Error("queue storage is not implemented");
+    return Queue<T> { storage: Array.Empty<T>(), head: 0, count: 0 };
 }

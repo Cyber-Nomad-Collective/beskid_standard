@@ -19,13 +19,21 @@ WORKSPACE_MEMBERS = (
 )
 
 REQUIRED_FILES = [
-    ROOT / "packages/foundation/src/Core/Results.bd",
-    ROOT / "packages/foundation/src/Core/ErrorHandling.bd",
-    ROOT / "packages/foundation/src/Core/String.bd",
+    ROOT / "packages/foundation/src/Core/Results/Results.bd",
+    ROOT / "packages/foundation/.generated/Core/Text/Regex/Generated.g.bd",
+    ROOT / "packages/foundation/src/Core/ErrorHandling/ErrorHandling.bd",
+    ROOT / "packages/foundation/src/Core/String/String.bd",
+    ROOT / "packages/foundation/src/Core/Optional/Option.bd",
+    ROOT / "packages/foundation/src/Collections/Collections.bd",
+    ROOT / "packages/foundation/src/Collections/Array.bd",
+    ROOT / "packages/foundation/src/Query/Query.bd",
+    ROOT / "packages/foundation/src/Query/QueryState.bd",
+    ROOT / "packages/foundation/src/Testing/Testing.bd",
+    ROOT / "packages/foundation/src/Testing/Assert/Assert.bd",
     ROOT / "packages/foundation/src/Testing/Contracts.bd",
-    ROOT / "packages/foundation/src/Testing/Assertions.bd",
-    ROOT / "packages/runtime/src/System/Input/Input.bd",
-    ROOT / "packages/runtime/src/System/Output/Output.bd",
+    ROOT / "packages/foundation/src/Core/Input/Input.bd",
+    ROOT / "packages/foundation/src/Core/Output/Output.bd",
+    ROOT / "packages/foundation/src/Core/Syscall/Syscall.bd",
 ]
 
 _MEMBER_BLOCK = re.compile(r'member\s+"([^"]+)"\s*\{([^}]*)\}', re.DOTALL)

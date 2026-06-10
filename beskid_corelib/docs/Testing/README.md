@@ -1,10 +1,8 @@
-**Testing** contains **`Testing.Contracts`** (protocol-style contracts for deferred assertions) and **`Testing.Assertions`** (concrete `Assert*` and **`Fail`** entry points). Both are re-exported from **`Prelude.bd`**.
+**Testing** helpers for Beskid `test` blocks and user-authored tests.
 
 ## Modules
 
-- [Testing.Contracts](./Contracts.md) — `AssertionPredicate`, `AssertionMessageBuilder`
-- [Testing.Assertions](./Assertions.md) — `Fail`, `AssertTrue`, `AssertEqual*`, `AssertContains`, …
+- [Testing.Assert](./Assert.md) — Shouldly-style assertions (`Equal`, `True`, `False`, `Contains`, `Fail`) with **actual-first** argument order.
+- [Testing.Contracts](./Contracts.md) — Deferred predicate/message contracts for staged assertion tooling.
 
-## Integration
-
-- Assertion functions use **`System.Output.WriteLine`** and intentional integer division by zero in a private **`trigger_failure`** path to stop the test—behavior matches the checked-in `Assertions.bd`.
+Deprecated `Testing.Assertions` (expected-first wrappers) has been removed; import `Testing.Assert` directly.

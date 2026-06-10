@@ -1,9 +1,8 @@
-**Query** modules model deferred query-like pipelines: **`Query.Contracts`** defines **`Option`** and the **`Iterator`** contract; **`Query.Operators`** holds **`QueryState<T>`** and combinators; **`Query.Execution`** exposes small helpers over that state.
+**Query** modules model array-backed query pipelines: **`Query.QueryState`** holds iterator state; **`Query.Operators`** exposes combinators; **`Query.Execution`** provides deferred/materialization helpers.
 
-These sources are still **staged**—several functions use placeholder logic to keep the project building while the language and runtime gain full query support. See each page for the exact behavior in `Query/*.bd`.
+Optional values use **`Core.Optional`** — not a separate query contracts module.
 
 ## Modules
 
-- [Query.Contracts](./Contracts.md) — `Option`, `Iterator`, `HasValue`
-- [Query.Operators](./Operators.md) — `QueryState`, `Where`, `Select`, `Take`, `Skip`, `Count`, `First`, `CollectArray`
+- [Query.Operators](./Operators.md) — `QueryState`, `FromArray`, `Where`, `Select`, `Take`, `Skip`, `Count`, `First`, `ToList`, `Any`, `All`, `OrderBy`, `CollectArray`
 - [Query.Execution](./Execution.md) — `IsDeferred`, `MaterializeCount`

@@ -1,8 +1,125 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Encoding.Base64;
+use Core.Encoding.EncodingError;
+use Core.Encoding.Hex;
+use Core.Encoding.Utf8;
+use Core.Results;
 use Testing.Assert;
 
 
-test utf8_from_str_builtin_round_trip {
-    i64 raw = __bytes_from_str("hi");
-    string round = __str_from_bytes_utf8(raw);
-    Assert.Equal(round, "hi", "utf8 builtin round trip");
+test utf8_encode_decode_round_trip {
+    Result<u8[], EncodingError> encoded = Utf8.EncodeToBytes("hello");
+    match encoded {
+        Result::Ok(bytes) => {
+            Assert.True(Utf8.IsValid(bytes), "encoded bytes should be valid utf8");
+            Result<string, EncodingError> decoded = Utf8.DecodeFromBytes(bytes);
+            match decoded {
+                Result::Ok(text) => {
+                    Assert.Equal(text, "hello", "Utf8 round trip");
+                },
+                Result::Error(_) => {
+                    Assert.Fail("Utf8.DecodeFromBytes should succeed");
+                },
+            };
+        },
+        Result::Error(_) => {
+            Assert.Fail("Utf8.EncodeToBytes should succeed");
+        },
+    };
+}
+
+test utf8_convert_helpers_round_trip {
+    u8[] bytes = Convert.StringToBytes("hi");
+    Result<string, EncodingError> text = Convert.BytesToString(bytes);
+    match text {
+        Result::Ok(value) => {
+            Assert.Equal(value, "hi", "Convert round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("Convert.BytesToString should succeed");
+        },
+    };
+}
+
+test utf8_is_valid_rejects_ill_formed {
+    u8[] bad = Slice.New(1);
+    Slice.Set(bad, 0, 255);
+    Assert.False(Utf8.IsValid(bad), "invalid lead byte");
+}
+
+test utf8_decode_rejects_invalid {
+    u8[] bad = Slice.New(1);
+    Slice.Set(bad, 0, 255);
+    Result<string, EncodingError> decoded = Utf8.DecodeFromBytes(bad);
+    match decoded {
+        Result::Ok(_) => {
+            Assert.Fail("DecodeFromBytes should fail on invalid utf8");
+        },
+        Result::Error(_) => {},
+    };
+}
+
+test hex_encode_decode_round_trip {
+    u8[] raw = Convert.StringToBytes("ab");
+    Result<u8[], EncodingError> encoded = Hex.EncodeBytes(raw);
+    match encoded {
+        Result::Ok(hexBytes) => {
+            Result<u8[], EncodingError> decoded = Hex.DecodeBytes(hexBytes);
+            match decoded {
+                Result::Ok(round) => {
+                    Assert.Equal(Slice.Compare(round, raw), 0, "Hex round trip");
+                },
+                Result::Error(_) => {
+                    Assert.Fail("Hex.DecodeBytes should succeed");
+                },
+            };
+        },
+        Result::Error(_) => {
+            Assert.Fail("Hex.EncodeBytes should succeed");
+        },
+    };
+}
+
+test hex_odd_length_errors {
+    u8[] odd = Convert.StringToBytes("abc");
+    Result<u8[], EncodingError> decoded = Hex.DecodeBytes(odd);
+    match decoded {
+        Result::Ok(_) => {
+            Assert.Fail("Hex.DecodeBytes should reject odd length");
+        },
+        Result::Error(_) => {},
+    };
+}
+
+test base64_encode_decode_round_trip {
+    u8[] raw = Convert.StringToBytes("fi");
+    Result<u8[], EncodingError> encoded = Base64.EncodeBytes(raw);
+    match encoded {
+        Result::Ok(b64Bytes) => {
+            Result<u8[], EncodingError> decoded = Base64.DecodeBytes(b64Bytes);
+            match decoded {
+                Result::Ok(round) => {
+                    Assert.Equal(Slice.Compare(round, raw), 0, "Base64 round trip");
+                },
+                Result::Error(_) => {
+                    Assert.Fail("Base64.DecodeBytes should succeed");
+                },
+            };
+        },
+        Result::Error(_) => {
+            Assert.Fail("Base64.EncodeBytes should succeed");
+        },
+    };
+}
+
+test base64_invalid_padding_errors {
+    u8[] bad = Convert.StringToBytes("abcd");
+    Result<u8[], EncodingError> decoded = Base64.DecodeBytes(bad);
+    match decoded {
+        Result::Ok(_) => {
+            Assert.Fail("Base64.DecodeBytes should reject invalid padding");
+        },
+        Result::Error(_) => {},
+    };
 }

@@ -20,6 +20,11 @@ def compute_version(session: nox.Session) -> None:
     session.run("python", "ci/version.py")
 
 
+@nox.session(python=False, name="regen_fluent")
+def regen_fluent(session: nox.Session) -> None:
+    session.run("python", "ci/regen_fluent_surfaces.py")
+
+
 @nox.session(python=False, name="publish_corelib")
 def publish_corelib(session: nox.Session) -> None:
     session.run("python", "ci/publish_corelib.py")

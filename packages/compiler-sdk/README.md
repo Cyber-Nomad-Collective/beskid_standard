@@ -4,12 +4,14 @@ Typed Mod SDK facades under `Beskid.Syntax` and `Beskid.Compiler.*` for compiler
 
 ## Generated surfaces
 
-`src/Beskid/Compiler/{Query,Diagnostics,TypedEmitter,Compilation}.bd` each combine:
+`src/Beskid/Compiler/{Query,Diagnostics,Compilation}.bd` each combine:
 
 1. **Generated** structural mirrors from `beskid_analysis` (via `beskid_ast_reflect_gen`), using `ReflectStub` for payloads where the Rust shape is not mapped field-for-field.
 2. **Hand-maintained** version tokens and facade helpers at the bottom of each file.
 
 `src/Beskid/Compiler/Collect.bd` is hand-maintained and declares the `Collector`, `Generator`, `Analyzer`, `Rewriter`, and `AttributeGenerator` contracts discovered from AOT-compiled `Mod` packages.
+
+`src/Beskid/Compiler/Emitter.bd` is the typed emit hub for generator mods. Hand-maintained builders live under `Emitter/{Nodes,Contracts,Items,Contribution,Fluent}.bd`; `Emitter/Kind.bd` is regenerated from `compiler_sdk_reflect.rs`.
 
 **Syntax** is split for stack-friendly consumption:
 

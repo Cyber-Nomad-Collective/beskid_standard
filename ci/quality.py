@@ -29,7 +29,7 @@ REQUIRED_FILES = [
     ROOT / "packages/foundation/src/Query/Query.bd",
     ROOT / "packages/foundation/src/Query/QueryState.bd",
     ROOT / "packages/foundation/src/Testing/Testing.bd",
-    ROOT / "packages/foundation/src/Testing/Assert/Assert.bd",
+    ROOT / "packages/foundation/src/Testing/Assert.bd",
     ROOT / "packages/foundation/src/Testing/Contracts.bd",
     ROOT / "packages/foundation/src/Core/Input/Input.bd",
     ROOT / "packages/foundation/src/Core/Output/Output.bd",

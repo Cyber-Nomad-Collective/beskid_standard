@@ -1,3 +1,4 @@
+# Corelib standalone repo: quality + test via rolling CLI (publish runs from beskid superrepo Dagger).
 name: CI
 
 on:
@@ -8,67 +9,35 @@ on:
   pull_request:
 
 jobs:
-  quality:
+  gate:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r ci/requirements.txt
-      - run: python -m nox --non-interactive -s quality
 
-  test:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build Beskid CLI from compiler workspace when available
+      - name: Install Beskid CLI (rolling)
+        run: curl -fsSL https://beskid-lang.org/install.sh | bash
+
+      - name: Corelib quality (manifest layout)
         run: |
-          if [ -f "${GITHUB_WORKSPACE}/../Cargo.toml" ]; then
-            cargo build -p beskid_cli --release --manifest-path ../Cargo.toml
-            echo "BESKID_CLI_BIN=${GITHUB_WORKSPACE}/../target/release/beskid_cli" >> "${GITHUB_ENV}"
-          else
-            bash ci/download_cli.sh
-            echo "${HOME}/.beskid/bin" >> "${GITHUB_PATH}"
-          fi
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r ci/requirements.txt
+          set -euo pipefail
+          test -d beskid_corelib
+          test -f CoreLib.bws
+          grep -q 'name = "corelib"' beskid_corelib/*.bproj
+          grep -q 'type = "Aggregate"' beskid_corelib/*.bproj
+          test -f packages/foundation/src/Core/Results/Results.bd
+
       - name: Run corelib_tests (beskid test)
-        run: python -m nox --non-interactive -s test
+        run: |
+          set -euo pipefail
+          export PATH="${HOME}/.beskid/bin:${PATH}"
+          manifest="$(ls beskid_corelib/tests/corelib_tests/*.bproj)"
+          cd beskid_corelib/tests/corelib_tests
+          beskid test --project "$(basename "$manifest")" --all-targets --plain
 
   publish:
-    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
-    needs:
-      - quality
-      - test
+    if: false
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Build Beskid CLI from compiler workspace when available
-        run: |
-          if [ -f "${GITHUB_WORKSPACE}/../Cargo.toml" ]; then
-            cargo build -p beskid_cli --release --manifest-path ../Cargo.toml
-            echo "BESKID_CLI_BIN=${GITHUB_WORKSPACE}/../target/release/beskid_cli" >> "${GITHUB_ENV}"
-          else
-            bash ci/download_cli.sh
-            echo "${HOME}/.beskid/bin" >> "${GITHUB_PATH}"
-          fi
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
-      - run: python -m pip install --upgrade pip
-      - run: python -m pip install -r ci/requirements.txt
-      - name: Publish beskid_corelib to pckg
-        env:
-          BESKID_CORELIB_ROOT: ${{ github.workspace }}
-          BESKID_PCKG_API_KEY: ${{ secrets.BESKID_PCKG_KEY }}
-          BESKID_PCKG_BASE_URL: https://pckg.beskid-lang.org
-        run: python -m nox --non-interactive -s publish_corelib
+      - run: |
+          echo "Corelib publish runs from the beskid superrepo (Dagger package-publish.publish-corelib)." >&2
+          exit 1

@@ -15,16 +15,11 @@ Compiler tooling discovers `compiler/corelib/beskid_corelib/corelib.bproj`; the 
 
 - Canonical aggregate package directory remains `compiler/corelib/beskid_corelib/`.
 - `corelib.bproj` declares `name = corelib` and `type = Aggregate` (dependency-only, no `src/`); sibling packages use `corelib_foundation`, `corelib_runtime`, and `corelib_compiler_sdk` internally.
-- Release packaging upserts and publishes **every workspace member** to pckg via `POST /api/workspaces/publish` (member metadata lives in `CoreLib.bws`; see `ci/publish_corelib.py`).
+- Release packaging upserts and publishes **every workspace member** to pckg via `POST /api/workspaces/publish` (see superrepo Dagger `package-publish.publish-corelib`).
 
 ## CI/CD authority
 
 `beskid_standard` is the publish authority for corelib artifacts.
 
-- Standalone CI/Nox live in this repository:
-  - `.github/workflows/ci.yml`
-  - `noxfile.py`
-  - `ci/download_cli.sh` (wraps `https://beskid-lang.org/install.sh`, rolling `cli-latest`)
-  - `ci/run_corelib_tests.py` (`beskid test` for every target in `beskid_corelib/tests/corelib_tests`)
-  - `ci/version.py`
-  - `ci/publish_corelib.py`
+- Superrepo workflow [`.github/workflows/corelib.yml`](../../.github/workflows/corelib.yml) runs Dagger `corelib-gate` and `package-publish.publish-corelib` from [`beskid_infra/dagger`](../../beskid_infra/dagger/).
+- Local fast path: from parent compiler workspace, `just corelib` runs all `corelib_tests` targets via release `beskid_cli`.

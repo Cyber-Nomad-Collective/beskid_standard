@@ -1,7 +1,7 @@
 /// Regex matching via combinator parsers generated from `regex.pest`.
 use Core.Text.Cursor;
 use Core.Text.Parser;
-use Core.Optional;
+use Core.Optional.Option;
 
 pub mod Core.Text.Regex.Generated;
 
@@ -27,7 +27,7 @@ pub bool IsValidPattern(string pattern) {
     if Core.String.Len(pattern) < 1 {
         return false;
     }
-    Parser.TextParseResult<string> parsed = Core.Text.Regex.Generated.ParsePat(Cursor.From(pattern));
+    Parser.Result.TextParseResult<string> parsed = Core.Text.Regex.Generated.ParsePat(Cursor.From(pattern));
     if !Parser.IsOk(parsed) {
         return false;
     }
@@ -68,7 +68,7 @@ pub Option<MatchSpan> Find(string pattern, string text) {
         }
         pos = pos + 1;
     }
-    return Contracts.Option<MatchSpan>::None;
+    return Option<MatchSpan>::None;
 }
 
 pub bool IsFindAllEmpty(MatchSpanList list) {
@@ -90,6 +90,24 @@ pub MatchSpanList FindAll(string pattern, string text) {
 
 pub Option<MatchSpan> MatchLowerRun(string pattern, string text) {
     return Match(pattern, text);
+}
+
+/// Predicate helper so callers can avoid spelling `Option.HasValue<MatchSpan>`.
+pub bool HasMatch(Option<MatchSpan> value) {
+    return match value {
+        Option::Some(_) => true,
+        Option::None => false,
+    };
+}
+
+/// True when `Match(pattern, text)` yields a span.
+pub bool Matches(string pattern, string text) {
+    return HasMatch(Match(pattern, text));
+}
+
+/// True when `Find(pattern, text)` yields a span.
+pub bool Finds(string pattern, string text) {
+    return HasMatch(Find(pattern, text));
 }
 
 pub type MatchStep {
@@ -245,7 +263,7 @@ MatchStep MatchQuant(string pattern, i64 piece_start, i64 pat_after, string text
 
 MatchStep MatchDot(string text, i64 text_pos, i64 pat_after) {
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), text_pos);
-    Parser.TextParseResult<string> parsed = Core.Text.Regex.Generated.ParseAnyUnit(c);
+    Parser.Result.TextParseResult<string> parsed = Core.Text.Regex.Generated.ParseAnyUnit(c);
     if !Parser.IsOk(parsed) {
         return MatchStep { pat_pos: pat_after, text_pos: text_pos, ok: false };
     }
@@ -259,7 +277,7 @@ MatchStep MatchEscape(string pattern, i64 pat_pos, string text, i64 text_pos) {
     }
     string esc = PatAt(pattern, pat_pos + 1);
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), text_pos);
-    Parser.TextParseResult<string> parsed = Core.Text.Regex.Generated.ParseDigit(c);
+    Parser.Result.TextParseResult<string> parsed = Core.Text.Regex.Generated.ParseDigit(c);
     if esc == "d" {
         parsed = Core.Text.Regex.Generated.ParseDigit(c);
     } else if esc == "D" {
@@ -285,24 +303,24 @@ MatchStep MatchEscape(string pattern, i64 pat_pos, string text, i64 text_pos) {
     return MatchStep { pat_pos: pat_pos + 2, text_pos: Cursor.Position(rest), ok: true };
 }
 
-Parser.TextParseResult<string> MatchNotDigit(Cursor.TextCursor c) {
-    Parser.TextParseResult<string> digit = Core.Text.Regex.Generated.ParseDigit(c);
+Parser.Result.TextParseResult<string> MatchNotDigit(Cursor.TextCursor c) {
+    Parser.Result.TextParseResult<string> digit = Core.Text.Regex.Generated.ParseDigit(c);
     if Parser.IsOk(digit) {
         return Parser.Fail(c, ParseErrorKind::ExpectedRule, "not_digit");
     }
     return Core.Text.Regex.Generated.ParseAnyUnit(c);
 }
 
-Parser.TextParseResult<string> MatchNotWord(Cursor.TextCursor c) {
-    Parser.TextParseResult<string> word = Core.Text.Regex.Generated.ParseWordTail(c);
+Parser.Result.TextParseResult<string> MatchNotWord(Cursor.TextCursor c) {
+    Parser.Result.TextParseResult<string> word = Core.Text.Regex.Generated.ParseWordTail(c);
     if Parser.IsOk(word) {
         return Parser.Fail(c, ParseErrorKind::ExpectedRule, "not_word");
     }
     return Core.Text.Regex.Generated.ParseAnyUnit(c);
 }
 
-Parser.TextParseResult<string> MatchNotSpace(Cursor.TextCursor c) {
-    Parser.TextParseResult<string> space = Core.Text.Regex.Generated.ParseSpace(c);
+Parser.Result.TextParseResult<string> MatchNotSpace(Cursor.TextCursor c) {
+    Parser.Result.TextParseResult<string> space = Core.Text.Regex.Generated.ParseSpace(c);
     if Parser.IsOk(space) {
         return Parser.Fail(c, ParseErrorKind::ExpectedRule, "not_space");
     }
@@ -376,7 +394,7 @@ MatchStep MatchLiteral(string pattern, i64 pat_pos, string text, i64 text_pos) {
     }
     string lit = Cursor.Slice(Cursor.From(pattern), pat_pos, end - pat_pos);
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), text_pos);
-    Parser.TextParseResult<string> parsed = Parser.Literal(c, lit, "literal");
+    Parser.Result.TextParseResult<string> parsed = Parser.Literal(c, lit, "literal");
     if !Parser.IsOk(parsed) {
         return MatchStep { pat_pos: pat_pos, text_pos: text_pos, ok: false };
     }

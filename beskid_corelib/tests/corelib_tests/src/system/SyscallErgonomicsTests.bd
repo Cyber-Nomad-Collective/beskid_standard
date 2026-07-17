@@ -1,26 +1,49 @@
-/// Runtime-backed syscall contract checks aligned with platform-spec panic-io-and-syscalls.
-/// Typed `Core.Syscall` wrapper tests (match / `Result`) require project dependency symbols
-/// in the JIT pipeline; until then this target validates stdin read, stdout write, and invalid fd
-/// behavior via runtime builtins used by the wrappers.
+/// Runtime-backed syscall contract checks via `Core.Syscall` typed requests.
 
-test syscall_write_stdout_builtin_smoke {
-    i64 written = __syscall_write(1_i64, "ergonomic-write");
-    if written < 1 {
-        __panic_str("stdout write should return at least one byte");
-    }
+use Testing.Assert;
+use Core.Syscall;
+use Core.Syscall.Descriptor;
+use Core.Syscall.StandardStream;
+use Core.Syscall.WriteRequest;
+use Core.Syscall.ReadRequest;
+use Core.Syscall.ReadLimit;
+use Core.Results;
+
+
+test syscall_write_stdout_typed_smoke {
+    StandardStream stream = StandardStream::Stdout();
+    Descriptor descriptor = Descriptor::Standard(stream);
+    Core.Results.Result<i64, Core.Syscall.SyscallError> result =
+        Core.Syscall.WriteWith(
+            WriteRequest {
+                descriptor: descriptor,
+                data: "ergonomic-write"
+            }
+        );
+    Assert.True(Results.IsOk(result), "stdout WriteWith should succeed");
+    match result {
+        Result::Ok(written) => {
+            Assert.True(written >= 1, "stdout write should return at least one byte");
+        },
+        Result::Error(_) => {},
+    };
 }
 
-test syscall_read_stdout_builtin_returns_empty_on_stub {
-    string text = __syscall_read(1_i64, 4_i64);
-    i64 len = __str_len(text);
-    if len < 0 {
-        __panic_str("unsupported read fd should yield empty string with non-negative length");
-    }
+test syscall_read_unsupported_fd_returns_error {
+    StandardStream stream = StandardStream::Stdout();
+    Descriptor descriptor = Descriptor::Standard(stream);
+    Core.Results.Result<string, Core.Syscall.SyscallError> result =
+        Core.Syscall.ReadWith(
+            ReadRequest {
+                descriptor: descriptor,
+                limit: ReadLimit::UpTo(4_i64)
+            }
+        );
+    Assert.True(Results.IsError(result), "read from stdout should fail in v1");
 }
 
-test syscall_write_invalid_fd_builtin_returns_negative {
-    i64 written = __syscall_write(-1_i64, "x");
-    if written >= 0 {
-        __panic_str("invalid fd write should return negative byte count");
-    }
+test syscall_write_invalid_fd_returns_error {
+    Core.Results.Result<i64, Core.Syscall.SyscallError> result =
+        Core.Syscall.Write(-1_i64, "x");
+    Assert.True(Results.IsError(result), "invalid fd write should return error");
 }

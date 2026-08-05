@@ -2,7 +2,8 @@
 use Concurrency.ChannelError;
 use Concurrency.ChannelOptions;
 use Concurrency.Status;
-use Core.Optional;
+use Core.Optional.Option;
+use Core.Results;
 
 /// Success marker for [`Send`] / [`TrySend`] (`Result<SendOk, ChannelError>` per platform spec `Result<(), _>`).
 pub type SendOk {
@@ -43,9 +44,9 @@ pub Core.Results.Result<T, ChannelError> Receive<T>(Channel<T> self) {
     i64 raw = __channel_receive(self.handle);
     Status status = Status.FromI64(raw);
     if status == Status::Ok {
-        return Result::Ok(__channel_receive_value(self.handle));
+        return Results.Success<T, ChannelError>(__channel_receive_value(self.handle));
     }
-    return Result::Error(MapReceiveError(status));
+    return Results.Failure<T, ChannelError>(MapReceiveError(status));
 }
 
 /// Non-blocking send; `None` when the operation would block.
@@ -53,12 +54,12 @@ pub Option<SendOk> TrySend<T>(Channel<T> self, T value) {
     i64 raw = __channel_try_send(self.handle, value);
     Status status = Status.FromI64(raw);
     if status == Status::Ok {
-        return Option::Some(SendOk { });
+        return Option.FromValue<SendOk>(SendOk { });
     }
     if status == Status::WouldBlock {
-        return Option::None();
+        return Option.Empty<SendOk>();
     }
-    return Option::None();
+    return Option.Empty<SendOk>();
 }
 
 /// Non-blocking receive; `None` when the operation would block.
@@ -67,12 +68,12 @@ pub Option<T> TryReceive<T>(Channel<T> self) {
     i64 raw = __channel_try_receive(self.handle, value);
     Status status = Status.FromI64(raw);
     if status == Status::Ok {
-        return Option::Some(value);
+        return Option.FromValue<T>(value);
     }
     if status == Status::WouldBlock {
-        return Option::None();
+        return Option.Empty<T>();
     }
-    return Option::None();
+    return Option.Empty<T>();
 }
 
 /// Idempotent writer shutdown.
@@ -83,15 +84,15 @@ pub unit Close<T>(Channel<T> self) {
 
 pub Core.Results.Result<SendOk, ChannelError> MapSendStatus(Status status) {
     if status == Status::Ok {
-        return Result::Ok(SendOk { });
+        return Results.Success<SendOk, ChannelError>(SendOk { });
     }
     if status == Status::Closed {
-        return Result::Error(ChannelError::Closed());
+        return Results.Failure<SendOk, ChannelError>(ChannelError::Closed());
     }
     if status == Status::Cancelled {
-        return Result::Error(ChannelError::Cancelled());
+        return Results.Failure<SendOk, ChannelError>(ChannelError::Cancelled());
     }
-    return Result::Error(ChannelError::Closed());
+    return Results.Failure<SendOk, ChannelError>(ChannelError::Closed());
 }
 
 pub ChannelError MapReceiveError(Status status) {

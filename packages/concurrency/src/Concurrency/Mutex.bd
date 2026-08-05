@@ -2,38 +2,39 @@
 use Concurrency.MutexError;
 use Concurrency.MutexGuard;
 use Concurrency.Status;
-use Core.Optional;
+use Core.Optional.Option;
+use Core.Results;
 
 pub type Mutex {
     i64 handle,
-
-    /// Parks until the mutex is acquired or the fiber is cancelled.
-    pub Core.Results.Result<MutexGuard, MutexError> Lock() {
-        i64 raw = __mutex_lock(handle);
-        Status status = Status.FromI64(raw);
-        if status == Status::Ok {
-            return Result::Ok(MutexGuard { mutexHandle: handle });
-        }
-        if status == Status::Cancelled {
-            return Result::Error(MutexError::Cancelled());
-        }
-        return Result::Error(MutexError::Cancelled());
-    }
-
-    /// Returns `None` when the mutex would block.
-    pub Option<MutexGuard> TryLock() {
-        i64 raw = __mutex_try_lock(handle);
-        Status status = Status.FromI64(raw);
-        if status == Status::Ok {
-            return Option::Some(MutexGuard { mutexHandle: handle });
-        }
-        return Option::None();
-    }
 }
 
 pub Mutex Create() {
     i64 handle = __mutex_create();
     return Mutex { handle: handle };
+}
+
+/// Parks until the mutex is acquired or the fiber is cancelled.
+pub Core.Results.Result<MutexGuard, MutexError> Lock(Mutex mutex) {
+    i64 raw = __mutex_lock(mutex.handle);
+    Status status = Status.FromI64(raw);
+    if status == Status::Ok {
+        return Results.Success<MutexGuard, MutexError>(MutexGuard { mutexHandle: mutex.handle });
+    }
+    if status == Status::Cancelled {
+        return Results.Failure<MutexGuard, MutexError>(MutexError::Cancelled());
+    }
+    return Results.Failure<MutexGuard, MutexError>(MutexError::Cancelled());
+}
+
+/// Returns `None` when the mutex would block.
+pub Option<MutexGuard> TryLock(Mutex mutex) {
+    i64 raw = __mutex_try_lock(mutex.handle);
+    Status status = Status.FromI64(raw);
+    if status == Status::Ok {
+        return Option.FromValue<MutexGuard>(MutexGuard { mutexHandle: mutex.handle });
+    }
+    return Option.Empty<MutexGuard>();
 }
 
 pub unit Unlock(MutexGuard guard) {

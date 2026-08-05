@@ -9,15 +9,16 @@ use Query.ArrayIterator;
 /// Maps each element through `project` (called externally for each element).
 /// Returns a new array of projected values.
 pub TOut[] Map<TIn, TOut>(mut ArrayIterator<TIn> it, TOut sample) {
-    i64 remaining = it.Remaining();
+    i64 remaining = ArrayIterator.Remaining<TIn>(it);
     TOut[] result = Array.EnsureCapacity<TOut>(Array.Empty<TOut>(), remaining);
     mut i64 outIndex = 0;
     while outIndex < remaining {
-        Option<TIn> next = it.Next();
+        Option<TIn> next = ArrayIterator.Current<TIn>(it);
         match next {
             Option::Some(_) => {
                 result = Array.Set<TOut>(result, outIndex, sample);
                 outIndex = outIndex + 1;
+                it = ArrayIterator.MoveNext<TIn>(it);
             },
             Option::None => { },
         };
@@ -38,7 +39,7 @@ pub T[] Take<T>(mut ArrayIterator<T> it, i64 count) {
     if count < 1 {
         return Array.Empty<T>();
     }
-    i64 remaining = it.Remaining();
+    i64 remaining = ArrayIterator.Remaining<T>(it);
     i64 take = count;
     if take > remaining {
         take = remaining;
@@ -46,11 +47,12 @@ pub T[] Take<T>(mut ArrayIterator<T> it, i64 count) {
     T[] result = Array.EnsureCapacity<T>(Array.Empty<T>(), take);
     mut i64 outIndex = 0;
     while outIndex < take {
-        Option<T> next = it.Next();
+        Option<T> next = ArrayIterator.Current<T>(it);
         match next {
             Option::Some(value) => {
                 result = Array.Set<T>(result, outIndex, value);
                 outIndex = outIndex + 1;
+                it = ArrayIterator.MoveNext<T>(it);
             },
             Option::None => { },
         };
@@ -62,24 +64,27 @@ pub T[] Take<T>(mut ArrayIterator<T> it, i64 count) {
 pub T[] Skip<T>(mut ArrayIterator<T> it, i64 count) {
     mut i64 skipped = 0;
     while skipped < count {
-        Option<T> next = it.Next();
+        Option<T> next = ArrayIterator.Current<T>(it);
         match next {
-            Option::Some(_) => { skipped = skipped + 1; },
+            Option::Some(_) => {
+                skipped = skipped + 1;
+                it = ArrayIterator.MoveNext<T>(it);
+            },
             Option::None => { skipped = count; },
         };
     }
-    i64 remaining = it.Remaining();
+    i64 remaining = ArrayIterator.Remaining<T>(it);
     return Take<T>(it, remaining);
 }
 
 /// Counts remaining elements in the iterator.
 pub i64 Count<T>(mut ArrayIterator<T> it) {
-    return it.Remaining();
+    return ArrayIterator.Remaining<T>(it);
 }
 
 /// Returns the first element or `None`.
 pub Option<T> First<T>(mut ArrayIterator<T> it) {
-    return it.Next();
+    return ArrayIterator.Current<T>(it);
 }
 
 /// Returns the last element or `None`.
@@ -87,9 +92,12 @@ pub Option<T> Last<T>(mut ArrayIterator<T> it) {
     mut Option<T> last = Option::None();
     mut bool done = false;
     while !done {
-        Option<T> next = it.Next();
+        Option<T> next = ArrayIterator.Current<T>(it);
         match next {
-            Option::Some(value) => { last = Option::Some(value); },
+            Option::Some(value) => {
+                last = Option::Some(value);
+                it = ArrayIterator.MoveNext<T>(it);
+            },
             Option::None => { done = true; },
         };
     }
@@ -98,18 +106,19 @@ pub Option<T> Last<T>(mut ArrayIterator<T> it) {
 
 /// Collects all remaining elements into a new array.
 pub T[] ToArray<T>(mut ArrayIterator<T> it) {
-    i64 remaining = it.Remaining();
+    i64 remaining = ArrayIterator.Remaining<T>(it);
     if remaining < 1 {
         return Array.Empty<T>();
     }
     T[] result = Array.EnsureCapacity<T>(Array.Empty<T>(), remaining);
     mut i64 outIndex = 0;
     while outIndex < remaining {
-        Option<T> next = it.Next();
+        Option<T> next = ArrayIterator.Current<T>(it);
         match next {
             Option::Some(value) => {
                 result = Array.Set<T>(result, outIndex, value);
                 outIndex = outIndex + 1;
+                it = ArrayIterator.MoveNext<T>(it);
             },
             Option::None => { },
         };
@@ -121,12 +130,13 @@ pub T[] ToArray<T>(mut ArrayIterator<T> it) {
 pub bool Any<T>(mut ArrayIterator<T> it, T value) {
     mut bool done = false;
     while !done {
-        Option<T> next = it.Next();
+        Option<T> next = ArrayIterator.Current<T>(it);
         match next {
             Option::Some(elem) => {
                 if elem == value {
                     return true;
                 }
+                it = ArrayIterator.MoveNext<T>(it);
             },
             Option::None => { done = true; },
         };
@@ -138,12 +148,13 @@ pub bool Any<T>(mut ArrayIterator<T> it, T value) {
 pub bool All<T>(mut ArrayIterator<T> it, T value) {
     mut bool done = false;
     while !done {
-        Option<T> next = it.Next();
+        Option<T> next = ArrayIterator.Current<T>(it);
         match next {
             Option::Some(elem) => {
                 if elem != value {
                     return false;
                 }
+                it = ArrayIterator.MoveNext<T>(it);
             },
             Option::None => { done = true; },
         };
@@ -157,9 +168,12 @@ pub i64 FoldI64(mut ArrayIterator<i64> it, i64 seed) {
     mut i64 acc = seed;
     mut bool done = false;
     while !done {
-        Option<i64> next = it.Next();
+        Option<i64> next = ArrayIterator.Current<i64>(it);
         match next {
-            Option::Some(value) => { acc = acc + value; },
+            Option::Some(value) => {
+                acc = acc + value;
+                it = ArrayIterator.MoveNext<i64>(it);
+            },
             Option::None => { done = true; },
         };
     }
@@ -167,8 +181,8 @@ pub i64 FoldI64(mut ArrayIterator<i64> it, i64 seed) {
 }
 
 /// Returns true when the iterator has no remaining elements.
-pub bool IsEmpty<T>(mut ArrayIterator<T> it) {
-    return it.Remaining() == 0;
+pub bool IteratorIsEmpty<T>(mut ArrayIterator<T> it) {
+    return ArrayIterator.Remaining<T>(it) == 0;
 }
 
 /// Bubble-sorts elements of the iterator ascending or descending, returns new array.

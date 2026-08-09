@@ -14,6 +14,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Make console panel/progress rendering and ASCII casing conversions explicit across `i32`,
+  `i64`, and `u8` boundaries, and cover exact progress-bar fill and clamping behavior.
+
 - Prevent the Sgr module import from shadowing StyleChain builder functions.
 - Assert monotonic clock ordering without requiring its arbitrary epoch to be positive.
 - Delegate deprecated console whitespace trimming to the canonical Core.String implementation.

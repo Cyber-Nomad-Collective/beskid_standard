@@ -2,7 +2,7 @@
 use Concurrency.MutexError;
 use Concurrency.MutexGuard;
 use Concurrency.Status;
-use Core.Optional.Option;
+use Concurrency.TryResult;
 use Core.Results;
 
 pub type Mutex {
@@ -17,24 +17,23 @@ pub Mutex Create() {
 /// Parks until the mutex is acquired or the fiber is cancelled.
 pub Core.Results.Result<MutexGuard, MutexError> Lock(Mutex mutex) {
     i64 raw = __mutex_lock(mutex.handle);
-    Status status = Status.FromI64(raw);
-    if status == Status::Ok {
-        return Results.Success<MutexGuard, MutexError>(MutexGuard { mutexHandle: mutex.handle });
-    }
-    if status == Status::Cancelled {
-        return Results.Failure<MutexGuard, MutexError>(MutexError::Cancelled());
-    }
-    return Results.Failure<MutexGuard, MutexError>(MutexError::Cancelled());
+    Status status = Status.FromCode(raw);
+    return match status {
+        Status::Ok => Results.Success<MutexGuard, MutexError>(MutexGuard { mutexHandle: mutex.handle }),
+        Status::Cancelled(reason) => Results.Failure<MutexGuard, MutexError>(MutexError::Cancelled(reason)),
+        _ => Results.Failure<MutexGuard, MutexError>(MutexError::Cancelled(0)),
+    };
 }
 
-/// Returns `None` when the mutex would block.
-pub Option<MutexGuard> TryLock(Mutex mutex) {
+/// Returns `WouldBlock` when contended, `Err` on cancel.
+pub TryResult<MutexGuard, MutexError> TryLock(Mutex mutex) {
     i64 raw = __mutex_try_lock(mutex.handle);
-    Status status = Status.FromI64(raw);
-    if status == Status::Ok {
-        return Option.FromValue<MutexGuard>(MutexGuard { mutexHandle: mutex.handle });
-    }
-    return Option.Empty<MutexGuard>();
+    Status status = Status.FromCode(raw);
+    return match status {
+        Status::Ok => TryResult::Ok(MutexGuard { mutexHandle: mutex.handle }),
+        Status::Cancelled(reason) => TryResult::Err(MutexError::Cancelled(reason)),
+        _ => TryResult::WouldBlock,
+    };
 }
 
 pub unit Unlock(MutexGuard guard) {

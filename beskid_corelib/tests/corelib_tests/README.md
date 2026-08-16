@@ -26,8 +26,8 @@ Add one or more **domain** imports for the API under test (examples):
 | ANSI escape | `use Ansi.Escape;` |
 | Terminal platform | `use Platform.Terminal;` |
 | Concurrency | `use Concurrency.Channel;`, `use Concurrency.Hub;`, … |
-| System I/O | `use System.Input;`, `use System.Error;`, `use System.FS;`, `use System.Path;` |
-| Collections | `use Collections.Array;`, `use Collections.List;`, … |
+| System I/O | `use Core.Input;`, `use Core.Error;`, `use Core.FS;`, `use Core.Path;` |
+| Collections | `use Core.Collections.Array;`, `use Core.Collections.List;`, … |
 | Core bytes | `use Core.Bytes;` |
 
 ## Normalizing imports
@@ -38,6 +38,10 @@ From `compiler/`:
 python3 corelib/ci/normalize_corelib_test_imports.py
 python3 corelib/ci/normalize_corelib_test_imports.py --check  # CI drift guard
 ```
+
+## Source fixtures
+
+Negative namespace and native-only overflow fixtures live under `fixtures/`; see `fixtures/README.md`. They are not ordinary `Lib` targets and must be selected by the compile-fail or installed-runtime fixture harness.
 
 ## Running tests
 

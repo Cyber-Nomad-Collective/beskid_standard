@@ -1,28 +1,61 @@
-/// Tier 2 (Supported) coverage for `Core.FS` parity helpers.
-/// Contract stub suite for `Core.FS` error shapes. Host-backed FS builtins require the
-/// std profile and `beskid_host` registration (ABI v4); this target pins heuristic placeholders.
+/// Native-only public API fixtures for canonical `Core.FS` behavior.
 
+use Core.FS;
+use Core.FS.FsError;
+use Core.Results;
 use Testing.Assert;
 
 
-test fs_exists_treats_empty_path_as_false {
-    bool result = "" != "";
-    Assert.False(result, "FS.Exists must return false for empty path");
+/// @native-only
+ test fs_write_read_empty_and_non_empty_files {
+    string path = "/tmp/beskid-corelib-fs-read.txt";
+    Result<unit, FsError> emptyWrite = FS.WriteAllText(path, "");
+    Assert.True(Results.IsOk(emptyWrite), "native adapter writes an empty file");
+    Result<string, FsError> emptyRead = FS.ReadAllText(path);
+    string empty = match emptyRead { Result::Ok(text) => text, Result::Error(_) => "error" };
+    Assert.Equal(empty, "", "public ReadAllText returns a non-null canonical empty string");
+
+    Result<unit, FsError> textWrite = FS.WriteAllText(path, "beskid");
+    Assert.True(Results.IsOk(textWrite), "native adapter overwrites text");
+    Result<string, FsError> textRead = FS.ReadAllText(path);
+    string text = match textRead { Result::Ok(value) => value, Result::Error(_) => "error" };
+    Assert.Equal(text, "beskid", "public ReadAllText returns persisted content");
+    Assert.True(Results.IsOk(FS.Delete(path)), "public Delete removes the fixture file");
 }
 
-test fs_exists_treats_nonempty_path_as_true {
-    bool result = "/tmp/something" != "";
-    Assert.True(result, "FS.Exists must return true for non-empty path heuristic stub");
+/// @native-only
+ test fs_exists_and_missing_read_preserve_typed_results {
+    string path = "/tmp/beskid-corelib-fs-missing.txt";
+    FS.Delete(path);
+    Result<bool, FsError> missing = FS.Exists(path);
+    bool absent = match missing { Result::Ok(value) => !value, Result::Error(_) => false };
+    Assert.True(absent, "Exists maps NotFound to Ok(false)");
+    bool notFound = match FS.ReadAllText(path) {
+        Result::Ok(_) => false,
+        Result::Error(FsError::NotFound(errorPath)) => errorPath == path,
+        Result::Error(_) => false,
+    };
+    Assert.True(notFound, "ReadAllText preserves the missing path in FsError::NotFound");
 }
 
-test fs_read_all_text_empty_path_is_rejected {
-    string path = "";
-    bool is_invalid = path == "";
-    Assert.True(is_invalid, "FS.ReadAllText must reject empty path with InvalidPath");
-}
-
-test fs_write_all_text_empty_payload_is_ok_noop {
-    string text = "";
-    bool is_noop = text == "";
-    Assert.True(is_noop, "FS.WriteAllText must treat empty payload as Ok noop");
+/// @native-only
+ test fs_directory_copy_and_delete_use_unit_success {
+    string directory = "/tmp/beskid-corelib-fs-dir";
+    string source = "/tmp/beskid-corelib-fs-dir/source.txt";
+    string destination = "/tmp/beskid-corelib-fs-dir/copy.txt";
+    FS.Delete(source);
+    FS.Delete(destination);
+    Result<unit, FsError> created = FS.CreateDirectory(directory);
+    bool directoryReady = Results.IsOk(created) || match created {
+        Result::Ok(()) => true,
+        Result::Error(FsError::AlreadyExists(_)) => true,
+        Result::Error(_) => false,
+    };
+    Assert.True(directoryReady, "CreateDirectory succeeds or reports the existing fixture directory");
+    Assert.True(Results.IsOk(FS.WriteAllText(source, "copy me")), "source fixture is written");
+    Assert.True(Results.IsOk(FS.Copy(source, destination)), "Copy propagates public read/write success");
+    string copied = match FS.ReadAllText(destination) { Result::Ok(text) => text, Result::Error(_) => "error" };
+    Assert.Equal(copied, "copy me", "Copy preserves file content");
+    Assert.True(Results.IsOk(FS.Delete(source)), "source deletion returns unit success");
+    Assert.True(Results.IsOk(FS.Delete(destination)), "destination deletion returns unit success");
 }

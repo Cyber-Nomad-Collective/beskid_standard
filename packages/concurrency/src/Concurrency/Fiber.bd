@@ -1,7 +1,7 @@
 /// Cooperative fiber handle returned by `spawn`.
 use Concurrency.FiberError;
 use Concurrency.FiberJoinStatus;
-use Concurrency.Status;
+use Core.Results;
 
 /// Runtime fiber handle; declares cancellation event on the handle only.
 pub type Fiber<T> {
@@ -10,15 +10,17 @@ pub type Fiber<T> {
 }
 
 /// Waits for completion and returns the entry value or a `FiberError`.
+/// The join status carries richer info: cancel reason/canceler, panic code/message,
+/// and stack-overflow limit/requested bytes.
 pub Core.Results.Result<T, FiberError> Join<T>(Fiber<T> self) {
-    i64 raw_status = __fiber_join(self.handle);
-    FiberJoinStatus status = FiberJoinStatus.FromI64(raw_status);
+    i64 raw = __fiber_join(self.handle);
+    FiberJoinStatus status = FiberJoinStatus.FromCode(raw);
     return match status {
-        FiberJoinStatus::Ok => Result::Ok(__fiber_join_value(self.handle)),
-        FiberJoinStatus::Cancelled => Result::Error(FiberError::Cancelled()),
-        FiberJoinStatus::StackOverflow => Result::Error(FiberError::StackOverflow()),
-        FiberJoinStatus::Panicked => Result::Error(FiberError::Panicked(raw_status)),
-        FiberJoinStatus::NotDone => Result::Error(FiberError::Panicked(raw_status)),
+        FiberJoinStatus::Ok(_) => Result::Ok(__fiber_join_value(self.handle)),
+        FiberJoinStatus::Cancelled(reason, cancelerId) => Result::Error(FiberError::Cancelled(reason, cancelerId)),
+        FiberJoinStatus::StackOverflow(limitBytes, requestedBytes) => Result::Error(FiberError::StackOverflow(limitBytes, requestedBytes)),
+        FiberJoinStatus::Panicked(code, message) => Result::Error(FiberError::Panicked(code, message)),
+        FiberJoinStatus::NotDone => __panic_str("Fiber.Join saw NotDone"),
     };
 }
 
@@ -29,16 +31,8 @@ pub unit Detach<T>(Fiber<T> self) {
 }
 
 /// Sets cancellation flag and raises `OnCancelled` on the child fiber.
-pub unit Cancel<T>(Fiber<T> self) {
-    __fiber_cancel(self.handle);
+/// The reason is stored in the fiber record and surfaced via `FiberError::Cancelled`.
+pub unit Cancel<T>(Fiber<T> self, i64 reason) {
+    __fiber_cancel(self.handle, reason);
     return;
-}
-
-pub FiberError MapJoinError(FiberJoinStatus status) {
-    return match status {
-        FiberJoinStatus::Cancelled => FiberError::Cancelled(),
-        FiberJoinStatus::StackOverflow => FiberError::StackOverflow(),
-        FiberJoinStatus::Panicked => FiberError::Panicked(FiberJoinStatus.ToI64(status)),
-        _ => FiberError::Panicked(FiberJoinStatus.ToI64(status)),
-    };
 }

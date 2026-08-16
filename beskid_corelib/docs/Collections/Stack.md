@@ -1,16 +1,5 @@
-`Collections.Stack` mirrors **`Collections.Queue`**: only the type shell and **`Count`** exist until push/pop are added.
+# Core.Collections.Stack
 
-## Type
+`Stack<T>` owns `T[] storage` and `i64 count`.
 
-```beskid
-pub type Stack<T> {
-    i64 count,
-}
-```
-
-## Functions
-
-| Function | Behavior |
-|----------|----------|
-| `New<T>() -> Stack<T>` | Stack with `count = 0`. |
-| `Count<T>(Stack<T> stack) -> i64` | Returns `stack.count`. |
+`Push`, `Pop`, `Peek`, `Count`, and `IsEmpty` are owning receiver methods and preserve LIFO order. `Peek` returns an error for an empty stack. `New<T>` is the module constructor.

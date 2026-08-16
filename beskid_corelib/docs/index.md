@@ -8,7 +8,7 @@ This section documents the **corelib** standard library shipped with the Beskid 
 | Testing | `Testing.Contracts`, `Testing.Assertions` |
 | Console | `Console` (`corelib_console`) |
 
-Other modules (`Collections.*`, `Query.*`, `Core.FS`, `Core.Path`, …) ship as separate compilation units under `src/`; import them explicitly when needed— they are not all pulled in through the prelude today.
+Other modules (`Core.Collections.*`, `Query.*`, `Core.FS`, `Core.Path`, …) ship as separate compilation units under `src/`; import them explicitly when needed—they are not all pulled in through the prelude today.
 
 ## Documentation map
 

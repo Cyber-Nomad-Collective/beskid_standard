@@ -8,12 +8,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Hard-cut collections to `Core.Collections`, separate array logical length from capacity, and route insertion/removal through rooted append and descriptor-aware clearing operations.
+- Align `Core.FS` with the canonical manifest intrinsic names and native public-API fixtures.
 - Consolidate Stack, Set, and Query iteration on module-function APIs supported by typed lowering.
 - Use module-function constructors for generic Result and Option values.
 - Align Channel and Mutex wrappers with the canonical Optional/Results modules.
 
 ### Fixed
 
+- Preserve pointer-bearing collection values across growth and forced GC, clear removed slots, maintain queue-head semantics, and preserve typed `Result` errors through mapping and FS propagation.
+- Replace legacy `AppendAt` and capacity-as-length consumers; add namespace rejection and native overflow source fixtures.
 - Make console panel/progress rendering and ASCII casing conversions explicit across `i32`,
   `i64`, and `u8` boundaries, and cover exact progress-bar fill and clamping behavior.
 

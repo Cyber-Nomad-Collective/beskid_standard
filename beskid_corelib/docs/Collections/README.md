@@ -1,10 +1,14 @@
-The **Collections** family lives under `src/Collections/*.bd`. These modules are **not** re-exported from `Prelude.bd` today; import the module you need explicitly.
+# Core.Collections
 
-Many APIs are still **staged**: types and function signatures are present for compilation and documentation, while backing storage or builtins may be incomplete. Each module page calls out what is implemented versus placeholder behavior.
+`Core.Collections` is the only public namespace for the array-backed collection family. The former `Collections.*` path is not declared or aliased.
+
+All receiver operations are defined on their owning public types. Modules retain only constructors and genuine array namespace helpers.
 
 ## Modules
 
-- [Array](./Array.md) — `ArrayIter`, iteration helpers (`Len` via **`__array_len`**).
-- [List](./List.md) — `List<T>` with placeholder storage (`Get` surfaces errors).
-- [Map](./Map.md), [Set](./Set.md) — keyed/unordered shapes with logical counts.
-- [Queue](./Queue.md), [Stack](./Stack.md) — FIFO/LIFO shapes with counts only.
+- [Array](./Array.md) — typed arrays, direct bounds semantics, rooted growth, and iteration.
+- [List](./List.md) — ordered growable values.
+- [Map](./Map.md) — key/value entries with linear lookup.
+- [Set](./Set.md) — unique values with linear membership.
+- [Queue](./Queue.md) — FIFO values.
+- [Stack](./Stack.md) — LIFO values.

@@ -1,4 +1,4 @@
-`Core.FS` defines **`FsError`** and file helpers backed by runtime `fs_*` builtins.
+`Core.FS` defines typed file helpers backed only by the canonical ABI-v5 `fs_*` adapters.
 
 ## FsError
 
@@ -6,74 +6,61 @@
 pub enum FsError {
     NotFound(string path),
     PermissionDenied(string path),
-    AlreadyExists(string path),
+    IOError(string path),
     InvalidPath(string path),
-    Unknown(string message),
+    AlreadyExists(string path),
 }
 ```
+
+The boundary maps every `BeskidFsStatus` value exactly once. An unrecognized status fails closed as `IOError`; it is never interpreted as success.
 
 ## Functions
 
-| Function | Behavior |
-|----------|----------|
-| `ReadAllText(string path)` | Empty path → **`InvalidPath`**. Reads file text via **`__fs_read_text`**; missing file → **`NotFound`**. |
-| `WriteAllText(string path, string text)` | Empty path → **`InvalidPath`**. Writes via **`__fs_write_text`**; I/O failure → **`Unknown`**. |
-| `Delete(string path)` | Empty path → **`InvalidPath`**. Deletes via **`__fs_delete`**. |
-| `CreateDirectory(string path)` | Empty path → **`InvalidPath`**. Creates via **`__fs_mkdir`**. |
-| `Exists(string path)` | Returns **`__fs_exists(path) == 1`** for non-empty paths. |
+| Function | Result |
+|----------|--------|
+| `ReadAllText(string path)` | `Result<string, FsError>` |
+| `WriteAllText(string path, string text)` | `Result<unit, FsError>` |
+| `Delete(string path)` | `Result<unit, FsError>` |
+| `CreateDirectory(string path)` | `Result<unit, FsError>` |
+| `Exists(string path)` | `Result<bool, FsError>` |
+| `Copy(string source, string destination)` | `Result<unit, FsError>` |
 
-Text paths use UTF-8 string handles; binary I/O uses **`Core.Syscall.ReadBytes`** / **`WriteBytes`**.
+`ReadAllText` uses the adapter's output parameter only when the status is `Ok`. A successful empty-file read is therefore `Result::Ok("")`, distinct from every error.
+
+`Exists` maps `Ok` to `Result::Ok(true)` and `NotFound` to `Result::Ok(false)`. Permission, I/O, invalid-input, already-exists, and unrecognized statuses remain typed failures.
 
 ## Usage examples
 
-### ReadAllText
-
 ```beskid
-let content = FS.ReadAllText("/tmp/hello.txt");
-match content {
-    Ok(text) => Console.WriteLine($"file says: {text}"),
-    Err(FsError.NotFound(path)) => Console.WriteLine($"not found: {path}"),
-    Err(other) => Console.WriteLine($"read failed: {other}"),
-}
+use Core.FS;
+use Core.FS.FsError;
+use Core.Results;
+
+match FS.ReadAllText("/tmp/hello.txt") {
+    Result::Ok(text) => Console.WriteLine(text),
+    Result::Error(FsError::NotFound(path)) => Console.WriteLine("missing: " + path),
+    Result::Error(_) => Console.WriteLine("read failed"),
+};
 ```
 
-### WriteAllText
-
 ```beskid
-let lines = "hello\nworld\n";
-match FS.WriteAllText("/tmp/out.txt", lines) {
-    Ok(()) => Console.WriteLine("wrote file"),
-    Err(e) => Console.WriteLine($"write failed: {e}"),
-}
+match FS.WriteAllText("/tmp/out.txt", "") {
+    Result::Ok(()) => Console.WriteLine("wrote empty file"),
+    Result::Error(error) => Console.WriteLine("write failed"),
+};
 ```
 
-### Exists + conditional read
-
 ```beskid
-let path = "/etc/config.json";
-if FS.Exists(path) {
-    match FS.ReadAllText(path) {
-        Ok(data) => parse_config(data),
-        Err(_) => Console.WriteLine("exists but unreadable"),
-    }
-} else {
-    Console.WriteLine($"{path} missing, using defaults");
-}
+match FS.Exists("/etc/config.json") {
+    Result::Ok(true) => Console.WriteLine("present"),
+    Result::Ok(false) => Console.WriteLine("missing"),
+    Result::Error(error) => Console.WriteLine("existence check failed"),
+};
 ```
 
-### CreateDirectory + WriteAllText
+## Constraints
 
-```beskid
-match FS.CreateDirectory("/tmp/app/cache") {
-    Ok(()) | Err(FsError.AlreadyExists(_)) => {
-        let _ = FS.WriteAllText("/tmp/app/cache/info.txt", "ready");
-    },
-    Err(e) => Console.WriteLine($"mkdir failed: {e}"),
-}
-```
-
-## Gotchas
-
-- **No recursive directory creation.** `CreateDirectory("/a/b/c")` fails if `/a/b` does not exist. Create each parent first.
-- **No append mode.** `WriteAllText` overwrites the file; use `ReadAllText` + concatenation + `WriteAllText` for append-like behaviour.
-- **Text-only.** For binary I/O, use `Core.Syscall.ReadBytes` / `WriteBytes` instead.
+- `CreateDirectory` is not recursive.
+- `WriteAllText` overwrites the file; there is no append mode.
+- The API is text-only. Binary I/O belongs to `Core.Syscall`.
+- Corelib does not declare, emulate, or fall back from the manifest-owned adapters.

@@ -1,17 +1,5 @@
-`Collections.Set` defines **`Set<T>`** with a logical **`count`** and a **`Contains`** helper whose semantics are intentionally narrow until real storage lands.
+# Core.Collections.Set
 
-## Type
+`Set<T>` owns `T[] storage` and `i64 count` and uses linear equality scans.
 
-```beskid
-pub type Set<T> {
-    i64 count,
-}
-```
-
-## Functions
-
-| Function | Behavior |
-|----------|----------|
-| `New<T>() -> Set<T>` | Empty set (`count = 0`). |
-| `Count<T>(Set<T> set) -> i64` | Returns `set.count`. |
-| `Contains<T>(Set<T> set, T value) -> bool` | If `set.count < 1`, returns **`false`**. Otherwise returns **`value == value`** (always **`true`** for comparable values)—a placeholder until proper hashing/equality-backed membership exists. |
+`Add`, `Remove`, `Contains`, `Count`, and `IsEmpty` are owning receiver methods. Duplicate additions do not change storage semantics or count, and removal preserves every other retained value. `New<T>` is the module constructor.

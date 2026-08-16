@@ -1,16 +1,5 @@
-`Collections.Queue` currently exposes only container shape and **`Count`**—enqueue/dequeue operations are not yet in the sources.
+# Core.Collections.Queue
 
-## Type
+`Queue<T>` owns `T[] storage`, `i64 head`, and `i64 count`.
 
-```beskid
-pub type Queue<T> {
-    i64 count,
-}
-```
-
-## Functions
-
-| Function | Behavior |
-|----------|----------|
-| `New<T>() -> Queue<T>` | Queue with `count = 0`. |
-| `Count<T>(Queue<T> queue) -> i64` | Returns `queue.count`. |
+`Enqueue`, `Dequeue`, `Peek`, `Count`, and `IsEmpty` are owning receiver methods and preserve FIFO order. `Peek` returns an error for an empty queue. `New<T>` is the module constructor.

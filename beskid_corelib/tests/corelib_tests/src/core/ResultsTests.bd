@@ -23,3 +23,49 @@ test result_ok_is_not_error {
     Result<i64, string> r = Results.Success<i64, string>(42_i64);
     Assert.False(Results.IsError(r), "Result::Ok(42) should return false from IsError");
 }
+
+test result_unit_ok_is_canonical_success {
+    Result<unit, string> r = Result::Ok(());
+    Assert.True(Results.IsOk(r), "Result<unit, E>::Ok must use the canonical success variant");
+    Assert.False(Results.IsError(r), "Result<unit, E>::Ok must not be encoded as failure");
+}
+
+test result_unit_ok_matches_without_fabricated_payload {
+    Result<unit, string> r = Result::Ok(());
+    bool matched = match r {
+        Result::Ok(()) => true,
+        Result::Error(_) => false,
+    };
+    Assert.True(matched, "Result<unit, E>::Ok must match its empty success payload");
+}
+
+Result<unit, string> UnitSuccess() {
+    return Result::Ok(());
+}
+
+Result<unit, string> UnitFailure(string message) {
+    return Result::Error(message);
+}
+
+test result_unit_success_propagates_through_return {
+    Result<unit, string> r = UnitSuccess();
+    Assert.True(Results.IsOk(r), "Result<unit, E> must propagate through typed returns");
+}
+
+test result_unit_error_payload_is_preserved {
+    Result<unit, string> result = UnitFailure("original error");
+    string error = match result {
+        Result::Ok(()) => "wrong variant",
+        Result::Error(message) => message,
+    };
+    Assert.Equal(error, "original error", "typed Error(E) payload must survive return propagation");
+}
+
+test result_map_preserves_error_and_maps_success {
+    Result<i64, string> ok = Results.Map<unit, i64, string>(Result::Ok(()), 7);
+    Result<i64, string> error = Results.Map<unit, i64, string>(Result::Error("kept"), 7);
+    i64 mapped = match ok { Result::Ok(value) => value, Result::Error(_) => -1 };
+    string preserved = match error { Result::Ok(_) => "wrong variant", Result::Error(message) => message };
+    Assert.Equal(mapped, 7, "Map changes only the success payload");
+    Assert.Equal(preserved, "kept", "Map preserves the original error payload");
+}

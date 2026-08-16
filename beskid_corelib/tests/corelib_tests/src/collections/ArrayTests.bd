@@ -1,33 +1,52 @@
-/// Runtime-backed slice arrays: `__array_*` builtins and `Collections.Array` surface.
-/// Iterator checks mirror `Collections.Array.Iterate` / `HasNext` until cross-package
-/// `Collections.Array` resolution from this harness is wired (direct calls overflow the JIT stack today).
-
+/// Public API coverage for typed `Core.Collections.Array` operations.
+use Core.Collections.Array;
+use Core.Collections.Array.ArrayIter;
 use Testing.Assert;
 
 
-test array_new_sets_logical_length {
-    i64 handle = __array_new(8, 3);
-    i64 len = __array_len(handle);
-    Assert.Equal(len, 3, "array_new logical length mismatch");
+test array_append_preserves_typed_values {
+    mut i64[] values = Array.Empty<i64>();
+    Array.Append<i64>(values, 10);
+    Array.Append<i64>(values, 20);
+    Array.Append<i64>(values, 30);
+    Assert.Equal(Array.Len<i64>(values), 3, "append grows logical length");
+    Assert.Equal(Array.Get<i64>(values, 0), 10, "growth preserves first value");
+    Assert.Equal(Array.Get<i64>(values, 2), 30, "append stores tail value");
 }
 
-test array_len_reports_zero_for_empty_allocation {
-    i64 handle = __array_new(8, 0);
-    i64 len = __array_len(handle);
-    Assert.Equal(len, 0, "empty allocation length should be zero");
+test array_set_uses_direct_index_semantics {
+    mut i64[] values = Array.Empty<i64>();
+    Array.Append<i64>(values, 1);
+    values = Array.Set<i64>(values, 0, 9);
+    Assert.Equal(Array.Get<i64>(values, 0), 9, "set replaces indexed value");
 }
 
-test collections_array_len_matches_builtin {
-    i64 handle = __array_new(8, 2);
-    i64 len = __array_len(handle);
-    Assert.Equal(len, 2, "Collections.Array.Len mismatch");
+test array_pointer_values_survive_forced_gc_during_growth {
+    mut string[] values = Array.Empty<string>();
+    Array.Append<string>(values, "first");
+    __gc_collect();
+    Array.Append<string>(values, "second");
+    __gc_collect();
+    Assert.Equal(Array.Get<string>(values, 0), "first", "rooted growth retains the first pointer value");
+    Assert.Equal(Array.Get<string>(values, 1), "second", "publication retains the appended pointer value");
 }
 
-test collections_array_iterate_has_next {
-    i64 handle = __array_new(8, 2);
-    i64 length = __array_len(handle);
-    i64 index = 0;
-    Assert.True(index < length, "HasNext expected true at index zero");
-    i64 done_index = 2;
-    Assert.False(done_index < length, "HasNext expected false when index == length");
+test array_capacity_is_not_logical_length {
+    mut i64[] values = Array.Empty<i64>();
+    Array.Append<i64>(values, 1);
+    Assert.Equal(Array.Len<i64>(values), 1, "append exposes exactly one initialized value");
+    Assert.True(Array.Capacity<i64>(values) >= Array.Len<i64>(values), "capacity may exceed logical length");
+}
+
+test array_iterator_stops_at_logical_length {
+    mut i64[] values = Array.Empty<i64>();
+    Array.Append<i64>(values, 4);
+    Array.Append<i64>(values, 5);
+    mut ArrayIter<i64> iterator = Array.Iterate<i64>(values);
+    Assert.True(Array.HasNext<i64>(iterator), "iterator starts in bounds");
+    Assert.Equal(Array.Current<i64>(values, iterator), 4, "iterator reads first value");
+    iterator = Array.Advance<i64>(iterator);
+    Assert.Equal(Array.Current<i64>(values, iterator), 5, "iterator reads second value");
+    iterator = Array.Advance<i64>(iterator);
+    Assert.False(Array.HasNext<i64>(iterator), "iterator stops at logical length");
 }

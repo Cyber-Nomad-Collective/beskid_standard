@@ -1,6 +1,6 @@
-`Core.Results` defines the standard **`Result<TValue, TError>`** enum used whenever a function can fail in a typed way.
+# Core.Results
 
-## Type
+`Core.Results` defines the standard `Result<TValue, TError>` enum for typed recoverable failures.
 
 ```beskid
 pub enum Result<TValue, TError> {
@@ -9,130 +9,46 @@ pub enum Result<TValue, TError> {
 }
 ```
 
-## Usage
-
-- Return **`Result::Ok(...)`** for success and **`Result::Error(...)`** for failure.
-- System modules (`Core.FS`, `Core.Process`, `Core.Syscall`, …) use this shape with domain-specific `TError` enums.
-- This is the preferred alternative to string-only error channels for recoverable failure at API boundaries.
-
 ## Helpers
 
-- **`IsOk`** / **`IsError`** — boolean predicates for branching without matching directly on the enum at every call site.
-
-## Result combinators
-
-`IsOk` and `IsError` are the primary combinators for conditional branching on a `Result` without destructuring it. They work as free functions or method-style calls on a `Result` value.
+- `Success<TValue, TError>(value)` constructs `Result::Ok(value)`.
+- `Failure<TValue, TError>(error)` constructs `Result::Error(error)`.
+- `IsOk` and `IsError` inspect the active variant.
+- `Map<TValue, TNext, TError>(result, mapped)` replaces an `Ok` payload and preserves an `Error` payload exactly.
 
 ```beskid
-let res: Result<I32, String> = might_fail();
-
-// Branch with IsOk / IsError — no match needed for simple cases.
-if IsOk(res) {
-    // res.value is in scope here; use it directly.
-    Core.Debug.Trace("succeeded");
-} else if IsError(res) {
-    Core.Debug.Trace("failed: ${res.error}");
-}
+Result<i64, string> original = Result::Ok(1);
+Result<string, string> mapped = Results.Map<i64, string, string>(original, "one");
 ```
 
-`IsOk` and `IsError` narrow the variant in their respective branches, so `res.value` and `res.error` are accessible without a full `match`. Use them when you only care about one side.
+## Unit success
 
-## Pattern matching
-
-All `match` arms on a `Result` must cover both `Ok` and `Error`. The compiler enforces exhaustiveness, so you cannot forget the error path.
+Operations with no success data use the ordinary `Result<unit, TError>` specialization. `Ok` retains its normal discriminant and carries `()`; it is never represented as a fabricated boolean.
 
 ```beskid
-pub fn describe(res: Result<I32, String>) -> String {
-    match res {
-        Result::Ok(value) => "got ${value}",
-        Result::Error(err) => "failed: ${err}",
-    }
+pub Result<unit, string> Save() {
+    return Result::Ok(());
 }
+
+Result<unit, string> saved = Save();
+match saved {
+    Result::Ok(()) => Console.WriteLine("saved"),
+    Result::Error(error) => Console.WriteLine(error),
+};
 ```
 
-You can nest pattern matching on the payload when `TValue` or `TError` is itself an enum:
+## Error propagation
+
+Match both variants and return the original typed error when the caller does not transform it.
 
 ```beskid
-match parse_and_validate(input) {
-    Result::Ok(ValidationResult::Pass(score)) => "passed with ${score}",
-    Result::Ok(ValidationResult::Warn(msg))    => "ok but ${msg}",
-    Result::Error(ParseError::Malformed(line)) => "bad input at line ${line}",
-    Result::Error(ParseError::Empty)            => "input was empty",
-}
-```
-
-## Returning from a function
-
-Wrap the happy path in `Result::Ok(...)` and each failure path in `Result::Error(...)`. The caller decides how to recover.
-
-```beskid
-pub fn divide(numerator: I32, denominator: I32) -> Result<I32, String> {
-    if denominator == 0 {
-        return Result::Error("division by zero");
-    }
-    return Result::Ok(numerator / denominator);
-}
-
-// Call site — match on both outcomes.
-let answer = divide(10, 2);
-match answer {
-    Result::Ok(q)  => Core.Debug.Trace("quotient: ${q}"),
-    Result::Error(e) => Core.Debug.Trace("error: ${e}"),
-}
-```
-
-## Match-based error handling
-
-When a caller receives a `Result`, the canonical way to handle it is `match`. This forces both paths to be addressed at compile time.
-
-```beskid
-let opened = Core.FS.ReadAllText("/etc/config.json");
-match opened {
-    Result::Ok(content) => {
-        let parsed = parse_config(content);
-        apply_config(parsed);
-    },
-    Result::Error(fs_err) => {
-        Core.Debug.Trace("cannot read config: ${fs_err}");
-        load_defaults();
-    },
-}
-```
-
-For early-exit patterns, combine `match` with `return` so the error path bails out and the happy path continues inline:
-
-```beskid
-pub fn load_user(id: I32) -> Result<User, String> {
-    let raw = Core.FS.ReadAllText("/data/users/${id}.json");
-    let json_text = match raw {
-        Result::Ok(text) => text,
-        Result::Error(e) => return Result::Error("read failed: ${e}"),
+pub Result<string, Core.FS.FsError> Load(string path) {
+    Result<string, Core.FS.FsError> opened = Core.FS.ReadAllText(path);
+    return match opened {
+        Result::Ok(content) => Result::Ok(content),
+        Result::Error(error) => Result::Error(error),
     };
-    // json_text is now a plain String; proceed with parsing.
-    let user = parse_user(json_text);
-    return Result::Ok(user);
 }
 ```
 
-## Composing multiple operations
-
-Chain fallible calls by matching each intermediate result. Each step either produces a value for the next step or short-circuits with an error.
-
-```beskid
-pub fn ingest(path: String) -> Result<Stats, String> {
-    let raw = match Core.FS.ReadAllText(path) {
-        Result::Ok(text) => text,
-        Result::Error(e) => return Result::Error("read: ${e}"),
-    };
-
-    let decoded = match Core.Encoding.Hex.Decode(raw) {
-        Result::Ok(bytes) => bytes,
-        Result::Error(e) => return Result::Error("hex decode: ${e}"),
-    };
-
-    let stats = compute_stats(decoded);
-    return Result::Ok(stats);
-}
-```
-
-When the error types differ across steps (e.g. `FsError` vs `String`), convert each one into a common error type — here `String` — so the return type stays uniform. This pattern is the idiomatic way to compose fallible operations until dedicated combinator support (e.g. `and_then`) lands in the language.
+The compiler treats `Result<unit, E>` as a normal generic enum instantiation; there is no unit-only layout or lowering special case.

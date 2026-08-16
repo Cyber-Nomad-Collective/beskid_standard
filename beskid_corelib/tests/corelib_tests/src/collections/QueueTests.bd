@@ -1,30 +1,36 @@
-/// Tier 2 (Supported) coverage for `Collections.Queue` parity helpers.
-/// Storage is not yet wired in v1; this suite asserts the count-based contract per
-/// `/platform-spec/core-library/stability-and-api-shape/corelib-api-shape/`.
-
+/// Public API coverage for `Core.Collections.Queue`.
+use Core.Collections.Queue;
 use Testing.Assert;
 
 
-test queue_enqueue_increments_logical_count {
-    i64 start = 0;
-    i64 after_enqueue = start + 1;
-    Assert.Equal(after_enqueue, 1, "Queue.Enqueue should bump count by one");
+test queue_is_fifo_and_retains_values {
+    mut Queue<i64> queue = Queue.New<i64>();
+    queue = queue.Enqueue(10);
+    queue = queue.Enqueue(20);
+    queue = queue.Enqueue(30);
+    i64 first = match queue.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(first, 10, "peek returns oldest value");
+    queue = queue.Dequeue();
+    i64 second = match queue.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(second, 20, "dequeue advances in FIFO order");
+    Assert.Equal(queue.Count(), 2, "dequeue decrements count");
 }
 
-test queue_dequeue_saturates_at_zero {
-    i64 count = 0;
-    mut i64 after_dequeue = 0;
-    if count > 0 {
-        after_dequeue = count - 1;
-    }
-    Assert.Equal(after_dequeue, 0, "Queue.Dequeue must saturate at zero");
+test queue_head_advances_and_cleared_pointer_slots_survive_gc {
+    mut Queue<string> queue = Queue.New<string>();
+    queue = queue.Enqueue("first");
+    queue = queue.Enqueue("second");
+    queue = queue.Dequeue();
+    __gc_collect();
+    string head = match queue.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => "error" };
+    Assert.Equal(head, "second", "dequeue advances head without shifting retained pointer values");
+    queue = queue.Enqueue("third");
+    __gc_collect();
+    Assert.Equal(queue.Count(), 2, "enqueue appends after an advanced head");
 }
 
-test queue_dequeue_drops_when_populated {
-    i64 count = 4;
-    mut i64 after_dequeue = 0;
-    if count > 0 {
-        after_dequeue = count - 1;
-    }
-    Assert.Equal(after_dequeue, 3, "Queue.Dequeue should drop count by one when populated");
+test queue_empty_peek_is_error {
+    Queue<i64> queue = Queue.New<i64>();
+    bool isError = match queue.Peek() { Core.Results.Result::Ok(_) => false, Core.Results.Result::Error(_) => true };
+    Assert.True(isError, "empty queue has no head value");
 }

@@ -203,10 +203,8 @@ EOF
 write_collect() {
   local out="$SDK_COMPILER_DIR/Collect.bd"
   {
-    header
     cat <<'EOF'
-
-// Hand-maintained facade ------------------------------------------------------
+// CHECKED IN: hand-maintained Mod SDK surface (regen_mod_sdk_surfaces.sh write_collect)
 // Mod packages import these contracts — do not redeclare locally.
 
 use Beskid.Compiler.Compilation;
@@ -233,12 +231,57 @@ pub type AnalysisRequest {
     CollectRequest context,
 }
 
-pub type AnalysisResult {}
+/// One diagnostic emitted by an `Analyzer` contract. `spanStart`/`spanEnd` are inclusive
+/// byte offsets into the entry source; `(0, 0)` means "no span" (host falls back to a
+/// whole-file span). `severity` mirrors `Beskid.Compiler.Diagnostics.Severity`.
+pub type Diagnostic {
+    string code,
+    string message,
+    Beskid.Compiler.Diagnostics.Severity severity,
+    u64 spanStart,
+    u64 spanEnd,
+}
+
+/// One text edit in a [`QuickFix`]. `kind` mirrors `ModEdit`: 0 = Insert, 1 = Replace,
+/// 2 = Delete. For `Insert`, `start == end`. For `Delete`, `text` is empty.
+pub type Edit {
+    u32 kind,
+    u64 start,
+    u64 end,
+    string text,
+}
+
+/// One quick-fix produced by an `Analyzer`. `diagnosticIndex` links the fix to an entry
+/// in the `AnalysisResult.diagnostics` array returned alongside.
+pub type QuickFix {
+    u32 diagnosticIndex,
+    string title,
+    Edit[] edits,
+}
+
+/// Result from `Analyzer.Analyze` — diagnostics + a flat list of quick-fixes.
+pub type AnalysisResult {
+    Diagnostic[] diagnostics,
+    QuickFix[] fixes,
+}
 pub type AttributeGenerationRequest {
     CollectRequest context,
 }
 pub type AttributeDeclarationSet {}
 pub type FixError {}
+
+/// Opaque fenced source payload (`code ```lang ... ``` ` with optional `@{}` holes).
+pub type CodeString {
+    string language,
+    string body,
+}
+
+/// One generated module file returned from `Generator.Generate`.
+pub type CodeContribution {
+    string modulePath,
+    string fileName,
+    CodeString body,
+}
 
 /// One top-level syntax item contributed by a Generator (typed AST, not source text).
 pub enum SyntaxContributionItem {
@@ -250,6 +293,7 @@ pub enum SyntaxContributionItem {
 /// Typed AST payload returned from `Generator.Generate`.
 pub type GeneratedSyntaxContribution {
     SyntaxContributionItem[] items,
+    CodeContribution[] codeOutputs,
 }
 
 /// Declarative target collection and scope narrowing for a Mod instance.
@@ -259,6 +303,11 @@ pub contract Collector {
 
 /// Incremental typed AST contribution entrypoint.
 pub contract Generator {
+    GeneratedSyntaxContribution Generate(GenerationRequest request);
+}
+
+/// Pest grammar combinator emit entrypoint (scheduling alias of [`Generator`] until dedicated host wiring lands).
+pub contract GrammarGenerator {
     GeneratedSyntaxContribution Generate(GenerationRequest request);
 }
 
@@ -278,7 +327,7 @@ pub contract AttributeGenerator {
 }
 
 pub string CollectFacadeVersion() {
-    return "0.3.0";
+    return "0.5.0";
 }
 EOF
   } >"$out"

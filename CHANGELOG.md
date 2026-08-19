@@ -9,6 +9,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Changed
 
 - Hard-cut collections to `Core.Collections`, separate array logical length from capacity, and route insertion/removal through rooted append and descriptor-aware clearing operations.
+- Purge the dead legacy `Collections` hub at `packages/foundation/src/Collections/` (no `Core.` prefix); `Core.Collections.*` is the sole collection hub. The `LegacyCollectionsNamespace` compile-fail fixture is retained as a regression guard.
 - Align `Core.FS` with the canonical manifest intrinsic names and native public-API fixtures.
 - Consolidate Stack, Set, and Query iteration on module-function APIs supported by typed lowering.
 - Use module-function constructors for generic Result and Option values.

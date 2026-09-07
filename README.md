@@ -15,11 +15,21 @@ Compiler tooling discovers `compiler/corelib/beskid_corelib/corelib.bproj`; the 
 
 - Canonical aggregate package directory remains `compiler/corelib/beskid_corelib/`.
 - `corelib.bproj` declares `name = corelib` and `type = Aggregate` (dependency-only, no `src/`); sibling packages use `corelib_foundation`, `corelib_runtime`, and `corelib_compiler_sdk` internally.
-- Release packaging upserts and publishes **every workspace member** to pckg via `POST /api/workspaces/publish` (see superrepo Dagger `package-publish.publish-corelib`).
+- Release packaging classifies the workspace explicitly: the eight production
+  packages are packed as canonical `.bpk` artifacts and published one at a time
+  through `POST /api/packages/{name}/versions`; development and test-only
+  members are rejected from the publication inventory. The same superrepo lane
+  publishes all seven first-party templates after every artifact has validated.
 
 ## CI/CD authority
 
-`beskid_standard` is the publish authority for corelib artifacts.
+The initialized `beskid_standard` checkout is the source authority; the
+superrepo workflow is the publication authority for corelib artifacts.
 
-- Superrepo workflow [`.github/workflows/corelib.yml`](../../.github/workflows/corelib.yml) runs Dagger `corelib-gate` and `package-publish.publish-corelib` from [`beskid_infra/dagger`](../../beskid_infra/dagger/).
+- Superrepo workflow [`.github/workflows/corelib.yml`](../../.github/workflows/corelib.yml)
+  runs the native corelib gate and the fail-closed
+  [`scripts/ci/corelib-publish.sh`](../../scripts/ci/corelib-publish.sh) publisher.
+- From an initialized superrepo checkout, `bash scripts/ci/corelib-publish.sh
+  --dry-run` builds and validates the complete 15-artifact publication set
+  without credentials or registry mutation.
 - Local fast path: from parent compiler workspace, `just corelib` runs all `corelib_tests` targets via release `beskid_cli`.

@@ -17,6 +17,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Route forced collection in runtime-sensitive tests through the unit-returning
+  `Testing.Assert.CollectGarbage` helper while keeping raw GC service authority compiler-owned.
 - Preserve pointer-bearing collection values across growth and forced GC, clear removed slots, maintain queue-head semantics, and preserve typed `Result` errors through mapping and FS propagation.
 - Replace legacy `AppendAt` and capacity-as-length consumers; add namespace rejection and native overflow source fixtures.
 - Make console panel/progress rendering and ASCII casing conversions explicit across `i32`,

@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Regenerate the compiler SDK from the current syntax authority, including the
+  first-class `U32` primitive and the canonical CLIF/optional block-expression
+  nodes used by reusable lowering.
 - Bound `Core.Process` 0.4 to current-process identity, comparison, and
   termination; remove the fabricated `Run`/`ExitCode` child-process surface
   and `ProcessError` until an exact cross-platform ABI-v5 service exists.
@@ -25,6 +28,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep the corelib test workspace lock bound only to its checked-out workspace
+  packages, avoiding duplicate installed-prefix package authorities.
 - Point the OS-thread surface test at the canonical `Core.Threading.Thread`
   module and stop executing an invalid null native entry routine as a test.
 - Align the compiler SDK gate with the canonical Collect facade's current

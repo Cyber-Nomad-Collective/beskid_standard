@@ -31,6 +31,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Thread the active cursor through generated nested sequences, choices, repeats, and optional terms;
+  preserve successful optional advances; stop regex class parsing before its closing delimiter; and
+  keep grouped-alternation branch traversal bounded by its enclosing parenthesis. Generated literals
+  now escape Beskid interpolation openers while preserving standalone `$`, quotes, and backslashes.
+- Resolve console, parser, Pest, and regex helpers through explicit module imports so
+  syntax-only lowering retains exact declaration edges instead of failing closed.
 - Keep the corelib test workspace lock bound only to its checked-out workspace
   packages, avoiding duplicate installed-prefix package authorities.
 - Point the OS-thread surface test at the canonical `Core.Threading.Thread`

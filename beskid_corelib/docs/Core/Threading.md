@@ -79,4 +79,4 @@ while i < 4 {
 - `Spawn` takes raw `i64` entry-point and argument values. Beskid's runtime attaches the language context before user code runs, but incorrect addresses produce undefined behavior at the OS level.
 - `Join` may return `SpawnFailed` as its error variant even though the actual failure was in joining — the error enum currently has only one variant.
 - The module attempts Linux `libc.so.6` first, then macOS `libc` — other platforms (Windows, WASM) are unsupported in v1.
-- This module is **not** re-exported from `Prelude.bd`; import `Core.Threading` explicitly.
+- This module is **not** re-exported from `Prelude.bd`; import `Core.Threading.Thread` explicitly.

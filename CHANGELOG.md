@@ -45,6 +45,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   primitives so syntax-only call lowering retains an exact declaration edge.
 - Mark Query operator accumulators, bounded counts, materialized arrays, and
   sort flags mutable where their implementations reassign them.
+- Align threading and filesystem gates with the canonical module path and
+  expression grammar.
 - Route forced collection in runtime-sensitive tests through the unit-returning
   `Testing.Assert.CollectGarbage` helper while keeping raw GC service authority compiler-owned.
 - Preserve pointer-bearing collection values across growth and forced GC, clear removed slots, maintain queue-head semantics, and preserve typed `Result` errors through mapping and FS propagation.

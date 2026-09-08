@@ -2,6 +2,12 @@
 
 This directory is the compiler-pinned core library source (submodule repository: `beskid_standard`).
 
+## Licensing
+
+The core library is Apache-2.0. It may be compiled into user programs without
+controlling the license of user-authored code; distributors retain the
+applicable Apache license and notices. See [LICENSING.md](LICENSING.md).
+
 ## Canonical source paths
 
 - Workspace root: `compiler/corelib/` (`CoreLib.bws`, `packages/`, `beskid_corelib/`).

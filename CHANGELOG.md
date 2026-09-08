@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Represent generic text-parser success as one `TextParseSuccess<T>` product
   payload nested inside `TextParseResult<T>`, preserving the reusable public
   surface while matching the compiler's single-payload enum ABI.
+- License the core library under Apache-2.0 and ship its license, notice, and
+  scope guidance with compiler-embedded snapshots.
+
 - Document the single per-package `.bpk` publication path and the superrepo's
   exact production-corelib plus first-party-template inventory.
 - Hard-cut collections to `Core.Collections`, separate array logical length from capacity, and route insertion/removal through rooted append and descriptor-aware clearing operations.

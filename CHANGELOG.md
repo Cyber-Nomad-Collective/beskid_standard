@@ -8,6 +8,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Bound `Core.Process` 0.4 to current-process identity, comparison, and
+  termination; remove the fabricated `Run`/`ExitCode` child-process surface
+  and `ProcessError` until an exact cross-platform ABI-v5 service exists.
+- Represent generic text-parser success as one `TextParseSuccess<T>` product
+  payload nested inside `TextParseResult<T>`, preserving the reusable public
+  surface while matching the compiler's single-payload enum ABI.
 - Document the single per-package `.bpk` publication path and the superrepo's
   exact production-corelib plus first-party-template inventory.
 - Hard-cut collections to `Core.Collections`, separate array logical length from capacity, and route insertion/removal through rooted append and descriptor-aware clearing operations.
@@ -19,6 +25,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Point the OS-thread surface test at the canonical `Core.Threading.Thread`
+  module and stop executing an invalid null native entry routine as a test.
+- Align the compiler SDK gate with the canonical Collect facade's current
+  `0.5.0` contract version.
+- Preserve UTF-8, Hex, and Base64 error context in a shared nominal payload
+  compatible with the single-payload enum ABI; route codec buffer operations
+  through the explicit `Core.Bytes.Slice` boundary and use `u8` Base64 alphabet
+  indices.
+- Resolve string helpers through an explicit `Core.String` import in parser
+  primitives so syntax-only call lowering retains an exact declaration edge.
+- Mark Query operator accumulators, bounded counts, materialized arrays, and
+  sort flags mutable where their implementations reassign them.
 - Route forced collection in runtime-sensitive tests through the unit-returning
   `Testing.Assert.CollectGarbage` helper while keeping raw GC service authority compiler-owned.
 - Preserve pointer-bearing collection values across growth and forced GC, clear removed slots, maintain queue-head semantics, and preserve typed `Result` errors through mapping and FS propagation.
@@ -30,7 +48,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Assert monotonic clock ordering without requiring its arbitrary epoch to be positive.
 - Delegate deprecated console whitespace trimming to the canonical Core.String implementation.
 - Normalize signed random remainders into documented non-negative integer ranges.
-- Mark the mutable floating-point random intermediate explicitly and strengthen bounded-random tests.
+- Convert the mutable random integer explicitly before floating-point
+  normalization, allocate byte-test buffers through `Core.Bytes.Slice`, and
+  assert exact deterministic seeded boolean and byte results.
 - Mark the recursively rendered Markdown fragment mutable before applying styles.
 - Align Stack and Query tests with typed arrays and the current collection APIs.
 - Remove a duplicate Syscall import that prevented the ergonomics target from resolving.

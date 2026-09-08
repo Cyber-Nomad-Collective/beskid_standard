@@ -43,7 +43,7 @@ pub Core.Results.Result<T, ChannelError> Receive<T>(Channel<T> self) {
     i64 raw = __channel_receive(self.handle);
     Status status = Status.FromCode(raw);
     return match status {
-        Status::Ok => Results.Success<T, ChannelError>(__channel_receive_value(self.handle)),
+        Status::Ok => Results.Success<T, ChannelError>(__channel_receive_value<T>(self.handle)),
         _ => Results.Failure<T, ChannelError>(MapReceiveError(status)),
     };
 }
@@ -56,9 +56,15 @@ pub TryResult<SendOk, ChannelError> TrySend<T>(Channel<T> self, T value) {
 
 /// Non-blocking receive; `WouldBlock` when empty, `Err` on close or cancel.
 pub TryResult<T, ChannelError> TryReceive<T>(Channel<T> self) {
-    mut i64 value = 0;
-    i64 raw = __channel_try_receive(self.handle, value);
-    return MapTryReceiveStatus<T>(Status.FromCode(raw), value);
+    i64 raw = __channel_try_receive(self.handle);
+    Status status = Status.FromCode(raw);
+    return match status {
+        Status::Ok => TryResult::Ok(__channel_receive_value<T>(self.handle)),
+        Status::WouldBlock => TryResult::WouldBlock,
+        Status::Cancelled(reason) => TryResult::Err(ChannelError::Cancelled(reason)),
+        Status::Closed(endpoint) => TryResult::Err(ChannelError::Closed(endpoint)),
+        _ => TryResult::WouldBlock,
+    };
 }
 
 /// Idempotent writer shutdown.
@@ -90,16 +96,6 @@ pub TryResult<SendOk, ChannelError> MapTrySendStatus(Status status) {
         Status::WouldBlock => TryResult::WouldBlock,
         Status::Closed(endpoint) => TryResult::Err(ChannelError::Closed(endpoint)),
         Status::Cancelled(reason) => TryResult::Err(ChannelError::Cancelled(reason)),
-        _ => TryResult::WouldBlock,
-    };
-}
-
-pub TryResult<T, ChannelError> MapTryReceiveStatus<T>(Status status, i64 value) {
-    return match status {
-        Status::Ok => TryResult::Ok(value),
-        Status::WouldBlock => TryResult::WouldBlock,
-        Status::Cancelled(reason) => TryResult::Err(ChannelError::Cancelled(reason)),
-        Status::Closed(endpoint) => TryResult::Err(ChannelError::Closed(endpoint)),
         _ => TryResult::WouldBlock,
     };
 }

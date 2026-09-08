@@ -30,6 +30,6 @@ superrepo workflow is the publication authority for corelib artifacts.
   runs the native corelib gate and the fail-closed
   [`scripts/ci/corelib-publish.sh`](../../scripts/ci/corelib-publish.sh) publisher.
 - From an initialized superrepo checkout, `bash scripts/ci/corelib-publish.sh
-  --dry-run` builds and validates the complete 15-artifact publication set
+  0.4.0 --dry-run` builds and validates the complete 15-artifact publication set
   without credentials or registry mutation.
 - Local fast path: from parent compiler workspace, `just corelib` runs all `corelib_tests` targets via release `beskid_cli`.

@@ -31,6 +31,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Route Core.Args tests through the public collection API and remove the unregistered duplicate Args test suite.
 - Thread the active cursor through generated nested sequences, choices, repeats, and optional terms;
   preserve successful optional advances; stop regex class parsing before its closing delimiter; and
   keep grouped-alternation branch traversal bounded by its enclosing parenthesis. Generated literals

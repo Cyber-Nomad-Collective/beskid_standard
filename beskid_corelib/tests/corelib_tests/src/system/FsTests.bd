@@ -30,10 +30,14 @@ use Testing.Assert;
     Result<bool, FsError> missing = FS.Exists(path);
     bool absent = match missing { Result::Ok(value) => !value, Result::Error(_) => false };
     Assert.True(absent, "Exists maps NotFound to Ok(false)");
-    bool notFound = match FS.ReadAllText(path) {
-        Result::Ok(_) => false,
-        Result::Error(FsError::NotFound(errorPath)) => errorPath == path,
-        Result::Error(_) => false,
+    Result<string, FsError> missingRead = FS.ReadAllText(path);
+    FsError missingError = match missingRead {
+        Result::Ok(_) => FsError::IOError("unexpected success"),
+        Result::Error(error) => error,
+    };
+    bool notFound = match missingError {
+        FsError::NotFound(errorPath) => errorPath == path,
+        _ => false,
     };
     Assert.True(notFound, "ReadAllText preserves the missing path in FsError::NotFound");
 }
@@ -46,12 +50,20 @@ use Testing.Assert;
     FS.Delete(source);
     FS.Delete(destination);
     Result<unit, FsError> created = FS.CreateDirectory(directory);
-    bool directoryReady = Results.IsOk(created) || (match created {
-        Result::Ok(()) => true,
-        Result::Error(FsError::AlreadyExists(_)) => true,
+    bool createAccepted = match created {
+        Result::Ok(_) => true,
+        Result::Error(error) => match error {
+            FsError::AlreadyExists(errorPath) => errorPath == directory,
+            _ => false,
+        },
+    };
+    Assert.True(createAccepted, "CreateDirectory returns success or the expected existing-directory error");
+    Result<bool, FsError> directoryExists = FS.Exists(directory);
+    bool directoryReady = match directoryExists {
+        Result::Ok(exists) => exists,
         Result::Error(_) => false,
-    });
-    Assert.True(directoryReady, "CreateDirectory succeeds or reports the existing fixture directory");
+    };
+    Assert.True(directoryReady, "CreateDirectory leaves the fixture directory available");
     Assert.True(Results.IsOk(FS.WriteAllText(source, "copy me")), "source fixture is written");
     Assert.True(Results.IsOk(FS.Copy(source, destination)), "Copy propagates public read/write success");
     string copied = match FS.ReadAllText(destination) { Result::Ok(text) => text, Result::Error(_) => "error" };

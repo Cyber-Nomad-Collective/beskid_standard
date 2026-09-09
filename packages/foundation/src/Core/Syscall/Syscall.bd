@@ -12,7 +12,9 @@ use Core.Syscall.ReadBytesRequest;
 use Core.Syscall.WriteRequest;
 use Core.Syscall.WriteBytesRequest;
 use Core.Syscall;
+use Core.Bytes.Slice;
 use Core.Results;
+use Core.String.Utf8;
 
 /// Returns descriptor for standard output.
 /// @returns POSIX-style stdout file descriptor constant (`1`).
@@ -95,7 +97,12 @@ pub Core.Results.Result<string, Core.Syscall.SyscallError> Read(i64 fd, i64 maxB
     if maxBytes < 1 {
         return Result::Error(SyscallError::InvalidReadLimit(maxBytes));
     }
-    return Result::Ok(__syscall_read(fd, maxBytes));
+    u8[] buffer = Slice.New(maxBytes);
+    i64 read = __syscall_read(i32(fd), buffer, word(maxBytes));
+    if read < 0 {
+        return Result::Error(SyscallError::IoFailure(read));
+    }
+    return Result::Ok(Utf8.FromUtf8CodeUnits(Slice.SubSlice(buffer, 0, read)));
 }
 
 /// Reads data based on typed descriptor and read-limit options.
@@ -119,7 +126,12 @@ pub Core.Results.Result<u8[], Core.Syscall.SyscallError> ReadBytes(i64 fd, i64 m
     if maxBytes < 1 {
         return Result::Error(SyscallError::InvalidReadLimit(maxBytes));
     }
-    return Result::Ok(__syscall_read_bytes(fd, maxBytes));
+    u8[] buffer = Slice.New(maxBytes);
+    i64 read = __syscall_read_bytes(i32(fd), buffer, word(maxBytes));
+    if read < 0 {
+        return Result::Error(SyscallError::IoFailure(read));
+    }
+    return Result::Ok(Slice.SubSlice(buffer, 0, read));
 }
 
 /// Writes a `u8[]` payload to a descriptor.

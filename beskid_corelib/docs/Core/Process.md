@@ -1,13 +1,6 @@
-`Core.Process` exposes **`ProcessError`** and process-level operations backed by runtime `process_*` builtins.
-
-## ProcessError
-
-```beskid
-pub enum ProcessError {
-    InvalidCommand(string command),
-    SpawnFailed(string command),
-}
-```
+`Core.Process` exposes current-process identity and termination through the
+canonical ABI-v5 process services. Beskid 0.4 does not expose child-process
+execution until one cross-platform manifest and runtime implementation exists.
 
 ## Functions
 
@@ -15,5 +8,5 @@ pub enum ProcessError {
 |----------|----------|
 | `Id() -> i32` | Returns **`__process_getpid()`**. |
 | `Exit(i32 code)` | Terminates via **`__process_exit(code)`** (all exit codes). |
-| `ExitCode() -> Result<i64, ProcessError>` | **`Ok(0)`** placeholder until child-process APIs land. |
-| `Run(string command) -> Result<bool, ProcessError>` | Empty command → **`InvalidCommand`**. Otherwise **`SpawnFailed`** (spawn deferred). |
+| `CurrentId() -> i32` | Returns the current process identifier through `Id()`. |
+| `IsCurrentProcess(i32 pid) -> bool` | Compares `pid` with the current process identifier. |

@@ -12,7 +12,7 @@ test channel_create_returns_handle {
 
 test channel_send_returns_result {
     Channel<i64> ch = Channel<i64>.Create();
-    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> result = Channel.Send<i64>(ch, 42);
+    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.Send(ch, 42);
     Assert.True(Results.IsOk(result) || Results.IsError(result), "Send returns a valid result");
 }
 
@@ -20,25 +20,47 @@ test channel_receive_returns_result {
     Channel<i64> ch = Channel<i64>.Create();
     i64 sent = 42;
     i64 discarded = sent;
-    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> s = Channel.Send<i64>(ch, discarded);
-    Core.Results.Result<i64, Concurrency.ChannelError> result = Channel.Receive<i64>(ch);
+    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> s = Channel<i64>.Send(ch, discarded);
+    Core.Results.Result<i64, Concurrency.ChannelError> result = Channel<i64>.Receive(ch);
     Assert.True(Results.IsOk(result) || Results.IsError(result), "Receive returns a valid result");
 }
 
 test channel_try_send_returns_try_result {
     Channel<i64> ch = Channel<i64>.Create();
-    TryResult<Channel.SendOk, Concurrency.ChannelError> result = Channel.TrySend<i64>(ch, 99);
-    Assert.True(true, "TrySend returns TryResult<SendOk, ChannelError>");
+    TryResult<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.TrySend(ch, 99);
+    match result {
+        TryResult::Ok(_) => Assert.True(true, "empty channel accepts a non-blocking send"),
+        _ => Assert.True(false, "empty channel must not reject its first non-blocking send"),
+    };
 }
 
-test channel_try_receive_returns_try_result {
+test channel_try_receive_distinguishes_empty_and_claimed_values {
     Channel<i64> ch = Channel<i64>.Create();
-    TryResult<i64, Concurrency.ChannelError> result = Channel.TryReceive<i64>(ch);
-    Assert.True(true, "TryReceive returns TryResult<T, ChannelError>");
+    TryResult<i64, Concurrency.ChannelError> empty = Channel<i64>.TryReceive(ch);
+    match empty {
+        TryResult::WouldBlock => Assert.True(true, "empty channel reports WouldBlock"),
+        _ => Assert.True(false, "empty channel must not manufacture a value"),
+    };
+
+    TryResult<Channel.SendOk, Concurrency.ChannelError> sent = Channel<i64>.TrySend(ch, 99_i64);
+    match sent {
+        TryResult::Ok(_) => Assert.True(true, "empty channel accepts the published value"),
+        _ => Assert.True(false, "empty channel must accept one published value"),
+    };
+    TryResult<i64, Concurrency.ChannelError> received = Channel<i64>.TryReceive(ch);
+    match received {
+        TryResult::Ok(value) => Assert.Equal(value, 99_i64, "try receive returns the single claimed value"),
+        _ => Assert.True(false, "published value must be claimed exactly once"),
+    };
+    TryResult<i64, Concurrency.ChannelError> consumed = Channel<i64>.TryReceive(ch);
+    match consumed {
+        TryResult::WouldBlock => Assert.True(true, "claimed value is removed from the queue"),
+        _ => Assert.True(false, "one publication cannot satisfy two receivers"),
+    };
 }
 
 test channel_close_is_idempotent {
     Channel<i64> ch = Channel<i64>.Create();
-    Channel.Close<i64>(ch);
+    Channel<i64>.Close(ch);
     Assert.True(true, "Close completes without panic");
 }

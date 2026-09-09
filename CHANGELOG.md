@@ -22,6 +22,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Convert the manifest-defined word result of `__str_len` explicitly at the
+  public `Core.String.Len` i64 boundary.
 - Align threading and filesystem gates with the canonical module path and
   expression grammar.
 - Route forced collection in runtime-sensitive tests through the unit-returning

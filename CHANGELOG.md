@@ -6,8 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- Publish the foundation `Core.Disposable` contract with typed `DisposeError`
+  results for exactly-once scoped cleanup.
+
 ### Changed
 
+- Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.
 - Box every Channel payload through one descriptor-backed generic value shape.
   Document sender/queue/receiver ownership at commit, cancellation and close;
   retain committed values for FIFO drain and adapt Hub receive to the same slot.

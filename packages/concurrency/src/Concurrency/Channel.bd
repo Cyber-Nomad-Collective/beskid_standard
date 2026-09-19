@@ -9,6 +9,10 @@ use Core.Results;
 pub type SendOk {
 }
 
+// Ordinary descriptor-backed box shared by every typed channel send. The native
+// boundary transports its traced ABI owner slot, never the payload's scalar bits.
+type ChannelValue<T> { T value, }
+
 /// Opaque channel handle (move-only at language layer).
 pub type Channel<T> {
     i64 handle,
@@ -32,9 +36,11 @@ pub Channel<T> CreateWithOptions<T>(ChannelOptions options) {
     return Channel<T> { handle: handle };
 }
 
-/// Sends a value; parks the current fiber when the queue is full (bounded + wait mode).
+/// Sender owns before commit; cancellation before commit retains that ownership.
+/// At commit the queue owns the value. Cancellation after commit reports Cancelled
+/// without retracting it; exactly one successful receiver becomes its owner.
 pub Core.Results.Result<SendOk, ChannelError> Send<T>(Channel<T> self, T value) {
-    i64 raw = __channel_send(self.handle, value);
+    i64 raw = __channel_send(self.handle, ChannelValue<T> { value: value });
     return MapSendStatus(Status.FromCode(raw));
 }
 
@@ -50,7 +56,7 @@ pub Core.Results.Result<T, ChannelError> Receive<T>(Channel<T> self) {
 
 /// Non-blocking send; `WouldBlock` when full, `Err` on close or cancel.
 pub TryResult<SendOk, ChannelError> TrySend<T>(Channel<T> self, T value) {
-    i64 raw = __channel_try_send(self.handle, value);
+    i64 raw = __channel_try_send(self.handle, ChannelValue<T> { value: value });
     return MapTrySendStatus(Status.FromCode(raw));
 }
 
@@ -67,7 +73,8 @@ pub TryResult<T, ChannelError> TryReceive<T>(Channel<T> self) {
     };
 }
 
-/// Idempotent writer shutdown.
+/// Idempotent writer shutdown. Queued values drain in FIFO order; close never
+/// disposes resources. A closed, empty queue reports Closed.
 pub unit Close<T>(Channel<T> self) {
     __channel_close(self.handle);
     return;

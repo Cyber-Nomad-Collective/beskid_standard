@@ -64,3 +64,19 @@ test channel_close_is_idempotent {
     Channel<i64>.Close(ch);
     Assert.True(true, "Close completes without panic");
 }
+
+test channel_close_drains_committed_value {
+    Channel<i64> ch = Channel<i64>.Create();
+    let sent = Channel.Send<i64>(ch, 42_i64);
+    Assert.True(Results.IsOk(sent), "send commits once");
+    Channel.Close<i64>(ch);
+    Channel.Close<i64>(ch);
+    match Channel.TryReceive<i64>(ch) {
+        TryResult::Ok(value) => Assert.Equal(value, 42_i64, "close retains committed value"),
+        _ => Assert.True(false, "close must not drain queue storage"),
+    };
+    match Channel.TryReceive<i64>(ch) {
+        TryResult::Err(Concurrency.ChannelError::Closed(_)) => Assert.True(true, "closed after drain"),
+        _ => Assert.True(false, "one committed value is delivered exactly once"),
+    };
+}

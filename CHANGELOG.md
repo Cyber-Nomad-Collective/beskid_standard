@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Box every Channel payload through one descriptor-backed generic value shape.
+  Document sender/queue/receiver ownership at commit, cancellation and close;
+  retain committed values for FIFO drain and adapt Hub receive to the same slot.
+- Document dynamically growing unbounded channel storage and add a close/drain
+  exactly-once facade regression.
 - Replace the scalar/static Fiber facade with move-only `Fiber<T>` instance
   Join, Detach, and idempotent parameterless Cancel methods. Preserve actual
   cancellation, stack-allocation, and panic metadata in `FiberError`; remove

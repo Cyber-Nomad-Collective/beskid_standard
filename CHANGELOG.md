@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Replace the scalar/static Fiber facade with move-only `Fiber<T>` instance
+  Join, Detach, and idempotent parameterless Cancel methods. Preserve actual
+  cancellation, stack-allocation, and panic metadata in `FiberError`; remove
+  fabricated `FiberJoinStatus` payload conversion.
 - Regenerate the compiler SDK from the current syntax authority, including the
   first-class `U32` primitive and the canonical CLIF/optional block-expression
   nodes used by reusable lowering.

@@ -10,16 +10,56 @@
 | `TimeOfDay` | `Core.Time.TimeOfDay` | UTC time within a civil day. |
 | `DateTime` | `Core.Time.DateTime` | UTC date and time-of-day pair. |
 | `TimeError` | `Core.Time.TimeError` | Parse and range failures for civil helpers. |
+| `TimerError` | `Core.Time.TimerError` | `InvalidDuration()`, `DeadlineOverflow()`, `Unavailable()`, or `Cancelled()`. |
 
 ## Clock functions
 
 | Function | Behavior |
 | --- | --- |
 | `NowUtc() -> Instant` | Realtime nanoseconds since Unix epoch. |
-| `MonotonicNow() -> Instant` | Monotonic nanoseconds since process start. |
+| `MonotonicNow() -> Instant` | Monotonic nanoseconds from an unspecified epoch. |
 | `FromMilliseconds(i64) -> Duration` | Builds a duration from whole milliseconds. |
 | `FromNanoseconds(i64) -> Duration` | Builds a duration from nanoseconds. |
 | `FromSeconds(i64) -> Duration` | Builds a duration from whole seconds. |
+| `Sleep(Duration) -> Result<unit, TimerError>` | Suspends a scheduler-owned fiber until its checked monotonic deadline. |
+
+## Scheduler sleep
+
+`Sleep` rejects negative durations before reading the clock. It reads the monotonic
+clock once, rejects unavailable samples and checks addition before registering a
+deadline. A host entry without a scheduler-owned fiber receives `Unavailable`;
+there is no blocking fallback. Duration constructors retain their existing arithmetic:
+`Sleep` validates the duration received, not overflow that happened before the call.
+
+Elapsed sleep returns `Ok(())`. Cancellation returns `Cancelled()` inside the
+sleeping frame and remains sticky for subsequent waits. The fiber's Join outcome
+is independent. Each call releases its private registration before returning; callers
+receive no timer handle or disposal obligation. Zero duration still observes
+cancellation, without promising a yield. Resumption can be later than the deadline;
+nanosecond units do not promise nanosecond precision or equal-deadline ordering.
+
+```beskid
+use Core.Time;
+use Core.Time.Duration;
+use Core.Time.TimerError;
+use Core.Results;
+use Concurrency.Fiber;
+use Concurrency.FiberError;
+
+i64 PauseWork() {
+    Result<unit, TimerError> result = Time.Sleep(Duration { nanos: 1000000_i64 });
+    return match result { Result::Ok(_) => 1_i64, Result::Error(_) => 0_i64, };
+}
+
+i64 RunPause() {
+    Fiber<i64> child = spawn PauseWork();
+    return match child.Join() { Result::Ok(value) => value, Result::Error(_) => 0_i64, };
+}
+```
+
+Public `SleepUntil(Instant)` is deferred until monotonic deadline domain identity
+can be enforced. Detached shutdown cleans timer registrations but does not promise
+that abandoned user frames resume or execute lexical cleanup.
 
 ## UTC civil conversions
 

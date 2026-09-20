@@ -53,6 +53,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Remove the lossy public `AppendUtf8Rune` APIs from both `Core.String.Utf8`
+  and the `Core.String` facade. Validated byte buffers now materialize only
+  through the canonical RFC 3629-checked decoding path.
 - Declare `ReadBytesWith` as `Result<u8[], SyscallError>` without a count-returning
   compatibility wrapper; retain the trusted raw syscall count ABI internally.
 - Reject non-shortest UTF-8, surrogates, out-of-range scalar values and malformed

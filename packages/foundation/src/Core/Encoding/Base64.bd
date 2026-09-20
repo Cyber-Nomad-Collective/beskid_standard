@@ -121,18 +121,28 @@ pub Core.Results.Result<u8[], EncodingError> DecodeBytes(u8[] data) {
         } else if c3 > 63 {
             return Result::Error(EncodingError::InvalidSequence(EncodingErrorDetail { position: i + 3, value: 0 }));
         }
+        // Padding is local to the final quantum; unused bits must be zero (RFC 4648).
+        if c2 == 64 {
+            if i + 4 != len || c3 != 64 || c1 % 16 != 0 {
+                return Result::Error(EncodingError::InvalidPadding(EncodingErrorDetail { position: i + 2, value: 61 }));
+            }
+        } else if c3 == 64 {
+            if i + 4 != len || c2 % 4 != 0 {
+                return Result::Error(EncodingError::InvalidPadding(EncodingErrorDetail { position: i + 3, value: 61 }));
+            }
+        }
         u8 b0 = c0 * 4 + c1 / 16;
         if o < bufLen {
             Slice.Set(buf, o, b0);
             o = o + 1;
         }
-        if pad < 2 && o < bufLen {
+        if c2 < 64 && o < bufLen {
             u8 c1Rem = c1 % 16;
             u8 b1 = c1Rem * 16 + c2 / 4;
             Slice.Set(buf, o, b1);
             o = o + 1;
         }
-        if pad < 1 && o < bufLen {
+        if c3 < 64 && o < bufLen {
             u8 c2Rem = c2 % 4;
             u8 b2 = c2Rem * 64 + c3;
             Slice.Set(buf, o, b2);

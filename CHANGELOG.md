@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add checked byte-reader and byte-writer contracts and fixed-buffer cursors.
+- Stage `Core.IO` Reader, Writer, Closer, Stream and IoError contracts, transfer
+  loops and explicit DisposeError cleanup conversion. Execution remains blocked
+  by compiler static contract-parameter specialization; close/idempotence and
+  scoped-conversion integration are not yet verified (partial F6 checkpoint).
+- Add strict HTTP ASCII decoding with typed encoding failures.
+
 - Publish the foundation `Core.Disposable` contract with typed `DisposeError`
   results for exactly-once scoped cleanup.
 
@@ -45,6 +52,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Channel and Mutex wrappers with the canonical Optional/Results modules.
 
 ### Fixed
+
+- Declare `ReadBytesWith` as `Result<u8[], SyscallError>` without a count-returning
+  compatibility wrapper; retain the trusted raw syscall count ABI internally.
+- Reject non-shortest UTF-8, surrogates, out-of-range scalar values and malformed
+  Base64 padding/unused bits; preserve every valid UTF-8 byte during decoding.
+- Validate whole source and destination ranges before byte-copy mutation or
+  zero-length bypass, preserving overlap-safe unit-returning copy behavior.
+- Replace unused legacy byte-error variants with the normative `InvalidRange`
+  and `OutOfBounds` cases used by checked cursors.
 
 - Route Core.Args tests through the public collection API and remove the unregistered duplicate Args test suite.
 - Thread the active cursor through generated nested sequences, choices, repeats, and optional terms;

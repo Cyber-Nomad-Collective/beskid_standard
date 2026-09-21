@@ -64,18 +64,22 @@ pub i64 ResolveReadLimit(ReadLimit limit) {
     };
 }
 
+i32 CheckedDescriptor(i64 descriptor) {
+    if descriptor < 0_i64 || descriptor > 2147483647_i64 {
+        return -1_i32;
+    }
+    return i32(descriptor);
+}
+
 /// Writes data to a descriptor.
 /// @arg(fd) Numeric host descriptor.
 /// @arg(data) UTF-8 payload.
 /// @returns Written byte count or a `SyscallError` when validation or syscall fails.
 pub Core.Results.Result<i64, SyscallError> Write(i64 fd, string data) {
-    if fd < 0 {
-        return Result::Error(SyscallError::InvalidFd(fd));
-    }
-    i64 written = __syscall_write(fd, data);
-    if written < 0 {
-        return Result::Error(SyscallError::IoFailure(written));
-    }
+    i32 descriptor = CheckedDescriptor(fd);
+    if descriptor < 0_i32 { return Result::Error(SyscallError::InvalidFd(fd)); }
+    i64 written = __syscall_write(i64(descriptor), data);
+    if written < 0 { return Result::Error(SyscallError::IoFailure(written)); }
     return Result::Ok(written);
 }
 
@@ -91,17 +95,13 @@ pub Core.Results.Result<i64, Core.Syscall.SyscallError> WriteWith(WriteRequest r
 /// @arg(maxBytes) Upper bound on returned string length.
 /// @returns Payload string or a `SyscallError`.
 pub Core.Results.Result<string, Core.Syscall.SyscallError> Read(i64 fd, i64 maxBytes) {
-    if fd != StdinFd() {
-        return Result::Error(SyscallError::UnsupportedReadFd(fd));
-    }
-    if maxBytes < 1 {
-        return Result::Error(SyscallError::InvalidReadLimit(maxBytes));
-    }
+    i32 descriptor = CheckedDescriptor(fd);
+    if descriptor < 0_i32 { return Result::Error(SyscallError::InvalidFd(fd)); }
+    if descriptor != 0_i32 { return Result::Error(SyscallError::UnsupportedReadFd(fd)); }
+    if maxBytes < 1 { return Result::Error(SyscallError::InvalidReadLimit(maxBytes)); }
     u8[] buffer = Slice.New(maxBytes);
-    i64 read = __syscall_read(i32(fd), buffer, word(maxBytes));
-    if read < 0 {
-        return Result::Error(SyscallError::IoFailure(read));
-    }
+    i64 read = __syscall_read(descriptor, buffer, word(maxBytes));
+    if read < 0 { return Result::Error(SyscallError::IoFailure(read)); }
     return Result::Ok(Utf8.FromUtf8CodeUnits(Slice.SubSlice(buffer, 0, read)));
 }
 
@@ -120,17 +120,12 @@ pub Core.Results.Result<string, Core.Syscall.SyscallError> ReadWith(ReadRequest 
 /// @arg(maxBytes) Upper bound on returned buffer length.
 /// @returns Payload buffer or a `SyscallError`.
 pub Core.Results.Result<u8[], Core.Syscall.SyscallError> ReadBytes(i64 fd, i64 maxBytes) {
-    if fd < 0 {
-        return Result::Error(SyscallError::InvalidFd(fd));
-    }
-    if maxBytes < 1 {
-        return Result::Error(SyscallError::InvalidReadLimit(maxBytes));
-    }
+    i32 descriptor = CheckedDescriptor(fd);
+    if descriptor < 0_i32 { return Result::Error(SyscallError::InvalidFd(fd)); }
+    if maxBytes < 1 { return Result::Error(SyscallError::InvalidReadLimit(maxBytes)); }
     u8[] buffer = Slice.New(maxBytes);
-    i64 read = __syscall_read_bytes(i32(fd), buffer, word(maxBytes));
-    if read < 0 {
-        return Result::Error(SyscallError::IoFailure(read));
-    }
+    i64 read = __syscall_read_bytes(descriptor, buffer, word(maxBytes));
+    if read < 0 { return Result::Error(SyscallError::IoFailure(read)); }
     return Result::Ok(Slice.SubSlice(buffer, 0, read));
 }
 
@@ -139,13 +134,10 @@ pub Core.Results.Result<u8[], Core.Syscall.SyscallError> ReadBytes(i64 fd, i64 m
 /// @arg(data) Raw byte payload.
 /// @returns Written byte count or a `SyscallError`.
 pub Core.Results.Result<i64, Core.Syscall.SyscallError> WriteBytes(i64 fd, u8[] data) {
-    if fd < 0 {
-        return Result::Error(SyscallError::InvalidFd(fd));
-    }
-    i64 written = __syscall_write_bytes(fd, data);
-    if written < 0 {
-        return Result::Error(SyscallError::IoFailure(written));
-    }
+    i32 descriptor = CheckedDescriptor(fd);
+    if descriptor < 0_i32 { return Result::Error(SyscallError::InvalidFd(fd)); }
+    i64 written = __syscall_write_bytes(descriptor, data);
+    if written < 0 { return Result::Error(SyscallError::IoFailure(written)); }
     return Result::Ok(written);
 }
 

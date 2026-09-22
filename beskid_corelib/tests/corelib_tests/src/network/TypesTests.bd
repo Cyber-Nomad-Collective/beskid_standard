@@ -1,0 +1,61 @@
+use Core.Disposable;
+use Core.Bytes.Slice;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Testing.Assert;
+
+test network_ipv4_and_ipv6_values_keep_bounded_ports {
+    SocketAddress v4 = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    SocketAddress v6 = SocketAddress { address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32), port: Network.Types.PortBytes(255_u8, 255_u8) };
+    Assert.Equal(v4.port.Value(), 0_i64, "bind permits an OS-selected port");
+    Assert.Equal(v6.port.Value(), 65535_i64, "largest portable port");
+    bool loopback = match v6.address { IpAddress::V6(_, _, _, last) => last == 1_u32, _ => false, };
+    Assert.True(loopback, "IPv6 address groups survive the typed value");
+}
+
+test network_datagram_keeps_source_and_truncation {
+    SocketAddress source = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(1_u8, 187_u8) };
+    Datagram value = Datagram { payload: [7_u8, 8_u8], source: source, truncated: true };
+    Assert.Equal(Slice.Len(value.payload), 2_i64, "one owned payload");
+    Assert.Equal(value.source.port.Value(), 443_i64, "source metadata");
+    Assert.True(value.truncated, "truncation remains visible");
+}
+
+test network_cleanup_conversion_is_explicit_and_portable {
+    NetworkError error = Network.Errors.FromDisposeError(DisposeError::Failed);
+    Assert.True(match error { NetworkError::CleanupFailed => true, _ => false, }, "cleanup maps only through the declared conversion");
+    SocketOptions options = Network.Types.DefaultSocketOptions();
+    Assert.False(options.noDelay, "default option has no native flag");
+    Assert.False(options.keepAlive, "default option is portable");
+}
+
+// Exhaustive matching makes additions to the closed error vocabulary reviewable.
+i64 ErrorOrdinal(NetworkError error) {
+    return match error {
+        NetworkError::AddressInUse => 1_i64, NetworkError::AddressNotAvailable => 2_i64,
+        NetworkError::ConnectionAborted => 3_i64, NetworkError::ConnectionRefused => 4_i64,
+        NetworkError::ConnectionReset => 5_i64, NetworkError::HostNotFound => 6_i64,
+        NetworkError::InvalidAddress => 7_i64, NetworkError::MessageTooLarge => 8_i64,
+        NetworkError::NetworkDown => 9_i64, NetworkError::NotConnected => 10_i64,
+        NetworkError::PermissionDenied => 11_i64, NetworkError::TimedOut => 12_i64,
+        NetworkError::Cancelled => 13_i64, NetworkError::Closed => 14_i64,
+        NetworkError::Busy => 15_i64, NetworkError::CleanupFailed => 16_i64,
+        NetworkError::Unsupported => 17_i64, NetworkError::ResourceExhausted => 18_i64,
+    };
+}
+
+test network_error_union_has_no_native_payload {
+    Assert.Equal(ErrorOrdinal(NetworkError::Busy), 15_i64, "portable admission failure");
+    Assert.Equal(ErrorOrdinal(NetworkError::Unsupported), 17_i64, "closed error vocabulary");
+    Assert.Equal(ErrorOrdinal(NetworkError::ResourceExhausted), 18_i64, "exhaustion is distinct from NetworkDown");
+}
+
+test network_ports_reject_out_of_range_numbers {
+    Assert.True(match Network.Types.PortNumber(-1_i64) { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "negative port has no value");
+    Assert.True(match Network.Types.PortNumber(65536_i64) { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "oversized port has no value");
+    match Network.Types.PortNumber(65535_i64) {
+        Result::Ok(port) => Assert.Equal(port.Value(), 65535_i64, "maximum port is representable"),
+        Result::Error(_) => Assert.Fail("valid bounded port"),
+    };
+}

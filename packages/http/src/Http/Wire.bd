@@ -1,0 +1,53 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.IO.IoError;
+use Core.Results;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Network.Tcp.TcpStream;
+
+/// The only HTTP transport read loop. Partial reads of up to 4096 octets locate
+/// the head; a declared Content-Length remainder is transferred by Foundation
+/// ReadExact. The role selects the RFC 9112 section 6.3 framing rules. One
+/// exchange owns exactly one message: octets past its boundary are returned to
+/// the parser, which reports them as TrailingBytes after its role checks (so an
+/// interim 1xx followed by a final response is InterimResponse). Stream failures
+/// keep their Foundation TransferFailure cause.
+pub Result<u8[],HttpError> ReadMessage(TcpStream stream, Limits limits, MessageRole role) {
+    mut u8[] wire = [];
+    u8[] chunk = Slice.New(4096_i64);
+    i64 ceiling = limits.maxHeaderBytes + limits.maxBodyBytes + 32_i64;
+    while true {
+        Result<i64,HttpError> boundary = Codec.MessageEnd(wire, limits, role);
+        match boundary {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(total) => {
+                if total > 0_i64 { return Complete(stream, wire, total); }
+            },
+        };
+        if Slice.Len(wire) >= ceiling { return Result::Error(HttpError::BodyTooLarge()); }
+        Result<i64,IoError> read = IO.Read(stream, chunk, 0_i64, 4096_i64);
+        match read {
+            Result::Error(error) => { return Result::Error(Errors.FromIoError(error)); },
+            Result::Ok(count) => {
+                if count == 0_i64 { return Result::Error(HttpError::UnexpectedEof()); }
+                mut i64 index = 0_i64;
+                while index < count { Array.Append<u8>(wire, chunk[index]); index = index + 1_i64; }
+            },
+        };
+    }
+}
+
+Result<u8[],HttpError> Complete(TcpStream stream, u8[] wire, i64 total) {
+    i64 buffered = Slice.Len(wire);
+    if buffered >= total { return Result::Ok(wire); }
+    u8[] message = Slice.New(total);
+    Slice.Copy(message, 0_i64, wire, 0_i64, buffered);
+    Result<unit,IoError> rest = IO.ReadExact(stream, message, buffered, total - buffered);
+    return match rest {
+        Result::Ok(_) => Result::Ok(message),
+        Result::Error(error) => Result::Error(Errors.FromIoError(error)),
+    };
+}

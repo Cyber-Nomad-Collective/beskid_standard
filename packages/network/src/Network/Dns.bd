@@ -1,0 +1,40 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Internal;
+
+/// A fresh host resolver job for each call. Results retain resolver order.
+/// Cancellation ends only the Beskid wait; late native results are discarded.
+pub Result<SocketAddress[], NetworkError> Resolve(string hostName, Port port, Option<AddressFamily> family) {
+    if port.Value() == 0_i64 { return Result::Error(NetworkError::InvalidAddress); }
+    i64 filter = match family {
+        Option::None => 0_i64,
+        Option::Some(value) => match value { AddressFamily::V4 => 4_i64, AddressFamily::V6 => 6_i64, },
+    };
+    word[] result = [word(0)];
+    i32 status = Internal.Resolve(hostName, port.Value(), filter, result);
+    if status != 0_i32 { return Result::Error(Internal.Error(i64(status))); }
+    word resolved = result[0];
+    i64 count = Internal.ResolveCount(resolved);
+    if count < 0_i64 {
+        Internal.ReleaseResolved(resolved);
+        return Result::Error(Internal.Error(-count));
+    }
+    mut SocketAddress[] addresses = Array.Empty<SocketAddress>();
+    mut i64 index = 0_i64;
+    while index < count {
+        u8[] wire = Slice.New(19_i64);
+        i32 itemStatus = Internal.ResolveAddress(resolved, index, wire);
+        if itemStatus != 0_i32 {
+            Internal.ReleaseResolved(resolved);
+            return Result::Error(Internal.Error(i64(itemStatus)));
+        }
+        Array.Append<SocketAddress>(addresses, Internal.Decode(wire));
+        index = index + 1_i64;
+    }
+    Internal.ReleaseResolved(resolved);
+    return Result::Ok(addresses);
+}

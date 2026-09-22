@@ -1,0 +1,57 @@
+use Core.Bytes.Slice;
+use Core.Disposable;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Internal;
+use Network.Internal.Resources;
+
+/// A datagram resource, deliberately not a Core.IO.Stream.
+/// One receive and one send may be pending concurrently. Same-direction work
+/// returns Busy before a second wait is installed or a payload is consumed.
+pub type UdpSocket: Disposable {
+    word handle,
+
+    pub Result<unit, NetworkError> Connect(SocketAddress peer) {
+        if peer.port.Value() == 0_i64 { return Result::Error(NetworkError::InvalidAddress); }
+        return Internal.Status(i64(Internal.ConnectDatagram(handle, Internal.Encode(peer))));
+    }
+
+    /// Receives one whole datagram boundary; capacity limits the returned payload.
+    Result<Datagram, NetworkError> ReceiveDatagram(i64 capacity, bool connected) {
+        if capacity < 0_i64 { return Result::Error(NetworkError::MessageTooLarge); }
+        u8[] payload = Slice.New(capacity);
+        u8[] metadata = Slice.New(20_i64);
+        i64 completed = Internal.Receive(handle, payload, metadata, connected);
+        if completed < 0_i64 { return Result::Error(Internal.Error(-completed)); }
+        return Result::Ok(Datagram { payload: Slice.SubSlice(payload, 0_i64, completed), source: Internal.Decode(metadata), truncated: metadata[19] != u8(0) });
+    }
+
+    pub Result<Datagram, NetworkError> ReceiveFrom(i64 capacity) { return ReceiveDatagram(capacity, false); }
+    pub Result<Datagram, NetworkError> Receive(i64 capacity) { return ReceiveDatagram(capacity, true); }
+
+    /// Payload remains caller-owned on both success and failure.
+    pub Result<unit, NetworkError> SendTo(u8[] payload, SocketAddress peer) {
+        if peer.port.Value() == 0_i64 { return Result::Error(NetworkError::InvalidAddress); }
+        i64 completed = Internal.Send(handle, payload, Internal.Encode(peer), false);
+        if completed < 0_i64 { return Result::Error(Internal.Error(-completed)); }
+        if completed != Slice.Len(payload) { return Result::Error(NetworkError::MessageTooLarge); }
+        return Result::Ok(());
+    }
+
+    pub Result<unit, NetworkError> Send(u8[] payload) {
+        i64 completed = Internal.Send(handle, payload, Slice.New(0_i64), true);
+        if completed < 0_i64 { return Result::Error(Internal.Error(-completed)); }
+        if completed != Slice.Len(payload) { return Result::Error(NetworkError::MessageTooLarge); }
+        return Result::Ok(());
+    }
+
+    pub Result<SocketAddress, NetworkError> LocalAddress() { return Internal.Address(handle, false); }
+    pub Result<SocketAddress, NetworkError> PeerAddress() { return Internal.Address(handle, true); }
+    pub Result<unit, NetworkError> Close() { return Internal.Status(i64(Internal.Close(handle))); }
+    pub Result<unit, DisposeError> Dispose() { return Internal.Dispose(handle); }
+}
+
+pub Result<UdpSocket, NetworkError> Bind(SocketAddress address) {
+    return Resources.BindUdpSocket(address);
+}

@@ -1,0 +1,313 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Encoding;
+use Core.Results;
+use Core.String;
+use Http.Errors;
+use Http.Types;
+
+bool TokenByte(u8 value) {
+    if value >= u8(48) && value <= u8(57) { return true; }
+    if value >= u8(65) && value <= u8(90) { return true; }
+    if value >= u8(97) && value <= u8(122) { return true; }
+    return value == u8(33) || value == u8(35) || value == u8(36) || value == u8(37) || value == u8(38) || value == u8(39) || value == u8(42) || value == u8(43) || value == u8(45) || value == u8(46) || value == u8(94) || value == u8(95) || value == u8(96) || value == u8(124) || value == u8(126);
+}
+bool Token(string value) { if String.Len(value) == 0_i64 { return false; } mut i64 i = 0_i64; while i < String.Len(value) { if !TokenByte(String.ByteAt(value, i)) { return false; } i = i + 1_i64; } return true; }
+bool FieldValue(string value) { mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if !(b == u8(9) || (b >= u8(32) && b <= u8(126))) { return false; } i = i + 1_i64; } return true; }
+pub string LowerAscii(string value) { mut string result = ""; mut i64 i = 0_i64; while i < String.Len(value) { mut u8 b = String.ByteAt(value, i); if b >= u8(65) && b <= u8(90) { b = b + u8(32); } result = result + String.CodeUnitChar(b); i = i + 1_i64; } return result; }
+string TrimOws(string value) { mut i64 start = 0_i64; mut i64 end = String.Len(value); while start < end && (String.ByteAt(value,start) == u8(32) || String.ByteAt(value,start) == u8(9)) { start = start + 1_i64; } while end > start && (String.ByteAt(value,end-1_i64) == u8(32) || String.ByteAt(value,end-1_i64) == u8(9)) { end = end - 1_i64; } return String.SubSlice(value,start,end-start); }
+Result<string,HttpError> Ascii(u8[] bytes,i64 offset,i64 count) { Result<string,Core.Encoding.EncodingError> value = Encoding.DecodeHttpAscii(Slice.SubSlice(bytes,offset,count)); return match value { Result::Ok(text) => Result::Ok(text), Result::Error(_) => Result::Error(HttpError::InvalidFraming()), }; }
+/// Index of the CRLFCRLF that ends the head. The field section, including the last field line's CRLF, is bytes[0, end + 2).
+i64 HeaderEnd(u8[] bytes, Limits limits) { mut i64 count = Slice.Len(bytes); if count > limits.maxHeaderBytes + 4_i64 { count = limits.maxHeaderBytes + 4_i64; } mut i64 i = 0_i64; while i + 3_i64 < count { if bytes[i] == u8(13) && bytes[i+1_i64] == u8(10) && bytes[i+2_i64] == u8(13) && bytes[i+3_i64] == u8(10) { return i; } i = i + 1_i64; } return -1_i64; }
+/// A lone LF inside the header section is never HTTP/1.1 framing; body octets are not scanned.
+bool HasBareLf(u8[] bytes, i64 end) {
+    mut i64 i = 0_i64;
+    while i < end {
+        if bytes[i] == u8(10) && (i == 0_i64 || bytes[i - 1_i64] != u8(13)) { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+/// The header-section prefix that may be scanned: through CRLFCRLF when found, else the bounded head.
+i64 HeadScanEnd(u8[] bytes, i64 end, Limits limits) {
+    if end >= 0_i64 { return end + 4_i64; }
+    i64 count = Slice.Len(bytes);
+    if count > limits.maxHeaderBytes + 4_i64 { return limits.maxHeaderBytes + 4_i64; }
+    return count;
+}
+
+/// Index of the CRLFCRLF head terminator. Bare LF wins over size so malformed framing is reported as such.
+pub Result<i64,HttpError> HeadBoundary(u8[] bytes, Limits limits) {
+    i64 end = HeaderEnd(bytes, limits);
+    if HasBareLf(bytes, HeadScanEnd(bytes, end, limits)) { return Result::Error(HttpError::InvalidFraming()); }
+    if end < 0_i64 { return Result::Error(HttpError::HeaderTooLarge()); }
+    return Result::Ok(end);
+}
+Result<i64,HttpError> Decimal(string value) { if String.Len(value) == 0_i64 { return Result::Error(HttpError::InvalidContentLength()); } mut i64 out = 0_i64; mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value,i); if b < u8(48) || b > u8(57) || out > (9223372036854775807_i64-i64(b-u8(48)))/10_i64 { return Result::Error(HttpError::InvalidContentLength()); } out = out*10_i64+i64(b-u8(48)); i = i+1_i64; } return Result::Ok(out); }
+Result<Header[],HttpError> Headers(u8[] bytes,i64 start,i64 end,Limits limits) {
+    mut Header[] out = Array.Empty<Header>(); mut i64 cursor = start; mut i64 count = 0_i64;
+    while cursor < end { mut i64 lineEnd = cursor; while lineEnd+1_i64 < end && !(bytes[lineEnd] == u8(13) && bytes[lineEnd+1_i64] == u8(10)) { lineEnd=lineEnd+1_i64; }
+        if lineEnd+1_i64 >= end || bytes[cursor] == u8(32) || bytes[cursor] == u8(9) { return Result::Error(HttpError::InvalidHeader()); }
+        mut i64 colon=cursor; while colon < lineEnd && bytes[colon] != u8(58) { colon=colon+1_i64; } if colon == cursor || colon == lineEnd { return Result::Error(HttpError::InvalidHeader()); }
+        Result<string,HttpError> rawName=Ascii(bytes,cursor,colon-cursor); Result<string,HttpError> rawValue=Ascii(bytes,colon+1_i64,lineEnd-colon-1_i64);
+        match rawName { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(name)=>match rawValue { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(value)=>{ if !Token(name) || !FieldValue(value) { return Result::Error(HttpError::InvalidHeader()); } count=count+1_i64; if count > limits.maxHeaders { return Result::Error(HttpError::TooManyHeaders()); } Array.Append<Header>(out,Header { name: LowerAscii(name), value: TrimOws(value) }); }, }, };
+        cursor=lineEnd+2_i64;
+    } return Result::Ok(out);
+}
+/// Validated framing fields: -2 chunked, -1 neither field, otherwise the declared length. Body limits are applied by Framing.
+Result<i64,HttpError> FieldFraming(Header[] headers) { mut bool lengthSeen=false; mut bool chunked=false; mut i64 length=-1_i64; mut i64 i=0_i64; while i<Array.Len<Header>(headers) { Header h=Array.Get<Header>(headers,i); if h.name=="content-length" { if lengthSeen {return Result::Error(HttpError::AmbiguousFraming());} Result<i64,HttpError> parsed=Decimal(h.value); match parsed { Result::Ok(value)=>{length=value;lengthSeen=true;},Result::Error(error)=>{return Result::Error(error);},}; } if h.name=="transfer-encoding" { if chunked || LowerAscii(h.value)!="chunked" {return Result::Error(HttpError::UnsupportedTransferCoding());} chunked=true; } i=i+1_i64; } if chunked && lengthSeen{return Result::Error(HttpError::AmbiguousFraming());} if chunked{return Result::Ok(-2_i64);} return Result::Ok(length); }
+bool IsRequest(MessageRole role) { return match role { MessageRole::Request => true, _ => false, }; }
+bool Interim(i64 status) { return status >= 100_i64 && status <= 199_i64; }
+/// RFC 9112 section 6.3 item 1: a HEAD response and any 1xx, 204, or 304 response end at the head.
+bool Bodiless(MessageRole role, i64 status) {
+    return match role {
+        MessageRole::Request => false,
+        MessageRole::HeadResponse => true,
+        MessageRole::Response => Interim(status) || status == 204_i64 || status == 304_i64,
+    };
+}
+/// Body framing for one message role; -1 means the message ends at its head.
+/// Framing fields are validated first, so AmbiguousFraming wins over the no-body rule;
+/// a bodiless response validates but does not apply them. A request with neither field
+/// has an empty body; a response with neither field would be close-delimited, which the
+/// bounded v0.5 reader rejects.
+Result<i64,HttpError> Framing(Header[] headers, Limits limits, MessageRole role, i64 status) {
+    Result<i64,HttpError> declared = FieldFraming(headers);
+    return match declared {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(length) => {
+            if Bodiless(role, status) { return Result::Ok(-1_i64); }
+            if length == -1_i64 && !IsRequest(role) { return Result::Error(HttpError::CloseDelimitedBody()); }
+            if length > limits.maxBodyBytes { return Result::Error(HttpError::BodyTooLarge()); }
+            return Result::Ok(length);
+        },
+    };
+}
+bool HexByte(u8 value) { return (value >= u8(48) && value <= u8(57)) || (value >= u8(65) && value <= u8(70)) || (value >= u8(97) && value <= u8(102)); }
+/// An RFC 3986 unreserved or sub-delims octet: ALPHA DIGIT - . _ ~ ! $ & ' ( ) * + , ; =
+bool HostByte(u8 value) {
+    if value >= u8(48) && value <= u8(57) { return true; }
+    if value >= u8(65) && value <= u8(90) { return true; }
+    if value >= u8(97) && value <= u8(122) { return true; }
+    return value == u8(45) || value == u8(46) || value == u8(95) || value == u8(126) || value == u8(33) || value == u8(36) || value == u8(38) || value == u8(39) || value == u8(40) || value == u8(41) || value == u8(42) || value == u8(43) || value == u8(44) || value == u8(59) || value == u8(61);
+}
+/// One to five decimal digits with a value in 0..65535.
+bool HostPort(string value, i64 start) {
+    i64 count = String.Len(value) - start;
+    if count <= 0_i64 || count > 5_i64 { return false; }
+    mut i64 port = 0_i64;
+    mut i64 i = start;
+    while i < String.Len(value) {
+        u8 b = String.ByteAt(value, i);
+        if b < u8(48) || b > u8(57) { return false; }
+        port = port * 10_i64 + i64(b - u8(48));
+        i = i + 1_i64;
+    }
+    return port <= 65535_i64;
+}
+/// Empty, or uri-host [ ":" port ]: a bracketed IPv6 literal or a run of unreserved,
+/// sub-delims, and pct-encoded octets. No whitespace, controls, or second colon outside brackets.
+bool HostValue(string value) {
+    i64 count = String.Len(value);
+    if count == 0_i64 { return true; }
+    mut i64 i = 0_i64;
+    if String.ByteAt(value, 0_i64) == u8(91) {
+        mut bool colon = false;
+        i = 1_i64;
+        while i < count && String.ByteAt(value, i) != u8(93) {
+            u8 b = String.ByteAt(value, i);
+            if b == u8(58) { colon = true; } else if !(HexByte(b) || b == u8(46)) { return false; }
+            i = i + 1_i64;
+        }
+        if i >= count || !colon { return false; }
+        i = i + 1_i64;
+    } else {
+        while i < count && String.ByteAt(value, i) != u8(58) {
+            u8 b = String.ByteAt(value, i);
+            if b == u8(37) {
+                if i + 2_i64 >= count || !HexByte(String.ByteAt(value, i + 1_i64)) || !HexByte(String.ByteAt(value, i + 2_i64)) { return false; }
+                i = i + 3_i64;
+            } else {
+                if !HostByte(b) { return false; }
+                i = i + 1_i64;
+            }
+        }
+        if i == 0_i64 { return false; }
+    }
+    if i == count { return true; }
+    if String.ByteAt(value, i) != u8(58) { return false; }
+    return HostPort(value, i + 1_i64);
+}
+/// RFC 9112 section 3.2: exactly one Host field line with a valid value. Runs before body framing.
+Result<unit,HttpError> HostField(Header[] headers) {
+    mut i64 seen = 0_i64;
+    mut bool valid = true;
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header h = Array.Get<Header>(headers, i);
+        if LowerAscii(h.name) == "host" { seen = seen + 1_i64; valid = HostValue(TrimOws(h.value)); }
+        i = i + 1_i64;
+    }
+    if seen == 0_i64 { return Result::Error(HttpError::MissingHost()); }
+    if seen > 1_i64 || !valid { return Result::Error(HttpError::InvalidHost()); }
+    return Result::Ok(());
+}
+Result<i64,HttpError> Hex(u8[] bytes,i64 start,i64 end) { if start==end{return Result::Error(HttpError::InvalidChunk());} mut i64 result=0_i64;mut i64 i=start;while i<end {u8 b=bytes[i];mut i64 digit=-1_i64;if b>=u8(48)&&b<=u8(57){digit=i64(b-u8(48));}if b>=u8(65)&&b<=u8(70){digit=i64(b-u8(65))+10_i64;}if b>=u8(97)&&b<=u8(102){digit=i64(b-u8(97))+10_i64;}if digit<0_i64||result>(9223372036854775807_i64-digit)/16_i64{return Result::Error(HttpError::InvalidChunk());}result=result*16_i64+digit;i=i+1_i64;}return Result::Ok(result);}
+Result<u8[],HttpError> Chunked(u8[] bytes,i64 start,Limits limits) {
+    mut u8[] result = [];
+    mut i64 cursor = start;
+    // Every iteration returns or advances past a size line, so the walk is bounded by the buffer.
+    while cursor <= Slice.Len(bytes) {
+        mut i64 lineEnd = cursor;
+        while lineEnd + 1_i64 < Slice.Len(bytes) && !(bytes[lineEnd] == u8(13) && bytes[lineEnd + 1_i64] == u8(10)) { lineEnd = lineEnd + 1_i64; }
+        if lineEnd + 1_i64 >= Slice.Len(bytes) { return Result::Error(HttpError::UnexpectedEof()); }
+        Result<i64,HttpError> parsed = Hex(bytes, cursor, lineEnd);
+        match parsed {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(size) => {
+                cursor = lineEnd + 2_i64;
+                if size > limits.maxBodyBytes - Slice.Len(result) { return Result::Error(HttpError::BodyTooLarge()); }
+                if Slice.Len(bytes) < cursor + size + 2_i64 { return Result::Error(HttpError::UnexpectedEof()); }
+                mut i64 index = 0_i64;
+                while index < size { Array.Append<u8>(result, bytes[cursor + index]); index = index + 1_i64; }
+                cursor = cursor + size;
+                if bytes[cursor] != u8(13) || bytes[cursor + 1_i64] != u8(10) { return Result::Error(HttpError::InvalidChunk()); }
+                cursor = cursor + 2_i64;
+                if size == 0_i64 {
+                    if cursor != Slice.Len(bytes) { return Result::Error(HttpError::TrailingBytes()); }
+                    return Result::Ok(result);
+                }
+            },
+        };
+    }
+    // The walk ran past the buffer without a terminal chunk: the body is truncated.
+    return Result::Error(HttpError::UnexpectedEof());
+}
+Result<u8[],HttpError> Body(u8[] bytes,i64 start,i64 framing,Limits limits) {if framing==-2_i64{return Chunked(bytes,start,limits);}if framing<0_i64 {if Slice.Len(bytes)!=start{return Result::Error(HttpError::TrailingBytes());}return Result::Ok(Slice.New(0_i64));}if Slice.Len(bytes)<start+framing{return Result::Error(HttpError::UnexpectedEof());}if Slice.Len(bytes)!=start+framing{return Result::Error(HttpError::TrailingBytes());}return Result::Ok(Slice.SubSlice(bytes,start,framing));}
+/// Walks chunk boundaries in place. Ok(0) means more octets are required.
+Result<i64,HttpError> ChunkedEnd(u8[] bytes, i64 start, Limits limits) {
+    mut i64 cursor = start;
+    mut i64 total = 0_i64;
+    // Every iteration returns or advances past a size line, so the walk is bounded by the buffer.
+    while cursor <= Slice.Len(bytes) {
+        mut i64 lineEnd = cursor;
+        while lineEnd + 1_i64 < Slice.Len(bytes) && !(bytes[lineEnd] == u8(13) && bytes[lineEnd + 1_i64] == u8(10)) { lineEnd = lineEnd + 1_i64; }
+        if lineEnd + 1_i64 >= Slice.Len(bytes) {
+            // A size line longer than 16 hex digits cannot fit i64; do not buffer it unboundedly.
+            if lineEnd - cursor > 16_i64 { return Result::Error(HttpError::InvalidChunk()); }
+            return Result::Ok(0_i64);
+        }
+        Result<i64,HttpError> parsed = Hex(bytes, cursor, lineEnd);
+        match parsed {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(size) => {
+                if size > limits.maxBodyBytes - total { return Result::Error(HttpError::BodyTooLarge()); }
+                total = total + size;
+                cursor = lineEnd + 2_i64 + size;
+                if Slice.Len(bytes) < cursor + 2_i64 { return Result::Ok(0_i64); }
+                if bytes[cursor] != u8(13) || bytes[cursor + 1_i64] != u8(10) { return Result::Error(HttpError::InvalidChunk()); }
+                cursor = cursor + 2_i64;
+                if size == 0_i64 { return Result::Ok(cursor); }
+            },
+        };
+    }
+    // The walk ran past the buffer without a terminal chunk: more octets are required.
+    return Result::Ok(0_i64);
+}
+
+/// Status code of a response start line for boundary detection; ResponseHead repeats the full start-line check.
+Result<i64,HttpError> StartStatus(u8[] bytes, i64 lineEnd) {
+    if lineEnd < 13_i64 || bytes[12_i64] != u8(32) { return Result::Error(HttpError::InvalidStatus()); }
+    Result<string,HttpError> version = Ascii(bytes, 0_i64, 9_i64);
+    return match version {
+        Result::Error(_) => Result::Error(HttpError::InvalidStatus()),
+        Result::Ok(text) => {
+            if text != "HTTP/1.1 " { return Result::Error(HttpError::InvalidStatus()); }
+            mut i64 status = 0_i64;
+            mut i64 i = 9_i64;
+            while i < 12_i64 {
+                u8 b = bytes[i];
+                if b < u8(48) || b > u8(57) { return Result::Error(HttpError::InvalidStatus()); }
+                status = status * 10_i64 + i64(b - u8(48));
+                i = i + 1_i64;
+            }
+            if status < 100_i64 || status > 599_i64 { return Result::Error(HttpError::InvalidStatus()); }
+            return Result::Ok(status);
+        },
+    };
+}
+Result<i64,HttpError> RoleStatus(u8[] bytes, i64 lineEnd, MessageRole role) {
+    return match role { MessageRole::Request => Result::Ok(0_i64), _ => StartStatus(bytes, lineEnd), };
+}
+
+/// Pure boundary detection for the shared transport reader; see Http.Wire.
+/// A bodiless response, including a 1xx, ends at its head; ParseResponse then rejects 1xx as InterimResponse.
+pub Result<i64,HttpError> MessageEnd(u8[] bytes, Limits limits, MessageRole role) {
+    i64 end = HeaderEnd(bytes, limits);
+    if HasBareLf(bytes, HeadScanEnd(bytes, end, limits)) { return Result::Error(HttpError::InvalidFraming()); }
+    if end < 0_i64 {
+        if Slice.Len(bytes) >= limits.maxHeaderBytes + 4_i64 { return Result::Error(HttpError::HeaderTooLarge()); }
+        return Result::Ok(0_i64);
+    }
+    i64 headEnd = end + 2_i64;
+    mut i64 lineEnd = 0_i64;
+    while lineEnd + 1_i64 < headEnd && !(bytes[lineEnd] == u8(13) && bytes[lineEnd + 1_i64] == u8(10)) { lineEnd = lineEnd + 1_i64; }
+    if lineEnd > limits.maxStartLine { return Result::Error(HttpError::InvalidStartLine()); }
+    Result<i64,HttpError> status = RoleStatus(bytes, lineEnd, role);
+    return match status {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(code) => {
+            Result<Header[],HttpError> headers = Headers(bytes, lineEnd + 2_i64, headEnd, limits);
+            return match headers {
+                Result::Error(error) => Result::Error(error),
+                Result::Ok(items) => {
+                    Result<i64,HttpError> framing = Framing(items, limits, role, code);
+                    return match framing {
+                        Result::Error(error) => Result::Error(error),
+                        Result::Ok(length) => {
+                            if length == -2_i64 { return ChunkedEnd(bytes, end + 4_i64, limits); }
+                            if length < 0_i64 { return Result::Ok(end + 4_i64); }
+                            return Result::Ok(end + 4_i64 + length);
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+Result<Request,HttpError> RequestHead(u8[] bytes,i64 end,Limits limits) {i64 headEnd=end+2_i64;mut i64 lineEnd=0_i64;while lineEnd+1_i64<headEnd&&!(bytes[lineEnd]==u8(13)&&bytes[lineEnd+1_i64]==u8(10)){lineEnd=lineEnd+1_i64;}if lineEnd+1_i64>=headEnd||lineEnd>limits.maxStartLine{return Result::Error(HttpError::InvalidStartLine());}Result<string,HttpError> decoded=Ascii(bytes,0_i64,lineEnd);return match decoded {Result::Error(error)=>Result::Error(error),Result::Ok(line)=>{i64 first=String.IndexOfFrom(line,0_i64," ");i64 second=String.IndexOfFrom(line,first+1_i64," ");if first<=0_i64||second<=first+1_i64||String.IndexOfFrom(line,second+1_i64," ")>=0_i64{return Result::Error(HttpError::InvalidStartLine());}string method=String.SubSlice(line,0_i64,first);string target=String.SubSlice(line,first+1_i64,second-first-1_i64);if !Token(method){return Result::Error(HttpError::InvalidMethod());}if String.Len(target)==0_i64||String.SubSlice(line,second+1_i64,String.Len(line)-second-1_i64)!="HTTP/1.1"{return Result::Error(HttpError::InvalidStartLine());}Result<Header[],HttpError> parsed=Headers(bytes,lineEnd+2_i64,headEnd,limits);return match parsed {Result::Ok(headers)=>{Result<unit,HttpError> hostCheck=HostField(headers);return match hostCheck {Result::Ok(_)=>Result::Ok(Request {method:method,target:target,headers:headers,body:[]}),Result::Error(error)=>Result::Error(error),};},Result::Error(error)=>Result::Error(error),};},};}
+pub Result<Request,HttpError> ParseRequest(u8[] bytes,Limits limits) {
+    Result<i64,HttpError> boundary = HeadBoundary(bytes, limits);
+    return match boundary {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(end) => {
+            Result<Request,HttpError> head=RequestHead(bytes,end,limits);return match head {Result::Error(error)=>Result::Error(error),Result::Ok(value)=>{Result<i64,HttpError> framing=Framing(value.headers,limits,MessageRole::Request(),0_i64);return match framing {Result::Error(error)=>Result::Error(error),Result::Ok(length)=>{Result<u8[],HttpError> body=Body(bytes,end+4_i64,length,limits);return match body {Result::Ok(payload)=>Result::Ok(Request {method:value.method,target:value.target,headers:value.headers,body:payload}),Result::Error(error)=>Result::Error(error),};},};},};
+        },
+    };
+}
+Result<Response,HttpError> ResponseHead(u8[] bytes,i64 end,Limits limits) {i64 headEnd=end+2_i64;mut i64 lineEnd=0_i64;while lineEnd+1_i64<headEnd&&!(bytes[lineEnd]==u8(13)&&bytes[lineEnd+1_i64]==u8(10)){lineEnd=lineEnd+1_i64;}if lineEnd+1_i64>=headEnd||lineEnd>limits.maxStartLine{return Result::Error(HttpError::InvalidStartLine());}Result<string,HttpError> decoded=Ascii(bytes,0_i64,lineEnd);return match decoded {Result::Error(error)=>Result::Error(error),Result::Ok(line)=>{if String.Len(line)<13_i64||String.SubSlice(line,0_i64,9_i64)!="HTTP/1.1 "||String.ByteAt(line,12_i64)!=u8(32){return Result::Error(HttpError::InvalidStatus());}Result<i64,HttpError> parsed=Decimal(String.SubSlice(line,9_i64,3_i64));return match parsed {Result::Error(_)=>Result::Error(HttpError::InvalidStatus()),Result::Ok(status)=>{if status<100_i64||status>599_i64{return Result::Error(HttpError::InvalidStatus());}Result<Header[],HttpError> headers=Headers(bytes,lineEnd+2_i64,headEnd,limits);return match headers {Result::Ok(items)=>Result::Ok(Response {status:status,reason:String.SubSlice(line,13_i64,String.Len(line)-13_i64),headers:items,body:[]}),Result::Error(error)=>Result::Error(error),};},};},};}
+/// Parses one complete response for a Response or HeadResponse role; a Request role is InvalidStatus.
+pub Result<Response,HttpError> ParseResponse(u8[] bytes,Limits limits,MessageRole role) {
+    if IsRequest(role) { return Result::Error(HttpError::InvalidStatus()); }
+    Result<i64,HttpError> boundary = HeadBoundary(bytes, limits);
+    return match boundary {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(end) => {
+            Result<Response,HttpError> head=ResponseHead(bytes,end,limits);return match head {Result::Error(error)=>Result::Error(error),Result::Ok(value)=>{Result<i64,HttpError> framing=Framing(value.headers,limits,role,value.status);return match framing {Result::Error(error)=>Result::Error(error),Result::Ok(length)=>{if Interim(value.status){return Result::Error(HttpError::InterimResponse());}Result<u8[],HttpError> body=Body(bytes,end+4_i64,length,limits);return match body {Result::Ok(payload)=>Result::Ok(Response {status:value.status,reason:value.reason,headers:value.headers,body:payload}),Result::Error(error)=>Result::Error(error),};},};},};
+        },
+    };
+}
+string DecimalText(i64 value) {if value==0_i64{return "0";}mut string out="";mut i64 v=value;while v>0_i64{out=String.CodeUnitChar(u8(48)+u8(v%10_i64))+out;v=v/10_i64;}return out;}
+/// Returns the grown buffer: Array.Append may reallocate, so the caller rebinds the handle.
+u8[] AppendText(mut u8[] destination, string text) { u8[] source = Convert.StringToBytes(text); mut i64 index = 0_i64; while index < Slice.Len(source) { Array.Append<u8>(destination, source[index]); index = index + 1_i64; } return destination; }
+u8[] AppendCrlf(mut u8[] destination) { Array.Append<u8>(destination, u8(13)); Array.Append<u8>(destination, u8(10)); return destination; }
+Result<u8[],HttpError> Serialize(string start,Header[] headers,u8[] body,Limits limits) {
+    if Slice.Len(body)>limits.maxBodyBytes{return Result::Error(HttpError::BodyTooLarge());}
+    mut u8[] bytes=[]; bytes=AppendText(bytes,start); bytes=AppendCrlf(bytes); mut i64 i=0_i64;
+    while i<Array.Len<Header>(headers) { Header h=Array.Get<Header>(headers,i); if !Token(h.name)||!FieldValue(h.value){return Result::Error(HttpError::InvalidHeader());} string name=LowerAscii(h.name); if name=="content-length"||name=="transfer-encoding"{return Result::Error(HttpError::AmbiguousFraming());} bytes=AppendText(bytes,name+": "+TrimOws(h.value)); bytes=AppendCrlf(bytes); if Slice.Len(bytes)>limits.maxHeaderBytes{return Result::Error(HttpError::HeaderTooLarge());} i=i+1_i64; }
+    bytes=AppendText(bytes,"content-length: "+DecimalText(Slice.Len(body))); bytes=AppendCrlf(bytes); bytes=AppendCrlf(bytes); i=0_i64; while i<Slice.Len(body){Array.Append<u8>(bytes,body[i]);i=i+1_i64;}return Result::Ok(bytes);
+}
+pub Result<u8[],HttpError> SerializeRequest(Request request,Limits limits) {if !Token(request.method){return Result::Error(HttpError::InvalidMethod());}if String.Len(request.target)==0_i64||String.IndexOfFrom(request.target,0_i64," ")>=0_i64{return Result::Error(HttpError::InvalidTarget());}Result<unit,HttpError> hostCheck=HostField(request.headers);return match hostCheck {Result::Error(error)=>Result::Error(error),Result::Ok(_)=>Serialize(request.method+" "+request.target+" HTTP/1.1",request.headers,request.body,limits),};}
+pub Result<u8[],HttpError> SerializeResponse(Response response,Limits limits) {if response.status<100_i64||response.status>599_i64||!FieldValue(response.reason){return Result::Error(HttpError::InvalidStatus());}return Serialize("HTTP/1.1 "+DecimalText(response.status)+" "+response.reason,response.headers,response.body,limits);}

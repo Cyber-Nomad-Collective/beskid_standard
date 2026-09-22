@@ -1,0 +1,68 @@
+use Core.Bytes.Slice;
+use Core.Disposable;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Internal;
+use Network.Internal.Resources;
+
+use Core.IO.Stream;
+use Core.IO.Reader;
+use Core.IO.Writer;
+use Core.IO.Closer;
+use Core.IO.IoError;
+use Core.IO.TransferFailure;
+
+/// One read and one write may wait concurrently; same-direction waits are rejected.
+/// Foundation owns ReadExact, WriteAll, EOF, no-progress detection, and scoped cleanup.
+/// Stream methods retain IoError. Lifecycle/policy operations retain NetworkError.
+pub type TcpStream: Stream, Reader, Writer, Closer, Disposable {
+    word handle,
+
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(destination), offset, count) { return Result::Error(IoError::InvalidRange); }
+        if count == 0_i64 { return Result::Ok(0_i64); }
+        i64 completed = Internal.Read(handle, destination, offset, count);
+        if completed < 0_i64 { return Result::Error(IoError::ReadFailed(Internal.TransferCause(-completed))); }
+        if completed > count { return Result::Error(IoError::ReadFailed(TransferFailure::Unspecified)); }
+        return Result::Ok(completed);
+    }
+
+    pub Result<i64, IoError> Write(u8[] source, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange); }
+        if count == 0_i64 { return Result::Ok(0_i64); }
+        i64 completed = Internal.Write(handle, source, offset, count);
+        if completed < 0_i64 { return Result::Error(IoError::WriteFailed(Internal.TransferCause(-completed))); }
+        if completed > count { return Result::Error(IoError::WriteFailed(TransferFailure::Unspecified)); }
+        return Result::Ok(completed);
+    }
+
+    /// Half-close leaves the read direction available until EOF or a terminal error.
+    pub Result<unit, NetworkError> ShutdownWrite() {
+        return Internal.Status(i64(Internal.ShutdownWrite(handle)));
+    }
+
+    pub Result<SocketAddress, NetworkError> LocalAddress() { return Internal.Address(handle, false); }
+    pub Result<SocketAddress, NetworkError> PeerAddress() { return Internal.Address(handle, true); }
+
+    pub Result<Network.Types.SocketOptions, NetworkError> SocketOptions() {
+        i64 bits = Internal.GetOptions(handle);
+        if bits < 0_i64 { return Result::Error(Internal.Error(-bits)); }
+        return Result::Ok(Network.Types.SocketOptions { noDelay: (bits & 1_i64) != 0_i64, keepAlive: (bits & 2_i64) != 0_i64 });
+    }
+
+    pub Result<unit, NetworkError> SetSocketOptions(Network.Types.SocketOptions options) {
+        return Internal.Status(i64(Internal.SetOptions(handle, Internal.Options(options))));
+    }
+
+    pub Result<unit, IoError> Close() {
+        if Internal.Close(handle) != 0_i32 { return Result::Error(IoError::CloseFailed); }
+        return Result::Ok(());
+    }
+
+    pub Result<unit, DisposeError> Dispose() { return Internal.Dispose(handle); }
+}
+
+pub Result<TcpStream, NetworkError> Connect(SocketAddress address, SocketOptions options) {
+    return Resources.ConnectTcpStream(address, options);
+}

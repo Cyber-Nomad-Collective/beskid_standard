@@ -1,0 +1,133 @@
+use Core.Bytes.Slice;
+use Core.Disposable;
+use Core.Results;
+use Core.IO.TransferFailure;
+use Network.Errors;
+use Network.Types;
+pub mod Network.Internal.Resources;
+
+// This module is deliberately not re-exported by Network. The service vocabulary
+// is portable and manifest-owned; these discriminants are never native error codes.
+pub NetworkError Error(i64 status) {
+    if status == 1_i64 { return NetworkError::AddressInUse; }
+    if status == 2_i64 { return NetworkError::AddressNotAvailable; }
+    if status == 3_i64 { return NetworkError::ConnectionAborted; }
+    if status == 4_i64 { return NetworkError::ConnectionRefused; }
+    if status == 5_i64 { return NetworkError::ConnectionReset; }
+    if status == 6_i64 { return NetworkError::HostNotFound; }
+    if status == 7_i64 { return NetworkError::InvalidAddress; }
+    if status == 8_i64 { return NetworkError::MessageTooLarge; }
+    if status == 9_i64 { return NetworkError::NetworkDown; }
+    if status == 10_i64 { return NetworkError::NotConnected; }
+    if status == 11_i64 { return NetworkError::PermissionDenied; }
+    if status == 12_i64 { return NetworkError::TimedOut; }
+    if status == 13_i64 { return NetworkError::Cancelled; }
+    if status == 14_i64 { return NetworkError::Closed; }
+    if status == 15_i64 { return NetworkError::Busy; }
+    if status == 16_i64 { return NetworkError::CleanupFailed; }
+    if status == 17_i64 { return NetworkError::Unsupported; }
+    if status == 18_i64 { return NetworkError::ResourceExhausted; }
+    __panic_str("Network observed an invalid portable runtime status");
+}
+
+// Stream failures keep the Foundation IoError shape and carry one portable cause.
+pub TransferFailure TransferCause(i64 status) {
+    if status == 15_i64 { return TransferFailure::Busy; }
+    if status == 14_i64 || status == 10_i64 { return TransferFailure::Closed; }
+    if status == 13_i64 { return TransferFailure::Cancelled; }
+    if status == 12_i64 { return TransferFailure::TimedOut; }
+    if status == 5_i64 { return TransferFailure::PeerReset; }
+    if status == 3_i64 { return TransferFailure::PeerAborted; }
+    return TransferFailure::Unspecified;
+}
+
+pub Result<unit, NetworkError> Status(i64 status) {
+    if status == 0_i64 { return Result::Ok(()); }
+    return Result::Error(Error(status));
+}
+
+pub Result<unit, DisposeError> Dispose(word handle) {
+    if Close(handle) == 0_i32 { return Result::Ok(()); }
+    return Result::Error(DisposeError::Failed);
+}
+
+pub i64 Options(SocketOptions options) {
+    mut i64 bits = 0_i64;
+    if options.noDelay { bits = bits + 1_i64; }
+    if options.keepAlive { bits = bits + 2_i64; }
+    return bits;
+}
+
+unit PutGroup(u8[] wire, i64 offset, i64 group) {
+    wire[offset] = u8(group >> 8);
+    wire[offset + 1_i64] = u8(group & 255);
+    return;
+}
+
+u32 AddressWord(u8[] wire, i64 offset) {
+    return u32(wire[offset]) << 24_u32 | u32(wire[offset + 1_i64]) << 16_u32 | u32(wire[offset + 2_i64]) << 8_u32 | u32(wire[offset + 3_i64]);
+}
+
+unit PutAddressWord(u8[] wire, i64 offset, u32 value) {
+    wire[offset] = u8(value >> 24_u32);
+    wire[offset + 1_i64] = u8((value >> 16_u32) & 255_u32);
+    wire[offset + 2_i64] = u8((value >> 8_u32) & 255_u32);
+    wire[offset + 3_i64] = u8(value & 255_u32);
+    return;
+}
+
+pub u8[] Encode(SocketAddress value) {
+    u8[] wire = Slice.New(19_i64);
+    PutGroup(wire, 1_i64, value.port.Value());
+    match value.address {
+        IpAddress::V4(a, b, c, d) => {
+            wire[0] = u8(4); wire[3] = a; wire[4] = b; wire[5] = c; wire[6] = d;
+        },
+        IpAddress::V6(a, b, c, d) => {
+            wire[0] = u8(6);
+            PutAddressWord(wire, 3_i64, a); PutAddressWord(wire, 7_i64, b);
+            PutAddressWord(wire, 11_i64, c); PutAddressWord(wire, 15_i64, d);
+        },
+    };
+    return wire;
+}
+
+pub SocketAddress Decode(u8[] wire) {
+    if Slice.Len(wire) < 19_i64 { __panic_str("Network returned a short address"); }
+    Port port = Network.Types.PortBytes(wire[1], wire[2]);
+    if wire[0] == u8(4) {
+        return SocketAddress { address: IpAddress::V4(wire[3], wire[4], wire[5], wire[6]), port: port };
+    }
+    if wire[0] != u8(6) { __panic_str("Network returned an invalid address family"); }
+    return SocketAddress { address: IpAddress::V6(AddressWord(wire, 3_i64), AddressWord(wire, 7_i64), AddressWord(wire, 11_i64), AddressWord(wire, 15_i64)), port: port };
+}
+
+pub Result<SocketAddress, NetworkError> Address(word handle, bool peer) {
+    u8[] wire = Slice.New(19_i64);
+    i32 status = __network_address(handle, peer, wire);
+    if status != 0_i32 { return Result::Error(Error(i64(status))); }
+    return Result::Ok(Decode(wire));
+}
+
+// One compiler-authorized module owns every raw networking service call.
+pub i32 Open(i64 kind, u8[] address, i64 options, i64 backlog, word[] result) {
+    return __network_open(kind, address, options, backlog, result);
+}
+pub i32 Accept(word handle, word[] result) { return __network_accept(handle, result); }
+pub i32 Close(word handle) { return __network_close(handle); }
+pub i64 Read(word handle, u8[] destination, i64 offset, i64 count) { return __network_read(handle, destination, offset, count); }
+pub i64 Write(word handle, u8[] source, i64 offset, i64 count) { return __network_write(handle, source, offset, count); }
+pub i64 GetOptions(word handle) { return __network_options(handle); }
+pub i32 SetOptions(word handle, i64 bits) { return __network_set_options(handle, bits); }
+pub i32 ShutdownWrite(word handle) { return __network_shutdown_write(handle); }
+pub i32 ConnectDatagram(word handle, u8[] address) { return __network_udp_connect(handle, address); }
+pub i64 Receive(word handle, u8[] payload, u8[] metadata, bool connected) {
+    i64 completed = __network_receive(handle, payload, metadata, connected);
+    if completed > Slice.Len(payload) { __panic_str("Network returned an invalid datagram length"); }
+    return completed;
+}
+pub i64 Send(word handle, u8[] payload, u8[] address, bool connected) { return __network_send(handle, payload, address, connected); }
+pub i32 Resolve(string hostName, i64 port, i64 family, word[] result) { return __network_dns_resolve(hostName, port, family, result); }
+pub i64 ResolveCount(word result) { return __network_dns_count(result); }
+pub i32 ResolveAddress(word result, i64 index, u8[] address) { return __network_dns_address(result, index, address); }
+pub unit ReleaseResolved(word result) { __network_dns_release(result); return; }

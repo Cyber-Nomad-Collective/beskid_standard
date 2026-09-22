@@ -1,0 +1,282 @@
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.IO.TransferFailure;
+use Core.Results;
+use Core.String;
+use Http.Client;
+use Http.Codec;
+use Http.Errors;
+use Http.Server;
+use Http.Types;
+use Http.Wire;
+use Network.Tcp.TcpStream;
+use Network.Types as NetworkTypes;
+use Testing.Assert;
+
+u8[] Filled(i64 count, u8 value) {
+    u8[] bytes = Slice.New(count);
+    mut i64 index = 0_i64;
+    while index < count { bytes[index] = value; index = index + 1_i64; }
+    return bytes;
+}
+
+Result<unit, HttpError> ServeOnce(HttpServer server) {
+    TcpStream stream = server.Accept()?;
+    Request request = server.Receive(stream, Types.DefaultLimits())?;
+    Assert.Equal(Slice.Len(request.body), 10000_i64, "server reads a body larger than one partial read");
+    Assert.Equal(request.body[9999], 7_u8, "server keeps the final octet");
+    Response response = Response { status: 200_i64, reason: "OK", headers: Array.Empty<Header>(), body: Filled(10000_i64, 9_u8) };
+    server.Respond(stream, response, Types.DefaultLimits())?;
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "accepted stream closes");
+    return server.Close();
+}
+
+unit Serve(HttpServer server) {
+    match ServeOnce(server) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("HTTP server exchange completes without HttpError"),
+    };
+}
+
+Result<TcpStream, HttpError> ConnectHttp(SocketAddress address) {
+    return match TcpStream.Connect(address, NetworkTypes.DefaultSocketOptions()) {
+        Result::Ok(stream) => Result::Ok(stream),
+        Result::Error(_) => Result::Error(HttpError::Network()),
+    };
+}
+
+Result<unit, HttpError> ExchangeResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: NetworkTypes.PortBytes(0_u8, 0_u8) };
+    HttpServer server = Server.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = server.LocalAddress()?;
+    Fiber<unit> serving = spawn (() => Serve(server));
+    TcpStream stream = ConnectHttp(address)?;
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "loopback.test" });
+    Request request = Request { method: "POST", target: "/upload", headers: headers, body: Filled(10000_i64, 7_u8) };
+    Response response = Client.Send(stream, request, Types.DefaultLimits())?;
+    Assert.Equal(response.status, 200_i64, "status is retained");
+    Assert.Equal(Slice.Len(response.body), 10000_i64, "client reads a body larger than one partial read");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes");
+    match serving.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server fiber exits"),
+    };
+    return Result::Ok(());
+}
+
+unit Exchange() {
+    match ExchangeResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("HTTP loopback exchange completes"),
+    };
+}
+
+test http_exchange_reads_bodies_across_partial_reads {
+    Fiber<unit> scenario = spawn Exchange();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("HTTP exchange scenario completes"),
+    };
+}
+
+// '|' stands for CRLF so raw wire fixtures stay readable.
+u8[] Crlf(string text) {
+    mut u8[] output = [];
+    mut i64 index = 0_i64;
+    while index < String.Len(text) {
+        u8 value = String.ByteAt(text, index);
+        if value == 124_u8 { Array.Append<u8>(output, 13_u8); Array.Append<u8>(output, 10_u8); } else { Array.Append<u8>(output, value); }
+        index = index + 1_i64;
+    }
+    return output;
+}
+
+bool WriteRaw(TcpStream stream, string text) {
+    u8[] bytes = Crlf(text);
+    return match IO.WriteAll(stream, bytes, 0_i64, Slice.Len(bytes)) { Result::Ok(_) => true, _ => false, };
+}
+
+SocketAddress Loopback() {
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: NetworkTypes.PortBytes(0_u8, 0_u8) };
+}
+
+unit JoinServer(Fiber<unit> serving) {
+    match serving.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server fiber exits"),
+    };
+}
+
+unit Scenario(Fiber<unit> scenario) {
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("HTTP exchange scenario completes"),
+    };
+}
+
+Request HostRequest(string method) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "loopback.test" });
+    return Request { method: method, target: "/", headers: headers, body: Array.Empty<u8>() };
+}
+
+// The server answers with a raw head so the response can carry a Content-Length that no body follows.
+Result<unit, HttpError> RawAnswerResult(HttpServer server, string head) {
+    TcpStream stream = server.Accept()?;
+    Request request = server.Receive(stream, Types.DefaultLimits())?;
+    Assert.Equal(Slice.Len(request.body), 0_i64, "request has no body");
+    Assert.True(WriteRaw(stream, head), "server writes the raw response");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "accepted stream closes");
+    return server.Close();
+}
+
+unit HeadAnswer(HttpServer server) {
+    match RawAnswerResult(server, "HTTP/1.1 200 OK|Content-Length: 1234||") {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("HEAD server completes without HttpError"),
+    };
+}
+
+// If the client applied Content-Length to the HEAD response it would see the
+// server close before 1234 octets and return UnexpectedEof instead of a response.
+Result<unit, HttpError> HeadResult() {
+    HttpServer server = Server.Bind(Loopback(), 8_i64)?;
+    SocketAddress address = server.LocalAddress()?;
+    Fiber<unit> serving = spawn (() => HeadAnswer(server));
+    TcpStream stream = ConnectHttp(address)?;
+    Response response = Client.Send(stream, HostRequest("HEAD"), Types.DefaultLimits())?;
+    Assert.Equal(response.status, 200_i64, "HEAD status is retained");
+    Assert.Equal(Slice.Len(response.body), 0_i64, "HEAD response has no body");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes");
+    JoinServer(serving);
+    return Result::Ok(());
+}
+
+unit Head() {
+    match HeadResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("HEAD exchange completes"),
+    };
+}
+
+test http_exchange_head_returns_no_body {
+    Fiber<unit> scenario = spawn Head();
+    Scenario(scenario);
+}
+
+unit UnframedAnswer(HttpServer server) {
+    match RawAnswerResult(server, "HTTP/1.1 200 OK||abc") {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("unframed server completes without HttpError"),
+    };
+}
+
+Result<unit, HttpError> UnframedResult() {
+    HttpServer server = Server.Bind(Loopback(), 8_i64)?;
+    SocketAddress address = server.LocalAddress()?;
+    Fiber<unit> serving = spawn (() => UnframedAnswer(server));
+    TcpStream stream = ConnectHttp(address)?;
+    Result<Response, HttpError> result = Client.Send(stream, HostRequest("GET"), Types.DefaultLimits());
+    Assert.True(match result { Result::Error(HttpError::CloseDelimitedBody) => true, _ => false, }, "a close-delimited response is rejected with no body");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes");
+    JoinServer(serving);
+    return Result::Ok(());
+}
+
+unit Unframed() {
+    match UnframedResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("close-delimited exchange completes"),
+    };
+}
+
+test http_exchange_unframed_response_is_close_delimited {
+    Fiber<unit> scenario = spawn Unframed();
+    Scenario(scenario);
+}
+
+// RFC 9112 section 3.2: Receive returns MissingHost; the application answers 400 and closes.
+Result<unit, HttpError> MissingHostAnswerResult(HttpServer server) {
+    TcpStream stream = server.Accept()?;
+    Result<Request, HttpError> received = server.Receive(stream, Types.DefaultLimits());
+    Assert.True(match received { Result::Error(HttpError::MissingHost) => true, _ => false, }, "server receive reports MissingHost");
+    server.Respond(stream, Types.EmptyResponse(400_i64, "Bad Request"), Types.DefaultLimits())?;
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "server closes after 400");
+    return server.Close();
+}
+
+unit MissingHostAnswer(HttpServer server) {
+    match MissingHostAnswerResult(server) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("missing-Host server completes without HttpError"),
+    };
+}
+
+Result<unit, HttpError> MissingHostResult() {
+    HttpServer server = Server.Bind(Loopback(), 8_i64)?;
+    SocketAddress address = server.LocalAddress()?;
+    Fiber<unit> serving = spawn (() => MissingHostAnswer(server));
+    TcpStream stream = ConnectHttp(address)?;
+    Assert.True(WriteRaw(stream, "GET / HTTP/1.1|Accept: x||"), "client writes a request without Host");
+    u8[] wire = Wire.ReadMessage(stream, Types.DefaultLimits(), MessageRole::Response())?;
+    Response response = Codec.ParseResponse(wire, Types.DefaultLimits(), MessageRole::Response())?;
+    Assert.Equal(response.status, 400_i64, "missing Host is answered with 400");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes");
+    JoinServer(serving);
+    return Result::Ok(());
+}
+
+unit MissingHost() {
+    match MissingHostResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("missing-Host exchange completes"),
+    };
+}
+
+test http_exchange_missing_host_is_answered_400 {
+    Fiber<unit> scenario = spawn MissingHost();
+    Scenario(scenario);
+}
+
+// Closing with unread received data makes the host abort the connection (RST).
+Result<unit, HttpError> ResetAnswerResult(HttpServer server) {
+    TcpStream stream = server.Accept()?;
+    u8[] first = Slice.New(1_i64);
+    Assert.True(match IO.ReadExact(stream, first, 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "server observes the first request octet");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "server closes with unread data");
+    return server.Close();
+}
+
+unit ResetAnswer(HttpServer server) {
+    match ResetAnswerResult(server) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("reset server completes without HttpError"),
+    };
+}
+
+Result<unit, HttpError> ResetResult() {
+    HttpServer server = Server.Bind(Loopback(), 8_i64)?;
+    SocketAddress address = server.LocalAddress()?;
+    Fiber<unit> serving = spawn (() => ResetAnswer(server));
+    TcpStream stream = ConnectHttp(address)?;
+    Result<Response, HttpError> result = Client.Send(stream, HostRequest("GET"), Types.DefaultLimits());
+    Assert.True(match result { Result::Error(HttpError::Transport(TransferFailure::PeerReset)) => true, _ => false, }, "peer reset reaches the HTTP caller as Transport(PeerReset)");
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes after reset");
+    JoinServer(serving);
+    return Result::Ok(());
+}
+
+unit Reset() {
+    match ResetResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("peer-reset exchange completes"),
+    };
+}
+
+test http_exchange_peer_reset_is_transport_cause {
+    Fiber<unit> scenario = spawn Reset();
+    Scenario(scenario);
+}

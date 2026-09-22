@@ -1,0 +1,71 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.String;
+use Core.Results;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Testing.Assert;
+
+u8[] ResponseWire(string text) {
+    mut u8[] output = [];
+    mut i64 index = 0_i64;
+    while index < String.Len(text) {
+        u8 value = String.ByteAt(text, index);
+        if value == 124_u8 { Array.Append<u8>(output, 13_u8); Array.Append<u8>(output, 10_u8); } else { Array.Append<u8>(output, value); }
+        index = index + 1_i64;
+    }
+    return output;
+}
+
+test http_request_serialization_emits_one_canonical_content_length {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
+    Request request = Request { method: "PUT", target: "/item", headers: headers, body: Convert.StringToBytes("ok") };
+    match Codec.SerializeRequest(request, Types.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("valid request serializes"),
+        Result::Ok(encoded) => match Codec.ParseRequest(encoded, Types.DefaultLimits()) {
+            Result::Error(_) => Assert.Fail("serialized request reparses"),
+            Result::Ok(reparsed) => {
+                Assert.Equal(reparsed.headers[0].name, "host", "serializer canonicalizes field name");
+                Assert.Equal(Slice.Len(reparsed.body), 2_i64, "serializer provides exact framing");
+            },
+        },
+    };
+}
+
+test http_serializer_rejects_caller_supplied_framing_header {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
+    Array.Append<Header>(headers, Header { name: "Content-Length", value: "7" });
+    Request request = Request { method: "GET", target: "/", headers: headers, body: [] };
+    Result<u8[], HttpError> result = Codec.SerializeRequest(request, Types.DefaultLimits());
+    Assert.True(match result { Result::Error(HttpError::AmbiguousFraming) => true, _ => false, }, "caller cannot create a second framing source");
+}
+
+test http_response_parser_requires_http11_status_and_exact_suffix {
+    u8[] valid = ResponseWire("HTTP/1.1 204 No Content||");
+    match Codec.ParseResponse(valid, Types.DefaultLimits(), MessageRole::Response()) {
+        Result::Error(_) => Assert.Fail("valid 204 response parses"),
+        Result::Ok(response) => Assert.Equal(response.status, 204_i64, "three digit status retained"),
+    };
+    u8[] suffix = ResponseWire("HTTP/1.1 204 No Content||x");
+    Result<Response, HttpError> result = Codec.ParseResponse(suffix, Types.DefaultLimits(), MessageRole::Response());
+    Assert.True(match result { Result::Error(HttpError::TrailingBytes) => true, _ => false, }, "bounded exchange rejects an unowned suffix");
+}
+
+test http_serializer_requires_host {
+    Request missing = Types.EmptyRequest("GET", "/");
+    Result<u8[], HttpError> absent = Codec.SerializeRequest(missing, Types.DefaultLimits());
+    Assert.True(match absent { Result::Error(HttpError::MissingHost) => true, _ => false, }, "serializer does not invent a Host field");
+    mut Header[] twice = Array.Empty<Header>();
+    Array.Append<Header>(twice, Header { name: "Host", value: "a.test" });
+    Array.Append<Header>(twice, Header { name: "host", value: "b.test" });
+    Result<u8[], HttpError> duplicate = Codec.SerializeRequest(Request { method: "GET", target: "/", headers: twice, body: [] }, Types.DefaultLimits());
+    Assert.True(match duplicate { Result::Error(HttpError::InvalidHost) => true, _ => false, }, "serializer rejects a second Host field");
+    mut Header[] malformed = Array.Empty<Header>();
+    Array.Append<Header>(malformed, Header { name: "Host", value: "a.test:99999" });
+    Result<u8[], HttpError> invalid = Codec.SerializeRequest(Request { method: "GET", target: "/", headers: malformed, body: [] }, Types.DefaultLimits());
+    Assert.True(match invalid { Result::Error(HttpError::InvalidHost) => true, _ => false, }, "serializer rejects an invalid Host value");
+}

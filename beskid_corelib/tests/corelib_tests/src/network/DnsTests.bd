@@ -1,0 +1,53 @@
+use Core.Collections.Array;
+use Concurrency.Fiber;
+use Core.Optional.Option;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Dns;
+use Testing.Assert;
+
+unit ResolveIpv4() {
+    Result<SocketAddress[], NetworkError> result = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 80_u8), Option::Some(AddressFamily::V4));
+    match result {
+        Result::Error(_) => Assert.Fail("numeric IPv4 resolution must succeed"),
+        Result::Ok(addresses) => {
+            Assert.True(Array.Len<SocketAddress>(addresses) > 0_i64, "resolver returns all matching results");
+            mut i64 index = 0_i64;
+            while index < Array.Len<SocketAddress>(addresses) {
+                SocketAddress address = addresses[index];
+                Assert.Equal(address.port.Value(), 80_i64, "requested port survives resolution");
+                Assert.True(match address.address { IpAddress::V4(_, _, _, _) => true, _ => false, }, "family filter excludes IPv6");
+                index = index + 1_i64;
+            }
+        },
+    };
+}
+
+test network_dns_ipv4_filter_preserves_typed_addresses {
+    Fiber<unit> scenario = spawn ResolveIpv4();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "resolver scenario completes");
+}
+
+test network_dns_port_zero_is_rejected_before_resolving {
+    Result<SocketAddress[], NetworkError> result = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 0_u8), Option::None);
+    Assert.True(match result { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "port zero is reserved for binding");
+}
+
+unit ResolveTwice() {
+    Result<SocketAddress[], NetworkError> first = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 81_u8), Option::None);
+    Result<SocketAddress[], NetworkError> second = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 82_u8), Option::None);
+    match first {
+        Result::Error(_) => Assert.Fail("first independent resolver call"),
+        Result::Ok(addresses) => Assert.Equal(addresses[0].port.Value(), 81_i64, "first result retains its own port"),
+    };
+    match second {
+        Result::Error(_) => Assert.Fail("second independent resolver call"),
+        Result::Ok(addresses) => Assert.Equal(addresses[0].port.Value(), 82_i64, "second call has fresh results"),
+    };
+}
+
+test network_dns_repeated_calls_return_independently_owned_results {
+    Fiber<unit> scenario = spawn ResolveTwice();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "independent resolver scenario completes");
+}

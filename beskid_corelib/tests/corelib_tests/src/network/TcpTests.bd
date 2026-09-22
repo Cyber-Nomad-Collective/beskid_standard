@@ -1,0 +1,205 @@
+use Concurrency;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.IO;
+use Core.IO.Stream;
+use Core.IO.IoError;
+use Core.IO.TransferFailure;
+use Core.Time;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Testing.Assert;
+
+Result<unit, NetworkError> ServeResult(TcpListener listener) {
+    TcpStream accepted = listener.Accept()?;
+    u8[] bytes = [11_u8, 22_u8, 33_u8];
+    Result<unit, IoError> written = IO.WriteAll(accepted, bytes, 0_i64, 3_i64);
+    Assert.True(match written { Result::Ok(_) => true, _ => false, }, "TCP reuses Foundation WriteAll");
+    accepted.ShutdownWrite()?;
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "accepted close");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit Serve(TcpListener listener) {
+    match ServeResult(listener) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("TCP server completes without a NetworkError"),
+    };
+}
+
+i64 ReadStream(Stream stream, u8[] bytes) {
+    return match stream.Read(bytes, 0_i64, 1_i64) { Result::Ok(count) => count, Result::Error(_) => -1_i64, };
+}
+
+Result<unit, NetworkError> TcpLoopbackResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Assert.True(address.port.Value() != 0_i64, "OS-selected port is reported");
+    Fiber<unit> server = spawn (() => Serve(listener));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    u8[] bytes = Slice.New(3_i64);
+    Result<unit, IoError> read = IO.ReadExact(client, bytes, 0_i64, 3_i64);
+    Assert.True(match read { Result::Ok(_) => true, _ => false, }, "TCP reuses Foundation ReadExact");
+    Assert.Equal(bytes[2], 33_u8, "full transfer retained final byte");
+    Assert.Equal(ReadStream(client, bytes), 0_i64, "half-close delivers Foundation EOF");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "first close succeeds");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "duplicate close is idempotent");
+    match server.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server exits without a leak"),
+    };
+    return Result::Ok(());
+}
+
+unit TcpLoopback() {
+    match TcpLoopbackResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("TCP loopback completes without a NetworkError"),
+    };
+}
+
+test network_tcp_reuses_stream_transfer_eof_and_idempotent_close {
+    Fiber<unit> scenario = spawn TcpLoopback();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("TCP loopback scenario completes"),
+    };
+}
+
+test network_tcp_invalid_backlog_has_typed_error {
+    SocketAddress address = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    Result<TcpListener, NetworkError> result = TcpListener.Bind(address, 0_i64);
+    Assert.True(match result { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "invalid bind is rejected before effects");
+}
+
+i64 CauseCode(TransferFailure cause) {
+    return match cause {
+        TransferFailure::Busy => -1_i64,
+        TransferFailure::PeerReset => -2_i64,
+        _ => -3_i64,
+    };
+}
+
+// A non-negative code is a completed count; a negative code names the failure cause.
+i64 ReadCode(Result<i64, IoError> result) {
+    return match result {
+        Result::Ok(count) => count,
+        Result::Error(IoError::ReadFailed(cause)) => CauseCode(cause),
+        Result::Error(_) => -4_i64,
+    };
+}
+
+i64 ReadOne(TcpStream stream) {
+    u8[] bytes = Slice.New(1_i64);
+    return ReadCode(stream.Read(bytes, 0_i64, 1_i64));
+}
+
+Result<unit, NetworkError> DelayedServeResult(TcpListener listener) {
+    TcpStream accepted = listener.Accept()?;
+    match Time.Sleep(Time.FromMilliseconds(100_i64)) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server delay completes"),
+    };
+    Result<unit, IoError> written = IO.WriteAll(accepted, [7_u8], 0_i64, 1_i64);
+    Assert.True(match written { Result::Ok(_) => true, _ => false, }, "delayed server writes one byte");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "delayed server closes");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit DelayedServe(TcpListener listener) {
+    match DelayedServeResult(listener) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("delayed server completes without a NetworkError"),
+    };
+}
+
+Result<unit, NetworkError> SecondReadResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Fiber<unit> server = spawn (() => DelayedServe(listener));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    Fiber<i64> first = spawn (() => ReadOne(client));
+    Concurrency.Yield();
+    Concurrency.Yield();
+    i64 second = ReadOne(client);
+    i64 firstCode = match first.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+    Assert.True((firstCode == -1_i64 && second == 1_i64) || (firstCode == 1_i64 && second == -1_i64), "a second same-direction read reports ReadFailed(Busy)");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes");
+    match server.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("delayed server exits"),
+    };
+    return Result::Ok(());
+}
+
+unit SecondRead() {
+    match SecondReadResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("second-read scenario completes without a NetworkError"),
+    };
+}
+
+test network_tcp_second_read_reports_busy_cause {
+    Fiber<unit> scenario = spawn SecondRead();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("second-read scenario completes"),
+    };
+}
+
+// Closing with unread received data makes the host abort the connection (RST).
+Result<unit, NetworkError> ResetServeResult(TcpListener listener) {
+    TcpStream accepted = listener.Accept()?;
+    u8[] bytes = Slice.New(1_i64);
+    Result<unit, IoError> read = IO.ReadExact(accepted, bytes, 0_i64, 1_i64);
+    Assert.True(match read { Result::Ok(_) => true, _ => false, }, "server observes the first byte");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "server closes with unread data");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit ResetServe(TcpListener listener) {
+    match ResetServeResult(listener) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("reset server completes without a NetworkError"),
+    };
+}
+
+Result<unit, NetworkError> PeerResetResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Fiber<unit> server = spawn (() => ResetServe(listener));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    Result<unit, IoError> written = IO.WriteAll(client, [1_u8, 2_u8], 0_i64, 2_i64);
+    Assert.True(match written { Result::Ok(_) => true, _ => false, }, "client sends two bytes");
+    Assert.Equal(ReadOne(client), -2_i64, "peer abort reports ReadFailed(PeerReset), not EOF");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after reset");
+    match server.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("reset server exits"),
+    };
+    return Result::Ok(());
+}
+
+unit PeerReset() {
+    match PeerResetResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("peer-reset scenario completes without a NetworkError"),
+    };
+}
+
+test network_tcp_peer_reset_is_not_eof {
+    Fiber<unit> scenario = spawn PeerReset();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("peer-reset scenario completes"),
+    };
+}

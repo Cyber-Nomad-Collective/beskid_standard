@@ -1,0 +1,22 @@
+use Core.Bytes.Slice;
+use Core.IO;
+use Core.IO.IoError;
+use Core.Results;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Http.Wire;
+use Network.Tcp.TcpStream;
+
+/// RFC 9112 section 6.3 item 1: the response to HEAD ends at its head.
+MessageRole ResponseRole(string method) {
+    if method == "HEAD" { return MessageRole::HeadResponse(); }
+    return MessageRole::Response();
+}
+
+/// One bounded exchange. A 1xx interim response is InterimResponse and a body
+/// without Content-Length or chunked framing is CloseDelimitedBody; this client
+/// reads neither.
+pub Result<Response,HttpError> Send(TcpStream stream, Request request, Limits limits) {
+    Result<u8[],HttpError> encoded=Codec.SerializeRequest(request,limits);return match encoded {Result::Error(error)=>Result::Error(error),Result::Ok(bytes)=>{Result<unit,IoError> written=IO.WriteAll(stream,bytes,0_i64,Slice.Len(bytes));return match written {Result::Error(error)=>Result::Error(Errors.FromIoError(error)),Result::Ok(_)=>{MessageRole role=ResponseRole(request.method);Result<u8[],HttpError> wire=Wire.ReadMessage(stream,limits,role);return match wire {Result::Ok(value)=>Codec.ParseResponse(value,limits,role),Result::Error(error)=>Result::Error(error),};},};},};
+}

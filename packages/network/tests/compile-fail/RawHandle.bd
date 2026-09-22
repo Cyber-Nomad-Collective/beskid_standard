@@ -1,0 +1,52 @@
+// Expected failure: Network resources expose neither a native handle field nor
+// a raw-descriptor constructor. This is deliberately outside positive test src.
+//
+// `handle` has no `pub` modifier on `TcpStream` (see
+// packages/network/src/Network/Tcp/TcpStream.bd), so it is private to that
+// type/unit and reading it from here must be rejected.
+//
+// The rejection only fires once this code is actually reached for lowering
+// (the private-field-across-units check lives in the ISLE/codegen facts
+// layer, not the front-end HIR type checker: `beskid_cli analyze` alone
+// type-checks `Escape`'s body without lowering it and reports no
+// diagnostics). A `test` that calls `Escape` on a real `TcpStream` value
+// forces that lowering, so `beskid_cli test --target RawHandle` is the
+// correct harness command for this fixture, not `analyze`.
+use Core.Results;
+use Concurrency.Fiber;
+use Network.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Testing.Assert;
+
+pub word Escape(TcpStream stream) {
+    return stream.handle;
+}
+
+Result<unit, NetworkError> AttemptEscapeResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 1_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    TcpStream stream = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    word leaked = Escape(stream);
+    Assert.Fail("unreachable if the compiler correctly rejects the private field read above");
+    listener.Close()?;
+    stream.Close()?;
+    return Result::Ok(());
+}
+
+unit AttemptEscape() {
+    match AttemptEscapeResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => (),
+    };
+}
+
+test network_tcp_stream_handle_is_not_reachable_outside_its_type {
+    Fiber<unit> scenario = spawn AttemptEscape();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => (),
+    };
+}

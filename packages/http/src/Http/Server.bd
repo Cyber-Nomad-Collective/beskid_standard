@@ -1,0 +1,29 @@
+use Core.Bytes.Slice;
+use Core.IO;
+use Core.IO.IoError;
+use Core.Results;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Http.Wire;
+use Network.Errors as NetworkErrors;
+use Network.Tcp;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Network.Types as NetworkTypes;
+
+/// A listener facade: Network still owns opaque socket handles, owner routing,
+/// disposal, and cancellation. HTTP only frames accepted stream octets.
+pub type HttpServer {
+    TcpListener listener,
+    pub Result<TcpStream,HttpError> Accept() { Result<TcpStream,NetworkError> result=listener.Accept();return match result {Result::Ok(stream)=>Result::Ok(stream),Result::Error(_)=>Result::Error(HttpError::Network()),}; }
+    /// MissingHost and InvalidHost are returned, not answered: the application
+    /// responds with status 400 and closes the stream (RFC 9112 section 3.2).
+    pub Result<Request,HttpError> Receive(TcpStream stream, Limits limits) {Result<u8[],HttpError> wire=Wire.ReadMessage(stream,limits,MessageRole::Request());return match wire {Result::Ok(value)=>Codec.ParseRequest(value,limits),Result::Error(error)=>Result::Error(error),};}
+    /// The application sends an empty body for a HEAD request; the serialized content-length: 0 is permitted by RFC 9110 section 8.6.
+    pub Result<unit,HttpError> Respond(TcpStream stream, Response response, Limits limits) {Result<u8[],HttpError> wire=Codec.SerializeResponse(response,limits);return match wire {Result::Error(error)=>Result::Error(error),Result::Ok(bytes)=>{Result<unit,IoError> written=IO.WriteAll(stream,bytes,0_i64,Slice.Len(bytes));return match written {Result::Ok(_)=>Result::Ok(()),Result::Error(error)=>Result::Error(Errors.FromIoError(error)),};},};}
+    pub Result<SocketAddress,HttpError> LocalAddress() {Result<SocketAddress,NetworkError> address=listener.LocalAddress();return match address {Result::Ok(value)=>Result::Ok(value),Result::Error(_)=>Result::Error(HttpError::Network()),};}
+    pub Result<unit,HttpError> Close() {Result<unit,NetworkError> closed=listener.Close();return match closed {Result::Ok(_)=>Result::Ok(()),Result::Error(_)=>Result::Error(HttpError::Closed()),};}
+}
+/// Binds the listener through Network; `impl` methods take a receiver, so construction is a module function like `TcpListener.Bind`.
+pub Result<HttpServer,HttpError> Bind(SocketAddress address,i64 backlog) {Result<TcpListener,NetworkError> bound=TcpListener.Bind(address,backlog);return match bound {Result::Ok(listener)=>Result::Ok(HttpServer {listener:listener}),Result::Error(_)=>Result::Error(HttpError::Network()),};}

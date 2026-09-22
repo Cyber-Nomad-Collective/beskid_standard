@@ -1,0 +1,42 @@
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Udp.UdpSocket;
+use Testing.Assert;
+
+// BSP-REQ-8A21D67C43FE: closing a network resource releases its native socket
+// at most once, and a duplicate close neither leaks nor double-closes. This
+// exercises that against the runtime's fixed 256-slot socket table: enough
+// open/close cycles to exceed the table size, each cycle closing twice. If a
+// close ever failed to free its slot, the table would fill and a later Bind
+// would fail with ResourceExhausted well before the loop finishes. Assertions
+// only observe typed Results and port numbers -- no descriptor, handle, or
+// platform constant is read or asserted on.
+
+Result<unit, NetworkError> ShutdownLeakAuditResult() {
+    i64 leakAuditCycles = 600_i64; // exceeds the runtime's fixed 256-slot socket table
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    mut i64 cycle = 0_i64;
+    while cycle < leakAuditCycles {
+        UdpSocket socket = UdpSocket.Bind(bindAddress)?;
+        Assert.True(socket.LocalAddress()?.port.Value() != 0_i64, "each cycle's socket is live before it closes");
+        Assert.True(match socket.Close() { Result::Ok(_) => true, _ => false, }, "first close in the cycle succeeds and releases the slot");
+        Assert.True(match socket.Close() { Result::Ok(_) => true, _ => false, }, "duplicate close in the cycle is safe: no double-close, no leak");
+        cycle = cycle + 1_i64;
+    }
+
+    // A fresh socket still binds after every cycle: the slot table is exactly
+    // as free as it started, proving no slot was leaked across leakAuditCycles
+    // open/close pairs even though that number exceeds the 256-slot table.
+    UdpSocket fresh = UdpSocket.Bind(bindAddress)?;
+    Assert.True(fresh.LocalAddress()?.port.Value() != 0_i64, "post-cycle bind still succeeds");
+    Assert.True(match fresh.Close() { Result::Ok(_) => true, _ => false, }, "post-cycle socket closes cleanly");
+    return Result::Ok(());
+}
+
+test network_shutdown_is_idempotent_and_repeated_cycles_do_not_leak_slots {
+    match ShutdownLeakAuditResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("shutdown leak audit completes without a NetworkError (a leak would surface as ResourceExhausted)"),
+    };
+}

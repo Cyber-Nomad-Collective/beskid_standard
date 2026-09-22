@@ -1,0 +1,153 @@
+use Core.Bytes.Slice;
+use Concurrency.Fiber;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Udp.UdpSocket;
+use Core.Collections.List;
+use Testing.Assert;
+
+Result<unit, NetworkError> UdpBoundariesResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    UdpSocket sender = UdpSocket.Bind(bindAddress)?;
+    UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
+    SocketAddress target = receiver.LocalAddress()?;
+    SocketAddress source = sender.LocalAddress()?;
+    u8[] payload = [1_u8, 2_u8, 3_u8, 4_u8];
+    sender.SendTo(payload, target)?;
+    Datagram datagram = receiver.ReceiveFrom(2_i64)?;
+    Assert.Equal(Slice.Len(datagram.payload), 2_i64, "receive returns only available payload");
+    Assert.True(datagram.truncated, "oversized datagram sets truncation");
+    Assert.Equal(datagram.source.port.Value(), source.port.Value(), "source address is retained");
+    Assert.Equal(Slice.Len(payload), 4_i64, "send retains caller payload ownership");
+    sender.SendTo(Slice.New(0_i64), target)?;
+    Datagram empty = receiver.ReceiveFrom(2_i64)?;
+    Assert.Equal(Slice.Len(empty.payload), 0_i64, "empty datagram is not EOF");
+    Assert.False(empty.truncated, "empty datagram fits");
+    sender.Close()?;
+    receiver.Close()?;
+    receiver.Close()?;
+    return Result::Ok(());
+}
+
+unit UdpBoundaries() {
+    match UdpBoundariesResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("UDP boundaries complete without a NetworkError"),
+    };
+}
+
+test network_udp_preserves_datagrams_sources_and_truncation {
+    Fiber<unit> scenario = spawn UdpBoundaries();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("UDP boundaries scenario completes"),
+    };
+}
+
+Result<unit, NetworkError> UdpConnectedResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    UdpSocket left = UdpSocket.Bind(bindAddress)?;
+    UdpSocket right = UdpSocket.Bind(bindAddress)?;
+    left.Connect(right.LocalAddress()?)?;
+    right.Connect(left.LocalAddress()?)?;
+    left.Send([99_u8])?;
+    Datagram received = right.Receive(1_i64)?;
+    Assert.Equal(received.payload[0], 99_u8, "connected receive preserves payload");
+    right.Close()?;
+    Assert.True(match right.Receive(1_i64) { Result::Error(NetworkError::Closed) => true, _ => false, }, "closed generation fails before native I/O");
+    left.Close()?;
+    return Result::Ok(());
+}
+
+unit UdpConnected() {
+    match UdpConnectedResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("connected UDP completes without a NetworkError"),
+    };
+}
+
+test network_udp_connected_operations_and_closed_error {
+    Fiber<unit> scenario = spawn UdpConnected();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("connected UDP scenario completes"),
+    };
+}
+
+Result<unit, NetworkError> SlotReuseResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    UdpSocket previous = UdpSocket.Bind(bindAddress)?;
+    previous.Close()?;
+    UdpSocket current = UdpSocket.Bind(bindAddress)?;
+    Assert.True(match previous.LocalAddress() { Result::Error(NetworkError::Closed) => true, _ => false, }, "stale generation cannot address replacement socket");
+    previous.Close()?;
+    SocketAddress address = current.LocalAddress()?;
+    Assert.True(address.port.Value() > 0_i64, "stale close cannot release replacement socket");
+    current.Close()?;
+    return Result::Ok(());
+}
+
+test network_closed_resource_cannot_reach_a_reused_slot {
+    match SlotReuseResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("slot reuse completes without a NetworkError"),
+    };
+}
+
+// Binds until the runtime reports exhaustion. state[0] records the live count,
+// state[1] the successful rebind after one close, state[2] the stop reason.
+Result<unit, NetworkError> ExhaustionResult(SocketAddress address, i64[] state) {
+    mut List<UdpSocket> held = List.New<UdpSocket>();
+    mut i64 stop = 0_i64;
+    while stop == 0_i64 && held.Count() <= 256_i64 {
+        match UdpSocket.Bind(address) {
+            Result::Ok(socket) => { held = held.Push(socket); },
+            Result::Error(NetworkError::ResourceExhausted) => { stop = 1_i64; },
+            Result::Error(_) => { stop = 2_i64; },
+        };
+    }
+    state[0] = held.Count();
+    state[2] = stop;
+    if stop == 1_i64 && held.Count() > 0_i64 {
+        match held.Get(held.Count() - 1_i64) {
+            Result::Ok(last) => { last.Close()?; },
+            Result::Error(_) => Assert.Fail("the last live socket is held"),
+        };
+        held = held.Pop();
+        UdpSocket replacement = UdpSocket.Bind(address)?;
+        held = held.Push(replacement);
+        state[1] = 1_i64;
+    }
+    mut i64 index = 0_i64;
+    while index < held.Count() {
+        match held.Get(index) {
+            Result::Ok(socket) => { socket.Close()?; },
+            Result::Error(_) => Assert.Fail("every live socket is held"),
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+Result<unit, NetworkError> BindAndClose(SocketAddress address) {
+    UdpSocket socket = UdpSocket.Bind(address)?;
+    socket.Close()?;
+    return Result::Ok(());
+}
+
+test network_udp_exhaustion_is_typed {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    i64[] state = [0_i64, 0_i64, 0_i64];
+    match ExhaustionResult(bindAddress, state) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("exhaustion fixture releases every socket"),
+    };
+    Assert.Equal(state[2], 1_i64, "exhaustion is reported as ResourceExhausted");
+    Assert.True(state[0] > 0_i64 && state[0] <= 256_i64, "exhaustion occurs at or before the slot count");
+    Assert.Equal(state[1], 1_i64, "closing one live socket admits the next bind");
+    match BindAndClose(bindAddress) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("every exhausted socket was released"),
+    };
+}

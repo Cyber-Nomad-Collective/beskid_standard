@@ -1,10 +1,86 @@
 /// Concrete fluent SGR builder implementing `Ansi.Contracts.AnsiStyleStep` shapes.
+use Ansi.Contracts.AnsiStyleStep;
 use Ansi.Escape;
 use Ansi.Sgr;
 use Console.Capabilities;
 
-pub type StyleChain {
+/// Real `AnsiStyleStep` conformance through inline type-body methods, the same shape as the
+/// other step builders (`CursorBuilder`, `EraseBuilder`, ...). Each step returns `This`, as the
+/// contract declares, and emits exactly the bytes of the free function of the same name below. The free functions stay
+/// for existing callers. A bare `Name(...)` call inside a method resolves to the sibling method
+/// of that name when one exists, so the methods call `AppendCode`/`IntoPrefix` as methods and
+/// never delegate to a same-named free function.
+pub type StyleChain : AnsiStyleStep {
     string openCodes,
+
+    pub This Bold() {
+        return AppendCode("1");
+    }
+
+    pub This Dim() {
+        return AppendCode("2");
+    }
+
+    pub This Italic() {
+        return AppendCode("3");
+    }
+
+    pub This Underline() {
+        return AppendCode("4");
+    }
+
+    pub This Inverse() {
+        return AppendCode("7");
+    }
+
+    pub This Strike() {
+        return AppendCode("9");
+    }
+
+    pub This FgBasic(i64 code) {
+        return AppendCode("${code}");
+    }
+
+    pub This BgBasic(i64 code) {
+        return AppendCode("${code}");
+    }
+
+    pub This Fg256(i64 index) {
+        return AppendCode("38;5;${index}");
+    }
+
+    pub This Bg256(i64 index) {
+        return AppendCode("48;5;${index}");
+    }
+
+    pub This FgRgb(i64 r, i64 g, i64 b) {
+        return AppendCode(Ansi.Sgr.ForegroundColorArgs(r, g, b));
+    }
+
+    pub This BgRgb(i64 r, i64 g, i64 b) {
+        return AppendCode(Ansi.Sgr.BackgroundColorArgs(r, g, b));
+    }
+
+    pub string ApplyTo(string text) {
+        if !Capabilities.ShouldEmitAnsi() {
+            return text;
+        }
+        return "${IntoPrefix()}${text}${Reset()}";
+    }
+
+    pub string IntoPrefix() {
+        if openCodes == "" {
+            return "";
+        }
+        return Escape.Csi(openCodes, "m");
+    }
+
+    pub This AppendCode(string code) {
+        if openCodes == "" {
+            return StyleChain { openCodes: code };
+        }
+        return StyleChain { openCodes: "${openCodes};${code}" };
+    }
 }
 
 /// Starts a new style chain.

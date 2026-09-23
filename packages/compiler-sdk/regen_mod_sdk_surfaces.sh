@@ -316,8 +316,8 @@ pub contract Analyzer {
     AnalysisResult Analyze(AnalysisRequest request);
 }
 
-/// Typed replacement contract. TSourceNode and TTargetNode are SDK type parameters until contract generics are admitted by the grammar.
-pub contract Rewriter {
+/// Typed replacement contract, parameterized over the source and target node types.
+pub contract Rewriter<TSourceNode, TTargetNode> {
     Result<TTargetNode, FixError> Rewrite(TSourceNode sourceNode);
 }
 

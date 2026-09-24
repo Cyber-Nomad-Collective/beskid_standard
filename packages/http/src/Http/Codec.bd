@@ -14,10 +14,30 @@ bool TokenByte(u8 value) {
     return value == u8(33) || value == u8(35) || value == u8(36) || value == u8(37) || value == u8(38) || value == u8(39) || value == u8(42) || value == u8(43) || value == u8(45) || value == u8(46) || value == u8(94) || value == u8(95) || value == u8(96) || value == u8(124) || value == u8(126);
 }
 bool Token(string value) { if String.Len(value) == 0_i64 { return false; } mut i64 i = 0_i64; while i < String.Len(value) { if !TokenByte(String.ByteAt(value, i)) { return false; } i = i + 1_i64; } return true; }
-bool FieldValue(string value) { mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if !(b == u8(9) || (b >= u8(32) && b <= u8(126))) { return false; } i = i + 1_i64; } return true; }
+bool NoControls(string value) { mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if b < u8(32) || b == u8(127) { return false; } i = i + 1_i64; } return true; }
+bool FieldVchar(u8 value) { return (value >= u8(33) && value <= u8(126)) || value >= u8(128); }
+bool FieldValue(string value) { if String.Len(value) == 0_i64 { return true; } if !FieldVchar(String.ByteAt(value, 0_i64)) || !FieldVchar(String.ByteAt(value, String.Len(value) - 1_i64)) { return false; } mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if !(FieldVchar(b) || b == u8(32) || b == u8(9)) { return false; } i = i + 1_i64; } return true; }
 pub string LowerAscii(string value) { mut string result = ""; mut i64 i = 0_i64; while i < String.Len(value) { mut u8 b = String.ByteAt(value, i); if b >= u8(65) && b <= u8(90) { b = b + u8(32); } result = result + String.CodeUnitChar(b); i = i + 1_i64; } return result; }
 string TrimOws(string value) { mut i64 start = 0_i64; mut i64 end = String.Len(value); while start < end && (String.ByteAt(value,start) == u8(32) || String.ByteAt(value,start) == u8(9)) { start = start + 1_i64; } while end > start && (String.ByteAt(value,end-1_i64) == u8(32) || String.ByteAt(value,end-1_i64) == u8(9)) { end = end - 1_i64; } return String.SubSlice(value,start,end-start); }
 Result<string,HttpError> Ascii(u8[] bytes,i64 offset,i64 count) { Result<string,Core.Encoding.EncodingError> value = Encoding.DecodeHttpAscii(Slice.SubSlice(bytes,offset,count)); return match value { Result::Ok(text) => Result::Ok(text), Result::Error(_) => Result::Error(HttpError::InvalidFraming()), }; }
+/// HTTP field values admit obs-text. Preserve ASCII code units exactly and materialize each
+/// high octet as its Latin-1 code point for the string representation.
+Result<string,HttpError> FieldText(u8[] bytes,i64 offset,i64 count) {
+    mut string text = "";
+    mut i64 start = 0_i64;
+    mut i64 i = 0_i64;
+    while i < count {
+        u8 value = bytes[offset + i];
+        if value >= u8(128) {
+            if i > start { text = text + String.FromUtf8CodeUnits(Slice.SubSlice(bytes, offset + start, i - start)); }
+            text = text + String.Latin1Rune(u8(194), value);
+            start = i + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    if start < count { text = text + String.FromUtf8CodeUnits(Slice.SubSlice(bytes, offset + start, count - start)); }
+    return Result::Ok(text);
+}
 /// Index of the CRLFCRLF that ends the head. The field section, including the last field line's CRLF, is bytes[0, end + 2).
 i64 HeaderEnd(u8[] bytes, Limits limits) { mut i64 count = Slice.Len(bytes); if count > limits.maxHeaderBytes + 4_i64 { count = limits.maxHeaderBytes + 4_i64; } mut i64 i = 0_i64; while i + 3_i64 < count { if bytes[i] == u8(13) && bytes[i+1_i64] == u8(10) && bytes[i+2_i64] == u8(13) && bytes[i+3_i64] == u8(10) { return i; } i = i + 1_i64; } return -1_i64; }
 /// A lone LF inside the header section is never HTTP/1.1 framing; body octets are not scanned.
@@ -51,8 +71,8 @@ Result<Header[],HttpError> Headers(u8[] bytes,i64 start,i64 end,Limits limits) {
     while cursor < end { mut i64 lineEnd = cursor; while lineEnd+1_i64 < end && !(bytes[lineEnd] == u8(13) && bytes[lineEnd+1_i64] == u8(10)) { lineEnd=lineEnd+1_i64; }
         if lineEnd+1_i64 >= end || bytes[cursor] == u8(32) || bytes[cursor] == u8(9) { return Result::Error(HttpError::InvalidHeader()); }
         mut i64 colon=cursor; while colon < lineEnd && bytes[colon] != u8(58) { colon=colon+1_i64; } if colon == cursor || colon == lineEnd { return Result::Error(HttpError::InvalidHeader()); }
-        Result<string,HttpError> rawName=Ascii(bytes,cursor,colon-cursor); Result<string,HttpError> rawValue=Ascii(bytes,colon+1_i64,lineEnd-colon-1_i64);
-        match rawName { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(name)=>match rawValue { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(value)=>{ if !Token(name) || !FieldValue(value) { return Result::Error(HttpError::InvalidHeader()); } count=count+1_i64; if count > limits.maxHeaders { return Result::Error(HttpError::TooManyHeaders()); } Array.Append<Header>(out,Header { name: LowerAscii(name), value: TrimOws(value) }); }, }, };
+        Result<string,HttpError> rawName=Ascii(bytes,cursor,colon-cursor); Result<string,HttpError> rawValue=FieldText(bytes,colon+1_i64,lineEnd-colon-1_i64);
+        match rawName { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(name)=>match rawValue { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(value)=>{ string stored=TrimOws(value); if !Token(name) || !FieldValue(stored) { return Result::Error(HttpError::InvalidHeader()); } count=count+1_i64; if count > limits.maxHeaders { return Result::Error(HttpError::TooManyHeaders()); } Array.Append<Header>(out,Header { name: LowerAscii(name), value: stored }); }, }, };
         cursor=lineEnd+2_i64;
     } return Result::Ok(out);
 }
@@ -107,6 +127,44 @@ bool HostPort(string value, i64 start) {
     }
     return port <= 65535_i64;
 }
+bool Ipv4(string value, i64 start, i64 end) {
+    mut i64 parts = 0_i64;
+    mut i64 cursor = start;
+    while cursor < end {
+        mut i64 partEnd = cursor;
+        while partEnd < end && String.ByteAt(value, partEnd) != u8(46) { partEnd = partEnd + 1_i64; }
+        i64 length = partEnd - cursor;
+        if length <= 0_i64 || length > 3_i64 || (length > 1_i64 && String.ByteAt(value, cursor) == u8(48)) { return false; }
+        mut i64 number = 0_i64;
+        mut i64 i = cursor;
+        while i < partEnd { u8 b = String.ByteAt(value, i); if b < u8(48) || b > u8(57) { return false; } number = number * 10_i64 + i64(b - u8(48)); i = i + 1_i64; }
+        if number > 255_i64 { return false; }
+        parts = parts + 1_i64;
+        cursor = partEnd + 1_i64;
+    }
+    return parts == 4_i64;
+}
+/// RFC 3986 IPv6address: up to eight h16 groups, one optional ::, and an optional final IPv4address.
+bool Ipv6(string value, i64 start, i64 end) {
+    mut i64 groups = 0_i64;
+    mut bool compressed = false;
+    mut i64 cursor = start;
+    while cursor < end {
+        if String.ByteAt(value, cursor) == u8(58) {
+            if compressed { return false; }
+            if (cursor + 1_i64 < end && String.ByteAt(value, cursor + 1_i64) == u8(58)) || (cursor > start && String.ByteAt(value, cursor - 1_i64) == u8(58)) { compressed = true; cursor = cursor + 1_i64; if cursor < end && String.ByteAt(value, cursor) == u8(58) { cursor = cursor + 1_i64; } continue; }
+            return false;
+        }
+        mut groupEnd = cursor;
+        mut dotted = false;
+        while groupEnd < end && String.ByteAt(value, groupEnd) != u8(58) { if String.ByteAt(value, groupEnd) == u8(46) { dotted = true; } groupEnd = groupEnd + 1_i64; }
+        if dotted { if groupEnd != end || !Ipv4(value, cursor, groupEnd) { return false; } groups = groups + 2_i64; }
+        else { i64 length = groupEnd - cursor; if length <= 0_i64 || length > 4_i64 { return false; } mut i64 i = cursor; while i < groupEnd { if !HexByte(String.ByteAt(value, i)) { return false; } i = i + 1_i64; } groups = groups + 1_i64; }
+        if groups > 8_i64 { return false; }
+        cursor = groupEnd + 1_i64;
+    }
+    return match compressed { true => groups < 8_i64, false => groups == 8_i64, };
+}
 /// Empty, or uri-host [ ":" port ]: a bracketed IPv6 literal or a run of unreserved,
 /// sub-delims, and pct-encoded octets. No whitespace, controls, or second colon outside brackets.
 bool HostValue(string value) {
@@ -114,14 +172,9 @@ bool HostValue(string value) {
     if count == 0_i64 { return true; }
     mut i64 i = 0_i64;
     if String.ByteAt(value, 0_i64) == u8(91) {
-        mut bool colon = false;
         i = 1_i64;
-        while i < count && String.ByteAt(value, i) != u8(93) {
-            u8 b = String.ByteAt(value, i);
-            if b == u8(58) { colon = true; } else if !(HexByte(b) || b == u8(46)) { return false; }
-            i = i + 1_i64;
-        }
-        if i >= count || !colon { return false; }
+        while i < count && String.ByteAt(value, i) != u8(93) { i = i + 1_i64; }
+        if i >= count || !Ipv6(value, 1_i64, i) { return false; }
         i = i + 1_i64;
     } else {
         while i < count && String.ByteAt(value, i) != u8(58) {
@@ -277,7 +330,7 @@ pub Result<i64,HttpError> MessageEnd(u8[] bytes, Limits limits, MessageRole role
         },
     };
 }
-Result<Request,HttpError> RequestHead(u8[] bytes,i64 end,Limits limits) {i64 headEnd=end+2_i64;mut i64 lineEnd=0_i64;while lineEnd+1_i64<headEnd&&!(bytes[lineEnd]==u8(13)&&bytes[lineEnd+1_i64]==u8(10)){lineEnd=lineEnd+1_i64;}if lineEnd+1_i64>=headEnd||lineEnd>limits.maxStartLine{return Result::Error(HttpError::InvalidStartLine());}Result<string,HttpError> decoded=Ascii(bytes,0_i64,lineEnd);return match decoded {Result::Error(error)=>Result::Error(error),Result::Ok(line)=>{i64 first=String.IndexOfFrom(line,0_i64," ");i64 second=String.IndexOfFrom(line,first+1_i64," ");if first<=0_i64||second<=first+1_i64||String.IndexOfFrom(line,second+1_i64," ")>=0_i64{return Result::Error(HttpError::InvalidStartLine());}string method=String.SubSlice(line,0_i64,first);string target=String.SubSlice(line,first+1_i64,second-first-1_i64);if !Token(method){return Result::Error(HttpError::InvalidMethod());}if String.Len(target)==0_i64||String.SubSlice(line,second+1_i64,String.Len(line)-second-1_i64)!="HTTP/1.1"{return Result::Error(HttpError::InvalidStartLine());}Result<Header[],HttpError> parsed=Headers(bytes,lineEnd+2_i64,headEnd,limits);return match parsed {Result::Ok(headers)=>{Result<unit,HttpError> hostCheck=HostField(headers);return match hostCheck {Result::Ok(_)=>Result::Ok(Request {method:method,target:target,headers:headers,body:[]}),Result::Error(error)=>Result::Error(error),};},Result::Error(error)=>Result::Error(error),};},};}
+Result<Request,HttpError> RequestHead(u8[] bytes,i64 end,Limits limits) {i64 headEnd=end+2_i64;mut i64 lineEnd=0_i64;while lineEnd+1_i64<headEnd&&!(bytes[lineEnd]==u8(13)&&bytes[lineEnd+1_i64]==u8(10)){lineEnd=lineEnd+1_i64;}if lineEnd+1_i64>=headEnd||lineEnd>limits.maxStartLine{return Result::Error(HttpError::InvalidStartLine());}Result<string,HttpError> decoded=Ascii(bytes,0_i64,lineEnd);return match decoded {Result::Error(error)=>Result::Error(error),Result::Ok(line)=>{i64 first=String.IndexOfFrom(line,0_i64," ");i64 second=String.IndexOfFrom(line,first+1_i64," ");if first<=0_i64||second<=first+1_i64||String.IndexOfFrom(line,second+1_i64," ")>=0_i64{return Result::Error(HttpError::InvalidStartLine());}string method=String.SubSlice(line,0_i64,first);string target=String.SubSlice(line,first+1_i64,second-first-1_i64);if !Token(method){return Result::Error(HttpError::InvalidMethod());}if String.Len(target)==0_i64||!NoControls(target){return Result::Error(HttpError::InvalidTarget());}if String.SubSlice(line,second+1_i64,String.Len(line)-second-1_i64)!="HTTP/1.1"{return Result::Error(HttpError::InvalidStartLine());}Result<Header[],HttpError> parsed=Headers(bytes,lineEnd+2_i64,headEnd,limits);return match parsed {Result::Ok(headers)=>{Result<unit,HttpError> hostCheck=HostField(headers);return match hostCheck {Result::Ok(_)=>Result::Ok(Request {method:method,target:target,headers:headers,body:[]}),Result::Error(error)=>Result::Error(error),};},Result::Error(error)=>Result::Error(error),};},};}
 pub Result<Request,HttpError> ParseRequest(u8[] bytes,Limits limits) {
     Result<i64,HttpError> boundary = HeadBoundary(bytes, limits);
     return match boundary {
@@ -287,7 +340,7 @@ pub Result<Request,HttpError> ParseRequest(u8[] bytes,Limits limits) {
         },
     };
 }
-Result<Response,HttpError> ResponseHead(u8[] bytes,i64 end,Limits limits) {i64 headEnd=end+2_i64;mut i64 lineEnd=0_i64;while lineEnd+1_i64<headEnd&&!(bytes[lineEnd]==u8(13)&&bytes[lineEnd+1_i64]==u8(10)){lineEnd=lineEnd+1_i64;}if lineEnd+1_i64>=headEnd||lineEnd>limits.maxStartLine{return Result::Error(HttpError::InvalidStartLine());}Result<string,HttpError> decoded=Ascii(bytes,0_i64,lineEnd);return match decoded {Result::Error(error)=>Result::Error(error),Result::Ok(line)=>{if String.Len(line)<13_i64||String.SubSlice(line,0_i64,9_i64)!="HTTP/1.1 "||String.ByteAt(line,12_i64)!=u8(32){return Result::Error(HttpError::InvalidStatus());}Result<i64,HttpError> parsed=Decimal(String.SubSlice(line,9_i64,3_i64));return match parsed {Result::Error(_)=>Result::Error(HttpError::InvalidStatus()),Result::Ok(status)=>{if status<100_i64||status>599_i64{return Result::Error(HttpError::InvalidStatus());}Result<Header[],HttpError> headers=Headers(bytes,lineEnd+2_i64,headEnd,limits);return match headers {Result::Ok(items)=>Result::Ok(Response {status:status,reason:String.SubSlice(line,13_i64,String.Len(line)-13_i64),headers:items,body:[]}),Result::Error(error)=>Result::Error(error),};},};},};}
+Result<Response,HttpError> ResponseHead(u8[] bytes,i64 end,Limits limits) {i64 headEnd=end+2_i64;mut i64 lineEnd=0_i64;while lineEnd+1_i64<headEnd&&!(bytes[lineEnd]==u8(13)&&bytes[lineEnd+1_i64]==u8(10)){lineEnd=lineEnd+1_i64;}if lineEnd+1_i64>=headEnd||lineEnd>limits.maxStartLine{return Result::Error(HttpError::InvalidStartLine());}Result<string,HttpError> decoded=Ascii(bytes,0_i64,lineEnd);return match decoded {Result::Error(error)=>Result::Error(error),Result::Ok(line)=>{if String.Len(line)<13_i64||String.SubSlice(line,0_i64,9_i64)!="HTTP/1.1 "||String.ByteAt(line,12_i64)!=u8(32){return Result::Error(HttpError::InvalidStatus());}Result<i64,HttpError> parsed=Decimal(String.SubSlice(line,9_i64,3_i64));return match parsed {Result::Error(_)=>Result::Error(HttpError::InvalidStatus()),Result::Ok(status)=>{if status<100_i64||status>599_i64||!NoControls(String.SubSlice(line,13_i64,String.Len(line)-13_i64)){return Result::Error(HttpError::InvalidStatus());}Result<Header[],HttpError> headers=Headers(bytes,lineEnd+2_i64,headEnd,limits);return match headers {Result::Ok(items)=>Result::Ok(Response {status:status,reason:String.SubSlice(line,13_i64,String.Len(line)-13_i64),headers:items,body:[]}),Result::Error(error)=>Result::Error(error),};},};},};}
 /// Parses one complete response for a Response or HeadResponse role; a Request role is InvalidStatus.
 pub Result<Response,HttpError> ParseResponse(u8[] bytes,Limits limits,MessageRole role) {
     if IsRequest(role) { return Result::Error(HttpError::InvalidStatus()); }
@@ -309,5 +362,5 @@ Result<u8[],HttpError> Serialize(string start,Header[] headers,u8[] body,Limits 
     while i<Array.Len<Header>(headers) { Header h=Array.Get<Header>(headers,i); if !Token(h.name)||!FieldValue(h.value){return Result::Error(HttpError::InvalidHeader());} string name=LowerAscii(h.name); if name=="content-length"||name=="transfer-encoding"{return Result::Error(HttpError::AmbiguousFraming());} bytes=AppendText(bytes,name+": "+TrimOws(h.value)); bytes=AppendCrlf(bytes); if Slice.Len(bytes)>limits.maxHeaderBytes{return Result::Error(HttpError::HeaderTooLarge());} i=i+1_i64; }
     bytes=AppendText(bytes,"content-length: "+DecimalText(Slice.Len(body))); bytes=AppendCrlf(bytes); bytes=AppendCrlf(bytes); i=0_i64; while i<Slice.Len(body){Array.Append<u8>(bytes,body[i]);i=i+1_i64;}return Result::Ok(bytes);
 }
-pub Result<u8[],HttpError> SerializeRequest(Request request,Limits limits) {if !Token(request.method){return Result::Error(HttpError::InvalidMethod());}if String.Len(request.target)==0_i64||String.IndexOfFrom(request.target,0_i64," ")>=0_i64{return Result::Error(HttpError::InvalidTarget());}Result<unit,HttpError> hostCheck=HostField(request.headers);return match hostCheck {Result::Error(error)=>Result::Error(error),Result::Ok(_)=>Serialize(request.method+" "+request.target+" HTTP/1.1",request.headers,request.body,limits),};}
-pub Result<u8[],HttpError> SerializeResponse(Response response,Limits limits) {if response.status<100_i64||response.status>599_i64||!FieldValue(response.reason){return Result::Error(HttpError::InvalidStatus());}return Serialize("HTTP/1.1 "+DecimalText(response.status)+" "+response.reason,response.headers,response.body,limits);}
+pub Result<u8[],HttpError> SerializeRequest(Request request,Limits limits) {if !Token(request.method){return Result::Error(HttpError::InvalidMethod());}if String.Len(request.target)==0_i64||String.IndexOfFrom(request.target,0_i64," ")>=0_i64||!NoControls(request.target){return Result::Error(HttpError::InvalidTarget());}Result<unit,HttpError> hostCheck=HostField(request.headers);return match hostCheck {Result::Error(error)=>Result::Error(error),Result::Ok(_)=>Serialize(request.method+" "+request.target+" HTTP/1.1",request.headers,request.body,limits),};}
+pub Result<u8[],HttpError> SerializeResponse(Response response,Limits limits) {if response.status<100_i64||response.status>599_i64||!NoControls(response.reason){return Result::Error(HttpError::InvalidStatus());}return Serialize("HTTP/1.1 "+DecimalText(response.status)+" "+response.reason,response.headers,response.body,limits);}

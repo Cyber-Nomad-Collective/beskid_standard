@@ -1,0 +1,107 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.String;
+use Core.Results;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Testing.Assert;
+
+type HostCase { string value, bool valid, }
+type FieldCase { string raw, string stored, }
+type ByteCase { string before, u8 value, string after, HttpError expected, }
+
+u8[] Wire(string text) {
+    mut u8[] output = [];
+    mut i64 index = 0_i64;
+    while index < String.Len(text) {
+        u8 value = String.ByteAt(text, index);
+        if value == 124_u8 { Array.Append<u8>(output, 13_u8); Array.Append<u8>(output, 10_u8); }
+        else { Array.Append<u8>(output, value); }
+        index = index + 1_i64;
+    }
+    return output;
+}
+
+u8[] WireWithByte(string before, u8 value, string after) {
+    mut u8[] output = Wire(before);
+    Array.Append<u8>(output, value);
+    u8[] suffix = Wire(after);
+    mut i64 index = 0_i64;
+    while index < Slice.Len(suffix) { Array.Append<u8>(output, suffix[index]); index = index + 1_i64; }
+    return output;
+}
+
+bool IsError<T>(Result<T, HttpError> result, HttpError expected) {
+    return match result { Result::Ok(_) => false, Result::Error(value) => match value {
+        HttpError::InvalidHeader => match expected { HttpError::InvalidHeader => true, _ => false, },
+        HttpError::InvalidStartLine => match expected { HttpError::InvalidStartLine => true, _ => false, },
+        HttpError::InvalidMethod => match expected { HttpError::InvalidMethod => true, _ => false, },
+        HttpError::InvalidTarget => match expected { HttpError::InvalidTarget => true, _ => false, },
+        HttpError::InvalidStatus => match expected { HttpError::InvalidStatus => true, _ => false, },
+        HttpError::InvalidHost => match expected { HttpError::InvalidHost => true, _ => false, },
+        _ => false,
+    }, };
+}
+
+test http_host_ipv6_literals_follow_rfc3986_address_grammar {
+    HostCase[] cases = [
+        HostCase { value: "[::1]", valid: true },
+        HostCase { value: "[2001:db8::1]:8080", valid: true },
+        HostCase { value: "[::ffff:192.0.2.1]", valid: true },
+        HostCase { value: "[:::::::]", valid: false },
+        HostCase { value: "[1::2::3]", valid: false },
+    ];
+    mut i64 index = 0_i64;
+    while index < Array.Len<HostCase>(cases) {
+        HostCase item = Array.Get<HostCase>(cases, index);
+        Result<Request, HttpError> result = Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: " + item.value + "||"), Types.DefaultLimits());
+        bool parsed = match result { Result::Ok(_) => true, Result::Error(_) => false, };
+        Assert.Equal(parsed, item.valid, "IPv6 Host literal follows RFC 3986 grammar");
+        index = index + 1_i64;
+    }
+}
+
+test http_field_values_allow_internal_htab_and_reject_other_controls {
+    FieldCase[] fields = [
+        FieldCase { raw: "a\tb", stored: "a\tb" },
+        FieldCase { raw: "\ta", stored: "a" },
+        FieldCase { raw: "a\t", stored: "a" },
+    ];
+    mut fieldIndex = 0_i64;
+    while fieldIndex < Array.Len<FieldCase>(fields) {
+        FieldCase item = Array.Get<FieldCase>(fields, fieldIndex);
+        Result<Request, HttpError> result = Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: example.test|X-Test: " + item.raw + "||"), Types.DefaultLimits());
+        match result {
+            Result::Error(_) => Assert.Fail("field value with permitted HTAB parses"),
+            Result::Ok(request) => Assert.Equal(request.headers[1].value, item.stored, "field OWS is not stored"),
+        };
+        fieldIndex = fieldIndex + 1_i64;
+    }
+    Assert.True(match Codec.ParseRequest(WireWithByte("GET / HTTP/1.1|Host: example.test|X-Test: a", 128_u8, "b||"), Types.DefaultLimits()) { Result::Ok(_) => true, Result::Error(_) => false, }, "obs-text field octets parse");
+    ByteCase[] cases = [
+        ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 0_u8, after: "b||", expected: HttpError::InvalidHeader() },
+        ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 127_u8, after: "b||", expected: HttpError::InvalidHeader() },
+    ];
+    mut i64 index = 0_i64;
+    while index < Array.Len<ByteCase>(cases) {
+        ByteCase item = Array.Get<ByteCase>(cases, index);
+        Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "NUL and DEL field octets are rejected");
+        index = index + 1_i64;
+    }
+}
+
+test http_start_line_components_reject_control_octets {
+    ByteCase[] requestCases = [
+        ByteCase { before: "GE", value: 9_u8, after: "T / HTTP/1.1|Host: example.test||", expected: HttpError::InvalidMethod() },
+        ByteCase { before: "GET /a", value: 0_u8, after: "b HTTP/1.1|Host: example.test||", expected: HttpError::InvalidTarget() },
+        ByteCase { before: "GET / HTTP/1.", value: 127_u8, after: "1|Host: example.test||", expected: HttpError::InvalidStartLine() },
+    ];
+    mut i64 index = 0_i64;
+    while index < Array.Len<ByteCase>(requestCases) {
+        ByteCase item = Array.Get<ByteCase>(requestCases, index);
+        Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "method and target control octets are rejected");
+        index = index + 1_i64;
+    }
+    Assert.True(IsError<Response>(Codec.ParseResponse(WireWithByte("HTTP/1.1 200 O", 127_u8, "K||"), Types.DefaultLimits(), MessageRole::Response()), HttpError::InvalidStatus()), "reason control octets are rejected");
+}

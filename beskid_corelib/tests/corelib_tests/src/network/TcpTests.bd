@@ -6,6 +6,8 @@ use Core.IO.Stream;
 use Core.IO.IoError;
 use Core.IO.TransferFailure;
 use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
 use Core.Results;
 use Network.Types;
 use Network.Errors;
@@ -151,6 +153,54 @@ test network_tcp_second_read_reports_busy_cause {
     match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("second-read scenario completes"),
+    };
+}
+
+Result<unit, NetworkError> TypedDeadlineReadRecoversResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Fiber<unit> server = spawn (() => DelayedServe(listener));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Ok(expired) => {
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(expired), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, Result::Error(_) => false, }, "typed read deadline is accepted");
+            u8[] bytes = [0_u8];
+            match client.Read(bytes, 0_i64, 1_i64) {
+                Result::Error(IoError::ReadFailed(TransferFailure::TimedOut)) => (),
+                _ => Assert.Fail("expired typed read returns TimedOut"),
+            };
+            TransferDeadlines cleared = TransferDeadlines { read: Option.Empty<Deadline>(), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(cleared) { Result::Ok(_) => true, Result::Error(_) => false, }, "clearing typed policy succeeds");
+            match client.Read(bytes, 0_i64, 1_i64) {
+                Result::Ok(count) => Assert.Equal(count, 1_i64, "read succeeds after deadline clear"),
+                Result::Error(_) => Assert.Fail("read remains usable after deadline clear"),
+            };
+            Assert.Equal(bytes[0], 7_u8, "later read receives peer data");
+        },
+        Result::Error(_) => Assert.Fail("zero duration creates a checked deadline"),
+    };
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "deadline client closes");
+    match server.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("deadline server completes"),
+    };
+    return Result::Ok(());
+}
+
+unit TypedDeadlineReadRecovers() {
+    match TypedDeadlineReadRecoversResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("typed deadline scenario completes without NetworkError"),
+    };
+}
+
+test network_tcp_typed_read_deadline_times_out_and_recovers {
+    Fiber<unit> scenario = spawn TypedDeadlineReadRecovers();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("typed deadline scenario completes"),
     };
 }
 

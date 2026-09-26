@@ -1,6 +1,8 @@
 use Core.Bytes.Slice;
 use Concurrency.Fiber;
 use Core.Results;
+use Core.Optional.Option;
+use Core.Time.Deadline;
 use Core.IO.IoError;
 use Core.IO.TransferFailure;
 use Network.Types;
@@ -15,7 +17,7 @@ use Testing.Assert;
 // must be idempotent; and a fresh stream must still work afterward.
 
 Result<unit, NetworkError> ServeOnceResult(TcpListener listener) {
-    TcpStream accepted = listener.Accept()?;
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "server closes its side");
     listener.Close()?;
     return Result::Ok(());
@@ -33,7 +35,7 @@ Result<unit, NetworkError> DisposedStreamFailsClosedResult() {
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => ServeOnce(listener));
-    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
 
     Assert.True(match client.Dispose() { Result::Ok(_) => true, _ => false, }, "Dispose succeeds");
 
@@ -77,7 +79,7 @@ Result<unit, NetworkError> FreshStreamAfterDisposeResult() {
     TcpListener firstListener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress firstAddress = firstListener.LocalAddress()?;
     Fiber<unit> firstServer = spawn (() => ServeOnce(firstListener));
-    TcpStream disposedClient = TcpStream.Connect(firstAddress, Network.Types.DefaultSocketOptions())?;
+    TcpStream disposedClient = TcpStream.Connect(firstAddress, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Assert.True(match disposedClient.Dispose() { Result::Ok(_) => true, _ => false, }, "first stream disposed");
     match firstServer.Join() {
         Result::Ok(_) => (),
@@ -89,7 +91,7 @@ Result<unit, NetworkError> FreshStreamAfterDisposeResult() {
     TcpListener secondListener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress secondAddress = secondListener.LocalAddress()?;
     Fiber<unit> secondServer = spawn (() => ServeOnce(secondListener));
-    TcpStream freshClient = TcpStream.Connect(secondAddress, Network.Types.DefaultSocketOptions())?;
+    TcpStream freshClient = TcpStream.Connect(secondAddress, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Assert.True(freshClient.LocalAddress()?.port.Value() != 0_i64, "fresh stream after a prior Dispose is fully usable");
     Assert.True(match freshClient.Dispose() { Result::Ok(_) => true, _ => false, }, "fresh stream disposes cleanly too");
     match secondServer.Join() {

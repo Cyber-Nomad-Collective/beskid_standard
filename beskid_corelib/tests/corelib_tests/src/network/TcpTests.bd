@@ -17,7 +17,7 @@ use Network.Tcp.TcpStream;
 use Testing.Assert;
 
 Result<unit, NetworkError> ServeResult(TcpListener listener) {
-    TcpStream accepted = listener.Accept()?;
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     u8[] bytes = [11_u8, 22_u8, 33_u8];
     Result<unit, IoError> written = IO.WriteAll(accepted, bytes, 0_i64, 3_i64);
     Assert.True(match written { Result::Ok(_) => true, _ => false, }, "TCP reuses Foundation WriteAll");
@@ -44,7 +44,7 @@ Result<unit, NetworkError> TcpLoopbackResult() {
     SocketAddress address = listener.LocalAddress()?;
     Assert.True(address.port.Value() != 0_i64, "OS-selected port is reported");
     Fiber<unit> server = spawn (() => Serve(listener));
-    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     u8[] bytes = Slice.New(3_i64);
     Result<unit, IoError> read = IO.ReadExact(client, bytes, 0_i64, 3_i64);
     Assert.True(match read { Result::Ok(_) => true, _ => false, }, "TCP reuses Foundation ReadExact");
@@ -103,7 +103,7 @@ i64 ReadOne(TcpStream stream) {
 }
 
 Result<unit, NetworkError> DelayedServeResult(TcpListener listener) {
-    TcpStream accepted = listener.Accept()?;
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     match Time.Sleep(Time.FromMilliseconds(100_i64)) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server delay completes"),
@@ -127,7 +127,7 @@ Result<unit, NetworkError> SecondReadResult() {
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => DelayedServe(listener));
-    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Fiber<i64> first = spawn (() => ReadOne(client));
     Concurrency.Yield();
     Concurrency.Yield();
@@ -162,7 +162,7 @@ Result<unit, NetworkError> TypedDeadlineReadRecoversResult() {
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => DelayedServe(listener));
-    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Ok(expired) => {
             TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(expired), write: Option.Empty<Deadline>() };
@@ -206,7 +206,7 @@ test network_tcp_typed_read_deadline_times_out_and_recovers {
 }
 
 Result<unit, NetworkError> ServeAfterClearResult(TcpListener listener, Channel<i64> release) {
-    TcpStream accepted = listener.Accept()?;
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     match Channel<i64>.Receive(release) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server receives release after read deadline clear"),
@@ -230,7 +230,7 @@ Result<unit, NetworkError> PendingReadClearResult() {
     SocketAddress address = listener.LocalAddress()?;
     Channel<i64> release = Channel<i64>.Create();
     Fiber<unit> server = spawn (() => ServeAfterClear(listener, release));
-    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Fiber<i64> pending = spawn (() => ReadOne(client));
     Concurrency.Yield();
     Concurrency.Yield();
@@ -277,7 +277,7 @@ test network_tcp_pending_typed_read_deadline_clear_preserves_readiness {
 
 // Closing with unread received data makes the host abort the connection (RST).
 Result<unit, NetworkError> ResetServeResult(TcpListener listener) {
-    TcpStream accepted = listener.Accept()?;
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     u8[] bytes = Slice.New(1_i64);
     Result<unit, IoError> read = IO.ReadExact(accepted, bytes, 0_i64, 1_i64);
     Assert.True(match read { Result::Ok(_) => true, _ => false, }, "server observes the first byte");
@@ -298,7 +298,7 @@ Result<unit, NetworkError> PeerResetResult() {
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => ResetServe(listener));
-    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Result<unit, IoError> written = IO.WriteAll(client, [1_u8, 2_u8], 0_i64, 2_i64);
     Assert.True(match written { Result::Ok(_) => true, _ => false, }, "client sends two bytes");
     Assert.Equal(ReadOne(client), -2_i64, "peer abort reports ReadFailed(PeerReset), not EOF");
@@ -322,5 +322,74 @@ test network_tcp_peer_reset_is_not_eof {
     match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("peer-reset scenario completes"),
+    };
+}
+
+Result<unit, NetworkError> TypedLifecycleDeadlineResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Ok(expired) => {
+            match listener.Accept(Option.FromValue<Deadline>(expired)) {
+                Result::Error(NetworkError::TimedOut) => (),
+                _ => Assert.Fail("expired typed accept returns TimedOut"),
+            };
+        },
+        Result::Error(_) => Assert.Fail("zero duration creates a checked lifecycle deadline"),
+    };
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "accepted stream closes after timeout recovery");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes after timeout recovery");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit TypedLifecycleDeadline() {
+    match TypedLifecycleDeadlineResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("typed TCP lifecycle deadline scenario completes"),
+    };
+}
+
+test network_tcp_typed_accept_deadline_times_out_and_recovers {
+    Fiber<unit> scenario = spawn TypedLifecycleDeadline();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("typed TCP lifecycle deadline scenario joins"),
+    };
+}
+
+Result<unit, NetworkError> ExpiredConnectOneWinnerResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Ok(expired) => {
+            match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.FromValue<Deadline>(expired)) {
+                Result::Ok(client) => Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "ready connect closes its sole owned stream"),
+                Result::Error(NetworkError::TimedOut) => (),
+                Result::Error(_) => Assert.Fail("expired connect has only readiness or timeout outcome"),
+            };
+        },
+        Result::Error(_) => Assert.Fail("zero duration creates a checked connect deadline"),
+    };
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit ExpiredConnectOneWinner() {
+    match ExpiredConnectOneWinnerResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("expired connect one-winner scenario completes"),
+    };
+}
+
+test network_tcp_expired_connect_has_one_outcome_and_closes_owned_stream {
+    Fiber<unit> scenario = spawn ExpiredConnectOneWinner();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("expired connect scenario joins"),
     };
 }

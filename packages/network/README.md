@@ -35,7 +35,7 @@ work lease until the resolver actually exits, then discards a cancelled result.
 ## TCP
 
 `TcpListener.Bind(address, backlog)` returns a listener, whose `Accept` returns
-an owned `TcpStream`. `TcpStream.Connect(address, options)` creates a client.
+an owned `TcpStream`. `TcpStream.Connect(address, options, deadline)` creates a client.
 Listeners expose `LocalAddress` and `Close`; streams additionally expose
 `PeerAddress`, `SocketOptions`, `SetSocketOptions`, and `ShutdownWrite`.
 

@@ -1,5 +1,6 @@
 use Concurrency;
 use Concurrency.Fiber;
+use Concurrency.Channel;
 use Core.Bytes.Slice;
 use Core.IO;
 use Core.IO.Stream;
@@ -201,6 +202,76 @@ test network_tcp_typed_read_deadline_times_out_and_recovers {
     match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("typed deadline scenario completes"),
+    };
+}
+
+Result<unit, NetworkError> ServeAfterClearResult(TcpListener listener, Channel<i64> release) {
+    TcpStream accepted = listener.Accept()?;
+    match Channel<i64>.Receive(release) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server receives release after read deadline clear"),
+    };
+    Assert.True(match IO.WriteAll(accepted, [9_u8], 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "released server writes one byte");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "released server closes");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit ServeAfterClear(TcpListener listener, Channel<i64> release) {
+    match ServeAfterClearResult(listener, release) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("released server completes"),
+    };
+}
+
+Result<unit, NetworkError> PendingReadClearResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Channel<i64> release = Channel<i64>.Create();
+    Fiber<unit> server = spawn (() => ServeAfterClear(listener, release));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions())?;
+    Fiber<i64> pending = spawn (() => ReadOne(client));
+    Concurrency.Yield();
+    Concurrency.Yield();
+    Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
+    match Deadline.After(Time.FromMilliseconds(20_i64)) {
+        Result::Ok(deadline) => {
+            TransferDeadlines armed = TransferDeadlines { read: Option.FromValue<Deadline>(deadline), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(armed) { Result::Ok(_) => true, _ => false, }, "pending read accepts typed deadline");
+            TransferDeadlines cleared = TransferDeadlines { read: Option.Empty<Deadline>(), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(cleared) { Result::Ok(_) => true, _ => false, }, "pending read deadline clears");
+        },
+        Result::Error(_) => Assert.Fail("positive duration creates a checked deadline"),
+    };
+    match Time.Sleep(Time.FromMilliseconds(50_i64)) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("wait past cleared deadline completes"),
+    };
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server is released after old deadline");
+    i64 pendingCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+    Assert.Equal(pendingCode, 1_i64, "pending read completes from peer readiness after deadline clear");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after pending read");
+    match server.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("released server exits"),
+    };
+    Channel<i64>.Close(release);
+    return Result::Ok(());
+}
+
+unit PendingReadClear() {
+    match PendingReadClearResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("pending read deadline clear completes without NetworkError"),
+    };
+}
+
+test network_tcp_pending_typed_read_deadline_clear_preserves_readiness {
+    Fiber<unit> scenario = spawn PendingReadClear();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("pending read deadline clear scenario completes"),
     };
 }
 

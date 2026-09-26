@@ -1,6 +1,8 @@
 use Core.Bytes.Slice;
 use Core.Disposable;
 use Core.Results;
+use Core.Time.Deadline;
+use Core.Optional.Option;
 use Network.Types;
 use Network.Errors;
 use Network.Internal;
@@ -18,29 +20,29 @@ pub type UdpSocket: Disposable {
     }
 
     /// Receives one whole datagram boundary; capacity limits the returned payload.
-    Result<Datagram, NetworkError> ReceiveDatagram(i64 capacity, bool connected) {
+    Result<Datagram, NetworkError> ReceiveDatagram(i64 capacity, bool connected, Option<Deadline> deadline) {
         if capacity < 0_i64 { return Result::Error(NetworkError::MessageTooLarge); }
         u8[] payload = Slice.New(capacity);
         u8[] metadata = Slice.New(20_i64);
-        i64 completed = Internal.Receive(handle, payload, metadata, connected);
+        i64 completed = Internal.Receive(handle, payload, metadata, connected, deadline);
         if completed < 0_i64 { return Result::Error(Internal.Error(-completed)); }
         return Result::Ok(Datagram { payload: Slice.SubSlice(payload, 0_i64, completed), source: Internal.Decode(metadata), truncated: metadata[19] != u8(0) });
     }
 
-    pub Result<Datagram, NetworkError> ReceiveFrom(i64 capacity) { return ReceiveDatagram(capacity, false); }
-    pub Result<Datagram, NetworkError> Receive(i64 capacity) { return ReceiveDatagram(capacity, true); }
+    pub Result<Datagram, NetworkError> ReceiveFrom(i64 capacity, Option<Deadline> deadline) { return ReceiveDatagram(capacity, false, deadline); }
+    pub Result<Datagram, NetworkError> Receive(i64 capacity, Option<Deadline> deadline) { return ReceiveDatagram(capacity, true, deadline); }
 
     /// Payload remains caller-owned on both success and failure.
-    pub Result<unit, NetworkError> SendTo(u8[] payload, SocketAddress peer) {
+    pub Result<unit, NetworkError> SendTo(u8[] payload, SocketAddress peer, Option<Deadline> deadline) {
         if peer.port.Value() == 0_i64 { return Result::Error(NetworkError::InvalidAddress); }
-        i64 completed = Internal.Send(handle, payload, Internal.Encode(peer), false);
+        i64 completed = Internal.Send(handle, payload, Internal.Encode(peer), false, deadline);
         if completed < 0_i64 { return Result::Error(Internal.Error(-completed)); }
         if completed != Slice.Len(payload) { return Result::Error(NetworkError::MessageTooLarge); }
         return Result::Ok(());
     }
 
-    pub Result<unit, NetworkError> Send(u8[] payload) {
-        i64 completed = Internal.Send(handle, payload, Slice.New(0_i64), true);
+    pub Result<unit, NetworkError> Send(u8[] payload, Option<Deadline> deadline) {
+        i64 completed = Internal.Send(handle, payload, Slice.New(0_i64), true, deadline);
         if completed < 0_i64 { return Result::Error(Internal.Error(-completed)); }
         if completed != Slice.Len(payload) { return Result::Error(NetworkError::MessageTooLarge); }
         return Result::Ok(());

@@ -26,11 +26,12 @@ portable `noDelay` and `keepAlive` booleans.
 
 ## DNS
 
-`Dns.Resolve(hostName, port, family)` takes an optional `AddressFamily`, starts
-a fresh host resolver job, and returns all matching addresses in resolver
-order. It adds no DNS cache. Cancellation ends the Beskid wait; it does not
-promise to interrupt the native resolver. Foundation retains a separate active
-work lease until the resolver actually exits, then discards a cancelled result.
+`Dns.Resolve(hostName, port, family, deadline)` takes an optional
+`AddressFamily` and an optional opaque `Core.Time.Deadline`, starts a fresh host
+resolver job, and returns all matching addresses in resolver order. It adds no
+DNS cache. Cancellation or timeout ends the Beskid wait; it does not promise to
+interrupt the native resolver. Foundation retains a separate active work lease
+until the resolver actually exits, then discards a cancelled result.
 
 ## TCP
 
@@ -59,8 +60,10 @@ failure. An orderly peer close is not a failure: `Read` returns `Ok(0)`.
 
 ## UDP
 
-`UdpSocket.Bind(address)` creates a datagram resource. `SendTo(payload, peer)`
-and `ReceiveFrom(capacity)` preserve one datagram per operation. A received
+`UdpSocket.Bind(address)` creates a datagram resource. `SendTo(payload, peer,
+deadline)`, `Send(payload, deadline)`, `ReceiveFrom(capacity, deadline)`, and
+`Receive(capacity, deadline)` take an optional opaque `Core.Time.Deadline` and
+preserve one datagram per operation. A received
 `Datagram` contains its owned payload, source address, and truncation flag.
 Zero-length payloads are datagrams, not EOF. `Connect(peer)` enables `Send`
 and `Receive`; `LocalAddress` and `PeerAddress` remain typed.
@@ -80,10 +83,10 @@ The handle remains opaque when the resource is transported through Foundation
 channels; resource transport must preserve its sole ownership obligation.
 
 Operations that may wait execute in a scheduler-owned fiber. Readiness,
-cancellation, and close compete through Foundation's single terminal winner;
-networking does not resume fibers itself. This API revision registers an
-unbounded deadline (`-1`): Foundation does not yet expose a typed ambient
-deadline context. No separate Network timer or transfer-settings API is added.
+cancellation, deadline, and close compete through Foundation's single terminal
+winner; networking does not resume fibers itself. `None` means no deadline;
+`Some(Deadline)` carries an absolute monotonic deadline through the private ABI.
+No separate Network timer or transfer-settings API is added.
 
 TLS, HTTP, Unix-domain sockets, raw sockets, multicast configuration, caching,
 and native descriptor escape hatches are absent.

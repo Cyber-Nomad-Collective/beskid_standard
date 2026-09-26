@@ -1,6 +1,9 @@
 use Core.Bytes.Slice;
 use Concurrency.Fiber;
 use Core.Results;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
 use Network.Types;
 use Network.Errors;
 use Network.Udp.UdpSocket;
@@ -14,14 +17,14 @@ Result<unit, NetworkError> UdpBoundariesResult() {
     SocketAddress target = receiver.LocalAddress()?;
     SocketAddress source = sender.LocalAddress()?;
     u8[] payload = [1_u8, 2_u8, 3_u8, 4_u8];
-    sender.SendTo(payload, target)?;
-    Datagram datagram = receiver.ReceiveFrom(2_i64)?;
+    sender.SendTo(payload, target, Option.Empty<Deadline>())?;
+    Datagram datagram = receiver.ReceiveFrom(2_i64, Option.Empty<Deadline>())?;
     Assert.Equal(Slice.Len(datagram.payload), 2_i64, "receive returns only available payload");
     Assert.True(datagram.truncated, "oversized datagram sets truncation");
     Assert.Equal(datagram.source.port.Value(), source.port.Value(), "source address is retained");
     Assert.Equal(Slice.Len(payload), 4_i64, "send retains caller payload ownership");
-    sender.SendTo(Slice.New(0_i64), target)?;
-    Datagram empty = receiver.ReceiveFrom(2_i64)?;
+    sender.SendTo(Slice.New(0_i64), target, Option.Empty<Deadline>())?;
+    Datagram empty = receiver.ReceiveFrom(2_i64, Option.Empty<Deadline>())?;
     Assert.Equal(Slice.Len(empty.payload), 0_i64, "empty datagram is not EOF");
     Assert.False(empty.truncated, "empty datagram fits");
     sender.Close()?;
@@ -51,11 +54,11 @@ Result<unit, NetworkError> UdpConnectedResult() {
     UdpSocket right = UdpSocket.Bind(bindAddress)?;
     left.Connect(right.LocalAddress()?)?;
     right.Connect(left.LocalAddress()?)?;
-    left.Send([99_u8])?;
-    Datagram received = right.Receive(1_i64)?;
+    left.Send([99_u8], Option.Empty<Deadline>())?;
+    Datagram received = right.Receive(1_i64, Option.Empty<Deadline>())?;
     Assert.Equal(received.payload[0], 99_u8, "connected receive preserves payload");
     right.Close()?;
-    Assert.True(match right.Receive(1_i64) { Result::Error(NetworkError::Closed) => true, _ => false, }, "closed generation fails before native I/O");
+    Assert.True(match right.Receive(1_i64, Option.Empty<Deadline>()) { Result::Error(NetworkError::Closed) => true, _ => false, }, "closed generation fails before native I/O");
     left.Close()?;
     return Result::Ok(());
 }
@@ -150,4 +153,38 @@ test network_udp_exhaustion_is_typed {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("every exhausted socket was released"),
     };
+}
+
+Result<unit, NetworkError> UdpExpiredReceiveRecoversResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Error(_) => Assert.Fail("zero duration creates a typed deadline"),
+        Result::Ok(expired) => match receiver.ReceiveFrom(1_i64, Option.FromValue<Deadline>(expired)) {
+            Result::Error(NetworkError::TimedOut) => (),
+            _ => Assert.Fail("an empty UDP receive times out at its expired deadline"),
+        },
+    };
+    UdpSocket sender = UdpSocket.Bind(bindAddress)?;
+    SocketAddress target = receiver.LocalAddress()?;
+    u8[] payload = [73_u8];
+    sender.SendTo(payload, target, Option.Empty<Deadline>())?;
+    Datagram datagram = receiver.ReceiveFrom(1_i64, Option.Empty<Deadline>())?;
+    Assert.Equal(datagram.payload[0], 73_u8, "socket accepts a datagram after its receive timeout");
+    Assert.Equal(payload[0], 73_u8, "timed operations retain caller-owned payloads");
+    sender.Close()?;
+    receiver.Close()?;
+    return Result::Ok(());
+}
+
+unit UdpExpiredReceiveRecovers() {
+    match UdpExpiredReceiveRecoversResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("UDP timeout recovery completes without a NetworkError"),
+    };
+}
+
+test network_udp_expired_receive_deadline_times_out_and_socket_recovers {
+    Fiber<unit> scenario = spawn UdpExpiredReceiveRecovers();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "UDP timeout recovery scenario completes");
 }

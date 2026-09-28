@@ -15,13 +15,12 @@ bool TokenByte(u8 value) {
 }
 bool Token(string value) { if String.Len(value) == 0_i64 { return false; } mut i64 i = 0_i64; while i < String.Len(value) { if !TokenByte(String.ByteAt(value, i)) { return false; } i = i + 1_i64; } return true; }
 bool NoControls(string value) { mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if b < u8(32) || b == u8(127) { return false; } i = i + 1_i64; } return true; }
-bool FieldVchar(u8 value) { return (value >= u8(33) && value <= u8(126)) || value >= u8(128); }
-bool FieldValue(string value) { if String.Len(value) == 0_i64 { return true; } if !FieldVchar(String.ByteAt(value, 0_i64)) || !FieldVchar(String.ByteAt(value, String.Len(value) - 1_i64)) { return false; } mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if !(FieldVchar(b) || b == u8(32) || b == u8(9)) { return false; } i = i + 1_i64; } return true; }
+bool FieldVchar(u8 value) { return value >= u8(33) && value <= u8(126); }
+bool FieldValue(string value) { mut i64 i = 0_i64; while i < String.Len(value) { u8 b = String.ByteAt(value, i); if !(FieldVchar(b) || b == u8(32)) { return false; } i = i + 1_i64; } return true; }
 pub string LowerAscii(string value) { mut string result = ""; mut i64 i = 0_i64; while i < String.Len(value) { mut u8 b = String.ByteAt(value, i); if b >= u8(65) && b <= u8(90) { b = b + u8(32); } result = result + String.CodeUnitChar(b); i = i + 1_i64; } return result; }
 string TrimOws(string value) { mut i64 start = 0_i64; mut i64 end = String.Len(value); while start < end && (String.ByteAt(value,start) == u8(32) || String.ByteAt(value,start) == u8(9)) { start = start + 1_i64; } while end > start && (String.ByteAt(value,end-1_i64) == u8(32) || String.ByteAt(value,end-1_i64) == u8(9)) { end = end - 1_i64; } return String.SubSlice(value,start,end-start); }
 Result<string,HttpError> Ascii(u8[] bytes,i64 offset,i64 count) { Result<string,Core.Encoding.EncodingError> value = Encoding.DecodeHttpAscii(Slice.SubSlice(bytes,offset,count)); return match value { Result::Ok(text) => Result::Ok(text), Result::Error(_) => Result::Error(HttpError::InvalidFraming()), }; }
-/// HTTP field values admit obs-text. Preserve ASCII code units exactly and materialize each
-/// high octet as its Latin-1 code point for the string representation.
+/// Preserve ASCII bytes and materialize high octets so FieldValue can reject non-ASCII values.
 Result<string,HttpError> FieldText(u8[] bytes,i64 offset,i64 count) {
     mut string text = "";
     mut i64 start = 0_i64;
@@ -72,7 +71,7 @@ Result<Header[],HttpError> Headers(u8[] bytes,i64 start,i64 end,Limits limits) {
         if lineEnd+1_i64 >= end || bytes[cursor] == u8(32) || bytes[cursor] == u8(9) { return Result::Error(HttpError::InvalidHeader()); }
         mut i64 colon=cursor; while colon < lineEnd && bytes[colon] != u8(58) { colon=colon+1_i64; } if colon == cursor || colon == lineEnd { return Result::Error(HttpError::InvalidHeader()); }
         Result<string,HttpError> rawName=Ascii(bytes,cursor,colon-cursor); Result<string,HttpError> rawValue=FieldText(bytes,colon+1_i64,lineEnd-colon-1_i64);
-        match rawName { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(name)=>match rawValue { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(value)=>{ string stored=TrimOws(value); if !Token(name) || !FieldValue(stored) { return Result::Error(HttpError::InvalidHeader()); } count=count+1_i64; if count > limits.maxHeaders { return Result::Error(HttpError::TooManyHeaders()); } Array.Append<Header>(out,Header { name: LowerAscii(name), value: stored }); }, }, };
+        match rawName { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(name)=>match rawValue { Result::Error(error)=>{return Result::Error(error);}, Result::Ok(value)=>{ if !Token(name) || !FieldValue(value) { return Result::Error(HttpError::InvalidHeader()); } string stored=TrimOws(value); count=count+1_i64; if count > limits.maxHeaders { return Result::Error(HttpError::TooManyHeaders()); } Array.Append<Header>(out,Header { name: LowerAscii(name), value: stored }); }, }, };
         cursor=lineEnd+2_i64;
     } return Result::Ok(out);
 }

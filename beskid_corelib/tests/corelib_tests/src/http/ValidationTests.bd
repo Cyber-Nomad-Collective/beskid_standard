@@ -11,8 +11,6 @@ type HostCase { string value, bool valid, }
 type FieldCase { string raw, string stored, }
 type ByteCase { string before, u8 value, string after, HttpError expected, }
 
-string Tab() { return String.CodeUnitChar(9_u8); }
-
 u8[] Wire(string text) {
     mut u8[] output = [];
     mut i64 index = 0_i64;
@@ -37,6 +35,7 @@ u8[] WireWithByte(string before, u8 value, string after) {
 bool IsError<T>(Result<T, HttpError> result, HttpError expected) {
     return match result { Result::Ok(_) => false, Result::Error(value) => match value {
         HttpError::InvalidHeader => match expected { HttpError::InvalidHeader => true, _ => false, },
+        HttpError::InvalidFraming => match expected { HttpError::InvalidFraming => true, _ => false, },
         HttpError::InvalidStartLine => match expected { HttpError::InvalidStartLine => true, _ => false, },
         HttpError::InvalidMethod => match expected { HttpError::InvalidMethod => true, _ => false, },
         HttpError::InvalidTarget => match expected { HttpError::InvalidTarget => true, _ => false, },
@@ -75,11 +74,10 @@ test http_host_ipv6_literals_follow_rfc3986_address_grammar {
     }
 }
 
-test http_field_values_allow_internal_htab_and_reject_other_controls {
+test http_field_values_allow_spaces_and_reject_controls_and_non_ascii {
     FieldCase[] fields = [
-        FieldCase { raw: "a" + Tab() + "b", stored: "a" + Tab() + "b" },
-        FieldCase { raw: Tab() + "a", stored: "a" },
-        FieldCase { raw: "a" + Tab(), stored: "a" },
+        FieldCase { raw: "a b", stored: "a b" },
+        FieldCase { raw: "  a  ", stored: "a" },
     ];
     mut i64 fieldIndex = 0_i64;
     while fieldIndex < Array.Len<FieldCase>(fields) {
@@ -91,15 +89,23 @@ test http_field_values_allow_internal_htab_and_reject_other_controls {
         };
         fieldIndex = fieldIndex + 1_i64;
     }
-    Assert.True(match Codec.ParseRequest(WireWithByte("GET / HTTP/1.1|Host: example.test|X-Test: a", 128_u8, "b||"), Types.DefaultLimits()) { Result::Ok(_) => true, Result::Error(_) => false, }, "obs-text field octets parse");
-    ByteCase[] cases = [
-        ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 0_u8, after: "b||", expected: HttpError::InvalidHeader() },
-        ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 127_u8, after: "b||", expected: HttpError::InvalidHeader() },
-    ];
+    mut ByteCase[] cases = Array.Empty<ByteCase>();
+    mut i64 control = 0_i64;
+    while control <= 31_i64 {
+        mut HttpError expected = HttpError::InvalidHeader();
+        if control == 10_i64 { expected = HttpError::InvalidFraming(); }
+        Array.Append<ByteCase>(cases, ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: u8(control), after: "b||", expected: expected });
+        control = control + 1_i64;
+    }
+    Array.Append<ByteCase>(cases, ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 127_u8, after: "b||", expected: HttpError::InvalidHeader() });
+    Array.Append<ByteCase>(cases, ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 128_u8, after: "b||", expected: HttpError::InvalidHeader() });
+    Array.Append<ByteCase>(cases, ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 255_u8, after: "b||", expected: HttpError::InvalidHeader() });
+    Array.Append<ByteCase>(cases, ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: ", value: 9_u8, after: "a||", expected: HttpError::InvalidHeader() });
+    Array.Append<ByteCase>(cases, ByteCase { before: "GET / HTTP/1.1|Host: example.test|X-Test: a", value: 9_u8, after: "||", expected: HttpError::InvalidHeader() });
     mut i64 index = 0_i64;
     while index < Array.Len<ByteCase>(cases) {
         ByteCase item = Array.Get<ByteCase>(cases, index);
-        Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "NUL and DEL field octets are rejected");
+        Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "control and non-ASCII field octets are rejected");
         index = index + 1_i64;
     }
 }

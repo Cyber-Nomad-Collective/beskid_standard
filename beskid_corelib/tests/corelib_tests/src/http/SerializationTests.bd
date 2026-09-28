@@ -19,6 +19,18 @@ u8[] ResponseWire(string text) {
     return output;
 }
 
+string WithByte(string before, u8 value, string after) {
+    mut u8[] output = Convert.StringToBytes(before);
+    Array.Append<u8>(output, value);
+    u8[] suffix = Convert.StringToBytes(after);
+    mut i64 index = 0_i64;
+    while index < Slice.Len(suffix) {
+        Array.Append<u8>(output, suffix[index]);
+        index = index + 1_i64;
+    }
+    return String.FromUtf8CodeUnits(output);
+}
+
 test http_request_serialization_emits_one_canonical_content_length {
     mut Header[] headers = Array.Empty<Header>();
     Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
@@ -42,6 +54,29 @@ test http_serializer_rejects_caller_supplied_framing_header {
     Request request = Request { method: "GET", target: "/", headers: headers, body: [] };
     Result<u8[], HttpError> result = Codec.SerializeRequest(request, Types.DefaultLimits());
     Assert.True(match result { Result::Error(HttpError::AmbiguousFraming) => true, _ => false, }, "caller cannot create a second framing source");
+}
+
+test http_serializer_rejects_header_control_and_non_ascii_octets {
+    mut string[] values = Array.Empty<string>();
+    mut i64 control = 0_i64;
+    while control <= 31_i64 {
+        Array.Append<string>(values, WithByte("a", u8(control), "b"));
+        control = control + 1_i64;
+    }
+    Array.Append<string>(values, WithByte("a", 127_u8, "b"));
+    Array.Append<string>(values, "a" + String.Latin1Rune(194_u8, 128_u8) + "b");
+    Array.Append<string>(values, "a" + String.Latin1Rune(195_u8, 191_u8) + "b");
+    Array.Append<string>(values, WithByte("", 9_u8, "a"));
+    Array.Append<string>(values, WithByte("a", 9_u8, ""));
+    mut i64 index = 0_i64;
+    while index < Array.Len<string>(values) {
+        mut Header[] headers = Array.Empty<Header>();
+        Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
+        Array.Append<Header>(headers, Header { name: "X-Test", value: Array.Get<string>(values, index) });
+        Request request = Request { method: "GET", target: "/", headers: headers, body: [] };
+        Assert.True(match Codec.SerializeRequest(request, Types.DefaultLimits()) { Result::Error(HttpError::InvalidHeader) => true, _ => false, }, "serializer rejects control and non-ASCII header value octets");
+        index = index + 1_i64;
+    }
 }
 
 test http_response_parser_requires_http11_status_and_exact_suffix {

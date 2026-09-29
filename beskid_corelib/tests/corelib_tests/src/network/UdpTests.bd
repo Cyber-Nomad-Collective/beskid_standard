@@ -188,3 +188,46 @@ test network_udp_expired_receive_deadline_times_out_and_socket_recovers {
     Fiber<unit> scenario = spawn UdpExpiredReceiveRecovers();
     Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "UDP timeout recovery scenario completes");
 }
+
+Result<unit, NetworkError> UdpExpiredSendKeepsPayloadResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    UdpSocket sender = UdpSocket.Bind(bindAddress)?;
+    UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
+    SocketAddress target = receiver.LocalAddress()?;
+    u8[] payload = [41_u8, 42_u8];
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Error(_) => Assert.Fail("zero duration creates a typed deadline"),
+        Result::Ok(expired) => match sender.SendTo(payload, target, Option.FromValue<Deadline>(expired)) {
+            Result::Error(NetworkError::TimedOut) => (),
+            _ => Assert.Fail("an expired UDP send returns TimedOut before submission"),
+        },
+    };
+    Assert.Equal(payload[0], 41_u8, "timed-out send leaves caller payload intact");
+    Assert.Equal(payload[1], 42_u8, "timed-out send retains the full caller payload");
+    match Deadline.After(Time.FromMilliseconds(100_i64)) {
+        Result::Error(_) => Assert.Fail("short duration creates a typed receive deadline"),
+        Result::Ok(receiveDeadline) => match receiver.ReceiveFrom(2_i64, Option.FromValue<Deadline>(receiveDeadline)) {
+            Result::Error(NetworkError::TimedOut) => (),
+            _ => Assert.Fail("an expired send does not deliver a datagram"),
+        },
+    };
+    sender.SendTo(payload, target, Option.Empty<Deadline>())?;
+    Datagram delivered = receiver.ReceiveFrom(2_i64, Option.Empty<Deadline>())?;
+    Assert.Equal(delivered.payload[0], 41_u8, "the caller can resend its payload after timeout");
+    Assert.Equal(delivered.payload[1], 42_u8, "the resent payload is complete");
+    sender.Close()?;
+    receiver.Close()?;
+    return Result::Ok(());
+}
+
+unit UdpExpiredSendKeepsPayload() {
+    match UdpExpiredSendKeepsPayloadResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("UDP send timeout scenario completes without another NetworkError"),
+    };
+}
+
+test network_udp_expired_send_keeps_unsent_payload_and_socket {
+    Fiber<unit> scenario = spawn UdpExpiredSendKeepsPayload();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "UDP send timeout scenario completes");
+}

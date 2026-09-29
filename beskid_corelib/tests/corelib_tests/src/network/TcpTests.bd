@@ -84,6 +84,8 @@ i64 CauseCode(TransferFailure cause) {
     return match cause {
         TransferFailure::Busy => -1_i64,
         TransferFailure::PeerReset => -2_i64,
+        TransferFailure::TimedOut => -6_i64,
+        TransferFailure::Closed => -7_i64,
         _ => -3_i64,
     };
 }
@@ -273,6 +275,141 @@ test network_tcp_pending_typed_read_deadline_clear_preserves_readiness {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending read deadline clear scenario completes"),
     };
+}
+
+Result<unit, NetworkError> CloseServerOnReleaseResult(TcpListener listener, Channel<i64> release) {
+    TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
+    match Channel<i64>.Receive(release) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server receives release after client read settles"),
+    };
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "server closes accepted stream after release");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit CloseServerOnRelease(TcpListener listener, Channel<i64> release) {
+    match CloseServerOnReleaseResult(listener, release) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("server closes after client read settles"),
+    };
+}
+
+Result<unit, NetworkError> PendingReadTimeoutResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Channel<i64> release = Channel<i64>.Create();
+    Fiber<unit> server = spawn (() => CloseServerOnRelease(listener, release));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
+    Fiber<i64> pending = spawn (() => ReadOne(client));
+    Concurrency.Yield();
+    Concurrency.Yield();
+    Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Ok(expired) => {
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(expired), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "expired typed policy reaches the pending read");
+        },
+        Result::Error(_) => Assert.Fail("zero duration creates a typed read deadline"),
+    };
+    i64 timedCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+    Assert.Equal(timedCode, -6_i64, "pending read reports exactly one TimedOut result");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after timeout");
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server is released after timeout");
+    Assert.True(match server.Join() { Result::Ok(_) => true, _ => false, }, "server exits after timeout");
+    Channel<i64>.Close(release);
+    return Result::Ok(());
+}
+
+unit PendingReadTimeout() {
+    match PendingReadTimeoutResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("pending read timeout scenario completes"),
+    };
+}
+
+test network_tcp_pending_read_expired_policy_reports_timed_out {
+    Fiber<unit> scenario = spawn PendingReadTimeout();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read timeout scenario joins");
+}
+
+Result<unit, NetworkError> PendingReadCloseResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Channel<i64> release = Channel<i64>.Create();
+    Fiber<unit> server = spawn (() => CloseServerOnRelease(listener, release));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
+    Fiber<i64> pending = spawn (() => ReadOne(client));
+    Concurrency.Yield();
+    Concurrency.Yield();
+    Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
+    match Deadline.After(Time.FromMilliseconds(30000_i64)) {
+        Result::Ok(future) => {
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(future), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "pending read has an armed typed deadline");
+        },
+        Result::Error(_) => Assert.Fail("future duration creates a typed read deadline"),
+    };
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes while read is pending");
+    i64 closedCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+    Assert.Equal(closedCode, -7_i64, "close wins the pending read before its deadline");
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server is released after close");
+    Assert.True(match server.Join() { Result::Ok(_) => true, _ => false, }, "server exits after close");
+    Channel<i64>.Close(release);
+    return Result::Ok(());
+}
+
+unit PendingReadClose() {
+    match PendingReadCloseResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("pending read close scenario completes"),
+    };
+}
+
+test network_tcp_pending_read_close_reports_closed_with_armed_deadline {
+    Fiber<unit> scenario = spawn PendingReadClose();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read close scenario joins");
+}
+
+Result<unit, NetworkError> PendingReadReadyWithDeadlineResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Channel<i64> release = Channel<i64>.Create();
+    Fiber<unit> server = spawn (() => ServeAfterClear(listener, release));
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
+    Fiber<i64> pending = spawn (() => ReadOne(client));
+    Concurrency.Yield();
+    Concurrency.Yield();
+    Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
+    match Deadline.After(Time.FromMilliseconds(30000_i64)) {
+        Result::Ok(future) => {
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(future), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "pending read has an armed typed deadline");
+        },
+        Result::Error(_) => Assert.Fail("future duration creates a typed read deadline"),
+    };
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server sends while deadline is armed");
+    i64 readyCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+    Assert.Equal(readyCode, 1_i64, "socket readiness wins the pending read before its deadline");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after readiness");
+    Assert.True(match server.Join() { Result::Ok(_) => true, _ => false, }, "server exits after readiness");
+    Channel<i64>.Close(release);
+    return Result::Ok(());
+}
+
+unit PendingReadReadyWithDeadline() {
+    match PendingReadReadyWithDeadlineResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("pending read readiness scenario completes"),
+    };
+}
+
+test network_tcp_pending_readiness_reports_byte_with_armed_deadline {
+    Fiber<unit> scenario = spawn PendingReadReadyWithDeadline();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read readiness scenario joins");
 }
 
 // Closing with unread received data makes the host abort the connection (RST).

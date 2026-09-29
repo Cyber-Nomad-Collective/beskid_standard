@@ -1,6 +1,8 @@
 use Concurrency;
 use Concurrency.Fiber;
 use Concurrency.Channel;
+use Concurrency.TryResult;
+use Concurrency.WaitGroup;
 use Core.Bytes.Slice;
 use Core.IO;
 use Core.IO.Stream;
@@ -410,6 +412,94 @@ unit PendingReadReadyWithDeadline() {
 test network_tcp_pending_readiness_reports_byte_with_armed_deadline {
     Fiber<unit> scenario = spawn PendingReadReadyWithDeadline();
     Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read readiness scenario joins");
+}
+
+unit PhysicalRaceWrite(TcpStream peer, WaitGroup prepared, WaitGroup start) {
+    WaitGroup.Done(prepared);
+    WaitGroup.Wait(start);
+    match peer.Write([31_u8], 0_i64, 1_i64) {
+        Result::Ok(count) => Assert.Equal(count, 1_i64, "peer writes one byte if it wins the physical race"),
+        Result::Error(IoError::WriteFailed(_)) => (),
+        _ => Assert.Fail("physical race writer returns a transfer outcome"),
+    };
+}
+
+unit PhysicalRaceClose(TcpStream client, WaitGroup prepared, WaitGroup start) {
+    WaitGroup.Done(prepared);
+    WaitGroup.Wait(start);
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "independent closer finishes the physical race");
+}
+
+unit PhysicalRaceWatchdog(WaitGroup start, Channel<i64> released) {
+    Assert.True(match Time.Sleep(Time.FromMilliseconds(200_i64)) { Result::Ok(_) => true, _ => false, }, "physical race watchdog sleep completes");
+    Assert.True(match Channel<i64>.Send(released, 1_i64) { Result::Ok(_) => true, _ => false, }, "physical race watchdog records release first");
+    WaitGroup.Done(start);
+}
+
+Result<unit, NetworkError> PhysicalReadRaceRound(bool releaseAfterDeadline) {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
+    TcpStream peer = listener.Accept(Option.Empty<Deadline>())?;
+    Fiber<i64> pending = spawn (() => ReadOne(client));
+    Concurrency.Yield();
+    Concurrency.Yield();
+    Assert.Equal(ReadOne(client), -1_i64, "the physical race starts with one pending read");
+
+    WaitGroup start = WaitGroup.Create();
+    WaitGroup.Add(start, 1_i64);
+    WaitGroup prepared = WaitGroup.Create();
+    WaitGroup.Add(prepared, 2_i64);
+    Fiber<unit> writer = spawn (() => PhysicalRaceWrite(peer, prepared, start));
+    Fiber<unit> closer = spawn (() => PhysicalRaceClose(client, prepared, start));
+    WaitGroup.Wait(prepared);
+    match Deadline.After(Time.FromMilliseconds(30_i64)) {
+        Result::Ok(deadline) => {
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(deadline), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "physical race arms a real pending-read timer");
+        },
+        Result::Error(_) => Assert.Fail("physical race creates a checked future deadline"),
+    };
+    mut i64 delay = 10_i64;
+    if releaseAfterDeadline { delay = 40_i64; }
+    Assert.True(match Time.Sleep(Time.FromMilliseconds(delay)) { Result::Ok(_) => true, _ => false, }, "physical race reaches its release point");
+    if releaseAfterDeadline {
+        Channel<i64> released = Channel<i64>.Create();
+        Fiber<unit> watchdog = spawn (() => PhysicalRaceWatchdog(start, released));
+        i64 outcome = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+        Assert.True(match Channel<i64>.TryReceive(released) { TryResult::WouldBlock => true, _ => false, }, "read completes before watchdog releases the producers");
+        Assert.Equal(outcome, -6_i64, "the real timer expires before either producer is released");
+        Assert.True(match watchdog.Join() { Result::Ok(_) => true, _ => false, }, "physical race watchdog releases the producers");
+        Assert.True(match Channel<i64>.TryReceive(released) { TryResult::Ok(value) => value == 1_i64, _ => false, }, "physical race watchdog marker is consumed once");
+        Channel<i64>.Close(released);
+    } else {
+        WaitGroup.Done(start);
+        i64 outcome = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+        Assert.True(outcome == 1_i64 || outcome == -6_i64 || outcome == -7_i64, "exactly one typed readiness, timeout, or close outcome wins");
+    }
+    Assert.True(match writer.Join() { Result::Ok(_) => true, _ => false, }, "independent readiness producer joins");
+    Assert.True(match closer.Join() { Result::Ok(_) => true, _ => false, }, "independent close producer joins");
+    Assert.True(match peer.Close() { Result::Ok(_) => true, _ => false, }, "peer closes after physical race");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client close remains idempotent after physical race");
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit PhysicalReadRace() {
+    mut i64 round = 0_i64;
+    while round < 7_i64 {
+        match PhysicalReadRaceRound(round == 6_i64) {
+            Result::Ok(_) => (),
+            Result::Error(_) => Assert.Fail("physical read race round closes all sockets"),
+        };
+        round = round + 1_i64;
+    }
+}
+
+test network_tcp_physical_readiness_close_deadline_has_one_typed_winner {
+    Fiber<unit> scenario = spawn PhysicalReadRace();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "bounded physical read race joins");
 }
 
 // Closing with unread received data makes the host abort the connection (RST).

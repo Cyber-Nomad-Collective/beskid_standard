@@ -5,6 +5,7 @@ use Core.IO;
 use Core.IO.TransferFailure;
 use Core.Results;
 use Core.Optional.Option;
+use Core.Time;
 use Core.Time.Deadline;
 use Core.String;
 use Http.Client;
@@ -240,6 +241,56 @@ unit MissingHost() {
 
 test http_exchange_missing_host_is_answered_400 {
     Fiber<unit> scenario = spawn MissingHost();
+    Scenario(scenario);
+}
+
+// The client deliberately never sends the declared body. An incorrect receive
+// path waits for that body and hits the bounded read deadline instead of
+// reporting the duplicate Host from the complete request head.
+Result<unit, HttpError> DuplicateHostAnswerResult(HttpServer server) {
+    TcpStream accepted = server.Accept()?;
+    match Deadline.After(Time.FromMilliseconds(500_i64)) {
+        Result::Error(_) => Assert.Fail("read deadline is created"),
+        Result::Ok(deadline) => {
+            NetworkTypes.TransferDeadlines policy = NetworkTypes.TransferDeadlines { read: Option.FromValue<Deadline>(deadline), write: Option.Empty<Deadline>() };
+            Assert.True(match accepted.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "server arms bounded read");
+        },
+    };
+    Result<Request, HttpError> received = server.Receive(accepted, Types.DefaultLimits());
+    bool invalidHost = match received { Result::Error(HttpError::InvalidHost) => true, _ => false, };
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "accepted stream closes");
+    server.Close()?;
+    Assert.True(invalidHost, "duplicate Host is rejected without waiting for the declared body");
+    return Result::Ok(());
+}
+
+unit DuplicateHostAnswer(HttpServer server) {
+    match DuplicateHostAnswerResult(server) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("duplicate-Host server completes"),
+    };
+}
+
+Result<unit, HttpError> DuplicateHostBeforeBodyResult() {
+    HttpServer server = Server.Bind(Loopback(), 8_i64)?;
+    SocketAddress address = server.LocalAddress()?;
+    Fiber<unit> serving = spawn (() => DuplicateHostAnswer(server));
+    TcpStream stream = ConnectHttp(address)?;
+    Assert.True(WriteRaw(stream, "POST / HTTP/1.1|Host: a|Host: b|Content-Length: 1000||"), "client sends only a duplicate-Host head");
+    JoinServer(serving);
+    Assert.True(match stream.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes");
+    return Result::Ok(());
+}
+
+unit DuplicateHostBeforeBody() {
+    match DuplicateHostBeforeBodyResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("duplicate-Host scenario completes"),
+    };
+}
+
+test http_exchange_duplicate_host_rejected_before_declared_body {
+    Fiber<unit> scenario = spawn DuplicateHostBeforeBody();
     Scenario(scenario);
 }
 

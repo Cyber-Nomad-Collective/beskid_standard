@@ -8,6 +8,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Cover duplicate HTTP `Host` rejection at the server transport boundary while
+  the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent
   opposite-direction send/receive with a channel rendezvous.
 - Add `Core.Time.Sleep(Duration)` with four closed `TimerError` outcomes,

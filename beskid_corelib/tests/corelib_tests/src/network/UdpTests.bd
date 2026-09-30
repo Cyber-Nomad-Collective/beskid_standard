@@ -8,7 +8,73 @@ use Network.Types;
 use Network.Errors;
 use Network.Udp.UdpSocket;
 use Core.Collections.List;
+use Concurrency.Channel;
 use Testing.Assert;
+
+unit PendingUdpReceive(UdpSocket receiver, Channel<i64> ready) {
+    Assert.True(match Channel<i64>.Send(ready, 1_i64) { Result::Ok(_) => true, _ => false, }, "receiver announces immediately before parking");
+    Assert.True(match receiver.ReceiveFrom(1_i64, Option.Empty<Deadline>()) {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "opposite-direction send wakes the pending receive");
+}
+
+Result<unit, NetworkError> UdpContentionResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    UdpSocket sender = UdpSocket.Bind(bindAddress)?;
+    UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
+    SocketAddress target = receiver.LocalAddress()?;
+    Channel<i64> ready = Channel<i64>.Create();
+    Fiber<unit> pending = spawn (() => PendingUdpReceive(receiver, ready));
+    match Channel<i64>.Receive(ready) {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("pending UDP receive announces readiness"),
+    };
+
+    // An expired deadline bounds an incorrectly admitted second wait without
+    // timing or sleeping: admission must reject it as Busy before timer setup.
+    bool sameDirectionBusy = match Deadline.After(Time.FromMilliseconds(0_i64)) {
+        Result::Error(_) => false,
+        Result::Ok(expired) => match receiver.ReceiveFrom(1_i64, Option.FromValue<Deadline>(expired)) {
+            Result::Error(NetworkError::Busy) => true,
+            _ => false,
+        },
+    };
+
+    u8[] payload = [81_u8, 82_u8];
+    bool oppositeDirectionSendSucceeded = match sender.SendTo(payload, target, Option.Empty<Deadline>()) {
+        Result::Ok(_) => true,
+        _ => false,
+    };
+    bool pendingReceiveSucceeded = match pending.Join() {
+        Result::Ok(_) => true,
+        _ => false,
+    };
+    Assert.Equal(payload[0], 81_u8, "send leaves the caller payload owned by its caller");
+    Assert.Equal(payload[1], 82_u8, "send retains the complete caller payload");
+    Channel<i64>.Close(ready);
+    sender.Close()?;
+    receiver.Close()?;
+    Assert.True(sameDirectionBusy, "a second receive is rejected as Busy while the first is pending");
+    Assert.True(oppositeDirectionSendSucceeded, "send proceeds while receive is pending");
+    Assert.True(pendingReceiveSucceeded, "the original pending receive completes exactly once");
+    return Result::Ok(());
+}
+
+unit UdpContention() {
+    match UdpContentionResult() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("UDP contention scenario completes without a NetworkError"),
+    };
+}
+
+test network_udp_same_direction_busy_and_opposite_direction_send_receive {
+    Fiber<unit> scenario = spawn UdpContention();
+    match scenario.Join() {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("UDP contention scenario joins"),
+    };
+}
 
 Result<unit, NetworkError> UdpBoundariesResult() {
     SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };

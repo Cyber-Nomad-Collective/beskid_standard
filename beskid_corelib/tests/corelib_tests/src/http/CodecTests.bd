@@ -97,7 +97,7 @@ i64 RequireEnd(Result<i64, HttpError> value) {
 test http_message_end_waits_for_head_and_reports_declared_total {
     Limits limits = Types.DefaultLimits();
     Assert.Equal(RequireEnd(Codec.MessageEnd(Wire("POST / HTTP/1.1|Content-Len"), limits, MessageRole::Request())), 0_i64, "incomplete head needs more bytes");
-    u8[] partial = Wire("POST / HTTP/1.1|Content-Length: 10||abc");
+    u8[] partial = Wire("POST / HTTP/1.1|Host: a|Content-Length: 10||abc");
     Assert.Equal(RequireEnd(Codec.MessageEnd(partial, limits, MessageRole::Request())), Slice.Len(partial) + 7_i64, "declared total is known before the body arrives");
     u8[] bare = Wire("GET / HTTP/1.1|Host: a||");
     Assert.Equal(RequireEnd(Codec.MessageEnd(bare, limits, MessageRole::Request())), Slice.Len(bare), "an unframed message ends at its head");
@@ -105,10 +105,10 @@ test http_message_end_waits_for_head_and_reports_declared_total {
 
 test http_message_end_walks_chunks_without_copying {
     Limits limits = Types.DefaultLimits();
-    Assert.Equal(RequireEnd(Codec.MessageEnd(Wire("POST / HTTP/1.1|Transfer-Encoding: chunked||3|ab"), limits, MessageRole::Request())), 0_i64, "split chunk data needs more bytes");
-    u8[] done = Wire("POST / HTTP/1.1|Transfer-Encoding: chunked||3|abc|0||");
+    Assert.Equal(RequireEnd(Codec.MessageEnd(Wire("POST / HTTP/1.1|Host: a|Transfer-Encoding: chunked||3|ab"), limits, MessageRole::Request())), 0_i64, "split chunk data needs more bytes");
+    u8[] done = Wire("POST / HTTP/1.1|Host: a|Transfer-Encoding: chunked||3|abc|0||");
     Assert.Equal(RequireEnd(Codec.MessageEnd(done, limits, MessageRole::Request())), Slice.Len(done), "terminal chunk ends the message");
-    u8[] bad = Wire("POST / HTTP/1.1|Transfer-Encoding: chunked||3|abcX|0||");
+    u8[] bad = Wire("POST / HTTP/1.1|Host: a|Transfer-Encoding: chunked||3|abcX|0||");
     Assert.True(IsError<i64>(Codec.MessageEnd(bad, limits, MessageRole::Request()), HttpError::InvalidChunk()), "missing chunk CRLF is rejected");
 }
 
@@ -134,6 +134,14 @@ test http_request_requires_exactly_one_host {
     Assert.True(match Codec.ParseRequest(Wire("GET / HTTP/1.1|host: [::1]:65535||"), limits) { Result::Ok(_) => true, _ => false, }, "bracketed IPv6 literal with port is accepted");
     Assert.True(match Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: a%2Db||"), limits) { Result::Ok(_) => true, _ => false, }, "percent-encoded octets are accepted");
     Assert.True(match Codec.ParseRequest(Wire("GET / HTTP/1.1|Host:||"), limits) { Result::Ok(_) => true, _ => false, }, "an empty Host value is accepted");
+}
+
+test http_request_rejects_invalid_host_before_body_framing {
+    Limits limits = Types.DefaultLimits();
+    u8[] withheldBody = Wire("POST / HTTP/1.1|Host: a|Host: b|Content-Length: 10000||");
+    Assert.True(IsError<i64>(Codec.MessageEnd(withheldBody, limits, MessageRole::Request()), HttpError::InvalidHost()), "duplicate Host is rejected before waiting for a declared body");
+    u8[] badLength = Wire("POST / HTTP/1.1|Host: a|Host: b|Content-Length: invalid||");
+    Assert.True(IsError<i64>(Codec.MessageEnd(badLength, limits, MessageRole::Request()), HttpError::InvalidHost()), "Host validation precedes framing diagnostics");
 }
 
 test http_response_head_role_ignores_content_length {

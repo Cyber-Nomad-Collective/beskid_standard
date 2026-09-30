@@ -57,6 +57,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Validate a request's `Host` field as soon as its header completes, before
+  waiting for or interpreting the body framing.
 - Reject HTTP header control and non-ASCII octets during parsing and serialization, including HTAB before OWS trimming.
 - Remove the lossy public `AppendUtf8Rune` APIs from both `Core.String.Utf8`
   and the `Core.String` facade. Validated byte buffers now materialize only

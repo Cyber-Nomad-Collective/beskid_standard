@@ -5,15 +5,10 @@
 // packages/network/src/Network/Tcp/TcpStream.bd), so it is private to that
 // type/unit and reading it from here must be rejected.
 //
-// The rejection only fires once this code is actually reached for lowering:
-// the private-field-across-units check lives in the ISLE/codegen facts layer
-// (crates/beskid_queries/src/semantic_contract/layouts/field_access.rs,
-// `nominal_field_projection.visibility`), not the front-end HIR type checker.
-// `beskid_cli analyze` alone type-checks `Escape`'s body without lowering it
-// and reports "No diagnostics." -- confirmed empirically, and is the exact
-// bug this fixture used to hide. `beskid_cli test --target RawHandle` is the
-// correct harness command, because a `test` that actually calls `Escape` on
-// a real `TcpStream` value forces that lowering.
+// The compiler must reject this field read in front-end member legality,
+// before ISLE lowering. An AOT build of the RawHandle target is the release
+// regression: it must report an inaccessible field rather than an internal
+// lowering error or a successful descriptor escape.
 //
 // A raw `word(0)` handle cannot be fabricated here to avoid live socket I/O:
 // the `word` primitive constructor is itself only recognized inside the
@@ -22,23 +17,6 @@
 // hatch. So this fixture obtains its `TcpStream` the only legitimate way, by
 // binding and connecting on loopback.
 //
-// KNOWN SEPARATE GAP (not this requirement, not fixable from this fixture):
-// binding a `TcpListener` or connecting a `TcpStream` in *this* standalone
-// compile-fail project -- with no call to `Accept` anywhere in scope -- by
-// itself fails the same way this file does, with the identical
-// `MissingRuleOrFact` at `Internal.bd#...:114:26-114:67`
-// (`Internal.Accept`'s `__network_accept` call). That reproduces with
-// `TcpListener.Bind` alone and with no reference to `Escape`/`handle` at
-// all, so the failure below is currently overdetermined by two independent
-// causes: the correct field-privacy rejection this fixture targets, and an
-// unrelated whole-unit ISLE lowering gap in
-// `packages/network/src/Network/Internal/Resources.bd` (all four
-// `BindTcpListener`/`ConnectTcpStream`/`BindUdpSocket`/`AcceptTcpStream`
-// functions live in one file, and using any one of them appears to force
-// lowering of all four, tripping on `AcceptTcpStream`). That gap blocks
-// every TCP/UDP-touching test in this project, not just this one, and needs
-// a `crates/beskid_queries`/`crates/beskid_isle` fix outside this fixture's
-// ownership -- flagged separately, not silently worked around here.
 use Core.Results;
 use Core.Optional.Option;
 use Core.Time.Deadline;

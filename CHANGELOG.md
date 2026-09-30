@@ -13,10 +13,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   fiber-only admission, sticky cancellation, and the unspecified clock epoch;
   cover the public result shape in the maintained Time frontend tests.
 - Add checked byte-reader and byte-writer contracts and fixed-buffer cursors.
-- Stage `Core.IO` Reader, Writer, Closer, Stream and IoError contracts, transfer
-  loops and explicit DisposeError cleanup conversion. Execution remains blocked
-  by compiler static contract-parameter specialization; close/idempotence and
-  scoped-conversion integration are not yet verified (partial F6 checkpoint).
+- Add `Core.IO` Reader, Writer, Closer, Stream and IoError contracts, transfer
+  loops and explicit DisposeError cleanup conversion. Focused JIT, static AOT,
+  and native-kit execution verifies reset-cause and orderly-EOF behavior.
 - Add strict HTTP ASCII decoding with typed encoding failures.
 
 - Publish the foundation `Core.Disposable` contract with typed `DisposeError`

@@ -1,0 +1,235 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.Aes;
+use Crypto.ConstantTime;
+use Crypto.Errors;
+
+/// AES-GCM AEAD (NIST SP 800-38D) with a 96-bit IV and a 16-byte tag.
+/// GHASH uses Shoup's 4-bit tables (as in mbed TLS) on (high, low) i64 halves.
+/// Constant-time limitation: the GHASH table and the AES T-tables are indexed by
+/// secret-dependent nibbles/bytes; see `Crypto.Aes`.
+pub type AesGcmKey {
+    AesKey aes,
+    i64[] hl,
+    i64[] hh,
+    i64[] last4,
+}
+
+pub i64 TagLength() { return 16_i64; }
+pub i64 NonceLength() { return 12_i64; }
+
+i64 Xor(i64 a, i64 b) { return (a | b) - (a & b); }
+
+i64 Be64(u8[] data, i64 offset) {
+    mut i64 v = 0_i64;
+    mut i64 i = 0_i64;
+    while i < 8_i64 { v = (v << 8_i64) | i64(data[offset + i]); i = i + 1_i64; }
+    return v;
+}
+
+unit PutBe64(u8[] out, i64 offset, i64 value) {
+    mut i64 i = 0_i64;
+    while i < 8_i64 { out[offset + i] = u8((value >> ((7_i64 - i) * 8_i64)) & 0xFF_i64); i = i + 1_i64; }
+    return;
+}
+
+/// Expands the AES key (16, 24, or 32 bytes) and precomputes the GHASH tables for H = E(K, 0^128).
+pub Result<AesGcmKey, CryptoError> New(u8[] key) {
+    return match Aes.NewKey(key) {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(aes) => {
+            u8[] h = Slice.New(16_i64);
+            Aes.EncryptBlock(aes, h, 0_i64, h, 0_i64);
+            mut i64 vh = Be64(h, 0_i64);
+            mut i64 vl = Be64(h, 8_i64);
+            i64[] hl = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+            i64[] hh = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+            hl[8] = vl;
+            hh[8] = vh;
+            mut i64 i = 4_i64;
+            while i > 0_i64 {
+                i64 t = (vl & 1_i64) * 0xe1000000_i64;
+                vl = (vh << 63_i64) | (vl >> 1_i64);
+                vh = Xor(vh >> 1_i64, t << 32_i64);
+                hl[i] = vl;
+                hh[i] = vh;
+                i = i / 2_i64;
+            }
+            i = 2_i64;
+            while i <= 8_i64 {
+                mut i64 j = 1_i64;
+                while j < i {
+                    hh[i + j] = Xor(hh[i], hh[j]);
+                    hl[i + j] = Xor(hl[i], hl[j]);
+                    j = j + 1_i64;
+                }
+                i = i * 2_i64;
+            }
+            return Result::Ok(AesGcmKey {
+                aes: aes, hl: hl, hh: hh,
+                last4: [0x0000_i64, 0x1c20_i64, 0x3840_i64, 0x2460_i64, 0x7080_i64, 0x6ca0_i64, 0x48c0_i64, 0x54e0_i64,
+                        0xe100_i64, 0xfd20_i64, 0xd940_i64, 0xc560_i64, 0x9180_i64, 0x8da0_i64, 0xa9c0_i64, 0xb5e0_i64],
+            });
+        },
+    };
+}
+
+/// y = y * H in GF(2^128); `y` is a 16-byte big-endian block updated in place.
+unit Multiply(AesGcmKey key, u8[] y) {
+    i64[] hl = key.hl;
+    i64[] hh = key.hh;
+    i64[] last4 = key.last4;
+    mut i64 lo = i64(y[15] & 0x0F_u8);
+    mut i64 zh = hh[lo];
+    mut i64 zl = hl[lo];
+    mut i64 i = 15_i64;
+    while i >= 0_i64 {
+        lo = i64(y[i] & 0x0F_u8);
+        i64 hi = i64(y[i] >> 4_u8);
+        if i != 15_i64 {
+            i64 rem = zl & 0x0F_i64;
+            zl = (zh << 60_i64) | (zl >> 4_i64);
+            zh = Xor(zh >> 4_i64, last4[rem] << 48_i64);
+            zh = Xor(zh, hh[lo]);
+            zl = Xor(zl, hl[lo]);
+        }
+        i64 rem2 = zl & 0x0F_i64;
+        zl = (zh << 60_i64) | (zl >> 4_i64);
+        zh = Xor(zh >> 4_i64, last4[rem2] << 48_i64);
+        zh = Xor(zh, hh[hi]);
+        zl = Xor(zl, hl[hi]);
+        i = i - 1_i64;
+    }
+    PutBe64(y, 0_i64, zh);
+    PutBe64(y, 8_i64, zl);
+    return;
+}
+
+/// Absorbs `count` bytes zero-padded to whole blocks into the GHASH accumulator `y`.
+unit Absorb(AesGcmKey key, u8[] y, u8[] data, i64 offset, i64 count) {
+    mut i64 done = 0_i64;
+    while done < count {
+        mut i64 take = 16_i64;
+        if count - done < take { take = count - done; }
+        mut i64 j = 0_i64;
+        while j < take {
+            u8 a = y[j];
+            u8 b = data[offset + done + j];
+            y[j] = (a | b) - (a & b);
+            j = j + 1_i64;
+        }
+        Multiply(key, y);
+        done = done + take;
+    }
+    return;
+}
+
+u8[] ComputeTag(AesGcmKey key, u8[] j0, u8[] aad, u8[] ciphertext, i64 offset, i64 count) {
+    u8[] y = Slice.New(16_i64);
+    Absorb(key, y, aad, 0_i64, Slice.Len(aad));
+    Absorb(key, y, ciphertext, offset, count);
+    u8[] lengths = Slice.New(16_i64);
+    PutBe64(lengths, 0_i64, Slice.Len(aad) * 8_i64);
+    PutBe64(lengths, 8_i64, count * 8_i64);
+    Absorb(key, y, lengths, 0_i64, 16_i64);
+    u8[] mask = Slice.New(16_i64);
+    Aes.EncryptBlock(key.aes, j0, 0_i64, mask, 0_i64);
+    mut i64 i = 0_i64;
+    while i < 16_i64 { u8 a = y[i]; u8 b = mask[i]; y[i] = (a | b) - (a & b); i = i + 1_i64; }
+    return y;
+}
+
+/// GCTR from counter block inc32(J0): XORs `count` bytes of `input` into `output`.
+unit Ctr(AesGcmKey key, u8[] j0, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
+    u8[] counter = Slice.SubSlice(j0, 0_i64, 16_i64);
+    u8[] stream = Slice.New(16_i64);
+    mut i64 done = 0_i64;
+    while done < count {
+        // inc32: increment the low 32 bits big-endian, modulo 2^32.
+        mut i64 k = 15_i64;
+        mut bool carry = true;
+        while carry && k >= 12_i64 {
+            counter[k] = counter[k] + 1_u8;
+            carry = counter[k] == 0_u8;
+            k = k - 1_i64;
+        }
+        Aes.EncryptBlock(key.aes, counter, 0_i64, stream, 0_i64);
+        mut i64 take = 16_i64;
+        if count - done < take { take = count - done; }
+        mut i64 j = 0_i64;
+        while j < take {
+            u8 a = input[inputOffset + done + j];
+            u8 b = stream[j];
+            output[outputOffset + done + j] = (a | b) - (a & b);
+            j = j + 1_i64;
+        }
+        done = done + take;
+    }
+    return;
+}
+
+u8[] InitialCounter(u8[] nonce) {
+    u8[] j0 = Slice.New(16_i64);
+    Slice.Copy(j0, 0_i64, nonce, 0_i64, 12_i64);
+    j0[15] = 1_u8;
+    return j0;
+}
+
+/// Maximum plaintext per invocation: 2^32 - 2 blocks (SP 800-38D section 5.2.1.1).
+i64 MaxPlaintext() { return 68719476704_i64; }
+
+/// Encrypts `count` bytes of `input` at `inputOffset` and writes ciphertext || tag
+/// (`count` + 16 bytes) to `output` at `outputOffset`; in-place use is allowed.
+/// Prefer this with a reused record buffer (see `ChaCha20Poly1305.SealInto`).
+pub Result<unit, CryptoError> SealInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
+    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
+    if count > MaxPlaintext() || !Slice.IsValidRange(Slice.Len(input), inputOffset, count) { return Result::Error(CryptoError::InvalidLength()); }
+    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count + 16_i64) { return Result::Error(CryptoError::InvalidLength()); }
+    u8[] j0 = InitialCounter(nonce);
+    Ctr(key, j0, input, inputOffset, count, output, outputOffset);
+    u8[] tag = ComputeTag(key, j0, aad, output, outputOffset, count);
+    Slice.Copy(output, outputOffset + count, tag, 0_i64, 16_i64);
+    return Result::Ok(());
+}
+
+/// Verifies ciphertext || tag (`sealedCount` bytes at `sealedOffset`) in constant time, then
+/// writes the plaintext to `output` at `outputOffset` and returns its length.
+/// A wrong tag returns AuthenticationFailed and writes nothing.
+pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset) {
+    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
+    if !Slice.IsValidRange(Slice.Len(sealed), sealedOffset, sealedCount) { return Result::Error(CryptoError::InvalidLength()); }
+    if sealedCount < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
+    i64 count = sealedCount - 16_i64;
+    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count) { return Result::Error(CryptoError::InvalidLength()); }
+    u8[] j0 = InitialCounter(nonce);
+    u8[] expected = ComputeTag(key, j0, aad, sealed, sealedOffset, count);
+    if !ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64) {
+        return Result::Error(CryptoError::AuthenticationFailed());
+    }
+    Ctr(key, j0, sealed, sealedOffset, count, output, outputOffset);
+    return Result::Ok(count);
+}
+
+/// Encrypts `plaintext` and returns ciphertext || tag. The nonce must be 12 bytes and unique per key.
+pub Result<u8[], CryptoError> Seal(AesGcmKey key, u8[] nonce, u8[] aad, u8[] plaintext) {
+    i64 count = Slice.Len(plaintext);
+    if count > MaxPlaintext() { return Result::Error(CryptoError::InvalidLength()); }
+    u8[] out = Slice.New(count + 16_i64);
+    return match SealInto(key, nonce, aad, plaintext, 0_i64, count, out, 0_i64) {
+        Result::Ok(_) => Result::Ok(out),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+/// Verifies the tag of ciphertext || tag in constant time, then decrypts.
+/// A wrong tag returns AuthenticationFailed and no plaintext.
+pub Result<u8[], CryptoError> Open(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed) {
+    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
+    i64 total = Slice.Len(sealed);
+    if total < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
+    u8[] out = Slice.New(total - 16_i64);
+    return match OpenInto(key, nonce, aad, sealed, 0_i64, total, out, 0_i64) {
+        Result::Ok(_) => Result::Ok(out),
+        Result::Error(error) => Result::Error(error),
+    };
+}

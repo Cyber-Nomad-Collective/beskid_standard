@@ -103,6 +103,21 @@ target do not run).
   collide with corelib ones (`Errors`, `Types`, `Codec`, ...); prefix them.
 - See `protocols/COMPILER-GAPS.md` before writing closures, nested generic
   matches, or matches on struct fields of `Option` type.
+- A contract value (e.g. `Core.IO.Stream`) cannot be a struct field (ICE), and a
+  method forwarding `this` plus a contract argument fails. Pass the transport to
+  module functions on every call (`Codec.Buffered.ReadLine(b, source, max)`), or
+  hold a concrete `TcpStream`, or an enum of concrete transports.
+- `this.Other()` inside a method is an ICE: write module-level functions and thin
+  wrapper methods. Field access on a call result (`F(x).f`) and `match` on a
+  nested field path are ICEs: bind a local first.
+- Narrowing `u8(i64)`/`u32(i64)` does not wrap: mask first. No `\n` escape.
+  `Core.Output.Write` traps inside `beskid test`.
+- Each test costs 1-2 s of JIT; a target has a 120 s budget
+  (`--target-timeout 600` on a loaded host). Keep targets under ~40 tests.
+- Available uri/codec: `Uri.Parse`, `Uri.Resolve`, `Uri.Scheme.AuthorityOf`,
+  `HostHeader`; `Codec.Cursor`, `Codec.Builder` (length back-patch), `Codec.Be`,
+  `Codec.Varint` (QUIC), `Codec.Vec` (TLS vectors), `Codec.Buffered`, `Codec.Hex`.
+- Available http2: HPACK (`Http2.Hpack*`).
 - Available connect: `Connect.ConnectHost(host, port, policy)` and
   `Connect.ConnectAddresses(addresses, policy)` return `TcpStream`.
 - Available crypto (`protocols/crypto`): SHA-256/384/512, HMAC, HKDF with

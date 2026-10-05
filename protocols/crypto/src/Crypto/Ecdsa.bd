@@ -1,0 +1,281 @@
+/// ECDSA over P-256 (FIPS 186-5 section 6.4, SEC 1 section 4.1) with RFC 6979 deterministic nonces.
+///
+/// Callers pass the message digest; this module does no hashing. A digest longer than 32
+/// bytes is truncated to its leftmost 256 bits (bits2int). Signatures are either raw
+/// `r || s` (64 bytes) or the DER `Ecdsa-Sig-Value` SEQUENCE used by TLS and X.509.
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.BigNat;
+use Crypto.ModArith;
+use Crypto.P256;
+use Crypto.PkErrors;
+
+/// HMAC with the hash that RFC 6979 uses for nonce generation (normally the message hash).
+/// Implementations must return the full MAC output, which must be at least 32 bytes.
+pub contract NonceMac {
+    u8[] Mac(u8[] key, u8[] data);
+}
+
+/// Length of a raw `r || s` signature.
+pub i64 RawSignatureLength() { return 64_i64; }
+
+/// bits2int (RFC 6979 section 2.3.2) for qlen = 256: the leftmost 256 bits of `bytes`.
+u32[] BitsToInt(u8[] bytes) {
+    i64 len = Slice.Len(bytes);
+    mut i64 take = len;
+    if take > 32_i64 { take = 32_i64; }
+    Result<u32[], PkError> value = BigNat.FromBytesFixed(Slice.SubSlice(bytes, 0_i64, take), 8_i64);
+    return match value { Result::Ok(v) => v, Result::Error(_) => BigNat.Zeros(8_i64), };
+}
+
+/// `x mod n` for `x < 2^256 < 2n`: one branch-free conditional subtraction.
+u32[] ReduceOnce(u32[] x) {
+    u32[] r = BigNat.Copy(x);
+    u32[] d = BigNat.Copy(x);
+    i64 borrow = BigNat.SubInPlace(d, P256.Order());
+    ModArith.CondAssign(r, d, 1_u32 - u32(borrow));
+    return r;
+}
+
+/// Scalar workspace slot offsets (n = 8).
+i64 S(i64 index) { return ModArith.WSlot(8_i64, index); }
+
+/// `a^-1 mod n` in plain form for plain `a` in [1, n-1]. Fermat; constant-time in `a`.
+u32[] InverseModN(Curve c, u32[] a) {
+    u32[] s = c.s;
+    ModArith.WLoad(s, 8_i64, S(0_i64), a);
+    ModArith.WToMont(s, 8_i64, S(0_i64), S(0_i64));
+    ModArith.WPowPublic(s, 8_i64, S(1_i64), S(0_i64), S(2_i64), P256.InverseExponent(P256.Order()));
+    ModArith.WFromMont(s, 8_i64, S(1_i64), S(1_i64));
+    return ModArith.WStore(s, 8_i64, S(1_i64));
+}
+
+/// Plain `a * b mod n` for plain `a`, `b` below n.
+u32[] MulModN(Curve c, u32[] a, u32[] b) {
+    u32[] s = c.s;
+    ModArith.WLoad(s, 8_i64, S(0_i64), a);
+    ModArith.WLoad(s, 8_i64, S(1_i64), b);
+    ModArith.WToMont(s, 8_i64, S(1_i64), S(1_i64));
+    ModArith.WMul(s, 8_i64, S(2_i64), S(0_i64), S(1_i64));
+    return ModArith.WStore(s, 8_i64, S(2_i64));
+}
+
+/// Plain `a + b mod n` for plain `a`, `b` below n.
+u32[] AddModN(Curve c, u32[] a, u32[] b) {
+    u32[] s = c.s;
+    ModArith.WLoad(s, 8_i64, S(0_i64), a);
+    ModArith.WLoad(s, 8_i64, S(1_i64), b);
+    ModArith.WAdd(s, 8_i64, S(2_i64), S(0_i64), S(1_i64));
+    return ModArith.WStore(s, 8_i64, S(2_i64));
+}
+
+bool InScalarRange(u32[] v) { return !BigNat.IsZero(v) && BigNat.Compare(v, P256.Order()) < 0_i64; }
+
+/// Verifies a raw `r || s` signature over `digest` with an uncompressed public key.
+pub Result<unit, PkError> Verify(u8[] publicKey, u8[] digest, u8[] signature) {
+    if Slice.Len(signature) != 64_i64 { return Result::Error(PkError::MalformedSignature()); }
+    Result<u32[], PkError> r = BigNat.FromBytesFixed(Slice.SubSlice(signature, 0_i64, 32_i64), 8_i64);
+    Result<u32[], PkError> s = BigNat.FromBytesFixed(Slice.SubSlice(signature, 32_i64, 32_i64), 8_i64);
+    return match r {
+        Result::Error(_) => Result::Error(PkError::MalformedSignature()),
+        Result::Ok(rv) => match s {
+            Result::Error(_) => Result::Error(PkError::MalformedSignature()),
+            Result::Ok(sv) => VerifyScalars(publicKey, digest, rv, sv),
+        },
+    };
+}
+
+/// Verifies a DER `SEQUENCE { INTEGER r, INTEGER s }` signature (strict DER).
+pub Result<unit, PkError> VerifyDer(u8[] publicKey, u8[] digest, u8[] der) {
+    Result<u8[], PkError> raw = DerToRaw(der);
+    return match raw {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(sig) => Verify(publicKey, digest, sig),
+    };
+}
+
+Result<unit, PkError> VerifyScalars(u8[] publicKey, u8[] digest, u32[] r, u32[] s) {
+    if !InScalarRange(r) || !InScalarRange(s) { return Result::Error(PkError::MalformedSignature()); }
+    if Slice.Len(digest) == 0_i64 { return Result::Error(PkError::InvalidDigest()); }
+    Result<Curve, PkError> curve = P256.NewCurve();
+    return match curve {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(c) => {
+            Result<unit, PkError> decoded = P256.Decode(c, P256.RegA(), publicKey);
+            return match decoded {
+                Result::Error(error) => Result::Error(error),
+                Result::Ok(_) => {
+                    u32[] z = ReduceOnce(BitsToInt(digest));
+                    u32[] w = InverseModN(c, s);
+                    u32[] u1 = MulModN(c, z, w);
+                    u32[] u2 = MulModN(c, r, w);
+                    P256.DoubleScalarMult(c, P256.RegB(), u1, P256.RegGenerator(), u2, P256.RegA());
+                    Result<Affine, PkError> affine = P256.ToAffine(c, P256.RegB());
+                    return match affine {
+                        Result::Error(_) => Result::Error(PkError::BadSignature()),
+                        Result::Ok(a) => {
+                            if BigNat.Compare(ReduceOnce(a.x), r) != 0_i64 { return Result::Error(PkError::BadSignature()); }
+                            return Result::Ok(());
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+/// Deterministic ECDSA signature (RFC 6979 section 3.2) as raw `r || s`.
+/// `privateKey` is 32 bytes in [1, n-1]; `mac` is HMAC with the hash that produced `digest`.
+pub Result<u8[], PkError> Sign(u8[] privateKey, u8[] digest, NonceMac mac) {
+    if Slice.Len(digest) == 0_i64 { return Result::Error(PkError::InvalidDigest()); }
+    Result<u32[], PkError> scalar = P256.DecodeScalar(privateKey);
+    Result<Curve, PkError> curve = P256.NewCurve();
+    return match scalar {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(d) => match curve {
+            Result::Error(error) => Result::Error(error),
+            Result::Ok(c) => SignWith(c, d, digest, mac),
+        },
+    };
+}
+
+/// Deterministic ECDSA signature encoded as DER.
+pub Result<u8[], PkError> SignDer(u8[] privateKey, u8[] digest, NonceMac mac) {
+    Result<u8[], PkError> raw = Sign(privateKey, digest, mac);
+    return match raw {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(sig) => RawToDer(sig),
+    };
+}
+
+u8[] Concat(u8[] a, u8[] b) {
+    u8[] out = BigNat.ZeroBytes(Slice.Len(a) + Slice.Len(b));
+    Slice.Copy(out, 0_i64, a, 0_i64, Slice.Len(a));
+    Slice.Copy(out, Slice.Len(a), b, 0_i64, Slice.Len(b));
+    return out;
+}
+
+u8[] Scalar32(u32[] v) {
+    u8[] out = BigNat.ZeroBytes(32_i64);
+    BigNat.WriteBytes(v, out, 0_i64, 32_i64);
+    return out;
+}
+
+Result<u8[], PkError> SignWith(Curve c, u32[] d, u8[] digest, NonceMac mac) {
+    u32[] z = ReduceOnce(BitsToInt(digest));
+    u8[] x = Scalar32(d);
+    u8[] h = Scalar32(z);
+    u8[] probe = mac.Mac([u8(0)], [u8(0)]);
+    i64 hlen = Slice.Len(probe);
+    if hlen < 32_i64 { return Result::Error(PkError::SigningFailed()); }
+    mut u8[] v = Slice.Fill(BigNat.ZeroBytes(hlen), 0_i64, hlen, u8(1));
+    mut u8[] k = BigNat.ZeroBytes(hlen);
+    k = mac.Mac(k, Concat(Concat(Concat(v, [u8(0)]), x), h));
+    v = mac.Mac(k, v);
+    k = mac.Mac(k, Concat(Concat(Concat(v, [u8(1)]), x), h));
+    v = mac.Mac(k, v);
+    mut i64 attempt = 0_i64;
+    while attempt < 64_i64 {
+        // hlen >= 32, so one HMAC output covers qlen = 256 bits.
+        v = mac.Mac(k, v);
+        u32[] nonce = BitsToInt(v);
+        if InScalarRange(nonce) {
+            P256.ScalarMult(c, P256.RegB(), nonce, P256.RegGenerator());
+            Result<Affine, PkError> affine = P256.ToAffine(c, P256.RegB());
+            match affine {
+                Result::Error(_) => {},
+                Result::Ok(a) => {
+                    u32[] r = ReduceOnce(a.x);
+                    if !BigNat.IsZero(r) {
+                        u32[] sum = AddModN(c, z, MulModN(c, r, d));
+                        u32[] s = MulModN(c, InverseModN(c, nonce), sum);
+                        if !BigNat.IsZero(s) { return Result::Ok(Concat(Scalar32(r), Scalar32(s))); }
+                    }
+                },
+            };
+        }
+        k = mac.Mac(k, Concat(v, [u8(0)]));
+        v = mac.Mac(k, v);
+        attempt = attempt + 1_i64;
+    }
+    return Result::Error(PkError::SigningFailed());
+}
+
+/// Index of the first byte of the minimal unsigned encoding of a 32-byte big-endian value.
+i64 MinimalStart(u8[] raw, i64 offset) {
+    mut i64 start = offset;
+    while start < offset + 31_i64 && raw[start] == u8(0) { start = start + 1_i64; }
+    return start;
+}
+
+/// Writes one DER INTEGER for `raw[offset, offset+32)` at `out[at]`; returns the offset after it.
+i64 WriteDerInteger(u8[] out, i64 at, u8[] raw, i64 offset) {
+    i64 start = MinimalStart(raw, offset);
+    i64 len = offset + 32_i64 - start;
+    i64 pad = i64(raw[start] >> u8(7));
+    out[at] = u8(2);
+    out[at + 1_i64] = u8(len + pad);
+    Slice.Copy(out, at + 2_i64 + pad, raw, start, len);
+    return at + 2_i64 + pad + len;
+}
+
+i64 DerIntegerLength(u8[] raw, i64 offset) {
+    i64 start = MinimalStart(raw, offset);
+    return 2_i64 + i64(raw[start] >> u8(7)) + offset + 32_i64 - start;
+}
+
+/// Raw `r || s` (64 bytes) to DER `SEQUENCE { INTEGER r, INTEGER s }`.
+pub Result<u8[], PkError> RawToDer(u8[] raw) {
+    if Slice.Len(raw) != 64_i64 { return Result::Error(PkError::MalformedSignature()); }
+    i64 body = DerIntegerLength(raw, 0_i64) + DerIntegerLength(raw, 32_i64);
+    u8[] out = BigNat.ZeroBytes(2_i64 + body);
+    out[0] = u8(48);
+    out[1] = u8(body);
+    i64 next = WriteDerInteger(out, 2_i64, raw, 0_i64);
+    WriteDerInteger(out, next, raw, 32_i64);
+    return Result::Ok(out);
+}
+
+/// Parses one strict DER INTEGER at `offset` into 32 bytes; returns the offset after it.
+/// Rejects negative values, non-minimal encodings and values wider than 256 bits.
+Result<i64, PkError> ReadDerInteger(u8[] der, i64 offset, u8[] dst, i64 dstOffset) {
+    i64 total = Slice.Len(der);
+    if offset + 2_i64 > total || der[offset] != u8(2) { return Result::Error(PkError::MalformedSignature()); }
+    i64 len = i64(der[offset + 1_i64]);
+    i64 start = offset + 2_i64;
+    if len == 0_i64 || len > 33_i64 || start + len > total { return Result::Error(PkError::MalformedSignature()); }
+    if der[start] >= u8(128) { return Result::Error(PkError::MalformedSignature()); }
+    mut i64 first = start;
+    mut i64 count = len;
+    if der[start] == u8(0) {
+        if len == 1_i64 { return Result::Error(PkError::MalformedSignature()); }
+        if der[start + 1_i64] < u8(128) { return Result::Error(PkError::MalformedSignature()); }
+        first = start + 1_i64;
+        count = len - 1_i64;
+    }
+    if count > 32_i64 { return Result::Error(PkError::MalformedSignature()); }
+    Slice.Copy(dst, dstOffset + 32_i64 - count, der, first, count);
+    return Result::Ok(start + len);
+}
+
+/// Strict DER `SEQUENCE { INTEGER r, INTEGER s }` to raw `r || s` (64 bytes).
+pub Result<u8[], PkError> DerToRaw(u8[] der) {
+    i64 total = Slice.Len(der);
+    if total < 8_i64 || total > 72_i64 { return Result::Error(PkError::MalformedSignature()); }
+    if der[0] != u8(48) || i64(der[1]) != total - 2_i64 { return Result::Error(PkError::MalformedSignature()); }
+    u8[] raw = BigNat.ZeroBytes(64_i64);
+    Result<i64, PkError> afterR = ReadDerInteger(der, 2_i64, raw, 0_i64);
+    return match afterR {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(next) => {
+            Result<i64, PkError> afterS = ReadDerInteger(der, next, raw, 32_i64);
+            return match afterS {
+                Result::Error(error) => Result::Error(error),
+                Result::Ok(end) => {
+                    if end != total { return Result::Error(PkError::MalformedSignature()); }
+                    return Result::Ok(raw);
+                },
+            };
+        },
+    };
+}

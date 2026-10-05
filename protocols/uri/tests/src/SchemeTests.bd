@@ -1,0 +1,37 @@
+use Testing.Assert;
+use Core.Results;
+use Uri.Errors;
+use Uri.Host;
+use Uri.Parse;
+use Uri.Scheme;
+use Uri.Types;
+
+Result<Authority, UriError> A(string text) {
+    Result<UriRef, UriError> r = Parse.ParseReference(text);
+    return match r {
+        Result::Ok(u) => Scheme.AuthorityOf(u),
+        Result::Error(e) => Result::Error(e),
+    };
+}
+string HostOf(string text) {
+    Result<Authority, UriError> a = A(text);
+    return match a { Result::Ok(x) => x.hostName, Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+i64 PortOf(string text) {
+    Result<Authority, UriError> a = A(text);
+    return match a { Result::Ok(x) => x.port, Result::Error(e) => -1000_i64 - Errors.Code(e), };
+}
+string HP(string text) {
+    Result<Authority, UriError> a = A(text);
+    return match a { Result::Ok(x) => Scheme.HostPort(x), Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+string HH(string text) {
+    Result<Authority, UriError> a = A(text);
+    return match a { Result::Ok(x) => Scheme.HostHeader(x), Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+test default_port_http_group { Assert.Equal<i64>(Scheme.DefaultPort("http"), 80_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort("https"), 443_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort("ws"), 80_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort("wss"), 443_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort("HTTP"), 80_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort("Https"), 443_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort("ftp"), -1_i64, "default"); Assert.Equal<i64>(Scheme.DefaultPort(""), -1_i64, "default"); }
+test default_port_file_group { Assert.Equal<i64>(Scheme.DefaultPort("file"), -1_i64, "default"); Assert.True(Scheme.IsSecure("https"), "https"); Assert.True(Scheme.IsSecure("WSS"), "wss"); Assert.False(Scheme.IsSecure("http"), "http"); Assert.False(Scheme.IsSecure("ws"), "ws"); Assert.False(Scheme.IsSecure("ftp"), "ftp"); Assert.True(Scheme.IsWebScheme("http"), "http"); Assert.True(Scheme.IsWebScheme("WS"), "ws"); Assert.False(Scheme.IsWebScheme("mailto"), "mailto"); Assert.Equal<string>(HostOf("http://Example.COM/x"), "example.com", "bare lowercase host"); Assert.Equal<string>(HostOf("http://exa%6dple.com/"), "example.com", "bare lowercase host"); Assert.Equal<string>(HostOf("https://[::1]:8443/"), "::1", "bare lowercase host"); Assert.Equal<string>(HostOf("http://[ABCD::1]/"), "abcd::1", "bare lowercase host"); Assert.Equal<string>(HostOf("http://1.2.3.4/"), "1.2.3.4", "bare lowercase host"); }
+test authority_host_http_u_p_h_group { Assert.Equal<string>(HostOf("http://u:p@h/"), "h", "bare lowercase host"); Assert.Equal<i64>(PortOf("http://h/"), 80_i64, "effective port"); Assert.Equal<i64>(PortOf("https://h/"), 443_i64, "effective port"); Assert.Equal<i64>(PortOf("ws://h/"), 80_i64, "effective port"); Assert.Equal<i64>(PortOf("wss://h/"), 443_i64, "effective port"); Assert.Equal<i64>(PortOf("http://h:8080/"), 8080_i64, "effective port"); Assert.Equal<i64>(PortOf("http://h:/"), 80_i64, "effective port"); Assert.Equal<i64>(PortOf("https://h:0/"), 0_i64, "effective port"); }
+test authority_port_foo_h_1234_group { Assert.Equal<i64>(PortOf("foo://h:1234/"), 1234_i64, "effective port"); Assert.Equal<i64>(PortOf("mailto:x@y"), -1017_i64, "error code"); Assert.Equal<i64>(PortOf("/relative"), -1017_i64, "error code"); Assert.Equal<i64>(PortOf("foo://h/"), -1018_i64, "error code"); Assert.Equal<i64>(PortOf("http:///x"), -1017_i64, "error code"); Assert.Equal<i64>(PortOf("http://%C3%A9.com/"), -1007_i64, "error code"); Assert.Equal<i64>(PortOf("http://h%2Fx/"), -1007_i64, "error code"); Assert.Equal<i64>(PortOf("file:///etc"), -1017_i64, "error code"); }
+test hostport_strings_group { Assert.Equal<string>(HP("http://example.com/"), "example.com:80", "reg"); Assert.Equal<string>(HP("https://[::1]:8443/"), "[::1]:8443", "ipv6"); Assert.Equal<string>(HP("http://1.2.3.4:9/"), "1.2.3.4:9", "ipv4"); Assert.Equal<string>(HH("http://example.com/"), "example.com", "http"); Assert.Equal<string>(HH("https://example.com:443/"), "example.com", "https"); Assert.Equal<string>(HH("http://example.com:8080/"), "example.com:8080", "custom"); Assert.Equal<string>(HH("https://example.com:80/"), "example.com:80", "https on 80"); Assert.Equal<string>(HH("http://[::1]/"), "[::1]", "ipv6"); }
+test authority_flags { Result<Authority, UriError> a = A("wss://[::1]/"); match a { Result::Ok(x) => { Assert.True(x.secure, "secure"); Assert.Equal<i64>(match x.kind { HostKind::Ipv6 => 1_i64, _ => 0_i64, }, 1_i64, "ipv6 kind"); }, Result::Error(_) => { Assert.Fail("authority"); }, }; }

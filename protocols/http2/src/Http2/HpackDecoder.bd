@@ -1,0 +1,186 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+use Http2.HpackHuffman;
+use Http2.HpackInteger;
+use Http2.HpackString;
+use Http2.HpackTable;
+
+// RFC 7541 section 3 header block decoding. One Decoder per connection
+// direction; blocks must be decoded in the order they arrive.
+
+/// Decoder bounds. `settingsTableSize` is the SETTINGS_HEADER_TABLE_SIZE this
+/// endpoint advertised; `maxHeaderListSize` counts name + value + 32 per field.
+pub type DecoderLimits { pub i64 settingsTableSize, pub i64 maxHeaderListSize, pub i64 maxStringLength, pub i64 maxFields, }
+
+pub DecoderLimits DefaultDecoderLimits() {
+    return DecoderLimits { settingsTableSize: Hpack.DefaultTableSize(), maxHeaderListSize: 65536_i64, maxStringLength: 65536_i64, maxFields: 512_i64 };
+}
+
+pub type Decoder {
+    pub DynamicTable table,
+    pub StaticTable statics,
+    pub HuffmanTables huffman,
+    pub DecoderLimits limits,
+    pub bool updateRequired,
+    pub bool failed,
+}
+
+bool LimitsValid(DecoderLimits limits) {
+    return limits.settingsTableSize >= 0_i64 && limits.settingsTableSize <= Hpack.MaxInteger()
+        && limits.maxHeaderListSize >= 0_i64 && limits.maxStringLength >= 0_i64 && limits.maxFields >= 0_i64;
+}
+
+/// A decoder whose dynamic table starts at limits.settingsTableSize.
+pub Result<Decoder,HpackError> NewDecoder(DecoderLimits limits) {
+    if !LimitsValid(limits) { return Result::Error(HpackError::InvalidLimit(limits.settingsTableSize)); }
+    return Result::Ok(Decoder {
+        table: HpackTable.NewDynamicTable(limits.settingsTableSize),
+        statics: HpackTable.NewStaticTable(),
+        huffman: HpackHuffman.NewHuffmanTables(),
+        limits: limits,
+        updateRequired: false,
+        failed: false,
+    });
+}
+
+/// Applies a new SETTINGS_HEADER_TABLE_SIZE once the peer acknowledged it.
+/// A value below the current table maximum requires the peer to start its
+/// next block with a size update (section 4.2).
+pub Result<unit,HpackError> SetSettingsTableSize(mut Decoder decoder, i64 size) {
+    if size < 0_i64 || size > Hpack.MaxInteger() { return Result::Error(HpackError::InvalidLimit(size)); }
+    decoder.limits.settingsTableSize = size;
+    if size < decoder.table.maxSize { decoder.updateRequired = true; }
+    return Result::Ok(());
+}
+
+/// Current dynamic table size in octets (section 4.1).
+pub i64 TableSize(Decoder decoder) { return decoder.table.size; }
+/// Current dynamic table maximum size.
+pub i64 TableMaxSize(Decoder decoder) { return decoder.table.maxSize; }
+/// Number of dynamic table entries.
+pub i64 TableCount(Decoder decoder) { return HpackTable.DynamicCount(decoder.table); }
+/// Dynamic table entry `index`, 1 being the newest.
+pub HeaderField TableEntry(Decoder decoder, i64 index) { return HpackTable.DynamicEntry(decoder.table, index); }
+
+/// Running state of one block.
+type BlockState { HeaderField[] fields, i64 listSize, i64 count, bool overLimit, bool tooMany, }
+
+unit Emit(mut BlockState state, DecoderLimits limits, HeaderField field) {
+    state.count = state.count + 1_i64;
+    state.listSize = state.listSize + Hpack.FieldSize(field);
+    if state.count > limits.maxFields { state.tooMany = true; }
+    if state.listSize > limits.maxHeaderListSize { state.overLimit = true; }
+    if !state.tooMany && !state.overLimit { Array.Append<HeaderField>(state.fields, field); }
+    return;
+}
+
+/// Decodes one complete header block (the concatenated HEADERS/CONTINUATION
+/// fragments). Any COMPRESSION_ERROR leaves the decoder failed. A header list
+/// over maxHeaderListSize or maxFields is still decoded to keep the dynamic
+/// table in sync and is reported as HeaderListTooLarge or TooManyFields.
+pub Result<HeaderField[],HpackError> Decode(mut Decoder decoder, u8[] block) {
+    if decoder.failed { return Result::Error(HpackError::DecoderFailed); }
+    mut BlockState state = BlockState { fields: Array.Empty<HeaderField>(), listSize: 0_i64, count: 0_i64, overLimit: false, tooMany: false };
+    Result<unit,HpackError> walked = Walk(decoder, block, state);
+    match walked {
+        Result::Error(error) => { decoder.failed = true; return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    if state.overLimit { return Result::Error(HpackError::HeaderListTooLarge(state.listSize)); }
+    if state.tooMany { return Result::Error(HpackError::TooManyFields); }
+    return Result::Ok(state.fields);
+}
+
+Result<unit,HpackError> Walk(mut Decoder decoder, u8[] block, mut BlockState state) {
+    i64 count = Slice.Len(block);
+    mut i64 cursor = 0_i64;
+    mut bool atStart = true;
+    mut bool updated = false;
+    while cursor < count {
+        u8 first = block[cursor];
+        if (first & 224_u8) == 32_u8 {
+            if !atStart { return Result::Error(HpackError::SizeUpdateNotAtStart); }
+            Result<Decoded,HpackError> size = HpackInteger.DecodeInteger(block, cursor, 5_i64);
+            match size {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(update) => {
+                    if update.value > decoder.limits.settingsTableSize { return Result::Error(HpackError::SizeUpdateExceedsLimit(update.value)); }
+                    HpackTable.DynamicResize(decoder.table, update.value);
+                    updated = true;
+                    cursor = update.next;
+                },
+            };
+            continue;
+        }
+        if atStart {
+            if decoder.updateRequired && !updated { return Result::Error(HpackError::SizeUpdateMissing); }
+            decoder.updateRequired = false;
+            atStart = false;
+        }
+        if (first & 128_u8) == 128_u8 {
+            Result<Decoded,HpackError> index = HpackInteger.DecodeInteger(block, cursor, 7_i64);
+            match index {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(decoded) => {
+                    Result<HeaderField,HpackError> entry = HpackTable.Lookup(decoder.statics, decoder.table, decoded.value);
+                    match entry {
+                        Result::Error(error) => { return Result::Error(error); },
+                        Result::Ok(field) => { Emit(state, decoder.limits, field); },
+                    };
+                    cursor = decoded.next;
+                },
+            };
+            continue;
+        }
+        mut i64 prefix = 4_i64;
+        mut bool indexing = false;
+        mut bool sensitive = false;
+        if (first & 192_u8) == 64_u8 { prefix = 6_i64; indexing = true; }
+        if (first & 240_u8) == 16_u8 { sensitive = true; }
+        Result<i64,HpackError> literal = Literal(decoder, block, cursor, prefix, indexing, sensitive, state);
+        match literal {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(next) => { cursor = next; },
+        };
+    }
+    if atStart && decoder.updateRequired && !updated { return Result::Error(HpackError::SizeUpdateMissing); }
+    if updated { decoder.updateRequired = false; }
+    return Result::Ok(());
+}
+
+/// Sections 6.2.1-6.2.3: literal field with incremental, without or never indexing.
+Result<i64,HpackError> Literal(mut Decoder decoder, u8[] block, i64 cursor, i64 prefix, bool indexing, bool sensitive, mut BlockState state) {
+    Result<Decoded,HpackError> nameIndex = HpackInteger.DecodeInteger(block, cursor, prefix);
+    return match nameIndex {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(decoded) => {
+            mut u8[] name = [];
+            mut i64 next = decoded.next;
+            if decoded.value == 0_i64 {
+                Result<DecodedString,HpackError> literalName = HpackString.DecodeString(decoder.huffman, block, next, decoder.limits.maxStringLength);
+                match literalName {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(text) => { name = text.bytes; next = text.next; },
+                };
+            } else {
+                Result<HeaderField,HpackError> entry = HpackTable.Lookup(decoder.statics, decoder.table, decoded.value);
+                match entry {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(field) => { name = field.name; },
+                };
+            }
+            Result<DecodedString,HpackError> value = HpackString.DecodeString(decoder.huffman, block, next, decoder.limits.maxStringLength);
+            return match value {
+                Result::Error(error) => Result::Error(error),
+                Result::Ok(text) => {
+                    HeaderField field = HeaderField { name: name, value: text.bytes, sensitive: sensitive };
+                    if indexing { HpackTable.DynamicInsert(decoder.table, field); }
+                    Emit(state, decoder.limits, field);
+                    return Result::Ok(text.next);
+                },
+            };
+        },
+    };
+}

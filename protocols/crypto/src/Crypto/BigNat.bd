@@ -1,0 +1,380 @@
+/// Unsigned big integers as little-endian `u32[]` limb vectors.
+///
+/// Limb vectors may carry leading zero limbs; every function treats missing limbs as zero.
+/// Products and carries use `i64` locals as unsigned 64-bit values: Beskid 0.5.2 `i64`
+/// arithmetic wraps and `>>` is logical, so `(a * b + c + d) >> 32` is the exact high
+/// word for 32-bit `a b c d`. Limbs are stored in `u32[]` because `i64[]` stores are slow
+/// under the 0.5.2 JIT (see protocols/COMPILER-GAPS.md).
+///
+/// These helpers are variable-time and meant for public values (RSA moduli, signatures,
+/// encodings). Secret-dependent arithmetic goes through `Crypto.ModArith`.
+use Core.Collections.Array;
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.PkErrors;
+
+/// Largest supported operand: 8192 bits (twice an RSA-4096 modulus, room for products).
+pub i64 MaxLimbs() { return 256_i64; }
+
+pub i64 Mask32() { return 4294967295_i64; }
+
+/// A zero-filled limb vector of `count` limbs.
+/// Array literals allocate in one step while `Array.Append` costs about 200 ns per element
+/// under the 0.5.2 JIT, so this trims a literal tier with the cheap `Array.RemoveLast`
+/// and only appends beyond 1024 limbs.
+pub u32[] Zeros(i64 count) {
+    if count <= 16_i64 { return FitLimbs(ZeroLimbs16(), 16_i64, count); }
+    return FitLimbs(ZeroLimbs1024(), 1024_i64, count);
+}
+
+u32[] FitLimbs(u32[] literal, i64 size, i64 count) {
+    mut u32[] result = literal;
+    mut i64 len = size;
+    mut i64 target = count;
+    if target < 0_i64 { target = 0_i64; }
+    while len > target {
+        Array.RemoveLast<u32>(result);
+        len = len - 1_i64;
+    }
+    while len < target {
+        Array.Append<u32>(result, 0_u32);
+        len = len + 1_i64;
+    }
+    return result;
+}
+
+/// A zero-filled byte buffer of `count` bytes; `Slice.New` appends one byte at a time.
+pub u8[] ZeroBytes(i64 count) {
+    if count <= 64_i64 { return FitBytes(ZeroBytes64(), 64_i64, count); }
+    return FitBytes(ZeroBytes512(), 512_i64, count);
+}
+
+u8[] FitBytes(u8[] literal, i64 size, i64 count) {
+    mut u8[] result = literal;
+    mut i64 len = size;
+    mut i64 target = count;
+    if target < 0_i64 { target = 0_i64; }
+    while len > target {
+        Array.RemoveLast<u8>(result);
+        len = len - 1_i64;
+    }
+    while len < target {
+        Array.Append<u8>(result, 0_u8);
+        len = len + 1_i64;
+    }
+    return result;
+}
+
+u32[] ZeroLimbs16() {
+    return [
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+    ];
+}
+
+u32[] ZeroLimbs1024() {
+    return [
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+        0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32, 0_u32,
+    ];
+}
+
+u8[] ZeroBytes64() {
+    return [
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+    ];
+}
+
+u8[] ZeroBytes512() {
+    return [
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+        0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8,
+    ];
+}
+
+/// A copy of `a` resized to `count` limbs. Dropped high limbs must be zero (callers check).
+pub u32[] Resize(u32[] a, i64 count) {
+    u32[] result = Zeros(count);
+    i64 len = Array.Len<u32>(a);
+    mut i64 i = 0_i64;
+    while i < count && i < len {
+        result[i] = a[i];
+        i = i + 1_i64;
+    }
+    return result;
+}
+
+pub u32[] Copy(u32[] a) { return Resize(a, Array.Len<u32>(a)); }
+
+/// Copies `src` into `dst` limb for limb; both have the same length.
+pub unit Assign(u32[] dst, u32[] src) {
+    i64 len = Array.Len<u32>(dst);
+    mut i64 i = 0_i64;
+    while i < len {
+        dst[i] = src[i];
+        i = i + 1_i64;
+    }
+    return;
+}
+
+pub u32[] FromU32(u32 value) { return [value]; }
+
+/// Number of limbs without leading zero limbs; zero has one significant limb.
+pub i64 SignificantLimbs(u32[] a) {
+    mut i64 n = Array.Len<u32>(a);
+    while n > 1_i64 && a[n - 1_i64] == 0_u32 { n = n - 1_i64; }
+    if n == 0_i64 { return 1_i64; }
+    return n;
+}
+
+/// A copy without leading zero limbs (at least one limb).
+pub u32[] Normalize(u32[] a) { return Resize(a, SignificantLimbs(a)); }
+
+pub bool IsZero(u32[] a) {
+    i64 len = Array.Len<u32>(a);
+    mut i64 i = 0_i64;
+    while i < len {
+        if a[i] != 0_u32 { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+pub bool IsOdd(u32[] a) {
+    if Array.Len<u32>(a) == 0_i64 { return false; }
+    return (a[0] & 1_u32) == 1_u32;
+}
+
+u32 Limb(u32[] a, i64 index) {
+    if index < Array.Len<u32>(a) { return a[index]; }
+    return 0_u32;
+}
+
+/// Number of significant bits; zero has bit length 0.
+pub i64 BitLength(u32[] a) {
+    i64 n = SignificantLimbs(a);
+    u32 top = Limb(a, n - 1_i64);
+    if top == 0_u32 { return 0_i64; }
+    mut i64 bits = 0_i64;
+    mut u32 v = top;
+    while v != 0_u32 {
+        bits = bits + 1_i64;
+        v = v >> 1_u32;
+    }
+    return (n - 1_i64) * 32_i64 + bits;
+}
+
+/// Bit `index` (0 = least significant) as 0 or 1.
+pub u32 Bit(u32[] a, i64 index) {
+    i64 limb = index / 32_i64;
+    if limb >= Array.Len<u32>(a) { return 0_u32; }
+    return (a[limb] >> u32(index % 32_i64)) & 1_u32;
+}
+
+/// Decodes a big-endian unsigned integer. Leading zero bytes are allowed.
+pub Result<u32[], PkError> FromBytes(u8[] bytes) {
+    i64 len = Slice.Len(bytes);
+    mut i64 limbs = (len + 3_i64) / 4_i64;
+    if limbs == 0_i64 { limbs = 1_i64; }
+    if limbs > MaxLimbs() { return Result::Error(PkError::OutOfRange()); }
+    return Result::Ok(FromBytesUnchecked(bytes, limbs));
+}
+
+/// Decodes a big-endian unsigned integer into exactly `limbs` limbs; fails when it does not fit.
+pub Result<u32[], PkError> FromBytesFixed(u8[] bytes, i64 limbs) {
+    i64 len = Slice.Len(bytes);
+    mut i64 i = 0_i64;
+    while i + limbs * 4_i64 < len {
+        if bytes[i] != u8(0) { return Result::Error(PkError::OutOfRange()); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(FromBytesUnchecked(bytes, limbs));
+}
+
+u32[] FromBytesUnchecked(u8[] bytes, i64 limbs) {
+    u32[] result = Zeros(limbs);
+    i64 len = Slice.Len(bytes);
+    mut i64 j = 0_i64;
+    while j < len && j < limbs * 4_i64 {
+        u32 b = u32(bytes[len - 1_i64 - j]);
+        i64 limb = j / 4_i64;
+        result[limb] = result[limb] | (b << u32((j % 4_i64) * 8_i64));
+        j = j + 1_i64;
+    }
+    return result;
+}
+
+/// Encodes as exactly `length` big-endian bytes; fails when the value needs more bytes.
+pub Result<u8[], PkError> ToBytes(u32[] a, i64 length) {
+    if length < 0_i64 { return Result::Error(PkError::OutOfRange()); }
+    i64 needed = (BitLength(a) + 7_i64) / 8_i64;
+    if needed > length { return Result::Error(PkError::OutOfRange()); }
+    u8[] result = ZeroBytes(length);
+    WriteBytes(a, result, 0_i64, length);
+    return Result::Ok(result);
+}
+
+/// Writes the low `length` bytes of `a` big-endian into `dst[offset, offset+length)`.
+pub unit WriteBytes(u32[] a, u8[] dst, i64 offset, i64 length) {
+    mut i64 j = 0_i64;
+    while j < length {
+        u32 limb = Limb(a, j / 4_i64);
+        dst[offset + length - 1_i64 - j] = u8((limb >> u32((j % 4_i64) * 8_i64)) & 255_u32);
+        j = j + 1_i64;
+    }
+    return;
+}
+
+/// -1, 0 or 1 as `a` is below, equal to, or above `b`. Variable-time.
+pub i64 Compare(u32[] a, u32[] b) {
+    mut i64 n = Array.Len<u32>(a);
+    if Array.Len<u32>(b) > n { n = Array.Len<u32>(b); }
+    mut i64 i = n - 1_i64;
+    while i >= 0_i64 {
+        u32 x = Limb(a, i);
+        u32 y = Limb(b, i);
+        if x > y { return 1_i64; }
+        if x < y { return -1_i64; }
+        i = i - 1_i64;
+    }
+    return 0_i64;
+}
+
+pub u32[] Add(u32[] a, u32[] b) {
+    mut i64 n = Array.Len<u32>(a);
+    if Array.Len<u32>(b) > n { n = Array.Len<u32>(b); }
+    u32[] result = Zeros(n + 1_i64);
+    mut i64 carry = 0_i64;
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 s = i64(Limb(a, i)) + i64(Limb(b, i)) + carry;
+        result[i] = u32(s & Mask32());
+        carry = s >> 32_i64;
+        i = i + 1_i64;
+    }
+    result[n] = u32(carry);
+    return Normalize(result);
+}
+
+/// `a - b`; fails with OutOfRange when `b > a`.
+pub Result<u32[], PkError> Sub(u32[] a, u32[] b) {
+    if Compare(a, b) < 0_i64 { return Result::Error(PkError::OutOfRange()); }
+    i64 n = Array.Len<u32>(a);
+    u32[] result = Zeros(n);
+    mut i64 borrow = 0_i64;
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 d = i64(a[i]) - i64(Limb(b, i)) - borrow;
+        result[i] = u32(d & Mask32());
+        borrow = (d >> 63_i64) & 1_i64;
+        i = i + 1_i64;
+    }
+    return Result::Ok(Normalize(result));
+}
+
+pub u32[] Mul(u32[] a, u32[] b) {
+    i64 na = SignificantLimbs(a);
+    i64 nb = SignificantLimbs(b);
+    u32[] result = Zeros(na + nb);
+    mut i64 i = 0_i64;
+    while i < na {
+        i64 ai = i64(a[i]);
+        mut i64 carry = 0_i64;
+        mut i64 j = 0_i64;
+        while j < nb {
+            i64 s = i64(result[i + j]) + ai * i64(b[j]) + carry;
+            result[i + j] = u32(s & Mask32());
+            carry = s >> 32_i64;
+            j = j + 1_i64;
+        }
+        result[i + nb] = u32(carry);
+        i = i + 1_i64;
+    }
+    return Normalize(result);
+}
+
+/// In-place `x = 2x + bit` over all limbs of `x`; returns the bit shifted out of the top limb.
+pub u32 ShiftLeft1(u32[] x, u32 bit) {
+    i64 n = Array.Len<u32>(x);
+    mut u32 carry = bit;
+    mut i64 i = 0_i64;
+    while i < n {
+        u32 v = x[i];
+        x[i] = (v << 1_u32) | carry;
+        carry = v >> 31_u32;
+        i = i + 1_i64;
+    }
+    return carry;
+}
+
+/// In-place `x = x - y` over `x`'s limbs; returns the final borrow (0 or 1).
+pub i64 SubInPlace(u32[] x, u32[] y) {
+    i64 n = Array.Len<u32>(x);
+    mut i64 borrow = 0_i64;
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 d = i64(x[i]) - i64(Limb(y, i)) - borrow;
+        x[i] = u32(d & Mask32());
+        borrow = (d >> 63_i64) & 1_i64;
+        i = i + 1_i64;
+    }
+    return borrow;
+}
+
+/// `a mod m` by binary long division. Variable-time; for public values. `m` must be nonzero.
+pub Result<u32[], PkError> Mod(u32[] a, u32[] m) {
+    if IsZero(m) { return Result::Error(PkError::InvalidModulus()); }
+    i64 nm = SignificantLimbs(m);
+    u32[] r = Zeros(nm + 1_i64);
+    mut i64 bit = BitLength(a) - 1_i64;
+    while bit >= 0_i64 {
+        ShiftLeft1(r, Bit(a, bit));
+        if Compare(r, m) >= 0_i64 { SubInPlace(r, m); }
+        bit = bit - 1_i64;
+    }
+    return Result::Ok(Normalize(r));
+}

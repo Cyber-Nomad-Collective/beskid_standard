@@ -150,3 +150,185 @@ Append: date, slice, symptom, minimal repro, workaround.
 ### C12. Blocks are not expressions
 - Symptom: `type mismatch: expected string, got unit` for `Result::Ok(s) => { s.Close(); "ok" }`.
 - Workaround: use `return` inside the arm, or a helper function.
+
+## 2026-10-05, http2 (HPACK slice)
+
+1. **Detached `///` doc comment is a parse error, silent in dependencies.**
+   Symptom: a `///` block followed by a blank line (file header comment) fails
+   `beskid parse` with "expected Visibility, ModuleDeclaration, ...". When the
+   file belongs to a path dependency, `beskid test` reports no parse error;
+   every item of that module is just missing ("unknown value `X` in module",
+   "unknown import path"). Repro: a library file starting with
+   `/// About this file.` + blank line + `pub i64 F() { return 1_i64; }`, used
+   from a test project. Workaround: use `//` for detached comments; run
+   `beskid parse` on library files when a module looks empty.
+2. **Literal argument for a `mut` array parameter is an ICE.**
+   `u8[] E(mut u8[] out) { ... }` called as `E([])` fails at CLIF time with
+   "no ISLE lowering rule or fact for `CallExpression`". Workaround: bind to
+   `mut u8[] buf = [];` and pass `buf`.
+3. **Field access on a call result is an ICE.**
+   `F(x).field` and `Array.Get<T>(a, i).field` fail with "no ISLE lowering
+   rule or fact for `CallExpression`". Seen also as a `BinaryExpression` ICE in
+   `Slice.Len(src) - header.next` where `header` is a match-arm binding.
+   Workaround: bind the call result (or the field) to a local first.
+4. **`match` on a nested field path is an ICE.**
+   `return match encoder.policy.huffman { ... };` fails with "no ISLE
+   lowering rule or fact for `MatchExpression`". Workaround:
+   `HuffmanMode mode = encoder.policy.huffman; return match mode { ... };`.
+5. **`return` inside a block arm of `return match` types the arm as unit.**
+   `return match r { Ok(d) => { Assert...; return d.value; }, ... };` is
+   "type mismatch: expected i64, got unit". Workaround: use `match` as a
+   statement with `return` in the arms and a trailing `return`.
+6. **`return [];` in a function returning `u8[]` is "expected u8[], got unit".**
+   Workaround: `return Slice.New(0_i64);`.
+7. Tooling note: a failed `Assert.True/Equal` traps with a generic message
+   ("should be true but was false"); the `because` text is not printed, and
+   the remaining tests of the target do not run. Workaround: one property per
+   test when diagnosing.
+8. **Array literal with computed elements is an ICE.**
+   `string[] p = ["a", "b" + n];` fails with "no ISLE lowering rule or fact
+   for `ArrayLiteralExpression`" (all-literal arrays work). Workaround: start
+   from the literal part and `Array.Append` the computed elements.
+9. Tooling note: the default per-target budget is 120 s; on a loaded host a
+   target of ~30 JIT-compiled tests can expire (`timed_out`). Raise it with
+   `--target-timeout` / `BESKID_TARGET_TIMEOUT_SECS` or split targets.
+
+## 2026-10-05, codec: multi-line `///` doc comments inside a type body
+
+Symptom: two consecutive `///` lines before a method inside `type X { ... }`
+fail ("callable `value` should use PascalCase" or a parse error "expected
+ImplMethodDefinition"): the second line is parsed as code.
+
+Repro:
+```
+pub type A { i64 x,
+    /// one line.
+    /// two line.
+    pub i64 F() { return this.x; }
+}
+```
+Workaround: use `//` comments (or a single `///` line) inside type bodies.
+Top-level multi-line `///` is fine.
+
+## 2026-10-05, codec: floating `///` block before an item doc empties the module
+
+Symptom: a file that starts with a `///` block, a blank line, and then a
+documented item (`/// doc` + `pub ...`) compiles, but every item of the module
+is reported as `unknown value X in module M` at use sites. No diagnostic in the
+module itself.
+
+Repro (`src/Codec/Be.bd`, module `pub mod Codec.Be;`):
+```
+/// Floating description line 1.
+/// line 2.
+
+/// Reads one.
+pub i64 ReadOne() { return 1_i64; }
+```
+Workaround: use `//` for file-level comments, or attach the text to the first item.
+
+## 2026-10-05, codec: sibling method call inside a type method is not lowered
+
+Symptom: `internal compiler error: no ISLE lowering rule or fact for CallExpression`
+(runtime test failure, not a compile diagnostic) for `this.Other(...)` inside a method.
+
+Repro:
+```
+pub type C { i64 n,
+    pub i64 A() { return this.n; }
+    pub i64 B() { return this.A(); }
+}
+```
+Workaround: put bodies in module-level functions `DoA(C self)` and make methods thin
+wrappers `pub i64 A() { return DoA(this); }`. Calls to module functions with `this` work.
+
+## 2026-10-05, codec: field assignment using a pattern-bound struct field
+
+Symptom: ICE `no ISLE lowering rule or fact for AssignExpression` for
+`Result::Ok(v) => { self.pos = self.pos + v.length; ... }` where `v` is a struct
+(`Varint { value, length }`) bound by the match arm. The same assignment with a
+local `i64` instead of `v.length` lowers fine.
+Workaround: read the field into a local, or use a value already in scope.
+
+## 2026-10-05, codec: contract value stored in a struct field, or forwarded with `this`
+
+Symptom A: `internal compiler error: no ISLE lowering rule or fact for StructLiteralExpression`
+when a struct literal initializes a field whose declared type is a contract
+(`pub type Holder { Reader source, ... }` with `source: MemReader { ... }`); using
+such a value later gives `semantic fact abi_type is unavailable`.
+Workaround: pass the `Reader` as an argument to every operation.
+
+Symptom B: `semantic fact call_abi_signature is unavailable` for a method that forwards
+`this` plus a contract argument to a module function:
+```
+pub type G { i64 q,
+  pub Result<i64, IoError> M(Reader r, u8[] b) { return DoM(this, r, b); }
+}
+Result<i64, IoError> DoM(G self, Reader r, u8[] b) { return IO.Read(r, b, 0_i64, 1_i64); }
+```
+Calling `DoM(h, r, b)` directly (not from a method) works, as does forwarding `this.q`
+instead of `this`. Workaround: operations that take a contract are module functions
+(`Buffered.ReadLine(reader, source, max)`), not methods.
+
+## 2026-10-05, codec: integer narrowing does not truncate
+
+`u8(0x100000041_i64)` and `u32(0x100000041_i64)` are not equal to 0x41 (no wraparound
+on narrowing from i64). Workaround: mask with `& 255_i64` / `& 0xFFFFFFFF_i64` first.
+
+## 2026-10-05, tooling: per-test overhead and the 120 s target budget
+
+Each `test` costs 1 to 2 s fixed in `beskid test` (compile/JIT per test), and a target has a
+120 s execution budget ("120-second target budget expired", remaining tests reported as
+`timed_out`). 50+ tiny tests in one target time out; the same assertions grouped into
+~8 tests per target run in about 20 s. Group assertions per test and keep targets under
+~40 tests.
+
+Also: test and function names beginning with `host_` fail to parse ("expected Identifier",
+the lexer appears to treat `host` as a keyword prefix); test names must be snake_case
+without double or trailing underscores, and must be unique per target.
+## 2026-10-05, crypto (public-key half)
+
+### Member access on a call result fails to lower
+- Symptom: `internal compiler error: no ISLE lowering rule or fact for MemberExpression (MissingRuleOrFact)`.
+- Repro: `i64 t = Time.MonotonicNow().nanos;`
+- Workaround: bind the call result first: `Core.Time.Instant now = Time.MonotonicNow(); i64 t = now.nanos;`
+
+### Fully qualified call without a `use` fails to lower
+- Symptom: `internal compiler error: no ISLE lowering rule or fact for CallExpression (MissingRuleOrFact)`.
+- Repro: `string Dec(i64 v) { return Core.String.DigitChar(v); }` with no `use Core.String;`.
+- Workaround: `use Core.String;` and call `String.DigitChar(v)`.
+
+### Bare field names are not in scope inside `type` method bodies
+- Symptom: `unknown value 'tag'`.
+- Repro: `pub type Dummy: Hasher { i64 tag, pub u8[] Digest(u8[] data) { return [u8(tag)]; } }`
+- Workaround: `this.tag`.
+
+### Performance: `i64[]` element stores are about 10x slower than `u32[]` stores
+- Symptom: a 256-iteration loop of `t[i & 15] = t[i & 15] + a[i & 15]` over `i64[]` takes ~3.7 us;
+  the same loop over `u32[]` takes ~0.4 us. Loads are fast for both.
+- Workaround: store limbs as `u32[]`, compute in `i64` locals (wrapping mul, logical `>>`).
+
+### Performance: per-call cost of array arguments and array helpers
+- Symptom (JIT, Apple silicon): each array argument of a call costs ~40 ns (an empty
+  `unit F(u32[] a)` call ~42 ns, two arrays ~83 ns, no arrays ~1 ns); `Array.Len<T>(a)` ~65 ns;
+  `Array.Append` ~200 ns per element, so `Slice.New(n)` costs ~200 ns per byte.
+- Workaround: keep hot field arithmetic on one workspace array addressed by offsets
+  (`Crypto.ModArith` W functions); allocate zeroed buffers from array literals trimmed with
+  `Array.RemoveLast` (`BigNat.Zeros`, `BigNat.ZeroBytes`); pass lengths instead of calling `Array.Len`.
+
+### Test-target compile time: every test recompiles its reachable code; 120 s target budget
+- Symptom: `beskid test` runs "Generate CLIF" per test, for every function the test reaches,
+  with no reuse across tests of one target. With ~90 reachable functions this was ~20 s per
+  test, so a 7-test target hit `120-second target budget expired ... execute_tests`.
+- Contributors measured: a `match` on `Result<Mont, PkError>` where `Mont` is a struct with
+  five array fields costs ~0.8 s to compile; a 700-element `u8` literal written as `u8(0)`
+  costs ~3 s while `0_u8` costs ~0.1 s; a 2048-element `u32` literal ~0.4 s.
+- Workaround: avoid structs with many array fields on hot API paths (one workspace array
+  instead), use literal suffixes (`0_u8`) instead of conversion calls in large literals,
+  and keep test targets to a few tests each.
+
+### Long straight-line function body fails to lower
+- Symptom: `internal compiler error: no ISLE lowering rule or fact for Block (MissingRuleOrFact)`
+  on a generated, fully unrolled 8-limb Montgomery multiply (~230 statements, ~45 `i64`
+  locals, no loops) taking `(u32[] w, i64 out, i64 a, i64 b)`. Codegen time per test also rose by ~5 s.
+- Workaround: keep the looped `ModArith.WMul`; the unrolled variant was dropped.

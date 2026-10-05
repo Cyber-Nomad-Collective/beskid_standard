@@ -1,0 +1,49 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Uri.Errors;
+use Uri.Host;
+use Uri.Parse;
+use Uri.Types;
+
+string Hex(u8[] data) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice("0123456789abcdef", b / 16_i64, 1_i64) + String.SubSlice("0123456789abcdef", b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+string V6(string text) {
+    Result<u8[], UriError> r = Host.ParseIpv6(text);
+    return match r { Result::Ok(b) => Hex(b), Result::Error(_) => "ERR", };
+}
+i64 V4(string text) {
+    Result<i64, UriError> r = Host.ParseIpv4(text);
+    return match r { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+}
+i64 C(string text) {
+    Result<UriRef, UriError> r = Parse.ParseReference(text);
+    return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), };
+}
+i64 CF(string text) {
+    Result<UriRef, UriError> r = Parse.ParseWith(text, 1000_i64, true, false);
+    return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), };
+}
+i64 Kind(string text) {
+    HostKind k = Host.Classify(text);
+    return match k { HostKind::RegName => 1_i64, HostKind::Ipv4 => 2_i64, HostKind::Ipv6 => 3_i64, HostKind::IpvFuture => 4_i64, };
+}
+test ipv4_ok_0_0_0_0_group { Assert.Equal<i64>(V4("0.0.0.0"), 0_i64, "value"); Assert.Equal<i64>(V4("192.168.1.1"), 3232235777_i64, "value"); Assert.Equal<i64>(V4("255.255.255.255"), 4294967295_i64, "value"); Assert.Equal<i64>(V4("127.0.0.1"), 2130706433_i64, "value"); Assert.Equal<i64>(V4("256.1.1.1"), -1_i64, "rejected"); Assert.Equal<i64>(V4("1.2.3"), -1_i64, "rejected"); Assert.Equal<i64>(V4("1.2.3.4.5"), -1_i64, "rejected"); Assert.Equal<i64>(V4("01.2.3.4"), -1_i64, "rejected"); }
+test ipv4_bad_1_2_3_6_group { Assert.Equal<i64>(V4("1..2.3"), -1_i64, "rejected"); Assert.Equal<i64>(V4("a.b.c.d"), -1_i64, "rejected"); Assert.Equal<i64>(V4("1.2.3.4."), -1_i64, "rejected"); Assert.Equal<i64>(V4(""), -1_i64, "rejected"); Assert.Equal<i64>(V4("1.2.3.-4"), -1_i64, "rejected"); Assert.Equal<i64>(V4("1.2.3.4 "), -1_i64, "rejected"); Assert.Equal<string>(V6("1:2:3:4:5:6:7:8"), "00010002000300040005000600070008", "bytes"); Assert.Equal<string>(V6("::"), "00000000000000000000000000000000", "bytes"); }
+test ipv6_ok_1_group { Assert.Equal<string>(V6("::1"), "00000000000000000000000000000001", "bytes"); Assert.Equal<string>(V6("1::"), "00010000000000000000000000000000", "bytes"); Assert.Equal<string>(V6("1::8"), "00010000000000000000000000000008", "bytes"); Assert.Equal<string>(V6("2001:db8::ff00:42:8329"), "20010db8000000000000ff0000428329", "bytes"); Assert.Equal<string>(V6("ABCD:EF01::1"), "abcdef01000000000000000000000001", "bytes"); Assert.Equal<string>(V6("1:2:3:4:5:6:7::"), "00010002000300040005000600070000", "bytes"); Assert.Equal<string>(V6("::2:3:4:5:6:7:8"), "00000002000300040005000600070008", "bytes"); Assert.Equal<string>(V6("::ffff:192.0.2.1"), "00000000000000000000ffffc0000201", "bytes"); }
+test ipv6_ok_1_2_3_4_group { Assert.Equal<string>(V6("::1.2.3.4"), "00000000000000000000000001020304", "bytes"); Assert.Equal<string>(V6("1:2:3:4:5:6:1.2.3.4"), "00010002000300040005000601020304", "bytes"); Assert.Equal<string>(V6("fe80::1"), "fe800000000000000000000000000001", "bytes"); Assert.Equal<string>(V6("0:0:0:0:0:0:0:0"), "00000000000000000000000000000000", "bytes"); Assert.Equal<string>(V6("1:2::3:4"), "00010002000000000000000000030004", "bytes"); Assert.Equal<string>(V6(":"), "ERR", "rejected"); Assert.Equal<string>(V6(":::"), "ERR", "rejected"); Assert.Equal<string>(V6("1:2:3:4:5:6:7"), "ERR", "rejected"); }
+test ipv6_bad_1_2_3_4_5_6_7_8_9_17_group { Assert.Equal<string>(V6("1:2:3:4:5:6:7:8:9"), "ERR", "rejected"); Assert.Equal<string>(V6("1::2::3"), "ERR", "rejected"); Assert.Equal<string>(V6(":1:2:3:4:5:6:7"), "ERR", "rejected"); Assert.Equal<string>(V6("1:2:3:4:5:6:7:"), "ERR", "rejected"); Assert.Equal<string>(V6("12345::"), "ERR", "rejected"); Assert.Equal<string>(V6("g::1"), "ERR", "rejected"); Assert.Equal<string>(V6("1:2:3:4:5:6:7::8"), "ERR", "rejected"); Assert.Equal<string>(V6("::1.2.3"), "ERR", "rejected"); }
+test ipv6_bad_256_1_1_1_11_group { Assert.Equal<string>(V6("::256.1.1.1"), "ERR", "rejected"); Assert.Equal<string>(V6("1.2.3.4::"), "ERR", "rejected"); Assert.Equal<string>(V6("::1.2.3.4:1"), "ERR", "rejected"); Assert.Equal<string>(V6("fe80::1%25eth0"), "ERR", "rejected"); Assert.Equal<string>(V6(""), "ERR", "rejected"); Assert.Equal<string>(V6("1:"), "ERR", "rejected"); Assert.Equal<string>(V6("::1:"), "ERR", "rejected"); Assert.Equal<string>(V6("1:::2"), "ERR", "rejected"); }
+test ipv6_bad_1_2_3_4_7_group { Assert.Equal<string>(V6("1.2.3.4"), "ERR", "rejected"); Assert.Equal<string>(V6("a:b"), "ERR", "rejected"); Assert.Equal<string>(V6("::g"), "ERR", "rejected"); Assert.Equal<i64>(C("http://127.1/"), 8_i64, "code"); Assert.Equal<i64>(C("http://0x7f.1/"), 8_i64, "code"); Assert.Equal<i64>(C("http://2130706433/"), 8_i64, "code"); Assert.Equal<i64>(C("http://0177.0.0.1/"), 8_i64, "code"); Assert.Equal<i64>(C("http://256.1.1.1/"), 8_i64, "code"); }
+test hostcase_http_example_123_group { Assert.Equal<i64>(C("http://example.123/"), 8_i64, "code"); Assert.Equal<i64>(C("http://1.2.3.4./"), 8_i64, "code"); Assert.Equal<i64>(C("http://1.2.3.4/"), 0_i64, "code"); Assert.Equal<i64>(C("http://example.com/"), 0_i64, "code"); Assert.Equal<i64>(C("http://a1/"), 0_i64, "code"); Assert.Equal<i64>(C("http://1a.com/"), 0_i64, "code"); Assert.Equal<i64>(C("http://localhost:8080/"), 0_i64, "code"); Assert.Equal<i64>(C("http://[::1]/"), 0_i64, "code"); }
+test hostcase_http_1_2_3_4_2_group { Assert.Equal<i64>(C("http://[1.2.3.4]/"), 9_i64, "code"); Assert.Equal<i64>(C("http://[fe80::1%25eth0]/"), 9_i64, "code"); Assert.Equal<i64>(C("http://[::g]/"), 9_i64, "code"); Assert.Equal<i64>(C("http:///x"), 0_i64, "code"); Assert.Equal<i64>(C("http://exa%6dple.com/"), 0_i64, "code"); Assert.Equal<i64>(C("http://[]/"), 9_i64, "code"); Assert.Equal<i64>(C("http://[v1.fe80]/"), 10_i64, "not allowed"); Assert.Equal<i64>(CF("http://[v1.fe80]/"), 0_i64, "allowed"); }
+test ipvfuture_allowed_with_port_group { Assert.Equal<i64>(CF("http://[vA.a:b]:80/"), 0_i64, "allowed with port"); Assert.Equal<i64>(CF("http://[v.x]/"), 7_i64, "no hex digit"); Assert.Equal<i64>(CF("http://[v1.]/"), 7_i64, "empty tail"); Assert.Equal<i64>(CF("http://[v1.a@b]/"), 6_i64, "illegal char (at sign splits userinfo)"); Assert.Equal<i64>(Kind("example.com"), 1_i64, "reg"); Assert.Equal<i64>(Kind("1.2.3.4"), 2_i64, "v4"); Assert.Equal<i64>(Kind("[::1]"), 3_i64, "v6"); Assert.Equal<i64>(Kind("[v1.x]"), 4_i64, "future"); Assert.Equal<i64>(Kind("256.1.1.1"), 1_i64, "not v4"); Assert.Equal<string>(Host.BareHost("[::1]"), "::1", "v6"); Assert.Equal<string>(Host.BareHost("a.b"), "a.b", "plain"); Assert.True(Host.LooksNumeric("127.1"), "a"); Assert.True(Host.LooksNumeric("0x7f"), "b"); Assert.True(Host.LooksNumeric("a.0X1F"), "c"); Assert.False(Host.LooksNumeric("example.com"), "d"); Assert.False(Host.LooksNumeric("1a.com"), "e"); Assert.False(Host.LooksNumeric("a.0xg"), "f"); Assert.False(Host.LooksNumeric(""), "g"); }

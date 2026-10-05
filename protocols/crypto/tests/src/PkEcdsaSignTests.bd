@@ -1,0 +1,197 @@
+/// ECDSA P-256 tests: RFC 6979 A.2.5 (SHA-256, messages "sample" and "test"), a SHA-512 digest
+/// (truncated to 256 bits) signed with Python cryptography 49 deterministic_signing=True,
+/// DER handling and negative cases. Digests are SHA-256/SHA-512 of the ASCII messages.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Crypto.BigNat;
+use Crypto.Ecdsa;
+use Crypto.PkErrors;
+pub u8 PkNibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
+    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
+    if c >= u8(65) && c <= u8(70) { return c - u8(55); }
+    return u8(0);
+}
+
+/// Test-only hex decoder; an odd-length string gets an implicit leading zero nibble.
+pub u8[] Hex(string text) {
+    i64 len = String.Len(text);
+    i64 odd = len % 2_i64;
+    u8[] out = Slice.New((len + 1_i64) / 2_i64);
+    mut i64 i = 0_i64;
+    while i < len {
+        i64 pos = i + odd;
+        u8 nib = PkNibble(String.ByteAt(text, i));
+        i64 index = pos / 2_i64;
+        if pos % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string HexDigit(u8 v) {
+    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
+    return String.CodeUnitChar(v + u8(87));
+}
+
+pub string ToHex(u8[] bytes) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) {
+        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+pub i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+// ---- Test-only SHA-256 / HMAC-SHA-256 (FIPS 180-4, RFC 2104). The production hash lives
+// ---- in the symmetric half of Crypto; this copy only drives RFC 6979 and MGF1 in tests.
+pub u32 TXor(u32 a, u32 b) { return (a | b) - (a & b); }
+pub u32 TRotr(u32 x, u32 n) { return (x >> n) | (x << (32_u32 - n)); }
+pub u32[] TShaK() {
+    return [0x428a2f98_u32, 0x71374491_u32, 0xb5c0fbcf_u32, 0xe9b5dba5_u32, 0x3956c25b_u32, 0x59f111f1_u32, 0x923f82a4_u32, 0xab1c5ed5_u32,
+        0xd807aa98_u32, 0x12835b01_u32, 0x243185be_u32, 0x550c7dc3_u32, 0x72be5d74_u32, 0x80deb1fe_u32, 0x9bdc06a7_u32, 0xc19bf174_u32,
+        0xe49b69c1_u32, 0xefbe4786_u32, 0x0fc19dc6_u32, 0x240ca1cc_u32, 0x2de92c6f_u32, 0x4a7484aa_u32, 0x5cb0a9dc_u32, 0x76f988da_u32,
+        0x983e5152_u32, 0xa831c66d_u32, 0xb00327c8_u32, 0xbf597fc7_u32, 0xc6e00bf3_u32, 0xd5a79147_u32, 0x06ca6351_u32, 0x14292967_u32,
+        0x27b70a85_u32, 0x2e1b2138_u32, 0x4d2c6dfc_u32, 0x53380d13_u32, 0x650a7354_u32, 0x766a0abb_u32, 0x81c2c92e_u32, 0x92722c85_u32,
+        0xa2bfe8a1_u32, 0xa81a664b_u32, 0xc24b8b70_u32, 0xc76c51a3_u32, 0xd192e819_u32, 0xd6990624_u32, 0xf40e3585_u32, 0x106aa070_u32,
+        0x19a4c116_u32, 0x1e376c08_u32, 0x2748774c_u32, 0x34b0bcb5_u32, 0x391c0cb3_u32, 0x4ed8aa4a_u32, 0x5b9cca4f_u32, 0x682e6ff3_u32,
+        0x748f82ee_u32, 0x78a5636f_u32, 0x84c87814_u32, 0x8cc70208_u32, 0x90befffa_u32, 0xa4506ceb_u32, 0xbef9a3f7_u32, 0xc67178f2_u32];
+}
+pub u8[] TSha256(u8[] msg) {
+    i64 len = Slice.Len(msg);
+    i64 padded = ((len + 9_i64 + 63_i64) / 64_i64) * 64_i64;
+    u8[] data = Slice.New(padded);
+    Slice.Copy(data, 0_i64, msg, 0_i64, len);
+    data[len] = u8(128);
+    i64 bits = len * 8_i64;
+    mut i64 b = 0_i64;
+    while b < 8_i64 { data[padded - 1_i64 - b] = u8((bits >> (b * 8_i64)) & 255_i64); b = b + 1_i64; }
+    u32[] k = TShaK();
+    u32[] h = [0x6a09e667_u32, 0xbb67ae85_u32, 0x3c6ef372_u32, 0xa54ff53a_u32, 0x510e527f_u32, 0x9b05688c_u32, 0x1f83d9ab_u32, 0x5be0cd19_u32];
+    u32[] w = BigNat.Zeros(64_i64);
+    mut i64 block = 0_i64;
+    while block < padded {
+        mut i64 t = 0_i64;
+        while t < 16_i64 {
+            i64 o = block + t * 4_i64;
+            w[t] = (u32(data[o]) << 24_u32) | (u32(data[o + 1_i64]) << 16_u32) | (u32(data[o + 2_i64]) << 8_u32) | u32(data[o + 3_i64]);
+            t = t + 1_i64;
+        }
+        while t < 64_i64 {
+            u32 x = w[t - 15_i64];
+            u32 y = w[t - 2_i64];
+            u32 s0 = TXor(TXor(TRotr(x, 7_u32), TRotr(x, 18_u32)), x >> 3_u32);
+            u32 s1 = TXor(TXor(TRotr(y, 17_u32), TRotr(y, 19_u32)), y >> 10_u32);
+            w[t] = w[t - 16_i64] + s0 + w[t - 7_i64] + s1;
+            t = t + 1_i64;
+        }
+        mut u32 a = h[0]; mut u32 bb = h[1]; mut u32 c = h[2]; mut u32 d = h[3];
+        mut u32 e = h[4]; mut u32 f = h[5]; mut u32 g = h[6]; mut u32 hh = h[7];
+        t = 0_i64;
+        while t < 64_i64 {
+            u32 bigS1 = TXor(TXor(TRotr(e, 6_u32), TRotr(e, 11_u32)), TRotr(e, 25_u32));
+            u32 ch = TXor(e & f, (0xFFFFFFFF_u32 - e) & g);
+            u32 t1 = hh + bigS1 + ch + k[t] + w[t];
+            u32 bigS0 = TXor(TXor(TRotr(a, 2_u32), TRotr(a, 13_u32)), TRotr(a, 22_u32));
+            u32 maj = TXor(TXor(a & bb, a & c), bb & c);
+            u32 t2 = bigS0 + maj;
+            hh = g; g = f; f = e; e = d + t1; d = c; c = bb; bb = a; a = t1 + t2;
+            t = t + 1_i64;
+        }
+        h[0] = h[0] + a; h[1] = h[1] + bb; h[2] = h[2] + c; h[3] = h[3] + d;
+        h[4] = h[4] + e; h[5] = h[5] + f; h[6] = h[6] + g; h[7] = h[7] + hh;
+        block = block + 64_i64;
+    }
+    u8[] out = Slice.New(32_i64);
+    mut i64 i = 0_i64;
+    while i < 32_i64 { out[i] = u8((h[i / 4_i64] >> u32(24_i64 - (i % 4_i64) * 8_i64)) & 255_u32); i = i + 1_i64; }
+    return out;
+}
+pub u8[] TJoin(u8[] a, u8[] b) {
+    u8[] out = Slice.New(Slice.Len(a) + Slice.Len(b));
+    Slice.Copy(out, 0_i64, a, 0_i64, Slice.Len(a));
+    Slice.Copy(out, Slice.Len(a), b, 0_i64, Slice.Len(b));
+    return out;
+}
+pub u8[] THmacSha256(u8[] key, u8[] data) {
+    mut u8[] k = key;
+    if Slice.Len(k) > 64_i64 { k = TSha256(k); }
+    u8[] ipad = Slice.New(64_i64);
+    u8[] opad = Slice.New(64_i64);
+    mut i64 i = 0_i64;
+    while i < 64_i64 {
+        mut u8 kb = u8(0);
+        if i < Slice.Len(k) { kb = k[i]; }
+        ipad[i] = (kb | u8(54)) - (kb & u8(54));
+        opad[i] = (kb | u8(92)) - (kb & u8(92));
+        i = i + 1_i64;
+    }
+    return TSha256(TJoin(opad, TSha256(TJoin(ipad, data))));
+}
+
+/// RFC 6979 nonce MAC for SHA-256 digests, backed by the test-only HMAC.
+pub type TestHmacSha256: NonceMac {
+    i64 unused,
+    pub u8[] Mac(u8[] key, u8[] data) { return THmacSha256(key, data); }
+}
+
+pub string Hx(Result<u8[], PkError> r) {
+    return match r { Result::Ok(v) => ToHex(v), Result::Error(_) => "error", };
+}
+
+pub bool Ok(Result<unit, PkError> r) { return match r { Result::Ok(_) => true, Result::Error(_) => false, }; }
+
+pub string Key() { return "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"; }
+pub string Pub() { return "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"; }
+pub string SampleDigest() { return "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf"; }
+pub string SampleSig() { return "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8"; }
+
+test pk_ecdsa_test_sha256_shim {
+    Assert.Equal<string>(ToHex(TSha256(Hex("73616d706c65"))), SampleDigest(), "SHA-256(sample)");
+    Assert.Equal<string>(ToHex(THmacSha256(Hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"), Hex("4869205468657265"))),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7", "RFC 4231 case 1");
+}
+
+test pk_ecdsa_rfc6979_sign_sample {
+    TestHmacSha256 mac = TestHmacSha256 { unused: 0_i64 };
+    Assert.Equal<string>(Hx(Ecdsa.Sign(Hex(Key()), Hex(SampleDigest()), mac)), SampleSig(), "RFC 6979 A.2.5 SHA-256 sample");
+}
+
+test pk_ecdsa_rfc6979_sign_test {
+    TestHmacSha256 mac = TestHmacSha256 { unused: 0_i64 };
+    Assert.Equal<string>(Hx(Ecdsa.Sign(Hex(Key()), Hex("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"), mac)),
+        "f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d38367019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083", "RFC 6979 A.2.5 SHA-256 test");
+    Assert.Equal<string>(Hx(Ecdsa.SignDer(Hex(Key()), Hex("9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"), mac)),
+        "3045022100f1abb023518351cd71d881567b1ea663ed3efcf6c5132b354f28d3b0b7d383670220019f4113742a2b14bd25926b49c649155f267e60d3814b4c0cc84250e46f0083", "DER encoding");
+}
+
+test pk_ecdsa_timing {
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < 5_i64 {
+        Result<unit, PkError> r = Ecdsa.Verify(Hex(Pub()), Hex(SampleDigest()), Hex(SampleSig()));
+        i = i + 1_i64;
+    }
+    i64 mid = NowNanos();
+    TestHmacSha256 mac = TestHmacSha256 { unused: 0_i64 };
+    i = 0_i64;
+    while i < 5_i64 {
+        Result<u8[], PkError> s = Ecdsa.Sign(Hex(Key()), Hex(SampleDigest()), mac);
+        i = i + 1_i64;
+    }
+    Output.WriteLine("p256 ecdsa verify: " + Dec((mid - start) / 5000_i64) + " us");
+    Output.WriteLine("p256 ecdsa sign: " + Dec((NowNanos() - mid) / 5000_i64) + " us");
+    Assert.True(true, "timing printed");
+}

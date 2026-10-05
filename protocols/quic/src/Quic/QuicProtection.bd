@@ -1,0 +1,258 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Crypto.Aes;
+use Crypto.AesGcm;
+use Crypto.ChaCha20;
+use Crypto.ChaCha20Poly1305;
+use Crypto.Errors;
+use Crypto.Hkdf;
+use Crypto.Hmac;
+use Codec.Hex;
+use Quic.QuicPacket;
+use Quic.QuicWire;
+
+// QUIC packet protection (RFC 9001 section 5): initial secrets, key/iv/hp derivation,
+// AEAD payload protection in place, AES and ChaCha20 header protection, key update,
+// and the Retry integrity tag.
+
+pub i64 SuiteAes128() { return 0_i64; }
+pub i64 SuiteAes256() { return 1_i64; }
+pub i64 SuiteChaCha20() { return 2_i64; }
+
+/// TLS cipher suite code (0x1301..0x1303) to a protection suite, or -1.
+pub i64 SuiteFromTls(i64 code) {
+    if code == 0x1301_i64 { return 0_i64; }
+    if code == 0x1302_i64 { return 1_i64; }
+    if code == 0x1303_i64 { return 2_i64; }
+    return -1_i64;
+}
+
+/// Keys for one direction of one encryption level.
+pub type PacketKeys {
+    pub i64 suite,
+    pub u8[] secret,
+    pub u8[] key,
+    pub u8[] iv,
+    pub u8[] hp,
+    AesGcmKey[] gcm,
+    AesKey[] hpAes,
+}
+
+/// Client and server Initial keys.
+pub type InitialKeys { pub PacketKeys client, pub PacketKeys server, }
+
+pub HashAlgorithm HashOf(i64 suite) {
+    if suite == 1_i64 { return HashAlgorithm::Sha384; }
+    return HashAlgorithm::Sha256;
+}
+
+i64 KeyLength(i64 suite) {
+    if suite == 0_i64 { return 16_i64; }
+    return 32_i64;
+}
+
+u8[] Label(HashAlgorithm h, u8[] secret, string label, i64 length) {
+    return match Hkdf.ExpandLabel(h, secret, label, Slice.New(0_i64), length) {
+        Result::Ok(v) => v,
+        Result::Error(_) => Slice.New(0_i64),
+    };
+}
+
+PacketKeys Assemble(i64 suite, u8[] secret, u8[] key, u8[] iv, u8[] hp, AesKey[] hpAes) {
+    mut AesGcmKey[] gcm = Array.Empty<AesGcmKey>();
+    if suite != 2_i64 {
+        match AesGcm.New(key) { Result::Ok(k) => { Array.Append<AesGcmKey>(gcm, k); }, Result::Error(_) => (), };
+    }
+    return PacketKeys { suite: suite, secret: secret, key: key, iv: iv, hp: hp, gcm: gcm, hpAes: hpAes };
+}
+
+/// Derives key, iv and hp from a traffic secret ("quic key", "quic iv", "quic hp").
+pub PacketKeys DeriveKeys(i64 suite, u8[] secret) {
+    HashAlgorithm h = HashOf(suite);
+    i64 kl = KeyLength(suite);
+    u8[] hp = Label(h, secret, "quic hp", kl);
+    mut AesKey[] hpAes = Array.Empty<AesKey>();
+    if suite != 2_i64 {
+        match Aes.NewKey(hp) { Result::Ok(k) => { Array.Append<AesKey>(hpAes, k); }, Result::Error(_) => (), };
+    }
+    return Assemble(suite, secret, Label(h, secret, "quic key", kl), Label(h, secret, "quic iv", 12_i64), hp, hpAes);
+}
+
+/// Next-generation keys after a key update (RFC 9001 section 6): a new secret from
+/// "quic ku", new key and iv, and the same header protection key.
+pub PacketKeys NextKeys(PacketKeys k) {
+    HashAlgorithm h = HashOf(k.suite);
+    u8[] next = Label(h, k.secret, "quic ku", Hmac.HashLength(h));
+    i64 kl = KeyLength(k.suite);
+    return Assemble(k.suite, next, Label(h, next, "quic key", kl), Label(h, next, "quic iv", 12_i64), k.hp, k.hpAes);
+}
+
+/// The QUIC version 1 initial salt (RFC 9001 section 5.2).
+pub u8[] InitialSalt() { return Hex.Of("38762cf7f55934b34d179ae6a4c80cadccbb7f0a"); }
+
+/// Initial secret = HKDF-Extract(initial_salt, client destination connection ID).
+pub u8[] InitialSecret(u8[] dcid) { return Hkdf.Extract(HashAlgorithm::Sha256, InitialSalt(), dcid); }
+
+/// Initial keys for both directions from the client's first Destination Connection ID.
+pub InitialKeys DeriveInitial(u8[] dcid) {
+    u8[] initial = InitialSecret(dcid);
+    u8[] client = Label(HashAlgorithm::Sha256, initial, "client in", 32_i64);
+    u8[] server = Label(HashAlgorithm::Sha256, initial, "server in", 32_i64);
+    return InitialKeys { client: DeriveKeys(0_i64, client), server: DeriveKeys(0_i64, server) };
+}
+
+/// Nonce = iv XOR packet number (left-padded).
+pub u8[] Nonce(PacketKeys k, i64 pn) {
+    u8[] nonce = QuicWire.CopyOf(k.iv, 0_i64, 12_i64);
+    mut i64 i = 0_i64;
+    while i < 8_i64 {
+        u8 a = nonce[11_i64 - i];
+        u8 b = u8((pn >> (i * 8_i64)) & 255_i64);
+        nonce[11_i64 - i] = (a | b) - (a & b);
+        i = i + 1_i64;
+    }
+    return nonce;
+}
+
+/// Five-byte header protection mask from the 16-byte sample at buf[sampleAt].
+pub u8[] Mask(PacketKeys k, u8[] buf, i64 sampleAt) {
+    if k.suite == 2_i64 {
+        u32 counter = u32(buf[sampleAt]) | (u32(buf[sampleAt + 1_i64]) << 8_u32) | (u32(buf[sampleAt + 2_i64]) << 16_u32) | (u32(buf[sampleAt + 3_i64]) << 24_u32);
+        u8[] nonce = QuicWire.CopyOf(buf, sampleAt + 4_i64, 12_i64);
+        return match ChaCha20.Block(k.hp, counter, nonce) {
+            Result::Ok(block) => block,
+            Result::Error(_) => Slice.New(64_i64),
+        };
+    }
+    u8[] out = Slice.New(16_i64);
+    Aes.EncryptBlock(k.hpAes[0], buf, sampleAt, out, 0_i64);
+    return out;
+}
+
+u8 Xor8(u8 a, u8 b) { return (a | b) - (a & b); }
+
+/// Applies (or removes: the operation is symmetric for the packet number bytes) header
+/// protection. `long` selects the 4-bit (long header) or 5-bit (short header) first-byte mask.
+unit ApplyMask(u8[] buf, i64 start, i64 pnOffset, i64 pnLength, u8[] mask, bool long) {
+    mut u8 bits = 31_u8;
+    if long { bits = 15_u8; }
+    buf[start] = Xor8(buf[start], mask[0] & bits);
+    mut i64 i = 0_i64;
+    while i < pnLength {
+        buf[pnOffset + i] = Xor8(buf[pnOffset + i], mask[1_i64 + i]);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+bool SealPayload(PacketKeys k, u8[] nonce, u8[] aad, u8[] buf, i64 at, i64 count) {
+    if k.suite == 2_i64 {
+        return match ChaCha20Poly1305.SealInto(k.key, nonce, aad, buf, at, count, buf, at) { Result::Ok(_) => true, Result::Error(_) => false, };
+    }
+    return match AesGcm.SealInto(k.gcm[0], nonce, aad, buf, at, count, buf, at) { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+/// Protects a packet in place. The plaintext payload is buf[pnOffset+pnLength .. payloadEnd);
+/// the 16-byte tag is written at payloadEnd. The header (from `start`) must already carry the
+/// final Length. The payload with the packet number must be at least 4 bytes long so that the
+/// header protection sample exists. Returns the packet end, or -1.
+pub i64 Seal(PacketKeys k, u8[] buf, i64 start, i64 pnOffset, i64 pnLength, i64 pn, i64 payloadEnd) {
+    i64 headerLength = pnOffset + pnLength - start;
+    i64 count = payloadEnd - pnOffset - pnLength;
+    if count < 0_i64 || pnLength + count < 4_i64 || payloadEnd + 16_i64 > Slice.Len(buf) { return -1_i64; }
+    u8[] aad = QuicWire.CopyOf(buf, start, headerLength);
+    u8[] nonce = Nonce(k, pn);
+    i64 at = pnOffset + pnLength;
+    if !SealPayload(k, nonce, aad, buf, at, count) { return -1_i64; }
+    u8[] mask = Mask(k, buf, pnOffset + 4_i64);
+    ApplyMask(buf, start, pnOffset, pnLength, mask, (i64(buf[start]) & 128_i64) != 0_i64);
+    return payloadEnd + 16_i64;
+}
+
+/// Removes header protection. Writes out[0] = full packet number, out[1] = packet number length,
+/// out[2] = key phase bit (short headers). Returns false when the packet is too short.
+pub bool Unmask(PacketKeys k, u8[] buf, i64 start, i64 pnOffset, i64 end, i64 largestPn, i64[] out) {
+    if pnOffset + 20_i64 > end { return false; }
+    u8[] mask = Mask(k, buf, pnOffset + 4_i64);
+    bool long = (i64(buf[start]) & 128_i64) != 0_i64;
+    mut u8 bits = 31_u8;
+    if long { bits = 15_u8; }
+    buf[start] = Xor8(buf[start], mask[0] & bits);
+    i64 pnLength = (i64(buf[start]) & 3_i64) + 1_i64;
+    mut i64 truncated = 0_i64;
+    mut i64 i = 0_i64;
+    while i < pnLength {
+        buf[pnOffset + i] = Xor8(buf[pnOffset + i], mask[1_i64 + i]);
+        truncated = (truncated << 8_i64) | i64(buf[pnOffset + i]);
+        i = i + 1_i64;
+    }
+    out[0] = QuicPacket.DecodePn(largestPn, truncated, pnLength * 8_i64);
+    out[1] = pnLength;
+    out[2] = (i64(buf[start]) >> 2_i64) & 1_i64;
+    return true;
+}
+
+/// True when the reserved bits of an unprotected first byte are zero (else PROTOCOL_VIOLATION
+/// once the packet authenticated, RFC 9000 section 17.2).
+pub bool ReservedBitsClear(u8[] buf, i64 start) {
+    i64 first = i64(buf[start]);
+    if (first & 128_i64) != 0_i64 { return (first & 12_i64) == 0_i64; }
+    return (first & 24_i64) == 0_i64;
+}
+
+/// Decrypts the payload in place after `Unmask`. Returns the plaintext length (the plaintext
+/// starts at pnOffset+pnLength), or -1 when authentication fails (buffer payload unchanged).
+pub i64 Open(PacketKeys k, u8[] buf, i64 start, i64 pnOffset, i64 pnLength, i64 pn, i64 end) {
+    i64 headerLength = pnOffset + pnLength - start;
+    i64 at = pnOffset + pnLength;
+    i64 sealedCount = end - at;
+    if sealedCount < 16_i64 { return -1_i64; }
+    u8[] aad = QuicWire.CopyOf(buf, start, headerLength);
+    u8[] nonce = Nonce(k, pn);
+    if k.suite == 2_i64 {
+        return match ChaCha20Poly1305.OpenInto(k.key, nonce, aad, buf, at, sealedCount, buf, at) { Result::Ok(n) => n, Result::Error(_) => -1_i64, };
+    }
+    return match AesGcm.OpenInto(k.gcm[0], nonce, aad, buf, at, sealedCount, buf, at) { Result::Ok(n) => n, Result::Error(_) => -1_i64, };
+}
+
+/// Retry integrity tag (RFC 9001 section 5.8) over the Retry pseudo-packet:
+/// ODCID length, ODCID, and the Retry packet without its tag.
+pub u8[] RetryTag(u8[] odcid, u8[] packet, i64 start, i64 count) {
+    i64 ol = Slice.Len(odcid);
+    u8[] pseudo = Slice.New(1_i64 + ol + count);
+    pseudo[0] = u8(ol);
+    Slice.Copy(pseudo, 1_i64, odcid, 0_i64, ol);
+    Slice.Copy(pseudo, 1_i64 + ol, packet, start, count);
+    u8[] tag = Slice.New(16_i64);
+    match AesGcm.New(Hex.Of("be0c690b9f66575a1d766b54e368c84e")) {
+        Result::Ok(key) => {
+            match AesGcm.SealInto(key, Hex.Of("461599d35d632bf2239825bb"), pseudo, tag, 0_i64, 0_i64, tag, 0_i64) { Result::Ok(_) => (), Result::Error(_) => (), };
+        },
+        Result::Error(_) => (),
+    };
+    return tag;
+}
+
+/// Checks the Retry integrity tag of the packet buf[start..end).
+pub bool RetryValid(u8[] odcid, u8[] buf, i64 start, i64 end) {
+    if end - start < 23_i64 { return false; }
+    u8[] tag = RetryTag(odcid, buf, start, end - start - 16_i64);
+    return QuicWire.SameBytes(tag, 0_i64, buf, end - 16_i64, 16_i64);
+}
+
+/// Builds a Retry packet (RFC 9000 section 17.2.5) with its integrity tag.
+pub u8[] BuildRetry(u8[] odcid, u8[] dcid, u8[] scid, u8[] token) {
+    i64 n = 7_i64 + Slice.Len(dcid) + Slice.Len(scid) + Slice.Len(token);
+    u8[] out = Slice.New(n + 16_i64);
+    Writer w = QuicWire.NewWriter(out, 0_i64, n);
+    QuicWire.PutByte(w, 255_i64);
+    QuicWire.PutUint(w, 4_i64, 1_i64);
+    QuicWire.PutByte(w, Slice.Len(dcid));
+    QuicWire.PutAll(w, dcid);
+    QuicWire.PutByte(w, Slice.Len(scid));
+    QuicWire.PutAll(w, scid);
+    QuicWire.PutAll(w, token);
+    Slice.Copy(out, n, RetryTag(odcid, out, 0_i64, n), 0_i64, 16_i64);
+    return out;
+}

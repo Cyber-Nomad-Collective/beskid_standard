@@ -1,0 +1,76 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.String;
+
+// Minimal growable big-endian writer for handshake messages, with length back-patching.
+
+pub type Emitter { pub u8[] data, }
+
+pub Emitter New() {
+    mut u8[] d = Array.Empty<u8>();
+    return Emitter { data: d };
+}
+
+pub i64 Len(Emitter e) { return Slice.Len(e.data); }
+
+pub unit U8(Emitter e, i64 v) { Array.Append<u8>(e.data, u8(v & 255_i64)); return; }
+
+pub unit U16(Emitter e, i64 v) { U8(e, v >> 8_i64); U8(e, v); return; }
+
+pub unit U24(Emitter e, i64 v) { U8(e, v >> 16_i64); U8(e, v >> 8_i64); U8(e, v); return; }
+
+pub unit U32(Emitter e, i64 v) { U8(e, v >> 24_i64); U8(e, v >> 16_i64); U8(e, v >> 8_i64); U8(e, v); return; }
+
+pub unit Raw(Emitter e, u8[] bytes) {
+    i64 n = Slice.Len(bytes);
+    mut i64 i = 0_i64;
+    while i < n { Array.Append<u8>(e.data, bytes[i]); i = i + 1_i64; }
+    return;
+}
+
+pub unit Text(Emitter e, string text) {
+    i64 n = String.Len(text);
+    mut i64 i = 0_i64;
+    while i < n { Array.Append<u8>(e.data, String.ByteAt(text, i)); i = i + 1_i64; }
+    return;
+}
+
+/// Reserves a `width`-byte length prefix and returns its position.
+pub i64 Open(Emitter e, i64 width) {
+    i64 at = Slice.Len(e.data);
+    mut i64 i = 0_i64;
+    while i < width { Array.Append<u8>(e.data, 0_u8); i = i + 1_i64; }
+    return at;
+}
+
+/// Back-patches the prefix opened at `mark` with the number of bytes written since.
+pub unit Close(Emitter e, i64 mark, i64 width) {
+    i64 length = Slice.Len(e.data) - mark - width;
+    mut i64 i = 0_i64;
+    while i < width {
+        e.data[mark + i] = u8((length >> ((width - 1_i64 - i) * 8_i64)) & 255_i64);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+/// Writes a complete vector: `width`-byte length then the bytes.
+pub unit Vec(Emitter e, i64 width, u8[] bytes) {
+    i64 n = Slice.Len(bytes);
+    mut i64 i = 0_i64;
+    while i < width {
+        U8(e, n >> ((width - 1_i64 - i) * 8_i64));
+        i = i + 1_i64;
+    }
+    Raw(e, bytes);
+    return;
+}
+
+pub u8[] Bytes(Emitter e) { return e.data; }
+
+/// Byte form of a string (UTF-8 code units).
+pub u8[] TextBytes(string text) {
+    Emitter e = New();
+    Text(e, text);
+    return e.data;
+}

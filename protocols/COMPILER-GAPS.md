@@ -360,6 +360,66 @@ without double or trailing underscores, and must be unique per target.
   path checks) 75-85 s of codegen per test, so x509 targets keep one heavy test each.
 - Workaround: single-exit functions, sticky `i64` error codes inside the parser
   (`Der.Fail(p, code)`, mapped to `X509Error` once at the API boundary), few tests per target.
+
+## 2026-10-05, tls slice
+
+### `Module.Variant(x)` constructs an enum variant through a module path, then ICEs
+- Symptom: `TlsErrors.InvalidConfig(TlsErrors.ConfigMissingServerName())` type-checks (the
+  module `TlsErrors` declares `enum TlsError { InvalidConfig(i64 reason), ... }`) but fails at
+  CLIF time with `no ISLE lowering rule or fact for CallExpression`, reported at an unrelated
+  line of the calling function.
+- Workaround: always construct variants as `TlsError::InvalidConfig(x)`.
+
+### `?` on a call that passes a contract value
+- Symptom: `no ISLE lowering rule or fact for TryExpression` for `WriteRaw(transport, buf, n)?;`
+  and `i64 t = ReadRecord(c, transport)?;` where `transport` is a `Core.IO.Stream` parameter.
+  `?` on calls without contract arguments lowers fine.
+- Workaround: bind the Result and match:
+  `Result<unit, TlsError> r = WriteRaw(transport, buf, n); match r { Result::Error(e) => { return Result::Error(e); }, Result::Ok(_) => {}, };`
+
+### `return match` with a block arm that returns, and a nested match in a `return match`
+- Symptom: `no ISLE lowering rule or fact for MatchExpression` for
+  `return match suite { CipherSuite::ChaCha20Poly1305Sha256 => { if ... { return ...; } return ...; }, _ => { ...; return match made { ... }; }, };`
+- Workaround: statement `match` with `return` in each arm, or `if` on a code.
+
+### Nested literal pattern in a match arm
+- Symptom: `match r { Result::Error(TlsError::LocalAlert(22)) => true, _ => false, }` ICEs
+  (`CallExpression`).
+- Workaround: bind `Result::Error(e)` and compare `TlsErrors.Code(e)`.
+
+### Array literal with a field/element/parameter element (again)
+- `string[] chosen = [e.names[0]];` and `i64[] st = [state, 0_i64]` (parameter) ICE with
+  `ArrayLiteralExpression`; `[suite]` with a parameter too. Workaround: `Array.Empty` + `Append`,
+  or a literal of constants followed by an element store.
+
+### No nested array types
+- `u8[][]` is a parse error (`expected Identifier`). Workaround: `type Blob { pub u8[] data, }`
+  and `Blob[]`.
+
+### `pub` is not usable as an identifier
+- `u8[] pub = ...;` is a parse error. Use another name.
+
+### Tests that touch the network must run inside a spawned fiber
+- Symptom: `TcpStream.Connect` and `TcpListener.Accept` both failed when the scenario ran on
+  the test's own body with a server fiber; wrapping the whole scenario in
+  `Fiber<unit> f = spawn (() => Scenario(codes)); f.Join();` (as the corelib TCP tests do) works.
+
+### `Assert.Equal` hides values; `Assert.Fail(message)` prints its message
+- Use a helper `Expect(actual, expected, what)` that calls `Assert.Fail(what + ": got " + Dec(actual))`.
+
+### Performance: per-test CLIF generation grows superlinearly with reachable functions
+- Measured (macOS arm64, loaded host): a test reaching the TLS client engine (544 functions)
+  spends 2m15s-2m45s in "Generate CLIF"; a loopback client+server test (722 functions, with
+  X.509) 4m05s-4m35s; type checking the project adds ~20-100 s per target. Runtime is small
+  in comparison (three full loopback handshakes plus echo in ~2.5 s).
+- Every `test` repeats the whole code generation, so a target with four replay tests took
+  11m35s. With `--all-targets`, the default `--matrix-timeout` of 1800 s bounds the whole run.
+- Workaround: one test function per heavy target that calls several scenario functions; keep
+  heavy targets few.
+
+### `beskid test` fails if the project tree changes during a run
+- Symptom: `prepared workspace content mutated during phase execute_target` when a test source
+  is edited while a target runs. Do not edit the test project during runs.
 ## 2026-10-05, websocket slice
 
 ### W1. Array literal with computed elements inside a struct literal is reported as a StructLiteral ICE

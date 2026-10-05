@@ -6,7 +6,6 @@
 /// of matching a Result per field. Only the definite, minimal length form is accepted,
 /// tags must use the minimal form, and primitive universal types must be primitive.
 use Core.Bytes.Slice;
-use Core.Collections.Array;
 use Core.String;
 use Core.Encoding.Utf8;
 use X509.X509Errors;
@@ -50,30 +49,28 @@ pub type DerElement {
     pub i64 end,
 }
 
-/// Input buffer plus the sticky error. `failed[0]` is 1 after the first failure.
+/// Input buffer plus the sticky error. `state[0]` is 0 while no error is recorded,
+/// otherwise the `X509Errors` code of the first failure.
 pub type DerParser {
     pub u8[] data,
-    X509Error[] error,
-    i64[] failed,
+    i64[] state,
 }
 
 pub DerParser New(u8[] data) {
-    mut X509Error[] error = Array.Empty<X509Error>();
-    Array.Append<X509Error>(error, X509Error::None);
-    return DerParser { data: data, error: error, failed: [0_i64] };
+    return DerParser { data: data, state: [0_i64] };
 }
 
-pub bool Ok(DerParser p) { return p.failed[0] == 0_i64; }
+pub bool Ok(DerParser p) { return p.state[0] == 0_i64; }
+
+/// The code of the first recorded error, or 0.
+pub i64 ErrorCode(DerParser p) { return p.state[0]; }
 
 /// The first recorded error, or `X509Error::None`.
-pub X509Error Error(DerParser p) { return p.error[0]; }
+pub X509Error Error(DerParser p) { return X509Errors.FromCode(p.state[0]); }
 
-/// Records `error` unless an earlier error is already recorded.
-pub unit Fail(DerParser p, X509Error error) {
-    if p.failed[0] == 0_i64 {
-        p.failed[0] = 1_i64;
-        p.error[0] = error;
-    }
+/// Records the error `code` (an `X509Errors.E*` value) unless one is already recorded.
+pub unit Fail(DerParser p, i64 code) {
+    if p.state[0] == 0_i64 { p.state[0] = code; }
     return;
 }
 
@@ -86,54 +83,64 @@ pub DerElement Empty(i64 at) {
 pub DerElement Read(DerParser p, i64 offset, i64 limit) {
     if !Ok(p) { return Empty(limit); }
     u8[] d = p.data;
-    if limit > Slice.Len(d) || offset < 0_i64 || offset >= limit { Fail(p, X509Error::Truncated); return Empty(limit); }
+    mut i64 code = 0_i64;
     mut i64 pos = offset;
-    u8 first = d[pos];
-    pos = pos + 1_i64;
-    i64 tagClass = i64(first >> 6_u8);
-    bool constructed = (first & 0x20_u8) != 0_u8;
-    mut i64 number = i64(first & 0x1F_u8);
-    if number == 31_i64 {
-        // High tag number form: base-128, no leading 0x80 octet, value >= 31.
-        number = 0_i64;
-        mut bool more = true;
-        mut i64 count = 0_i64;
-        while more {
-            if pos >= limit { Fail(p, X509Error::Truncated); return Empty(limit); }
-            u8 b = d[pos];
-            pos = pos + 1_i64;
-            if count == 0_i64 && b == 0x80_u8 { Fail(p, X509Error::BadTag); return Empty(limit); }
-            count = count + 1_i64;
-            if count > 4_i64 { Fail(p, X509Error::BadTag); return Empty(limit); }
-            number = number * 128_i64 + i64(b & 0x7F_u8);
-            more = (b & 0x80_u8) != 0_u8;
-        }
-        if number < 31_i64 { Fail(p, X509Error::BadTag); return Empty(limit); }
-    }
-    if pos >= limit { Fail(p, X509Error::Truncated); return Empty(limit); }
-    u8 lb = d[pos];
-    pos = pos + 1_i64;
+    mut i64 tagClass = 0_i64;
+    mut bool constructed = false;
+    mut i64 number = 0_i64;
     mut i64 length = 0_i64;
-    if lb < 0x80_u8 {
-        length = i64(lb);
-    } else {
-        i64 octets = i64(lb & 0x7F_u8);
-        // 0x80 is the indefinite form (BER only); more than 4 octets is never needed.
-        if octets == 0_i64 || octets > 4_i64 { Fail(p, X509Error::BadLength); return Empty(limit); }
-        if pos + octets > limit { Fail(p, X509Error::Truncated); return Empty(limit); }
-        if d[pos] == 0_u8 { Fail(p, X509Error::BadLength); return Empty(limit); }
-        mut i64 i = 0_i64;
-        while i < octets {
-            length = length * 256_i64 + i64(d[pos + i]);
-            i = i + 1_i64;
+    if limit > Slice.Len(d) || offset < 0_i64 || offset >= limit { code = 1_i64; }
+    if code == 0_i64 {
+        u8 first = d[pos];
+        pos = pos + 1_i64;
+        tagClass = i64(first >> 6_u8);
+        constructed = (first & 0x20_u8) != 0_u8;
+        number = i64(first & 0x1F_u8);
+        if number == 31_i64 {
+            // High tag number form: base-128, no leading 0x80 octet, value >= 31.
+            number = 0_i64;
+            mut bool more = true;
+            mut i64 count = 0_i64;
+            while more && code == 0_i64 {
+                if pos >= limit { code = 1_i64; }
+                else {
+                    u8 b = d[pos];
+                    pos = pos + 1_i64;
+                    if (count == 0_i64 && b == 0x80_u8) || count >= 4_i64 { code = 2_i64; }
+                    count = count + 1_i64;
+                    number = number * 128_i64 + i64(b & 0x7F_u8);
+                    more = (b & 0x80_u8) != 0_u8;
+                }
+            }
+            if code == 0_i64 && number < 31_i64 { code = 2_i64; }
         }
-        pos = pos + octets;
-        if length < 128_i64 { Fail(p, X509Error::BadLength); return Empty(limit); }
     }
-    if length > limit - pos { Fail(p, X509Error::Truncated); return Empty(limit); }
-    if tagClass == 0_i64 {
-        if !UniversalConstructionOk(number, constructed) { Fail(p, X509Error::BadConstruction); return Empty(limit); }
+    if code == 0_i64 && pos >= limit { code = 1_i64; }
+    if code == 0_i64 {
+        u8 lb = d[pos];
+        pos = pos + 1_i64;
+        if lb < 0x80_u8 {
+            length = i64(lb);
+        } else {
+            i64 octets = i64(lb & 0x7F_u8);
+            // 0x80 is the indefinite form (BER only); more than 4 octets is never needed.
+            if octets == 0_i64 || octets > 4_i64 { code = 3_i64; }
+            else if pos + octets > limit { code = 1_i64; }
+            else if d[pos] == 0_u8 { code = 3_i64; }
+            else {
+                mut i64 i = 0_i64;
+                while i < octets {
+                    length = length * 256_i64 + i64(d[pos + i]);
+                    i = i + 1_i64;
+                }
+                pos = pos + octets;
+                if length < 128_i64 { code = 3_i64; }
+            }
+        }
     }
+    if code == 0_i64 && length > limit - pos { code = 1_i64; }
+    if code == 0_i64 && tagClass == 0_i64 && !UniversalConstructionOk(number, constructed) { code = 15_i64; }
+    if code != 0_i64 { Fail(p, code); return Empty(limit); }
     return DerElement { tagClass: tagClass, constructed: constructed, tagNumber: number, start: offset, content: pos, length: length, end: pos + length };
 }
 
@@ -169,7 +176,7 @@ pub bool PeekIs(DerParser p, i64 offset, i64 limit, i64 tagClass, i64 number) {
 pub DerElement Expect(DerParser p, i64 offset, i64 limit, i64 tagClass, bool constructed, i64 number) {
     DerElement e = Read(p, offset, limit);
     if !Ok(p) { return Empty(limit); }
-    if !Is(e, tagClass, constructed, number) { Fail(p, X509Error::UnexpectedTag); return Empty(limit); }
+    if !Is(e, tagClass, constructed, number) { Fail(p, 4_i64); return Empty(limit); }
     return e;
 }
 
@@ -183,7 +190,7 @@ pub DerElement ExpectUniversal(DerParser p, i64 offset, i64 limit, i64 number) {
 
 /// Requires that `offset` reached `end` exactly.
 pub unit ExpectEnd(DerParser p, i64 offset, i64 end) {
-    if Ok(p) && offset != end { Fail(p, X509Error::TrailingData); }
+    if Ok(p) && offset != end { Fail(p, 5_i64); }
     return;
 }
 
@@ -193,14 +200,14 @@ pub unit ExpectEnd(DerParser p, i64 offset, i64 end) {
 pub unit CheckTree(DerParser p, i64 offset, i64 limit) {
     DerElement e = Read(p, offset, limit);
     if !Ok(p) { return; }
-    if e.end != limit { Fail(p, X509Error::TrailingData); return; }
+    if e.end != limit { Fail(p, 5_i64); return; }
     CheckChildren(p, e, 1_i64);
     return;
 }
 
 unit CheckChildren(DerParser p, DerElement e, i64 depth) {
     if !e.constructed { return; }
-    if depth > MaxDepth() { Fail(p, X509Error::TooDeep); return; }
+    if depth > MaxDepth() { Fail(p, 6_i64); return; }
     mut i64 pos = e.content;
     while Ok(p) && pos < e.end {
         DerElement child = Read(p, pos, e.end);
@@ -224,13 +231,13 @@ pub u8[] Encoded(DerParser p, DerElement e) {
 /// Validates a primitive INTEGER: non-empty and minimally encoded (X.690 8.3.2).
 pub unit CheckInteger(DerParser p, DerElement e) {
     if !Ok(p) { return; }
-    if !IsUniversal(e, 2_i64) { Fail(p, X509Error::UnexpectedTag); return; }
-    if e.length == 0_i64 { Fail(p, X509Error::BadInteger); return; }
+    if !IsUniversal(e, 2_i64) { Fail(p, 4_i64); return; }
+    if e.length == 0_i64 { Fail(p, 8_i64); return; }
     if e.length > 1_i64 {
         u8 b0 = p.data[e.content];
         u8 b1 = p.data[e.content + 1_i64];
-        if b0 == 0_u8 && b1 < 0x80_u8 { Fail(p, X509Error::BadInteger); return; }
-        if b0 == 0xFF_u8 && b1 >= 0x80_u8 { Fail(p, X509Error::BadInteger); return; }
+        if b0 == 0_u8 && b1 < 0x80_u8 { Fail(p, 8_i64); return; }
+        if b0 == 0xFF_u8 && b1 >= 0x80_u8 { Fail(p, 8_i64); return; }
     }
     return;
 }
@@ -246,11 +253,11 @@ pub i64 ReadSmallInteger(DerParser p, i64 offset, i64 limit) {
     DerElement e = ExpectUniversal(p, offset, limit, 2_i64);
     CheckInteger(p, e);
     if !Ok(p) { return 0_i64; }
-    if IntegerIsNegative(p, e) || e.length > 8_i64 { Fail(p, X509Error::BadInteger); return 0_i64; }
+    if IntegerIsNegative(p, e) || e.length > 8_i64 { Fail(p, 8_i64); return 0_i64; }
     mut i64 v = 0_i64;
     mut i64 i = 0_i64;
     while i < e.length {
-        if v > 0x3FFFFFFFFFFFFF_i64 { Fail(p, X509Error::BadInteger); return 0_i64; }
+        if v > 0x3FFFFFFFFFFFFF_i64 { Fail(p, 8_i64); return 0_i64; }
         v = v * 256_i64 + i64(p.data[e.content + i]);
         i = i + 1_i64;
     }
@@ -261,7 +268,7 @@ pub i64 ReadSmallInteger(DerParser p, i64 offset, i64 limit) {
 pub u8[] UnsignedIntegerBytes(DerParser p, DerElement e) {
     CheckInteger(p, e);
     if !Ok(p) { return Slice.New(0_i64); }
-    if IntegerIsNegative(p, e) { Fail(p, X509Error::BadInteger); return Slice.New(0_i64); }
+    if IntegerIsNegative(p, e) { Fail(p, 8_i64); return Slice.New(0_i64); }
     if e.length > 1_i64 && p.data[e.content] == 0_u8 {
         return Slice.SubSlice(p.data, e.content + 1_i64, e.length - 1_i64);
     }
@@ -271,38 +278,38 @@ pub u8[] UnsignedIntegerBytes(DerParser p, DerElement e) {
 /// Reads a DER BOOLEAN (0x00 or 0xFF).
 pub bool ReadBoolean(DerParser p, DerElement e) {
     if !Ok(p) { return false; }
-    if !IsUniversal(e, 1_i64) { Fail(p, X509Error::UnexpectedTag); return false; }
-    if e.length != 1_i64 { Fail(p, X509Error::BadBoolean); return false; }
+    if !IsUniversal(e, 1_i64) { Fail(p, 4_i64); return false; }
+    if e.length != 1_i64 { Fail(p, 9_i64); return false; }
     u8 v = p.data[e.content];
     if v == 0_u8 { return false; }
     if v == 0xFF_u8 { return true; }
-    Fail(p, X509Error::BadBoolean);
+    Fail(p, 9_i64);
     return false;
 }
 
 /// Validates a NULL.
 pub unit CheckNull(DerParser p, DerElement e) {
     if !Ok(p) { return; }
-    if !IsUniversal(e, 5_i64) { Fail(p, X509Error::UnexpectedTag); return; }
-    if e.length != 0_i64 { Fail(p, X509Error::BadNull); }
+    if !IsUniversal(e, 5_i64) { Fail(p, 4_i64); return; }
+    if e.length != 0_i64 { Fail(p, 11_i64); }
     return;
 }
 
 /// Validates a BIT STRING and returns its unused-bit count (0..7). Padding bits must be zero.
 pub i64 CheckBitString(DerParser p, DerElement e) {
     if !Ok(p) { return 0_i64; }
-    if !IsUniversal(e, 3_i64) { Fail(p, X509Error::UnexpectedTag); return 0_i64; }
-    if e.length < 1_i64 { Fail(p, X509Error::BadBitString); return 0_i64; }
+    if !IsUniversal(e, 3_i64) { Fail(p, 4_i64); return 0_i64; }
+    if e.length < 1_i64 { Fail(p, 10_i64); return 0_i64; }
     i64 unused = i64(p.data[e.content]);
-    if unused > 7_i64 { Fail(p, X509Error::BadBitString); return 0_i64; }
+    if unused > 7_i64 { Fail(p, 10_i64); return 0_i64; }
     if e.length == 1_i64 {
-        if unused != 0_i64 { Fail(p, X509Error::BadBitString); }
+        if unused != 0_i64 { Fail(p, 10_i64); }
         return 0_i64;
     }
     if unused > 0_i64 {
         u8 last = p.data[e.end - 1_i64];
         u8 mask = u8((1_i64 << unused) - 1_i64);
-        if (last & mask) != 0_u8 { Fail(p, X509Error::BadBitString); return 0_i64; }
+        if (last & mask) != 0_u8 { Fail(p, 10_i64); return 0_i64; }
     }
     return unused;
 }
@@ -311,23 +318,20 @@ pub i64 CheckBitString(DerParser p, DerElement e) {
 pub u8[] BitStringOctets(DerParser p, DerElement e) {
     i64 unused = CheckBitString(p, e);
     if !Ok(p) { return Slice.New(0_i64); }
-    if unused != 0_i64 { Fail(p, X509Error::BadBitString); return Slice.New(0_i64); }
+    if unused != 0_i64 { Fail(p, 10_i64); return Slice.New(0_i64); }
     return Slice.SubSlice(p.data, e.content + 1_i64, e.length - 1_i64);
 }
 
 /// Named-bit BIT STRING (keyUsage) as an integer: bit 0 of the ASN.1 value is the
 /// most significant bit of the first octet and becomes bit 0 of the result. DER requires
-/// trailing zero bits to be removed; that is checked.
+/// trailing zero bits to be removed (X.690 11.2.2); that rule is not enforced because
+/// deployed roots (Trustwave Global ECC, 2017) encode keyUsage as 03 03 07 06 00.
+/// Padding bits must still be zero.
 pub i64 NamedBits(DerParser p, DerElement e) {
-    i64 unused = CheckBitString(p, e);
+    CheckBitString(p, e);
     if !Ok(p) { return 0_i64; }
     i64 octets = e.length - 1_i64;
-    if octets > 4_i64 { Fail(p, X509Error::BadBitString); return 0_i64; }
-    if octets > 0_i64 {
-        u8 last = p.data[e.end - 1_i64];
-        if last == 0_u8 { Fail(p, X509Error::BadBitString); return 0_i64; }
-        if ((last >> u8(unused)) & 1_u8) == 0_u8 { Fail(p, X509Error::BadBitString); return 0_i64; }
-    }
+    if octets > 4_i64 { Fail(p, 10_i64); return 0_i64; }
     mut i64 bits = 0_i64;
     mut i64 i = 0_i64;
     while i < octets {
@@ -345,21 +349,21 @@ pub i64 NamedBits(DerParser p, DerElement e) {
 /// Validates an OBJECT IDENTIFIER: non-empty, minimal arcs, last octet terminates.
 pub unit CheckOid(DerParser p, DerElement e) {
     if !Ok(p) { return; }
-    if !IsUniversal(e, 6_i64) { Fail(p, X509Error::UnexpectedTag); return; }
-    if e.length == 0_i64 { Fail(p, X509Error::BadOid); return; }
+    if !IsUniversal(e, 6_i64) { Fail(p, 4_i64); return; }
+    if e.length == 0_i64 { Fail(p, 12_i64); return; }
     mut bool atStart = true;
     mut i64 arcLen = 0_i64;
     mut i64 i = 0_i64;
     while i < e.length {
         u8 b = p.data[e.content + i];
-        if atStart && b == 0x80_u8 { Fail(p, X509Error::BadOid); return; }
+        if atStart && b == 0x80_u8 { Fail(p, 12_i64); return; }
         arcLen = arcLen + 1_i64;
-        if arcLen > 8_i64 { Fail(p, X509Error::BadOid); return; }
+        if arcLen > 8_i64 { Fail(p, 12_i64); return; }
         atStart = (b & 0x80_u8) == 0_u8;
         if atStart { arcLen = 0_i64; }
         i = i + 1_i64;
     }
-    if !atStart { Fail(p, X509Error::BadOid); }
+    if !atStart { Fail(p, 12_i64); }
     return;
 }
 
@@ -413,7 +417,7 @@ i64 Digits(DerParser p, i64 at, i64 count) {
     mut i64 i = 0_i64;
     while i < count {
         u8 c = p.data[at + i];
-        if c < 48_u8 || c > 57_u8 { Fail(p, X509Error::BadTime); return 0_i64; }
+        if c < 48_u8 || c > 57_u8 { Fail(p, 13_i64); return 0_i64; }
         v = v * 10_i64 + i64(c - 48_u8);
         i = i + 1_i64;
     }
@@ -455,16 +459,16 @@ pub i64 ReadTime(DerParser p, i64 offset, i64 limit) {
     mut i64 year = 0_i64;
     mut i64 at = e.content;
     if IsUniversal(e, 23_i64) {
-        if e.length != 13_i64 { Fail(p, X509Error::BadTime); return 0_i64; }
+        if e.length != 13_i64 { Fail(p, 13_i64); return 0_i64; }
         i64 yy = Digits(p, at, 2_i64);
         if yy >= 50_i64 { year = 1900_i64 + yy; } else { year = 2000_i64 + yy; }
         at = at + 2_i64;
     } else if IsUniversal(e, 24_i64) {
-        if e.length != 15_i64 { Fail(p, X509Error::BadTime); return 0_i64; }
+        if e.length != 15_i64 { Fail(p, 13_i64); return 0_i64; }
         year = Digits(p, at, 4_i64);
         at = at + 4_i64;
     } else {
-        Fail(p, X509Error::UnexpectedTag);
+        Fail(p, 4_i64);
         return 0_i64;
     }
     i64 month = Digits(p, at, 2_i64);
@@ -473,9 +477,9 @@ pub i64 ReadTime(DerParser p, i64 offset, i64 limit) {
     i64 minute = Digits(p, at + 6_i64, 2_i64);
     i64 second = Digits(p, at + 8_i64, 2_i64);
     if !Ok(p) { return 0_i64; }
-    if p.data[at + 10_i64] != 90_u8 { Fail(p, X509Error::BadTime); return 0_i64; }
+    if p.data[at + 10_i64] != 90_u8 { Fail(p, 13_i64); return 0_i64; }
     if month < 1_i64 || month > 12_i64 || day < 1_i64 || day > DaysInMonth(year, month) || hour > 23_i64 || minute > 59_i64 || second > 59_i64 {
-        Fail(p, X509Error::BadTime);
+        Fail(p, 13_i64);
         return 0_i64;
     }
     return EpochSeconds(year, month, day, hour, minute, second);
@@ -517,20 +521,20 @@ u8[] Prefix(u8[] data, i64 count) { return Slice.SubSlice(data, 0_i64, count); }
 /// UniversalString (UCS-4). Other tags fail with UnexpectedTag.
 pub string ReadString(DerParser p, DerElement e) {
     if !Ok(p) { return ""; }
-    if e.tagClass != 0_i64 || e.constructed { Fail(p, X509Error::UnexpectedTag); return ""; }
+    if e.tagClass != 0_i64 || e.constructed { Fail(p, 4_i64); return ""; }
     i64 n = e.tagNumber;
     u8[] d = p.data;
     if n == 12_i64 {
         u8[] bytes = Content(p, e);
-        if !Utf8.IsValid(bytes) { Fail(p, X509Error::BadString); return ""; }
+        if !Utf8.IsValid(bytes) { Fail(p, 14_i64); return ""; }
         return String.FromUtf8CodeUnits(bytes);
     }
     if n == 19_i64 || n == 22_i64 {
         mut i64 i = 0_i64;
         while i < e.length {
             u8 c = d[e.content + i];
-            if n == 19_i64 && !IsPrintable(c) { Fail(p, X509Error::BadString); return ""; }
-            if c >= 0x80_u8 { Fail(p, X509Error::BadString); return ""; }
+            if n == 19_i64 && !IsPrintable(c) { Fail(p, 14_i64); return ""; }
+            if c >= 0x80_u8 { Fail(p, 14_i64); return ""; }
             i = i + 1_i64;
         }
         return String.FromUtf8CodeUnits(Content(p, e));
@@ -545,7 +549,7 @@ pub string ReadString(DerParser p, DerElement e) {
     if n == 30_i64 || n == 28_i64 {
         mut i64 width = 2_i64;
         if n == 28_i64 { width = 4_i64; }
-        if e.length % width != 0_i64 { Fail(p, X509Error::BadString); return ""; }
+        if e.length % width != 0_i64 { Fail(p, 14_i64); return ""; }
         u8[] out = Slice.New(e.length * 2_i64);
         mut i64 at = 0_i64;
         mut i64 i = 0_i64;
@@ -553,13 +557,13 @@ pub string ReadString(DerParser p, DerElement e) {
             mut i64 cp = 0_i64;
             mut i64 k = 0_i64;
             while k < width { cp = cp * 256_i64 + i64(d[e.content + i + k]); k = k + 1_i64; }
-            if (cp >= 0xD800_i64 && cp <= 0xDFFF_i64) || cp > 0x10FFFF_i64 { Fail(p, X509Error::BadString); return ""; }
+            if (cp >= 0xD800_i64 && cp <= 0xDFFF_i64) || cp > 0x10FFFF_i64 { Fail(p, 14_i64); return ""; }
             at = PutUtf8(out, at, cp);
             i = i + width;
         }
         return String.FromUtf8CodeUnits(Prefix(out, at));
     }
-    Fail(p, X509Error::UnexpectedTag);
+    Fail(p, 4_i64);
     return "";
 }
 
@@ -568,7 +572,7 @@ pub string ReadIa5(DerParser p, DerElement e) {
     if !Ok(p) { return ""; }
     mut i64 i = 0_i64;
     while i < e.length {
-        if p.data[e.content + i] >= 0x80_u8 { Fail(p, X509Error::BadString); return ""; }
+        if p.data[e.content + i] >= 0x80_u8 { Fail(p, 14_i64); return ""; }
         i = i + 1_i64;
     }
     return String.FromUtf8CodeUnits(Content(p, e));

@@ -126,10 +126,10 @@ pub type Certificate {
 }
 
 pub bool IsKeyAlgorithm(KeyAlgorithm a, KeyAlgorithm b) {
-    return KeyIndex(a) == KeyIndex(b);
+    return KeyIndexOf(a) == KeyIndexOf(b);
 }
 
-i64 KeyIndex(KeyAlgorithm a) {
+pub i64 KeyIndexOf(KeyAlgorithm a) {
     return match a { KeyAlgorithm::Rsa => 0_i64, KeyAlgorithm::EcP256 => 1_i64, KeyAlgorithm::EcOther => 2_i64, KeyAlgorithm::Ed25519 => 3_i64, KeyAlgorithm::Unknown => 4_i64, };
 }
 
@@ -161,7 +161,7 @@ unit NullOrAbsent(DerParser p, i64 at, i64 end) {
 }
 
 unit Absent(DerParser p, i64 at, i64 end) {
-    if Der.Ok(p) && at != end { Der.Fail(p, X509Error::BadAlgorithm); }
+    if Der.Ok(p) && at != end { Der.Fail(p, 19_i64); }
     return;
 }
 
@@ -188,7 +188,7 @@ i64 MgfHashBits(DerParser p, DerElement m) {
     Der.ExpectEnd(p, mseq.end, m.end);
     DerElement mgfOidEl = Der.Read(p, mseq.content, mseq.end);
     string mgfOid = Der.OidString(p, mgfOidEl);
-    if Der.Ok(p) && mgfOid != "1.2.840.113549.1.1.8" { Der.Fail(p, X509Error::UnsupportedAlgorithm); }
+    if Der.Ok(p) && mgfOid != "1.2.840.113549.1.1.8" { Der.Fail(p, 20_i64); }
     return HashBits(p, mgfOidEl.end, mseq.end);
 }
 
@@ -225,12 +225,12 @@ PssParams ParsePssParams(DerParser p, i64 at, i64 end) {
     }
     if Der.PeekIs(p, q, params.end, 2_i64, 3_i64) {
         DerElement t = Der.Expect(p, q, params.end, 2_i64, true, 3_i64);
-        if TaggedInteger(p, t) != 1_i64 { Der.Fail(p, X509Error::BadAlgorithm); }
+        if TaggedInteger(p, t) != 1_i64 { Der.Fail(p, 19_i64); }
         q = t.end;
     }
     Der.ExpectEnd(p, q, params.end);
-    if hashBits == 0_i64 || mgfBits != hashBits { Der.Fail(p, X509Error::UnsupportedAlgorithm); }
-    if salt > 512_i64 { Der.Fail(p, X509Error::BadAlgorithm); }
+    if hashBits == 0_i64 || mgfBits != hashBits { Der.Fail(p, 20_i64); }
+    if salt > 512_i64 { Der.Fail(p, 19_i64); }
     return PssParams { hashBits: hashBits, saltLength: salt };
 }
 
@@ -258,7 +258,7 @@ SignatureScheme SchemeOf(string oid) {
 /// Unrecognized algorithms parse as `Unknown` with their parameters unchecked.
 pub SignatureAlgorithm ParseSignatureAlgorithm(DerParser p, DerElement e) {
     if !Der.Ok(p) { return UnknownAlgorithm(); }
-    if !Der.Is(e, 0_i64, true, 16_i64) { Der.Fail(p, X509Error::UnexpectedTag); return UnknownAlgorithm(); }
+    if !Der.Is(e, 0_i64, true, 16_i64) { Der.Fail(p, 4_i64); return UnknownAlgorithm(); }
     DerElement oidEl = Der.Read(p, e.content, e.end);
     string oid = Der.OidString(p, oidEl);
     SignatureScheme scheme = SchemeOf(oid);
@@ -286,14 +286,14 @@ pub i64 SchemeIndex(SignatureScheme s) {
     };
 }
 
-PublicKeyInfo EmptyKey() {
+pub PublicKeyInfo EmptyKey() {
     return PublicKeyInfo { algorithm: KeyAlgorithm::Unknown, der: Slice.New(0_i64), rsaModulus: Slice.New(0_i64), rsaExponent: Slice.New(0_i64), keyBytes: Slice.New(0_i64), curveOid: "" };
 }
 
 /// Parses SubjectPublicKeyInfo (RFC 5280 4.1.2.7, RFC 3279, RFC 5480, RFC 8410).
 pub PublicKeyInfo ParsePublicKeyInfo(DerParser p, DerElement e) {
     if !Der.Ok(p) { return EmptyKey(); }
-    if !Der.Is(e, 0_i64, true, 16_i64) { Der.Fail(p, X509Error::UnexpectedTag); return EmptyKey(); }
+    if !Der.Is(e, 0_i64, true, 16_i64) { Der.Fail(p, 4_i64); return EmptyKey(); }
     DerElement alg = Der.ExpectSequence(p, e.content, e.end);
     DerElement bits = Der.ExpectUniversal(p, alg.end, e.end, 3_i64);
     Der.ExpectEnd(p, bits.end, e.end);
@@ -316,21 +316,21 @@ pub PublicKeyInfo ParsePublicKeyInfo(DerParser p, DerElement e) {
         Der.ExpectEnd(kp, ee.end, seq.end);
         n = Der.UnsignedIntegerBytes(kp, ne);
         exp = Der.UnsignedIntegerBytes(kp, ee);
-        if !Der.Ok(kp) { Der.Fail(p, X509Error::BadKey); return EmptyKey(); }
+        if !Der.Ok(kp) { Der.Fail(p, 22_i64); return EmptyKey(); }
         algorithm = KeyAlgorithm::Rsa;
     } else if oid == "1.2.840.10045.2.1" {
         curve = Der.ReadOid(p, oidEl.end, alg.end);
         DerElement curveEl = Der.Read(p, oidEl.end, alg.end);
         Der.ExpectEnd(p, curveEl.end, alg.end);
         if curve == "1.2.840.10045.3.1.7" {
-            if Slice.Len(keyBytes) != 65_i64 || keyBytes[0] != 4_u8 { Der.Fail(p, X509Error::BadKey); return EmptyKey(); }
+            if Slice.Len(keyBytes) != 65_i64 || keyBytes[0] != 4_u8 { Der.Fail(p, 22_i64); return EmptyKey(); }
             algorithm = KeyAlgorithm::EcP256;
         } else {
             algorithm = KeyAlgorithm::EcOther;
         }
     } else if oid == "1.3.101.112" {
         Absent(p, oidEl.end, alg.end);
-        if Slice.Len(keyBytes) != 32_i64 { Der.Fail(p, X509Error::BadKey); return EmptyKey(); }
+        if Slice.Len(keyBytes) != 32_i64 { Der.Fail(p, 22_i64); return EmptyKey(); }
         algorithm = KeyAlgorithm::Ed25519;
     }
     if !Der.Ok(p) { return EmptyKey(); }
@@ -341,7 +341,7 @@ NameConstraints NoConstraints() {
     return NameConstraints { present: false, permittedDns: Array.Empty<string>(), excludedDns: Array.Empty<string>(), permittedIp: Array.Empty<IpBytes>(), excludedIp: Array.Empty<IpBytes>(), hasUnsupportedForm: false };
 }
 
-Extensions NoExtensions() {
+pub Extensions NoExtensions() {
     return Extensions {
         hasBasicConstraints: false, isCa: false, pathLen: -1_i64,
         hasKeyUsage: false, keyUsage: 0_i64,
@@ -380,7 +380,7 @@ Subtrees ParseSubtrees(DerParser p, DerElement trees) {
     mut string[] dns = Array.Empty<string>();
     mut IpBytes[] ips = Array.Empty<IpBytes>();
     mut bool unsupported = false;
-    if trees.length == 0_i64 { Der.Fail(p, X509Error::BadExtension); }
+    if trees.length == 0_i64 { Der.Fail(p, 23_i64); }
     mut i64 pos = trees.content;
     while Der.Ok(p) && pos < trees.end {
         DerElement sub = Der.ExpectSequence(p, pos, trees.end);
@@ -391,7 +391,7 @@ Subtrees ParseSubtrees(DerParser p, DerElement trees) {
             if Der.Is(base, 2_i64, false, 2_i64) {
                 Array.Append<string>(dns, Lower(Der.ReadIa5(p, base)));
             } else if Der.Is(base, 2_i64, false, 7_i64) {
-                if base.length != 8_i64 && base.length != 32_i64 { Der.Fail(p, X509Error::BadExtension); }
+                if base.length != 8_i64 && base.length != 32_i64 { Der.Fail(p, 23_i64); }
                 else { Array.Append<IpBytes>(ips, IpBytes { bytes: Der.Content(p, base) }); }
             } else {
                 unsupported = true;
@@ -408,7 +408,7 @@ pub NameConstraints ParseNameConstraints(DerParser p, i64 at, i64 end) {
     mut Subtrees permitted = Subtrees { dns: Array.Empty<string>(), ips: Array.Empty<IpBytes>(), unsupported: false };
     mut Subtrees excluded = Subtrees { dns: Array.Empty<string>(), ips: Array.Empty<IpBytes>(), unsupported: false };
     mut i64 q = seq.content;
-    if Der.Ok(p) && seq.length == 0_i64 { Der.Fail(p, X509Error::BadExtension); }
+    if Der.Ok(p) && seq.length == 0_i64 { Der.Fail(p, 23_i64); }
     if Der.PeekIs(p, q, seq.end, 2_i64, 0_i64) {
         DerElement pe = Der.Expect(p, q, seq.end, 2_i64, true, 0_i64);
         permitted = ParseSubtrees(p, pe);
@@ -432,133 +432,166 @@ bool Contains(string[] list, string value) {
     return false;
 }
 
+// Scalar extension state, indexed by the constants below.
+i64 SBc() { return 0_i64; }
+i64 SCa() { return 1_i64; }
+i64 SPathLen() { return 2_i64; }
+i64 SKu() { return 3_i64; }
+i64 SKuBits() { return 4_i64; }
+i64 SEku() { return 5_i64; }
+i64 SServer() { return 6_i64; }
+i64 SClient() { return 7_i64; }
+i64 SAny() { return 8_i64; }
+i64 SSan() { return 9_i64; }
+
+/// basicConstraints (RFC 5280 4.2.1.9).
+pub unit ParseBasicConstraints(DerParser p, i64 vs, i64 ve, i64[] st) {
+    st[SBc()] = 1_i64;
+    DerElement bc = Der.ExpectSequence(p, vs, ve);
+    Der.ExpectEnd(p, bc.end, ve);
+    mut i64 b = bc.content;
+    if Der.PeekIs(p, b, bc.end, 0_i64, 1_i64) {
+        DerElement caEl = Der.Read(p, b, bc.end);
+        if Der.ReadBoolean(p, caEl) { st[SCa()] = 1_i64; }
+        b = caEl.end;
+    }
+    if Der.PeekIs(p, b, bc.end, 0_i64, 2_i64) {
+        DerElement plEl = Der.Read(p, b, bc.end);
+        st[SPathLen()] = Der.ReadSmallInteger(p, b, bc.end);
+        b = plEl.end;
+        // pathLenConstraint is meaningful only when cA is TRUE.
+        if st[SCa()] == 0_i64 { Der.Fail(p, 23_i64); }
+    }
+    Der.ExpectEnd(p, b, bc.end);
+    return;
+}
+
+/// keyUsage (RFC 5280 4.2.1.3).
+unit ParseKeyUsage(DerParser p, i64 vs, i64 ve, i64[] st) {
+    st[SKu()] = 1_i64;
+    DerElement kuEl = Der.ExpectUniversal(p, vs, ve, 3_i64);
+    Der.ExpectEnd(p, kuEl.end, ve);
+    i64 bits = Der.NamedBits(p, kuEl);
+    if bits == 0_i64 { Der.Fail(p, 23_i64); }
+    st[SKuBits()] = bits;
+    return;
+}
+
+/// extKeyUsage (RFC 5280 4.2.1.12).
+unit ParseExtKeyUsage(DerParser p, i64 vs, i64 ve, i64[] st) {
+    st[SEku()] = 1_i64;
+    DerElement ekuEl = Der.ExpectSequence(p, vs, ve);
+    Der.ExpectEnd(p, ekuEl.end, ve);
+    if Der.Ok(p) && ekuEl.length == 0_i64 { Der.Fail(p, 23_i64); }
+    mut i64 k = ekuEl.content;
+    while Der.Ok(p) && k < ekuEl.end {
+        DerElement purposeEl = Der.Read(p, k, ekuEl.end);
+        string purpose = Der.OidString(p, purposeEl);
+        if purpose == "1.3.6.1.5.5.7.3.1" { st[SServer()] = 1_i64; }
+        if purpose == "1.3.6.1.5.5.7.3.2" { st[SClient()] = 1_i64; }
+        if purpose == "2.5.29.37.0" { st[SAny()] = 1_i64; }
+        k = purposeEl.end;
+    }
+    return;
+}
+
+pub type AltNames { string[] dns, IpBytes[] ips, }
+
+/// subjectAltName (RFC 5280 4.2.1.6): dNSName and iPAddress are kept, other forms skipped.
+pub AltNames ParseSubjectAltName(DerParser p, i64 vs, i64 ve) {
+    mut string[] dns = Array.Empty<string>();
+    mut IpBytes[] ips = Array.Empty<IpBytes>();
+    DerElement sanEl = Der.ExpectSequence(p, vs, ve);
+    Der.ExpectEnd(p, sanEl.end, ve);
+    if Der.Ok(p) && sanEl.length == 0_i64 { Der.Fail(p, 23_i64); }
+    mut i64 k = sanEl.content;
+    while Der.Ok(p) && k < sanEl.end {
+        DerElement gn = Der.Read(p, k, sanEl.end);
+        if Der.Ok(p) && gn.tagClass != 2_i64 { Der.Fail(p, 23_i64); }
+        if Der.Is(gn, 2_i64, false, 2_i64) {
+            Array.Append<string>(dns, Der.ReadIa5(p, gn));
+        } else if Der.Is(gn, 2_i64, false, 7_i64) {
+            if gn.length != 4_i64 && gn.length != 16_i64 { Der.Fail(p, 23_i64); }
+            else { Array.Append<IpBytes>(ips, IpBytes { bytes: Der.Content(p, gn) }); }
+        }
+        k = gn.end;
+    }
+    return AltNames { dns: dns, ips: ips };
+}
+
+u8[] ParseSubjectKeyId(DerParser p, i64 vs, i64 ve) {
+    DerElement skiEl = Der.ExpectUniversal(p, vs, ve, 4_i64);
+    Der.ExpectEnd(p, skiEl.end, ve);
+    return Der.Content(p, skiEl);
+}
+
+u8[] ParseAuthorityKeyId(DerParser p, i64 vs, i64 ve) {
+    DerElement akiEl = Der.ExpectSequence(p, vs, ve);
+    Der.ExpectEnd(p, akiEl.end, ve);
+    if Der.PeekIs(p, akiEl.content, akiEl.end, 2_i64, 0_i64) {
+        DerElement kid = Der.Expect(p, akiEl.content, akiEl.end, 2_i64, false, 0_i64);
+        return Der.Content(p, kid);
+    }
+    return Slice.New(0_i64);
+}
+
+/// One Extension SEQUENCE header: OID, critical flag, and the OCTET STRING value.
+pub type ExtHeader { string oid, bool critical, i64 valueStart, i64 valueEnd, i64 end, }
+
+pub ExtHeader ReadExtHeader(DerParser p, i64 pos, i64 limit) {
+    DerElement ext = Der.ExpectSequence(p, pos, limit);
+    DerElement oidEl = Der.Read(p, ext.content, ext.end);
+    string oid = Der.OidString(p, oidEl);
+    mut i64 q = oidEl.end;
+    mut bool critical = false;
+    if Der.PeekIs(p, q, ext.end, 0_i64, 1_i64) {
+        // DER omits a DEFAULT FALSE value; an explicit FALSE is tolerated because
+        // deployed certificates carry it, and it changes nothing.
+        DerElement flag = Der.Read(p, q, ext.end);
+        critical = Der.ReadBoolean(p, flag);
+        q = flag.end;
+    }
+    DerElement value = Der.ExpectUniversal(p, q, ext.end, 4_i64);
+    Der.ExpectEnd(p, value.end, ext.end);
+    if !Der.Ok(p) { return ExtHeader { oid: "", critical: false, valueStart: limit, valueEnd: limit, end: limit }; }
+    return ExtHeader { oid: oid, critical: critical, valueStart: value.content, valueEnd: value.end, end: ext.end };
+}
+
 /// Parses the [3] Extensions wrapper content.
 pub Extensions ParseExtensions(DerParser p, DerElement wrapper) {
     DerElement list = Der.ExpectSequence(p, wrapper.content, wrapper.end);
     Der.ExpectEnd(p, list.end, wrapper.end);
-    if Der.Ok(p) && list.length == 0_i64 { Der.Fail(p, X509Error::BadExtension); }
+    if Der.Ok(p) && list.length == 0_i64 { Der.Fail(p, 23_i64); }
     mut string[] seen = Array.Empty<string>();
-    mut bool hasBc = false;
-    mut bool isCa = false;
-    mut i64 pathLen = -1_i64;
-    mut bool hasKu = false;
-    mut i64 ku = 0_i64;
-    mut bool hasEku = false;
-    mut bool ekuServer = false;
-    mut bool ekuClient = false;
-    mut bool ekuAny = false;
-    mut bool hasSan = false;
-    mut string[] dns = Array.Empty<string>();
-    mut IpBytes[] ips = Array.Empty<IpBytes>();
+    i64[] st = [0_i64, 0_i64, -1_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+    mut AltNames san = AltNames { dns: Array.Empty<string>(), ips: Array.Empty<IpBytes>() };
     mut u8[] ski = Slice.New(0_i64);
     mut u8[] aki = Slice.New(0_i64);
     mut NameConstraints nc = NoConstraints();
     mut i64 pos = list.content;
     while Der.Ok(p) && pos < list.end {
-        DerElement ext = Der.ExpectSequence(p, pos, list.end);
-        string oid = Der.ReadOid(p, ext.content, ext.end);
-        DerElement oidEl = Der.Read(p, ext.content, ext.end);
-        mut i64 q = oidEl.end;
-        mut bool critical = false;
-        if Der.PeekIs(p, q, ext.end, 0_i64, 1_i64) {
-            DerElement flag = Der.Read(p, q, ext.end);
-            critical = Der.ReadBoolean(p, flag);
-            // DER omits a DEFAULT FALSE value; an explicit FALSE is tolerated because
-            // deployed certificates carry it, but it changes nothing.
-            q = flag.end;
-        }
-        DerElement value = Der.ExpectUniversal(p, q, ext.end, 4_i64);
-        Der.ExpectEnd(p, value.end, ext.end);
-        if Der.Ok(p) {
-            if Contains(seen, oid) { Der.Fail(p, X509Error::BadExtension); }
-            Array.Append<string>(seen, oid);
-        }
-        i64 vs = value.content;
-        i64 ve = value.end;
-        if !Der.Ok(p) {
-            pos = list.end;
-        } else if oid == "2.5.29.19" {
-            hasBc = true;
-            DerElement bc = Der.ExpectSequence(p, vs, ve);
-            Der.ExpectEnd(p, bc.end, ve);
-            mut i64 b = bc.content;
-            if Der.PeekIs(p, b, bc.end, 0_i64, 1_i64) {
-                DerElement caEl = Der.Read(p, b, bc.end);
-                isCa = Der.ReadBoolean(p, caEl);
-                b = caEl.end;
-            }
-            if Der.PeekIs(p, b, bc.end, 0_i64, 2_i64) {
-                DerElement plEl = Der.Read(p, b, bc.end);
-                pathLen = Der.ReadSmallInteger(p, b, bc.end);
-                b = plEl.end;
-                // pathLenConstraint is meaningful only when cA is TRUE.
-                if Der.Ok(p) && !isCa { Der.Fail(p, X509Error::BadExtension); }
-            }
-            Der.ExpectEnd(p, b, bc.end);
-        } else if oid == "2.5.29.15" {
-            hasKu = true;
-            DerElement kuEl = Der.ExpectUniversal(p, vs, ve, 3_i64);
-            Der.ExpectEnd(p, kuEl.end, ve);
-            ku = Der.NamedBits(p, kuEl);
-            if Der.Ok(p) && ku == 0_i64 { Der.Fail(p, X509Error::BadExtension); }
-        } else if oid == "2.5.29.37" {
-            hasEku = true;
-            DerElement ekuEl = Der.ExpectSequence(p, vs, ve);
-            Der.ExpectEnd(p, ekuEl.end, ve);
-            if Der.Ok(p) && ekuEl.length == 0_i64 { Der.Fail(p, X509Error::BadExtension); }
-            mut i64 k = ekuEl.content;
-            while Der.Ok(p) && k < ekuEl.end {
-                DerElement purposeEl = Der.Read(p, k, ekuEl.end);
-                string purpose = Der.ReadOid(p, k, ekuEl.end);
-                if purpose == "1.3.6.1.5.5.7.3.1" { ekuServer = true; }
-                if purpose == "1.3.6.1.5.5.7.3.2" { ekuClient = true; }
-                if purpose == "2.5.29.37.0" { ekuAny = true; }
-                k = purposeEl.end;
-            }
-        } else if oid == "2.5.29.17" {
-            hasSan = true;
-            DerElement sanEl = Der.ExpectSequence(p, vs, ve);
-            Der.ExpectEnd(p, sanEl.end, ve);
-            if Der.Ok(p) && sanEl.length == 0_i64 { Der.Fail(p, X509Error::BadExtension); }
-            mut i64 k = sanEl.content;
-            while Der.Ok(p) && k < sanEl.end {
-                DerElement gn = Der.Read(p, k, sanEl.end);
-                if Der.Ok(p) && gn.tagClass != 2_i64 { Der.Fail(p, X509Error::BadExtension); }
-                if Der.Is(gn, 2_i64, false, 2_i64) {
-                    Array.Append<string>(dns, Der.ReadIa5(p, gn));
-                } else if Der.Is(gn, 2_i64, false, 7_i64) {
-                    if gn.length != 4_i64 && gn.length != 16_i64 { Der.Fail(p, X509Error::BadExtension); }
-                    else { Array.Append<IpBytes>(ips, IpBytes { bytes: Der.Content(p, gn) }); }
-                }
-                k = gn.end;
-            }
-        } else if oid == "2.5.29.14" {
-            DerElement skiEl = Der.ExpectUniversal(p, vs, ve, 4_i64);
-            Der.ExpectEnd(p, skiEl.end, ve);
-            ski = Der.Content(p, skiEl);
-        } else if oid == "2.5.29.35" {
-            DerElement akiEl = Der.ExpectSequence(p, vs, ve);
-            Der.ExpectEnd(p, akiEl.end, ve);
-            if Der.PeekIs(p, akiEl.content, akiEl.end, 2_i64, 0_i64) {
-                DerElement kid = Der.Expect(p, akiEl.content, akiEl.end, 2_i64, false, 0_i64);
-                aki = Der.Content(p, kid);
-            }
-        } else if oid == "2.5.29.30" {
-            nc = ParseNameConstraints(p, vs, ve);
-        } else if oid == "2.5.29.32" {
-            // certificatePolicies: accepted, no policy processing (RFC 5280 6.1 with
-            // initial-any-policy).
-            Der.ExpectSequence(p, vs, ve);
-        } else if critical {
-            Der.Fail(p, X509Error::UnknownCriticalExtension);
-        }
-        pos = ext.end;
+        ExtHeader h = ReadExtHeader(p, pos, list.end);
+        string oid = h.oid;
+        if Der.Ok(p) && Contains(seen, oid) { Der.Fail(p, 23_i64); }
+        Array.Append<string>(seen, oid);
+        if !Der.Ok(p) { pos = list.end; }
+        else if oid == "2.5.29.19" { ParseBasicConstraints(p, h.valueStart, h.valueEnd, st); }
+        else if oid == "2.5.29.15" { ParseKeyUsage(p, h.valueStart, h.valueEnd, st); }
+        else if oid == "2.5.29.37" { ParseExtKeyUsage(p, h.valueStart, h.valueEnd, st); }
+        else if oid == "2.5.29.17" { st[SSan()] = 1_i64; san = ParseSubjectAltName(p, h.valueStart, h.valueEnd); }
+        else if oid == "2.5.29.14" { ski = ParseSubjectKeyId(p, h.valueStart, h.valueEnd); }
+        else if oid == "2.5.29.35" { aki = ParseAuthorityKeyId(p, h.valueStart, h.valueEnd); }
+        else if oid == "2.5.29.30" { nc = ParseNameConstraints(p, h.valueStart, h.valueEnd); }
+        // certificatePolicies: accepted without policy processing (initial-any-policy).
+        else if oid == "2.5.29.32" { Der.ExpectSequence(p, h.valueStart, h.valueEnd); }
+        else if h.critical { Der.Fail(p, 24_i64); }
+        pos = h.end;
     }
     return Extensions {
-        hasBasicConstraints: hasBc, isCa: isCa, pathLen: pathLen,
-        hasKeyUsage: hasKu, keyUsage: ku,
-        hasExtKeyUsage: hasEku, ekuServerAuth: ekuServer, ekuClientAuth: ekuClient, ekuAny: ekuAny,
-        hasSubjectAltName: hasSan, dnsNames: dns, ipAddresses: ips,
+        hasBasicConstraints: st[0] == 1_i64, isCa: st[1] == 1_i64, pathLen: st[2],
+        hasKeyUsage: st[3] == 1_i64, keyUsage: st[4],
+        hasExtKeyUsage: st[5] == 1_i64, ekuServerAuth: st[6] == 1_i64, ekuClientAuth: st[7] == 1_i64, ekuAny: st[8] == 1_i64,
+        hasSubjectAltName: st[9] == 1_i64, dnsNames: san.dns, ipAddresses: san.ips,
         subjectKeyId: ski, authorityKeyId: aki,
         nameConstraints: nc,
     };
@@ -585,17 +618,17 @@ pub Result<Certificate, X509Error> Parse(u8[] der) {
         Der.ExpectEnd(p, vi.end, v.end);
         i64 raw = Der.ReadSmallInteger(p, v.content, v.end);
         // v1 is the DEFAULT and must not be encoded in DER.
-        if Der.Ok(p) && (raw < 1_i64 || raw > 2_i64) { Der.Fail(p, X509Error::BadVersion); }
+        if Der.Ok(p) && (raw < 1_i64 || raw > 2_i64) { Der.Fail(p, 17_i64); }
         version = raw + 1_i64;
         q = v.end;
     }
     DerElement serialEl = Der.ExpectUniversal(p, q, tbs.end, 2_i64);
     Der.CheckInteger(p, serialEl);
-    if Der.Ok(p) && (Der.IntegerIsNegative(p, serialEl) || serialEl.length > 21_i64) { Der.Fail(p, X509Error::BadSerial); }
+    if Der.Ok(p) && (Der.IntegerIsNegative(p, serialEl) || serialEl.length > 21_i64) { Der.Fail(p, 18_i64); }
     u8[] serial = Der.Content(p, serialEl);
     DerElement innerAlg = Der.ExpectSequence(p, serialEl.end, tbs.end);
-    if Der.Ok(p) && !Der.RangeEquals(der, innerAlg.start, der, outerAlg.start, innerAlg.end - innerAlg.start) { Der.Fail(p, X509Error::BadAlgorithm); }
-    if Der.Ok(p) && innerAlg.end - innerAlg.start != outerAlg.end - outerAlg.start { Der.Fail(p, X509Error::BadAlgorithm); }
+    if Der.Ok(p) && !Der.RangeEquals(der, innerAlg.start, der, outerAlg.start, innerAlg.end - innerAlg.start) { Der.Fail(p, 19_i64); }
+    if Der.Ok(p) && innerAlg.end - innerAlg.start != outerAlg.end - outerAlg.start { Der.Fail(p, 19_i64); }
     SignatureAlgorithm sigAlg = ParseSignatureAlgorithm(p, outerAlg);
     DerElement issuerEl = Der.ExpectSequence(p, innerAlg.end, tbs.end);
     DistinguishedName issuer = Names.Parse(p, issuerEl);
@@ -611,18 +644,18 @@ pub Result<Certificate, X509Error> Parse(u8[] der) {
     PublicKeyInfo key = ParsePublicKeyInfo(p, spkiEl);
     q = spkiEl.end;
     if Der.PeekIs(p, q, tbs.end, 2_i64, 1_i64) {
-        if Der.Ok(p) && version < 2_i64 { Der.Fail(p, X509Error::BadVersion); }
+        if Der.Ok(p) && version < 2_i64 { Der.Fail(p, 17_i64); }
         DerElement uid = Der.Read(p, q, tbs.end);
         q = uid.end;
     }
     if Der.PeekIs(p, q, tbs.end, 2_i64, 2_i64) {
-        if Der.Ok(p) && version < 2_i64 { Der.Fail(p, X509Error::BadVersion); }
+        if Der.Ok(p) && version < 2_i64 { Der.Fail(p, 17_i64); }
         DerElement uid2 = Der.Read(p, q, tbs.end);
         q = uid2.end;
     }
     mut Extensions ext = NoExtensions();
     if Der.PeekIs(p, q, tbs.end, 2_i64, 3_i64) {
-        if Der.Ok(p) && version != 3_i64 { Der.Fail(p, X509Error::BadVersion); }
+        if Der.Ok(p) && version != 3_i64 { Der.Fail(p, 17_i64); }
         DerElement wrapper = Der.Expect(p, q, tbs.end, 2_i64, true, 3_i64);
         ext = ParseExtensions(p, wrapper);
         q = wrapper.end;
@@ -673,12 +706,12 @@ Result<Certificate[], X509Error> ParseBlobs(DerBlob[] list) {
     return Result::Ok(certs);
 }
 
-/// The certificate of a successful parse; callers check `ErrorOf` first.
-Certificate Unwrap(Result<Certificate, X509Error> parsed) {
+/// The certificate of a successful parse; callers check `Succeeded` first.
+pub Certificate Unwrap(Result<Certificate, X509Error> parsed) {
     return match parsed { Result::Ok(c) => c, Result::Error(_) => Placeholder(), };
 }
 
-Certificate Placeholder() {
+pub Certificate Placeholder() {
     return Certificate {
         der: Slice.New(0_i64), tbsStart: 0_i64, tbsLength: 0_i64, version: 0_i64, serial: Slice.New(0_i64),
         signatureAlgorithm: UnknownAlgorithm(), issuer: Names.EmptyName(), subject: Names.EmptyName(),
@@ -686,8 +719,13 @@ Certificate Placeholder() {
     };
 }
 
-X509Error ErrorOf(Result<Certificate, X509Error> parsed) {
+/// The error of a failed parse, or None.
+pub X509Error ErrorOf(Result<Certificate, X509Error> parsed) {
     return match parsed { Result::Ok(_) => X509Error::None, Result::Error(e) => e, };
+}
+
+pub bool Succeeded(Result<Certificate, X509Error> parsed) {
+    return match parsed { Result::Ok(_) => true, Result::Error(_) => false, };
 }
 
 /// True when the certificate is a self-issued (issuer equals subject) certificate.

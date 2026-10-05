@@ -42,3 +42,9 @@ Append: date, slice, symptom, minimal repro, workaround.
 - Workaround: avoid structs with many array fields on hot API paths (one workspace array
   instead), use literal suffixes (`0_u8`) instead of conversion calls in large literals,
   and keep test targets to a few tests each.
+
+### Long straight-line function body fails to lower
+- Symptom: `internal compiler error: no ISLE lowering rule or fact for Block (MissingRuleOrFact)`
+  on a generated, fully unrolled 8-limb Montgomery multiply (~230 statements, ~45 `i64`
+  locals, no loops) taking `(u32[] w, i64 out, i64 a, i64 b)`. Codegen time per test also rose by ~5 s.
+- Workaround: keep the looped `ModArith.WMul`; the unrolled variant was dropped.

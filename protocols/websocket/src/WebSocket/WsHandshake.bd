@@ -1,0 +1,392 @@
+use Core.Bytes.Slice;
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Core.Encoding.Base64;
+use Core.Encoding.EncodingError;
+use Core.Results;
+use Core.String;
+use Crypto.Entropy;
+use Crypto.Sha1;
+use Uri.Chars;
+use WebSocket.WsErrors;
+
+// RFC 6455 section 4 opening handshake over HTTP/1.1, client and server side.
+// Pure functions over head lines; reading the head from a transport lives in
+// WsConnection. Corelib Http treats 1xx as an interim response, so the 101 is
+// parsed here.
+
+// HandshakeFailed reason codes.
+pub i64 ReasonBadStatusLine() { return 1_i64; }
+pub i64 ReasonBadHeader() { return 2_i64; }
+pub i64 ReasonMissingUpgrade() { return 3_i64; }
+pub i64 ReasonMissingConnection() { return 4_i64; }
+pub i64 ReasonBadAccept() { return 5_i64; }
+pub i64 ReasonUnexpectedExtension() { return 6_i64; }
+pub i64 ReasonUnexpectedProtocol() { return 7_i64; }
+pub i64 ReasonBadRequestLine() { return 8_i64; }
+pub i64 ReasonMissingHost() { return 9_i64; }
+pub i64 ReasonBadKey() { return 10_i64; }
+pub i64 ReasonUnsupportedVersion() { return 11_i64; }
+pub i64 ReasonHeadTooLarge() { return 12_i64; }
+pub i64 ReasonTruncated() { return 13_i64; }
+pub i64 ReasonBadProtocolList() { return 14_i64; }
+pub i64 ReasonUnexpectedBody() { return 15_i64; }
+
+/// Head limits: bytes per line, header count.
+pub i64 MaxLineLength() { return 4096_i64; }
+pub i64 MaxHeaders() { return 64_i64; }
+
+/// One header field: lowercased name, value without surrounding whitespace.
+pub type WsHeader {
+    pub string name,
+    pub string value,
+}
+
+/// A validated client opening handshake as the server sees it.
+pub type UpgradeRequest {
+    pub string resource,
+    pub string hostHeader,
+    pub string key,
+    pub string origin,
+    pub string[] protocols,
+}
+
+pub string Guid() { return "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"; }
+
+WsError Fail(i64 reason) { return WsError::HandshakeFailed(reason); }
+
+/// Sec-WebSocket-Accept for a key: base64(SHA-1(key + GUID)) (section 4.2.2).
+pub string AcceptKey(string key) {
+    u8[] digest = Sha1.Hash(Convert.StringToBytes(key + Guid()));
+    return match Base64.EncodeBytes(digest) {
+        Result::Ok(text) => String.FromUtf8CodeUnits(text),
+        Result::Error(_) => "",
+    };
+}
+
+/// A fresh Sec-WebSocket-Key: 16 random bytes, base64 (section 4.1).
+pub Result<string, WsError> NewKey() {
+    return match Entropy.Bytes(16_i64) {
+        Result::Error(_) => Result::Error(WsError::EntropyUnavailable()),
+        Result::Ok(nonce) => EncodeKey(nonce),
+    };
+}
+
+Result<string, WsError> EncodeKey(u8[] nonce) {
+    return match Base64.EncodeBytes(nonce) {
+        Result::Ok(text) => Result::Ok(String.FromUtf8CodeUnits(text)),
+        Result::Error(_) => Result::Error(WsError::EntropyUnavailable()),
+    };
+}
+
+/// True when `key` is the canonical base64 form of exactly 16 bytes.
+pub bool ValidKey(string key) {
+    if String.Len(key) != 24_i64 { return false; }
+    u8[] raw = Convert.StringToBytes(key);
+    return match Base64.DecodeBytes(raw) {
+        Result::Error(_) => false,
+        Result::Ok(decoded) => Slice.Len(decoded) == 16_i64 && Reencodes(decoded, raw),
+    };
+}
+
+bool Reencodes(u8[] decoded, u8[] raw) {
+    return match Base64.EncodeBytes(decoded) {
+        Result::Ok(again) => Slice.Compare(again, raw) == 0_i64,
+        Result::Error(_) => false,
+    };
+}
+
+// RFC 9110 tchar.
+pub bool IsTokenByte(i64 c) {
+    if Chars.IsAlpha(c) || Chars.IsDigit(c) { return true; }
+    return c == 33_i64 || c == 35_i64 || c == 36_i64 || c == 37_i64 || c == 38_i64 || c == 39_i64 || c == 42_i64
+        || c == 43_i64 || c == 45_i64 || c == 46_i64 || c == 94_i64 || c == 95_i64 || c == 96_i64 || c == 124_i64 || c == 126_i64;
+}
+
+pub bool IsToken(string text) {
+    i64 n = String.Len(text);
+    if n == 0_i64 { return false; }
+    mut i64 i = 0_i64;
+    while i < n {
+        if !IsTokenByte(i64(String.ByteAt(text, i))) { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+bool IsOws(i64 c) { return c == 32_i64 || c == 9_i64; }
+
+// Field value bytes: VCHAR, SP, HTAB. obs-text is rejected (strict ASCII head).
+bool IsValueByte(i64 c) { return c == 9_i64 || (c >= 32_i64 && c <= 126_i64); }
+
+string Text(u8[] bytes, i64 start, i64 stop) {
+    if stop <= start { return ""; }
+    return String.FromUtf8CodeUnits(Slice.SubSlice(bytes, start, stop - start));
+}
+
+/// Parses `name: value`. The name is a token with no whitespace before the colon;
+/// the value is trimmed of SP/HTAB. Obsolete line folding is rejected.
+pub Result<WsHeader, WsError> ParseHeaderLine(u8[] line) {
+    i64 n = Slice.Len(line);
+    mut i64 colon = -1_i64;
+    mut i64 i = 0_i64;
+    while i < n && colon < 0_i64 {
+        i64 c = i64(line[i]);
+        if c == 58_i64 { colon = i; } else if !IsTokenByte(c) { return Result::Error(Fail(ReasonBadHeader())); }
+        i = i + 1_i64;
+    }
+    if colon <= 0_i64 { return Result::Error(Fail(ReasonBadHeader())); }
+    mut i64 start = colon + 1_i64;
+    mut i64 stop = n;
+    while start < stop && IsOws(i64(line[start])) { start = start + 1_i64; }
+    while stop > start && IsOws(i64(line[stop - 1_i64])) { stop = stop - 1_i64; }
+    i = start;
+    while i < stop {
+        if !IsValueByte(i64(line[i])) { return Result::Error(Fail(ReasonBadHeader())); }
+        i = i + 1_i64;
+    }
+    string name = Chars.LowerAscii(Text(line, 0_i64, colon));
+    return Result::Ok(WsHeader { name: name, value: Text(line, start, stop) });
+}
+
+i64 Digit(u8[] line, i64 i) {
+    i64 c = i64(line[i]);
+    if c < 48_i64 || c > 57_i64 { return -1_i64; }
+    return c - 48_i64;
+}
+
+/// Parses `HTTP/1.1 SP 3DIGIT SP reason-phrase` and returns the status code.
+pub Result<i64, WsError> ParseStatusLine(u8[] line) {
+    i64 n = Slice.Len(line);
+    if n < 13_i64 { return Result::Error(Fail(ReasonBadStatusLine())); }
+    if Text(line, 0_i64, 9_i64) != "HTTP/1.1 " || line[12] != 32_u8 { return Result::Error(Fail(ReasonBadStatusLine())); }
+    i64 d0 = Digit(line, 9_i64);
+    i64 d1 = Digit(line, 10_i64);
+    i64 d2 = Digit(line, 11_i64);
+    if d0 < 1_i64 || d1 < 0_i64 || d2 < 0_i64 { return Result::Error(Fail(ReasonBadStatusLine())); }
+    mut i64 i = 13_i64;
+    while i < n {
+        if !IsValueByte(i64(line[i])) { return Result::Error(Fail(ReasonBadStatusLine())); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(d0 * 100_i64 + d1 * 10_i64 + d2);
+}
+
+/// Parses `GET SP origin-form SP HTTP/1.1` and returns the request target.
+pub Result<string, WsError> ParseRequestLine(u8[] line) {
+    i64 n = Slice.Len(line);
+    if n < 14_i64 || Text(line, 0_i64, 4_i64) != "GET " { return Result::Error(Fail(ReasonBadRequestLine())); }
+    if Text(line, n - 9_i64, n) != " HTTP/1.1" { return Result::Error(Fail(ReasonBadRequestLine())); }
+    i64 stop = n - 9_i64;
+    if line[4] != 47_u8 { return Result::Error(Fail(ReasonBadRequestLine())); }
+    mut i64 i = 4_i64;
+    while i < stop {
+        i64 c = i64(line[i]);
+        if c <= 32_i64 || c >= 127_i64 || c == 35_i64 { return Result::Error(Fail(ReasonBadRequestLine())); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(Text(line, 4_i64, stop));
+}
+
+/// Number of headers named `name` (lowercase).
+pub i64 CountOf(WsHeader[] headers, string name) {
+    mut i64 count = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Array.Len<WsHeader>(headers) {
+        WsHeader h = headers[i];
+        if h.name == name { count = count + 1_i64; }
+        i = i + 1_i64;
+    }
+    return count;
+}
+
+/// Value of the first header named `name`, or "".
+pub string ValueOf(WsHeader[] headers, string name) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<WsHeader>(headers) {
+        WsHeader h = headers[i];
+        if h.name == name { return h.value; }
+        i = i + 1_i64;
+    }
+    return "";
+}
+
+/// Elements of a comma-separated list over every header named `name`, trimmed;
+/// empty elements are skipped (RFC 9110 section 5.6.1). Fails on a non-token element.
+pub Result<string[], WsError> TokenList(WsHeader[] headers, string name) {
+    mut string[] out = Array.Empty<string>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<WsHeader>(headers) {
+        WsHeader h = headers[i];
+        if h.name == name {
+            string value = h.value;
+            i64 n = String.Len(value);
+            mut i64 start = 0_i64;
+            while start <= n {
+                mut i64 stop = start;
+                while stop < n && String.ByteAt(value, stop) != 44_u8 { stop = stop + 1_i64; }
+                mut i64 a = start;
+                mut i64 b = stop;
+                while a < b && IsOws(i64(String.ByteAt(value, a))) { a = a + 1_i64; }
+                while b > a && IsOws(i64(String.ByteAt(value, b - 1_i64))) { b = b - 1_i64; }
+                if b > a {
+                    string element = String.SubSlice(value, a, b - a);
+                    if !IsToken(element) { return Result::Error(Fail(ReasonBadProtocolList())); }
+                    Array.Append<string>(out, element);
+                }
+                start = stop + 1_i64;
+            }
+        }
+        i = i + 1_i64;
+    }
+    return Result::Ok(out);
+}
+
+bool ContainsCi(string[] list, string lowered) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(list) {
+        if Chars.LowerAscii(list[i]) == lowered { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+bool ContainsExact(string[] list, string value) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(list) {
+        if list[i] == value { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+bool ListHasCi(WsHeader[] headers, string name, string lowered) {
+    return match TokenList(headers, name) {
+        Result::Ok(list) => ContainsCi(list, lowered),
+        Result::Error(_) => false,
+    };
+}
+
+// String.CodeUnitChar covers only ASCII letters and digits.
+string Crlf() { return String.FromUtf8CodeUnits([13_u8, 10_u8]); }
+
+/// The client opening handshake (section 4.1). `protocols` may be empty and
+/// `origin` "" to omit those fields. Extensions are never offered.
+pub Result<u8[], WsError> ClientRequest(string resource, string hostHeader, string key, string[] protocols, string origin) {
+    if String.Len(resource) == 0_i64 || String.ByteAt(resource, 0_i64) != 47_u8 || String.Len(hostHeader) == 0_i64 {
+        return Result::Error(WsError::InvalidArgument());
+    }
+    string nl = Crlf();
+    mut string head = "GET " + resource + " HTTP/1.1" + nl;
+    head = head + "Host: " + hostHeader + nl;
+    head = head + "Upgrade: websocket" + nl;
+    head = head + "Connection: Upgrade" + nl;
+    head = head + "Sec-WebSocket-Key: " + key + nl;
+    head = head + "Sec-WebSocket-Version: 13" + nl;
+    i64 count = Array.Len<string>(protocols);
+    if count > 0_i64 {
+        mut string list = "";
+        mut i64 i = 0_i64;
+        while i < count {
+            string p = protocols[i];
+            if !IsToken(p) { return Result::Error(WsError::InvalidArgument()); }
+            if i > 0_i64 { list = list + ", "; }
+            list = list + p;
+            i = i + 1_i64;
+        }
+        head = head + "Sec-WebSocket-Protocol: " + list + nl;
+    }
+    if String.Len(origin) > 0_i64 { head = head + "Origin: " + origin + nl; }
+    head = head + nl;
+    return Result::Ok(Convert.StringToBytes(head));
+}
+
+/// Validates the server's opening handshake (section 4.2.2 / 4.1 client rules)
+/// and returns the selected subprotocol ("" when none).
+pub Result<string, WsError> ValidateServerResponse(i64 status, WsHeader[] headers, string key, string[] offered) {
+    if status != 101_i64 { return Result::Error(WsError::Rejected(status)); }
+    if CountOf(headers, "upgrade") != 1_i64 || Chars.LowerAscii(ValueOf(headers, "upgrade")) != "websocket" {
+        return Result::Error(Fail(ReasonMissingUpgrade()));
+    }
+    if !ListHasCi(headers, "connection", "upgrade") { return Result::Error(Fail(ReasonMissingConnection())); }
+    if CountOf(headers, "sec-websocket-accept") != 1_i64 || ValueOf(headers, "sec-websocket-accept") != AcceptKey(key) {
+        return Result::Error(Fail(ReasonBadAccept()));
+    }
+    Result<string[], WsError> extensions = TokenList(headers, "sec-websocket-extensions");
+    match extensions {
+        Result::Error(_) => { return Result::Error(Fail(ReasonUnexpectedExtension())); },
+        Result::Ok(list) => { if Array.Len<string>(list) > 0_i64 { return Result::Error(Fail(ReasonUnexpectedExtension())); } },
+    };
+    i64 protocolCount = CountOf(headers, "sec-websocket-protocol");
+    if protocolCount == 0_i64 { return Result::Ok(""); }
+    string chosen = ValueOf(headers, "sec-websocket-protocol");
+    if protocolCount > 1_i64 || !IsToken(chosen) || !ContainsExact(offered, chosen) {
+        return Result::Error(Fail(ReasonUnexpectedProtocol()));
+    }
+    return Result::Ok(chosen);
+}
+
+/// Validates a client opening handshake (section 4.2.1). UnsupportedVersion means
+/// the server answers 426 with `Sec-WebSocket-Version: 13`; every other failure is 400.
+pub Result<UpgradeRequest, WsError> ValidateClientRequest(string resource, WsHeader[] headers) {
+    if CountOf(headers, "host") != 1_i64 || String.Len(ValueOf(headers, "host")) == 0_i64 {
+        return Result::Error(Fail(ReasonMissingHost()));
+    }
+    if CountOf(headers, "transfer-encoding") > 0_i64 { return Result::Error(Fail(ReasonUnexpectedBody())); }
+    if CountOf(headers, "content-length") > 0_i64 && ValueOf(headers, "content-length") != "0" {
+        return Result::Error(Fail(ReasonUnexpectedBody()));
+    }
+    if !ListHasCi(headers, "upgrade", "websocket") { return Result::Error(Fail(ReasonMissingUpgrade())); }
+    if !ListHasCi(headers, "connection", "upgrade") { return Result::Error(Fail(ReasonMissingConnection())); }
+    if CountOf(headers, "sec-websocket-version") != 1_i64 || ValueOf(headers, "sec-websocket-version") != "13" {
+        return Result::Error(Fail(ReasonUnsupportedVersion()));
+    }
+    string key = ValueOf(headers, "sec-websocket-key");
+    if CountOf(headers, "sec-websocket-key") != 1_i64 || !ValidKey(key) { return Result::Error(Fail(ReasonBadKey())); }
+    Result<string[], WsError> protocols = TokenList(headers, "sec-websocket-protocol");
+    return match protocols {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(list) => Result::Ok(UpgradeRequest {
+            resource: resource,
+            hostHeader: ValueOf(headers, "host"),
+            key: key,
+            origin: ValueOf(headers, "origin"),
+            protocols: list,
+        }),
+    };
+}
+
+/// The first protocol in the server's preference order that the client offered, or "".
+pub string ChooseProtocol(string[] offered, string[] supported) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(supported) {
+        string candidate = supported[i];
+        if ContainsExact(offered, candidate) { return candidate; }
+        i = i + 1_i64;
+    }
+    return "";
+}
+
+/// The server's 101 response for a validated key and the chosen protocol ("" for none).
+pub u8[] ServerAccept(string key, string protocol) {
+    string nl = Crlf();
+    mut string head = "HTTP/1.1 101 Switching Protocols" + nl;
+    head = head + "Upgrade: websocket" + nl;
+    head = head + "Connection: Upgrade" + nl;
+    head = head + "Sec-WebSocket-Accept: " + AcceptKey(key) + nl;
+    if String.Len(protocol) > 0_i64 { head = head + "Sec-WebSocket-Protocol: " + protocol + nl; }
+    head = head + nl;
+    return Convert.StringToBytes(head);
+}
+
+/// The server's refusal for a failed handshake: 426 with the supported version for
+/// UnsupportedVersion, 400 otherwise. The server closes the connection afterwards.
+pub u8[] ServerReject(WsError error) {
+    string nl = Crlf();
+    mut string head = "HTTP/1.1 400 Bad Request" + nl;
+    if WsErrors.Code(error) == 7_i64 && WsErrors.Detail(error) == ReasonUnsupportedVersion() {
+        head = "HTTP/1.1 426 Upgrade Required" + nl + "Sec-WebSocket-Version: 13" + nl;
+    }
+    head = head + "Connection: close" + nl + "Content-Length: 0" + nl + nl;
+    return Convert.StringToBytes(head);
+}

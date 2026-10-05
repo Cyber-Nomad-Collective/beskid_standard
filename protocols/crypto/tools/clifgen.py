@@ -9,6 +9,8 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "Crypto")
 
 
@@ -388,7 +390,295 @@ def gen_chacha():
         "meta[2] < meta[3]", poly1305_blocks(), "meta[2]"))
 
 
-GENERATORS = {"sha": gen_sha, "chacha": gen_chacha}
+# ---------------------------------------------------------------- AES (vpaes) and GHASH
+
+import vpaes  # noqa: E402  (tools/vpaes.py, the checked model)
+
+
+class VecEmit:
+    """vpaes vector interface emitting CLIF for `width` independent blocks at once.
+    A value is either one SSA name shared by every block (constants, round keys) or a
+    tuple with one name per block; each operation is emitted block by block, which
+    interleaves the independent blocks for the out-of-order core."""
+
+    def __init__(self, block, tables, width):
+        self.b = block
+        self.tp = tables
+        self.width = width
+
+    def _lanes(self, value):
+        return value if isinstance(value, tuple) else (value,) * self.width
+
+    def _map(self, fmt, *values):
+        if all(not isinstance(v, tuple) for v in values):
+            return self.b.op(fmt % values)
+        lanes = [self._lanes(v) for v in values]
+        return tuple(self.b.op(fmt % tuple(l[i] for l in lanes)) for i in range(self.width))
+
+    def const(self, name):
+        # A fresh load per use: a single-use load can fold into its consumer.
+        return self.b.op("load.i8x16 %s+%d" % (self.tp, 16 * vpaes.NAMES.index(name)), "k")
+
+    def xor(self, a, b):
+        return self._map("bxor %s, %s", a, b)
+
+    def band(self, a, b):
+        return self._map("band %s, %s", a, b)
+
+    def shr4(self, a):
+        four = self.b.const("i32", 4)
+        wide = self._map("bitcast.i32x4 little %s", a)
+        shifted = self._map("ushr %%s, %s" % four.replace("%", "%%"), wide)
+        return self._map("bitcast.i8x16 little %s", shifted)
+
+    def swizzle(self, table, index):
+        return self._map("swizzle %s, %s", table, index)
+
+    def shuffle(self, a, b, mask):
+        return self._map("shuffle %%s, %%s, %s" % lane_mask(mask), a, b)
+
+    def zero(self):
+        return self.b.op("splat.i8x16 %s" % self.b.const("i8", 0), "z")
+
+
+def aes_rounds_of(bits):
+    return {128: 10, 192: 12, 256: 14}[bits]
+
+
+def aes_schedule(bits):
+    """vpaes encryption key schedule: %0 key bytes, %1 tables, %2 out ((rounds+1) * 16)."""
+    b = Block()
+    kp = b.op("payload %0", "kp")
+    tp = b.op("payload %1", "tp")
+    op = b.op("payload %2", "op")
+    v = VecEmit(b, tp, 1)
+    lo = b.op("load.i8x16 %s" % kp, "key")
+    hi = None
+    if bits == 192:
+        hi = b.op("load.i8x16 %s+8" % kp, "key")
+    elif bits == 256:
+        hi = b.op("load.i8x16 %s+16" % kp, "key")
+    keys = vpaes.schedule(v, lo, hi, bits)
+    for i, k in enumerate(keys):
+        b.raw("store %s, %s+%d" % (k, op, 16 * i))
+    b.raw("return %s" % b.const("i64", 0))
+    return b
+
+
+def aes_round_kernels(width):
+    """vpaes split into three inline blocks so one function serves every key size and the
+    rounds run as a Beskid loop (a fully unrolled 4-wide AES-256 is ~2500 instructions and
+    dominated JIT time). Parameters: %0 round keys, %1 tables, %2 counter block (width 4) or
+    unused, %3 input, %4 output, %5 state (16 * width bytes), %6 meta i64[]:
+    width 4: [pos, out - in, end, counter, round, rounds]; width 1: [in, out, -, -, round, rounds]."""
+    first_b, middle_b, last_b = Block(), Block(), Block()
+
+    def common(b):
+        return {
+            "kp": b.op("payload %0", "kp"),
+            "tp": b.op("payload %1", "tp"),
+            "sp": b.op("payload %5", "sp"),
+            "mp": b.op("payload %6", "mp"),
+        }
+
+    # Entry: counter blocks (or the input block), input transform, round-0 key.
+    b = first_b
+    p = common(b)
+    v = VecEmit(b, p["tp"], width)
+    if width == 4:
+        jp = b.op("payload %2", "jp")
+        ctr = b.op("load.i32 %s+24" % p["mp"], "ctr")
+        base = b.op("bitcast.i32x4 little %s" % b.op("load.i8x16 %s" % jp, "j0"))
+        blocks = []
+        for j in range(4):
+            c = ctr if j == 0 else b.op("iadd %s, %s" % (ctr, b.const("i32", j)))
+            lane = b.op("insertlane %s, %s, 3" % (base, b.op("bswap %s" % c)))
+            blocks.append(b.op("bitcast.i8x16 little %s" % lane, "cb"))
+        block = tuple(blocks)
+    else:
+        ip = b.op("payload %3", "ip")
+        off = b.op("load.i64 %s" % p["mp"], "off")
+        block = b.op("load.i8x16 %s" % b.op("iadd %s, %s" % (ip, off), "src"), "in")
+    x = vpaes.first(v, block, b.op("load.i8x16 %s" % p["kp"], "rk"))
+    for j, xj in enumerate(x if isinstance(x, tuple) else (x,)):
+        b.raw("store %s, %s+%d" % (xj, p["sp"], 16 * j))
+    one = b.const("i64", 1)
+    b.raw("store %s, %s+32" % (one, p["mp"]))
+    b.raw("return %s" % one)
+
+    def round_key(b, p, r):
+        return b.op("load.i8x16 %s" % b.op("iadd %s, %s" % (p["kp"], b.op("ishl %s, %s" % (r, b.const("i64", 4)))), "ka"), "rk")
+
+    def table_at(b, p, name, r):
+        sel = b.op("ishl %s, %s" % (b.op("band %s, %s" % (r, b.const("i64", 3))), b.const("i64", 4)))
+        address = b.op("iadd %s, %s" % (p["tp"], sel), "ta")
+        return b.op("load.i8x16 %s+%d" % (address, 16 * vpaes.NAMES.index(name)), "k")
+
+    def load_state(b, p):
+        xs = tuple(b.op("load.i8x16 %s+%d" % (p["sp"], 16 * j), "x") for j in range(width))
+        return xs if width > 1 else xs[0]
+
+    # One middle round r = meta[4].
+    b = middle_b
+    p = common(b)
+    v = VecEmit(b, p["tp"], width)
+    r = b.op("load.i64 %s+32" % p["mp"], "r")
+    x = vpaes.middle(v, load_state(b, p), round_key(b, p, r), table_at(b, p, "mcf0", r), table_at(b, p, "mcb0", r))
+    for j, xj in enumerate(x if isinstance(x, tuple) else (x,)):
+        b.raw("store %s, %s+%d" % (xj, p["sp"], 16 * j))
+    nr = b.op("iadd %s, %s" % (r, b.const("i64", 1)), "next")
+    b.raw("store %s, %s+32" % (nr, p["mp"]))
+    b.raw("return %s" % nr)
+
+    # Final round, keystream use, cursor advance.
+    b = last_b
+    p = common(b)
+    v = VecEmit(b, p["tp"], width)
+    rounds = b.op("load.i64 %s+40" % p["mp"], "rounds")
+    out = vpaes.last(v, load_state(b, p), round_key(b, p, rounds), table_at(b, p, "sr0", rounds))
+    ip = b.op("payload %3", "ip")
+    op = b.op("payload %4", "op")
+    if width == 4:
+        pos = b.op("load.i64 %s" % p["mp"], "pos")
+        delta = b.op("load.i64 %s+8" % p["mp"], "delta")
+        src = b.op("iadd %s, %s" % (ip, pos), "src")
+        dst = b.op("iadd %s, %s" % (b.op("iadd %s, %s" % (op, pos)), delta), "dst")
+        for j in range(4):
+            data = b.op("load.i8x16 %s+%d" % (src, 16 * j))
+            b.raw("store %s, %s+%d" % (b.op("bxor %s, %s" % (data, out[j])), dst, 16 * j))
+        ctr = b.op("load.i32 %s+24" % p["mp"], "ctr")
+        b.raw("store %s, %s+24" % (b.op("iadd %s, %s" % (ctr, b.const("i32", 4))), p["mp"]))
+        nxt = b.op("iadd %s, %s" % (pos, b.const("i64", 64)), "next")
+    else:
+        dst = b.op("iadd %s, %s" % (op, b.op("load.i64 %s+8" % p["mp"], "off")), "dst")
+        b.raw("store %s, %s" % (out, dst))
+        nxt = b.op("iadd %s, %s" % (b.op("load.i64 %s" % p["mp"]), b.const("i64", 16)), "next")
+    b.raw("store %s, %s" % (nxt, p["mp"]))
+    b.raw("return %s" % nxt)
+    return first_b, middle_b, last_b
+
+
+def aes_round_function(name, width, doc):
+    first_b, middle_b, last_b = aes_round_kernels(width)
+    ind = "            "
+    return ("%s\ni64 %s(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u8[] state, i64[] meta) {\n"
+            "    mut i64 last = 0_i64;\n"
+            "    while meta[0] < meta[2] {\n"
+            "        last = clif {\n%s\n        };\n"
+            "        while meta[4] < meta[5] {\n"
+            "            last = clif {\n%s\n            };\n"
+            "        }\n"
+            "        last = clif {\n%s\n        };\n"
+            "    }\n"
+            "    return last;\n}\n") % (doc, name, first_b.render(ind), middle_b.render(ind + "    "), last_b.render(ind))
+
+
+def ghash_blocks():
+    """GHASH (SP 800-38D) over the 16-byte blocks of %1 from g[8] to g[9], constant time:
+    BearSSL ghash_ctmul64 (64-bit multiplies with 4-bit holes, Karatsuba on the bit-reversed
+    halves). %0 g i64[]: y1, y0, h1, h0, h1r, h0r, h2 = h0^h1, h2r, pos, end."""
+    b = Block()
+    gp = b.op("payload %0", "gp")
+    dp = b.op("payload %1", "dp")
+    pos = b.op("load.i64 %s+64" % gp, "pos")
+    src = b.op("iadd %s, %s" % (dp, pos), "src")
+    y1, y0, h1, h0, h1r, h0r, h2, h2r = [b.op("load.i64 %s+%d" % (gp, 8 * i), "g") for i in range(8)]
+    y1 = b.op("bxor %s, %s" % (y1, b.op("bswap %s" % b.op("load.i64 %s" % src))))
+    y0 = b.op("bxor %s, %s" % (y0, b.op("bswap %s" % b.op("load.i64 %s+8" % src))))
+    masks = [b.const("i64", m) for m in (0x1111111111111111, 0x2222222222222222, 0x4444444444444444, 0x8888888888888888)]
+
+    def x(u, v):
+        return b.op("bxor %s, %s" % (u, v))
+
+    def bmul64(u, v):
+        us = [b.op("band %s, %s" % (u, m)) for m in masks]
+        vs = [b.op("band %s, %s" % (v, m)) for m in masks]
+        pairs = [((0, 0), (1, 3), (2, 2), (3, 1)), ((0, 1), (1, 0), (2, 3), (3, 2)),
+                 ((0, 2), (1, 1), (2, 0), (3, 3)), ((0, 3), (1, 2), (2, 1), (3, 0))]
+        zs = []
+        for k, terms in enumerate(pairs):
+            prods = [b.op("imul %s, %s" % (us[i], vs[j])) for (i, j) in terms]
+            z = x(x(prods[0], prods[1]), x(prods[2], prods[3]))
+            zs.append(b.op("band %s, %s" % (z, masks[k])))
+        return b.op("bor %s, %s" % (b.op("bor %s, %s" % (zs[0], zs[1])), b.op("bor %s, %s" % (zs[2], zs[3]))))
+
+    def sh(op, u, n):
+        return b.op("%s %s, %s" % (op, u, b.const("i64", n)))
+
+    y0r = b.op("bitrev %s" % y0)
+    y1r = b.op("bitrev %s" % y1)
+    y2 = x(y0, y1)
+    y2r = x(y0r, y1r)
+    z0 = bmul64(y0, h0)
+    z1 = bmul64(y1, h1)
+    z2 = bmul64(y2, h2)
+    z0h = bmul64(y0r, h0r)
+    z1h = bmul64(y1r, h1r)
+    z2h = bmul64(y2r, h2r)
+    z2 = x(z2, x(z0, z1))
+    z2h = x(z2h, x(z0h, z1h))
+    z0h = sh("ushr", b.op("bitrev %s" % z0h), 1)
+    z1h = sh("ushr", b.op("bitrev %s" % z1h), 1)
+    z2h = sh("ushr", b.op("bitrev %s" % z2h), 1)
+    v0, v1, v2, v3 = z0, x(z0h, z2), x(z1, z2h), z1h
+    v3 = b.op("bor %s, %s" % (sh("ishl", v3, 1), sh("ushr", v2, 63)))
+    v2 = b.op("bor %s, %s" % (sh("ishl", v2, 1), sh("ushr", v1, 63)))
+    v1 = b.op("bor %s, %s" % (sh("ishl", v1, 1), sh("ushr", v0, 63)))
+    v0 = sh("ishl", v0, 1)
+    v2 = x(v2, x(x(v0, sh("ushr", v0, 1)), x(sh("ushr", v0, 2), sh("ushr", v0, 7))))
+    v1 = x(v1, x(x(sh("ishl", v0, 63), sh("ishl", v0, 62)), sh("ishl", v0, 57)))
+    v3 = x(v3, x(x(v1, sh("ushr", v1, 1)), x(sh("ushr", v1, 2), sh("ushr", v1, 7))))
+    v2 = x(v2, x(x(sh("ishl", v1, 63), sh("ishl", v1, 62)), sh("ishl", v1, 57)))
+    b.raw("store %s, %s" % (v3, gp))
+    b.raw("store %s, %s+8" % (v2, gp))
+    nxt = b.op("iadd %s, %s" % (pos, b.const("i64", 16)), "next")
+    b.raw("store %s, %s+64" % (nxt, gp))
+    b.raw("return %s" % nxt)
+    return b
+
+
+def ghash_prepare():
+    """Derives h1r, h0r, h2, h2r of g from h1, h0 (g[2], g[3])."""
+    b = Block()
+    gp = b.op("payload %0", "gp")
+    h1 = b.op("load.i64 %s+16" % gp)
+    h0 = b.op("load.i64 %s+24" % gp)
+    h1r = b.op("bitrev %s" % h1)
+    h0r = b.op("bitrev %s" % h0)
+    b.raw("store %s, %s+32" % (h1r, gp))
+    b.raw("store %s, %s+40" % (h0r, gp))
+    b.raw("store %s, %s+48" % (b.op("bxor %s, %s" % (h0, h1)), gp))
+    b.raw("store %s, %s+56" % (b.op("bxor %s, %s" % (h0r, h1r)), gp))
+    b.raw("return %s" % b.const("i64", 0))
+    return b
+
+
+def gen_aes():
+    if not vpaes.check():
+        sys.exit("vpaes model does not match FIPS-197")
+    parts = []
+    for bits in (128, 192, 256):
+        parts.append(function(
+            "i64 Schedule%d(u8[] key, u8[] tables, u8[] out)" % bits, aes_schedule(bits),
+            "/// vpaes encryption key schedule for a %d-bit key into `out` (%d bytes)." % (bits, 16 * (aes_rounds_of(bits) + 1))))
+    parts.append(aes_round_function("Blocks4", 4,
+        "/// AES-CTR over 64-byte groups (four blocks interleaved) from input offset `meta[0]` up\n"
+        "/// to `meta[2]`; `meta[1]` is the output minus input offset, `meta[3]` the 32-bit block\n"
+        "/// counter, `meta[5]` the round count. Precondition: all ranges are in bounds."))
+    parts.append(aes_round_function("Block1", 1,
+        "/// One AES block from `input[meta[0]]` to `output[meta[1]]` (run with `meta[2] = meta[0] + 1`)."))
+    table = ", ".join("0x%02x_u8" % x for x in vpaes.table_bytes())
+    parts.append("/// The vpaes constant vectors in `tools/vpaes.py` order.\nu8[] Tables() {\n    return [%s];\n}\n" % table)
+    replace_region("Aes.bd", "AesKernels", "\n".join(parts))
+    replace_region("AesGcm.bd", "GhashKernels", looped(
+        "i64 GhashBlocks(i64[] g, u8[] data)",
+        "/// GHASH over the 16-byte blocks of `data` from offset `g[8]` up to `g[9]`.\n"
+        "/// Precondition: the range is in bounds.", "g[8] < g[9]", ghash_blocks()) + "\n" + function(
+        "i64 GhashPrepare(i64[] g)", ghash_prepare(),
+        "/// Fills the bit-reversed and Karatsuba middle hash-key words of `g`."))
+
+
+GENERATORS = {"sha": gen_sha, "chacha": gen_chacha, "aes": gen_aes}
 
 if __name__ == "__main__":
     names = sys.argv[1:] or sorted(GENERATORS)

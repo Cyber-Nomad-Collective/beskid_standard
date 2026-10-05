@@ -1,0 +1,139 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use X509.Certificate;
+use X509.Names;
+use X509.Pem;
+use X509.X509Errors;
+use TestSupport;
+
+Certificate Load(string name) {
+    Result<Certificate, X509Error> r = Certificate.ParsePem(TestSupport.Fixture(name));
+    return match r {
+        Result::Ok(c) => c,
+        Result::Error(e) => Failed(name, e),
+    };
+}
+
+Certificate Failed(string name, X509Error e) {
+    Assert.Fail("parse " + name + ": " + X509Errors.Name(e));
+    return Failed(name, e);
+}
+
+string ParseError(u8[] der) {
+    Result<Certificate, X509Error> r = Certificate.Parse(der);
+    return match r { Result::Ok(_) => "None", Result::Error(e) => X509Errors.Name(e), };
+}
+
+u8[] DerOf(string name) {
+    PemStep step = Pem.Next(TestSupport.Fixture(name), 0_i64);
+    Assert.True(step.found, "pem block");
+    return step.der;
+}
+
+test pem_decodes_multiple_blocks {
+    Result<DerBlob[], X509Error> r = Pem.DecodeAll(TestSupport.Fixture("roots.pem"));
+    i64 count = match r { Result::Ok(list) => Array.Len<DerBlob>(list), Result::Error(_) => -1_i64, };
+    Assert.Equal<i64>(count, 2_i64, "two roots");
+}
+
+test pem_rejects_bad_base64 {
+    string bad = "-----BEGIN CERTIFICATE----- MII*AAAA -----END CERTIFICATE----- ";
+    PemStep step = Pem.Next(bad, 0_i64);
+    Assert.False(step.found, "not found");
+    Assert.True(X509Errors.Name(step.error) == "BadPem", "bad char");
+    string pad = "-----BEGIN CERTIFICATE----- AA==AAAA -----END CERTIFICATE----- ";
+    PemStep padStep = Pem.Next(pad, 0_i64);
+    Assert.True(X509Errors.Name(padStep.error) == "BadPem", "padding inside");
+    string none = "hello";
+    Result<DerBlob[], X509Error> r = Pem.DecodeAll(none);
+    bool failed = match r { Result::Ok(_) => false, Result::Error(_) => true, };
+    Assert.True(failed, "no block");
+}
+
+test parses_rsa_leaf {
+    Certificate c = Load("rsa-leaf.pem");
+    Assert.Equal<i64>(c.version, 3_i64, "v3");
+    Assert.True(c.subject.commonName == "www.example.test", "subject CN");
+    Assert.True(c.issuer.commonName == "Beskid Test RSA Intermediate", "issuer CN");
+    Assert.True(c.issuer.organization == "Beskid Test", "issuer O");
+    Assert.True(c.issuer.country == "PL", "issuer C");
+    Assert.Equal<i64>(c.notBefore, 1735689600_i64, "notBefore 2025-01-01");
+    Assert.Equal<i64>(c.notAfter, 1893456000_i64, "notAfter 2030-01-01");
+    PublicKeyInfo key = c.publicKey;
+    Assert.True(Certificate.IsKeyAlgorithm(key.algorithm, KeyAlgorithm::Rsa), "rsa key");
+    Assert.Equal<i64>(Slice.Len(key.rsaModulus), 256_i64, "2048-bit modulus");
+    Assert.Equal<i64>(Slice.Len(key.rsaExponent), 3_i64, "e = 65537");
+    SignatureAlgorithm alg = c.signatureAlgorithm;
+    Assert.True(Certificate.SchemeName(alg.scheme) == "sha256WithRSAEncryption", "alg");
+    Extensions ext = c.extensions;
+    Assert.True(ext.hasBasicConstraints && !ext.isCa, "not CA");
+    Assert.True(ext.hasKeyUsage, "ku");
+    Assert.Equal<i64>(ext.keyUsage, Certificate.KeyUsageDigitalSignature() | Certificate.KeyUsageKeyEncipherment(), "ku bits");
+    Assert.True(ext.hasExtKeyUsage && ext.ekuServerAuth && !ext.ekuClientAuth, "eku");
+    Assert.Equal<i64>(Array.Len<string>(ext.dnsNames), 2_i64, "two dns");
+    Assert.True(ext.dnsNames[1] == "*.api.example.test", "wildcard san");
+    Assert.Equal<i64>(Array.Len<IpBytes>(ext.ipAddresses), 2_i64, "two ips");
+    IpBytes v4 = ext.ipAddresses[0];
+    Assert.Equal<i64>(Slice.Len(v4.bytes), 4_i64, "v4");
+    Assert.True(v4.bytes[3] == 10_u8, "192.0.2.10");
+    Assert.Equal<i64>(Slice.Len(ext.subjectKeyId), 20_i64, "ski");
+    Assert.Equal<i64>(Slice.Len(ext.authorityKeyId), 20_i64, "aki");
+    Assert.Equal<i64>(Slice.Len(c.signature), 256_i64, "rsa signature");
+}
+
+test parses_ca_and_ec {
+    Certificate root = Load("ec-root.pem");
+    Assert.True(Certificate.IsSelfIssued(root), "self issued");
+    Assert.True(root.extensions.isCa, "CA");
+    Assert.Equal<i64>(root.extensions.pathLen, -1_i64, "no pathlen");
+    Assert.True(Certificate.IsKeyAlgorithm(root.publicKey.algorithm, KeyAlgorithm::EcP256), "P-256");
+    Assert.Equal<i64>(Slice.Len(root.publicKey.keyBytes), 65_i64, "point");
+    Certificate inter = Load("ec-int.pem");
+    Assert.True(Certificate.SchemeName(inter.signatureAlgorithm.scheme) == "ecdsa-with-SHA384", "sha384");
+    Assert.True(Names.Equal(inter.issuer, root.subject), "issuer links");
+    Certificate rint = Load("rsa-int.pem");
+    Assert.Equal<i64>(rint.extensions.pathLen, 0_i64, "pathlen 0");
+    Assert.Equal<i64>(rint.extensions.keyUsage, Certificate.KeyUsageKeyCertSign() | Certificate.KeyUsageCrlSign(), "ca ku");
+}
+
+test parses_pss_and_sha512 {
+    Certificate pss = Load("rsa-leafpss.pem");
+    SignatureAlgorithm alg = pss.signatureAlgorithm;
+    Assert.True(Certificate.SchemeName(alg.scheme) == "RSASSA-PSS", "pss");
+    Assert.Equal<i64>(alg.pssHashBits, 256_i64, "sha256");
+    Assert.Equal<i64>(alg.pssSaltLength, 32_i64, "salt");
+    Certificate s512 = Load("rsa-leaf512.pem");
+    Assert.True(Certificate.SchemeName(s512.signatureAlgorithm.scheme) == "sha512WithRSAEncryption", "sha512");
+}
+
+test parses_name_constraints {
+    Certificate nc = Load("ec-nc.pem");
+    NameConstraints c = nc.extensions.nameConstraints;
+    Assert.True(c.present, "present");
+    Assert.Equal<i64>(Array.Len<string>(c.permittedDns), 1_i64, "one permitted");
+    Assert.True(c.permittedDns[0] == "allowed.test", "permitted");
+    Assert.True(c.excludedDns[0] == "bad.allowed.test", "excluded");
+    Assert.False(c.hasUnsupportedForm, "dns only");
+}
+
+test rejects_unknown_critical_extension {
+    Assert.True(ParseError(DerOf("ec-crit.pem")) == "UnknownCriticalExtension", "critical private extension");
+}
+
+test rejects_corrupted_encodings {
+    u8[] der = DerOf("ec-leaf.pem");
+    i64 n = Slice.Len(der);
+    Assert.True(ParseError(der) == "None", "original parses");
+    // Trailing byte after the certificate.
+    u8[] longer = Slice.New(n + 1_i64);
+    Slice.Copy(longer, 0_i64, der, 0_i64, n);
+    Assert.True(ParseError(longer) == "TrailingData", "trailing data");
+    // Truncated certificate.
+    Assert.True(ParseError(Slice.SubSlice(der, 0_i64, n - 1_i64)) == "Truncated", "truncated");
+    // Outer SEQUENCE length rewritten in a non-minimal form is caught.
+    u8[] copy = Slice.SubSlice(der, 0_i64, n);
+    copy[0] = 0x31_u8;
+    Assert.True(ParseError(copy) == "UnexpectedTag", "outer SET");
+}

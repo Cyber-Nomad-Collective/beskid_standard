@@ -1,0 +1,317 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Crypto.Entropy;
+use Crypto.Hkdf;
+use Crypto.Hmac;
+use Quic.QuicWire;
+
+// The handshake interface QUIC drives (RFC 9001 section 4): the carrier feeds CRYPTO bytes per
+// encryption level and drains events in order:
+//   Send(level, bytes)         handshake bytes to send in CRYPTO frames at that level
+//   ReadSecret(level, secret)  install the peer's traffic secret for that level
+//   WriteSecret(level, secret) install this side's traffic secret for that level
+//   Connected                  the handshake completed
+// Levels: 0 Initial, 1 0-RTT, 2 Handshake, 3 Application (the TLS 1.3 engine numbering).
+//
+// The only driver in this build is `Loopback`, a deliberately INSECURE stand-in used to test
+// the transport before the TLS 1.3 engine is integrated: it negotiates ALPN and exchanges
+// transport parameters, but derives its secrets from public random values and authenticates
+// nothing. It must never protect real traffic; configurations name it explicitly
+// (`QuicConfig.InsecureLoopbackForTestsOnly`).
+
+pub i64 LevelInitial() { return 0_i64; }
+pub i64 LevelEarlyData() { return 1_i64; }
+pub i64 LevelHandshake() { return 2_i64; }
+pub i64 LevelApplication() { return 3_i64; }
+
+pub enum HandshakeEvent {
+    Send(i64 level, u8[] data),
+    ReadSecret(i64 level, u8[] secret),
+    WriteSecret(i64 level, u8[] secret),
+    Connected(),
+}
+
+// st indices: 0 state, 1 next event, 2 protection suite, 3 alert (0 none).
+pub type LoopbackHandshake {
+    bool isClient,
+    i64[] st,
+    HandshakeEvent[] events,
+    u8[] inbuf,
+    u8[] random,
+    u8[] peerRandom,
+    u8[] localParams,
+    u8[] peerParams,
+    string[] alpn,
+    string[] selected,
+    u8[] master,
+}
+
+pub enum Handshake {
+    Loopback(LoopbackHandshake hs),
+}
+
+// States.
+i64 StStart() { return 0_i64; }
+i64 StWaitHello() { return 1_i64; }
+i64 StWaitServerFinished() { return 2_i64; }
+i64 StWaitClientFinished() { return 3_i64; }
+i64 StConnected() { return 4_i64; }
+i64 StFailed() { return 9_i64; }
+
+/// TLS alert codes used by the loopback driver (CRYPTO_ERROR = 0x100 + alert).
+pub i64 AlertUnexpectedMessage() { return 10_i64; }
+pub i64 AlertDecodeError() { return 50_i64; }
+pub i64 AlertNoApplicationProtocol() { return 120_i64; }
+pub i64 AlertMissingExtension() { return 109_i64; }
+
+u8[] Random32() {
+    return match Entropy.Bytes(32_i64) { Result::Ok(b) => b, Result::Error(_) => Slice.New(32_i64), };
+}
+
+LoopbackHandshake MakeLoopback(bool isClient, string[] alpn, u8[] transportParams, i64 suite) {
+    mut HandshakeEvent[] events = Array.Empty<HandshakeEvent>();
+    mut u8[] inbuf = Array.Empty<u8>();
+    return LoopbackHandshake {
+        isClient: isClient, st: [0_i64, 0_i64, 0_i64, 0_i64], events: events, inbuf: inbuf,
+        random: Random32(), peerRandom: Slice.New(0_i64), localParams: transportParams, peerParams: Slice.New(0_i64),
+        alpn: alpn, selected: [""], master: Slice.New(0_i64),
+    };
+}
+
+/// An insecure loopback client offering `alpn` (in preference order).
+pub Handshake InsecureLoopbackClient(string[] alpn, u8[] transportParams, i64 suite) {
+    LoopbackHandshake hs = MakeLoopback(true, alpn, transportParams, suite);
+    hs.st[2] = suite;
+    return Handshake::Loopback(hs);
+}
+
+/// An insecure loopback server accepting the first client protocol it supports.
+pub Handshake InsecureLoopbackServer(string[] alpn, u8[] transportParams, i64 suite) {
+    LoopbackHandshake hs = MakeLoopback(false, alpn, transportParams, suite);
+    hs.st[0] = StWaitHello();
+    hs.st[2] = suite;
+    return Handshake::Loopback(hs);
+}
+
+// ------------------------------------------------------------ generic interface
+
+/// Starts the handshake (the client queues its first flight).
+pub unit Start(Handshake h) {
+    match h { Handshake::Loopback(hs) => { LbStart(hs); }, };
+    return;
+}
+
+/// Feeds in-order CRYPTO bytes received at `level`. Returns 0 or a TLS alert code.
+pub i64 Feed(Handshake h, i64 level, u8[] data, i64 offset, i64 count) {
+    return match h { Handshake::Loopback(hs) => LbFeed(hs, level, data, offset, count), };
+}
+
+pub bool HasEvent(Handshake h) {
+    return match h { Handshake::Loopback(hs) => hs.st[1] < Array.Len<HandshakeEvent>(hs.events), };
+}
+
+pub HandshakeEvent TakeEvent(Handshake h) {
+    return match h { Handshake::Loopback(hs) => LbTake(hs), };
+}
+
+pub bool IsConnected(Handshake h) {
+    return match h { Handshake::Loopback(hs) => hs.st[0] == StConnected(), };
+}
+
+/// Negotiated protection suite (QuicProtection.Suite*).
+pub i64 Suite(Handshake h) {
+    return match h { Handshake::Loopback(hs) => hs.st[2], };
+}
+
+/// Negotiated ALPN protocol ("" before negotiation).
+pub string Alpn(Handshake h) {
+    return match h { Handshake::Loopback(hs) => hs.selected[0], };
+}
+
+/// The peer's encoded transport parameters (empty until received).
+pub u8[] PeerTransportParameters(Handshake h) {
+    return match h { Handshake::Loopback(hs) => hs.peerParams, };
+}
+
+// ------------------------------------------------------------ loopback driver
+
+HandshakeEvent LbTake(LoopbackHandshake hs) {
+    i64 i = hs.st[1];
+    HandshakeEvent ev = hs.events[i];
+    hs.st[1] = i + 1_i64;
+    return ev;
+}
+
+unit Push(LoopbackHandshake hs, HandshakeEvent ev) { Array.Append<HandshakeEvent>(hs.events, ev); return; }
+
+u8[] Message(i64 kind, u8[] body) {
+    i64 n = Slice.Len(body);
+    u8[] out = Slice.New(4_i64 + n);
+    out[0] = u8(kind);
+    out[1] = u8((n >> 16_i64) & 255_i64);
+    out[2] = u8((n >> 8_i64) & 255_i64);
+    out[3] = u8(n & 255_i64);
+    Slice.Copy(out, 4_i64, body, 0_i64, n);
+    return out;
+}
+
+unit PutString(Writer w, string s) {
+    i64 n = String.Len(s);
+    QuicWire.PutByte(w, n);
+    mut i64 i = 0_i64;
+    while i < n { QuicWire.PutByte(w, i64(String.ByteAt(s, i))); i = i + 1_i64; }
+    return;
+}
+
+string ReadString(Reader r) {
+    i64 n = QuicWire.Byte(r);
+    u8[] b = QuicWire.Take(r, n);
+    mut string s = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(b) { s = s + String.CodeUnitChar(b[i]); i = i + 1_i64; }
+    return s;
+}
+
+u8[] Secret(LoopbackHandshake hs, string label) {
+    return match Hkdf.ExpandLabel(HashAlgorithm::Sha256, hs.master, label, Slice.New(0_i64), 32_i64) {
+        Result::Ok(v) => v,
+        Result::Error(_) => Slice.New(32_i64),
+    };
+}
+
+unit DeriveMaster(LoopbackHandshake hs, u8[] clientRandom, u8[] serverRandom) {
+    u8[] ikm = Slice.New(64_i64);
+    Slice.Copy(ikm, 0_i64, clientRandom, 0_i64, 32_i64);
+    Slice.Copy(ikm, 32_i64, serverRandom, 0_i64, 32_i64);
+    u8[] salt = [98_u8, 101_u8, 115_u8, 107_u8, 105_u8, 100_u8];
+    hs.master = Hkdf.Extract(HashAlgorithm::Sha256, salt, ikm);
+    return;
+}
+
+unit LbStart(LoopbackHandshake hs) {
+    if !hs.isClient || hs.st[0] != StStart() { return; }
+    u8[] body = Slice.New(1024_i64);
+    Writer w = QuicWire.NewWriter(body, 0_i64, 1024_i64);
+    QuicWire.PutAll(w, hs.random);
+    QuicWire.PutByte(w, Array.Len<string>(hs.alpn));
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(hs.alpn) { PutString(w, hs.alpn[i]); i = i + 1_i64; }
+    QuicWire.PutUint(w, 2_i64, Slice.Len(hs.localParams));
+    QuicWire.PutAll(w, hs.localParams);
+    Push(hs, HandshakeEvent::Send(0_i64, Message(1_i64, QuicWire.CopyOf(body, 0_i64, QuicWire.WPos(w)))));
+    hs.st[0] = StWaitHello();
+    return;
+}
+
+i64 Fail(LoopbackHandshake hs, i64 alert) {
+    hs.st[0] = StFailed();
+    hs.st[3] = alert;
+    return alert;
+}
+
+i64 LbFeed(LoopbackHandshake hs, i64 level, u8[] data, i64 offset, i64 count) {
+    if hs.st[0] == StFailed() { return hs.st[3]; }
+    if Slice.Len(hs.inbuf) + count > 16384_i64 { return Fail(hs, AlertDecodeError()); }
+    mut i64 i = 0_i64;
+    while i < count { Array.Append<u8>(hs.inbuf, data[offset + i]); i = i + 1_i64; }
+    while Slice.Len(hs.inbuf) >= 4_i64 {
+        i64 n = (i64(hs.inbuf[1]) << 16_i64) | (i64(hs.inbuf[2]) << 8_i64) | i64(hs.inbuf[3]);
+        i64 have = Slice.Len(hs.inbuf);
+        if have < 4_i64 + n { return 0_i64; }
+        i64 kind = i64(hs.inbuf[0]);
+        u8[] body = QuicWire.CopyOf(hs.inbuf, 4_i64, n);
+        hs.inbuf = QuicWire.CopyOf(hs.inbuf, 4_i64 + n, have - 4_i64 - n);
+        i64 alert = Handle(hs, level, kind, body);
+        if alert != 0_i64 { return Fail(hs, alert); }
+    }
+    return 0_i64;
+}
+
+i64 Handle(LoopbackHandshake hs, i64 level, i64 kind, u8[] body) {
+    Reader r = QuicWire.NewReader(body, 0_i64, Slice.Len(body));
+    i64 state = hs.st[0];
+    if !hs.isClient && state == StWaitHello() && kind == 1_i64 && level == 0_i64 {
+        u8[] clientRandom = QuicWire.Take(r, 32_i64);
+        i64 offered = QuicWire.Byte(r);
+        mut string chosen = "";
+        mut i64 i = 0_i64;
+        while i < offered {
+            string p = ReadString(r);
+            if String.Len(chosen) == 0_i64 && Supports(hs.alpn, p) { chosen = p; }
+            i = i + 1_i64;
+        }
+        i64 tl = QuicWire.Uint(r, 2_i64);
+        hs.peerParams = QuicWire.Take(r, tl);
+        if !QuicWire.Ok(r) { return AlertDecodeError(); }
+        if String.Len(chosen) == 0_i64 { return AlertNoApplicationProtocol(); }
+        if tl == 0_i64 { return AlertMissingExtension(); }
+        hs.selected[0] = chosen;
+        hs.peerRandom = clientRandom;
+        DeriveMaster(hs, clientRandom, hs.random);
+        u8[] sh = Slice.New(300_i64);
+        Writer w = QuicWire.NewWriter(sh, 0_i64, 300_i64);
+        QuicWire.PutAll(w, hs.random);
+        PutString(w, chosen);
+        Push(hs, HandshakeEvent::Send(0_i64, Message(2_i64, QuicWire.CopyOf(sh, 0_i64, QuicWire.WPos(w)))));
+        Push(hs, HandshakeEvent::WriteSecret(2_i64, Secret(hs, "s hs")));
+        Push(hs, HandshakeEvent::ReadSecret(2_i64, Secret(hs, "c hs")));
+        u8[] ee = Slice.New(Slice.Len(hs.localParams) + 2_i64);
+        Writer we = QuicWire.NewWriter(ee, 0_i64, Slice.Len(ee));
+        QuicWire.PutUint(we, 2_i64, Slice.Len(hs.localParams));
+        QuicWire.PutAll(we, hs.localParams);
+        Push(hs, HandshakeEvent::Send(2_i64, Message(8_i64, ee)));
+        Push(hs, HandshakeEvent::Send(2_i64, Message(20_i64, Secret(hs, "s finished"))));
+        Push(hs, HandshakeEvent::WriteSecret(3_i64, Secret(hs, "s ap")));
+        hs.st[0] = StWaitClientFinished();
+        return 0_i64;
+    }
+    if hs.isClient && state == StWaitHello() && kind == 2_i64 && level == 0_i64 {
+        u8[] serverRandom = QuicWire.Take(r, 32_i64);
+        string chosen = ReadString(r);
+        if !QuicWire.Ok(r) { return AlertDecodeError(); }
+        if !Supports(hs.alpn, chosen) { return AlertNoApplicationProtocol(); }
+        hs.selected[0] = chosen;
+        hs.peerRandom = serverRandom;
+        DeriveMaster(hs, hs.random, serverRandom);
+        Push(hs, HandshakeEvent::ReadSecret(2_i64, Secret(hs, "s hs")));
+        Push(hs, HandshakeEvent::WriteSecret(2_i64, Secret(hs, "c hs")));
+        hs.st[0] = StWaitServerFinished();
+        return 0_i64;
+    }
+    if hs.isClient && state == StWaitServerFinished() && kind == 8_i64 && level == 2_i64 {
+        i64 tl = QuicWire.Uint(r, 2_i64);
+        hs.peerParams = QuicWire.Take(r, tl);
+        if !QuicWire.Ok(r) { return AlertDecodeError(); }
+        if tl == 0_i64 { return AlertMissingExtension(); }
+        return 0_i64;
+    }
+    if hs.isClient && state == StWaitServerFinished() && kind == 20_i64 && level == 2_i64 {
+        if Slice.Len(hs.peerParams) == 0_i64 { return AlertUnexpectedMessage(); }
+        if !QuicWire.Equal(body, Secret(hs, "s finished")) { return 51_i64; }
+        Push(hs, HandshakeEvent::ReadSecret(3_i64, Secret(hs, "s ap")));
+        Push(hs, HandshakeEvent::Send(2_i64, Message(20_i64, Secret(hs, "c finished"))));
+        Push(hs, HandshakeEvent::WriteSecret(3_i64, Secret(hs, "c ap")));
+        Push(hs, HandshakeEvent::Connected());
+        hs.st[0] = StConnected();
+        return 0_i64;
+    }
+    if !hs.isClient && state == StWaitClientFinished() && kind == 20_i64 && level == 2_i64 {
+        if !QuicWire.Equal(body, Secret(hs, "c finished")) { return 51_i64; }
+        Push(hs, HandshakeEvent::ReadSecret(3_i64, Secret(hs, "c ap")));
+        Push(hs, HandshakeEvent::Connected());
+        hs.st[0] = StConnected();
+        return 0_i64;
+    }
+    return AlertUnexpectedMessage();
+}
+
+bool Supports(string[] list, string p) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(list) {
+        if list[i] == p { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}

@@ -678,7 +678,419 @@ def gen_aes():
         "/// Fills the bit-reversed and Karatsuba middle hash-key words of `g`."))
 
 
-GENERATORS = {"sha": gen_sha, "chacha": gen_chacha, "aes": gen_aes}
+# ---------------------------------------------------------------- 256-bit fields (4 x 64)
+
+P256_P = (1 << 256) - (1 << 224) + (1 << 192) + (1 << 96) - 1
+P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+X25519_P = (1 << 255) - 19
+
+
+def wslot(n, index):
+    """ModArith.WSlot: offset in u32 limbs of caller slot `index` for width n."""
+    return 5 * n + 3 + index * n
+
+
+class Field:
+    """Montgomery arithmetic modulo a 256-bit odd m (R = 2^256) on four i64 limbs, emitted as
+    straight-line CLIF. Branch-free: carries come from `uadd_overflow`/`usub_overflow` and the
+    final corrections use all-ones masks with `bitselect`, so the instruction stream does not
+    depend on operand values."""
+
+    def __init__(self, b, modulus_limbs, mprime):
+        self.b = b
+        self.m = modulus_limbs
+        self.mprime = mprime
+        self.zero = b.const("i64", 0)
+
+    @staticmethod
+    def constant(b, value):
+        m = [b.const("i64", (value >> (64 * i)) & ((1 << 64) - 1)) for i in range(4)]
+        mprime = (-pow(value, -1, 1 << 64)) % (1 << 64)
+        return Field(b, m, b.const("i64", mprime))
+
+    def add2(self, x, y):
+        out, carry = self.b.fresh("s"), self.b.fresh("c")
+        self.b.raw("%s, %s = uadd_overflow %s, %s" % (out, carry, x, y))
+        return out, carry
+
+    def sub2(self, x, y):
+        out, borrow = self.b.fresh("d"), self.b.fresh("w")
+        self.b.raw("%s, %s = usub_overflow %s, %s" % (out, borrow, x, y))
+        return out, borrow
+
+    def ext(self, flag):
+        return self.b.op("uextend.i64 %s" % flag)
+
+    def adc(self, x, y, cin):
+        if cin is None:
+            return self.add2(x, y)
+        s1, c1 = self.add2(x, y)
+        s2, c2 = self.add2(s1, self.ext(cin))
+        return s2, self.b.op("bor %s, %s" % (c1, c2))
+
+    def sbb(self, x, y, bin_):
+        if bin_ is None:
+            return self.sub2(x, y)
+        d1, w1 = self.sub2(x, y)
+        d2, w2 = self.sub2(d1, self.ext(bin_))
+        return d2, self.b.op("bor %s, %s" % (w1, w2))
+
+    def select(self, mask, when_set, when_clear):
+        return [self.b.op("bitselect %s, %s, %s" % (mask, x, y)) for x, y in zip(when_set, when_clear)]
+
+    def reduce_once(self, t, top):
+        """t (4 limbs) + top * 2^256 with t + top 2^256 < 2m: subtract m when it fits."""
+        d, w = [], None
+        for j in range(4):
+            dj, w = self.sbb(t[j], self.m[j], w)
+            d.append(dj)
+        sel = self.b.op("isub %s, %s" % (top, self.ext(w)))         # -1: t < m, keep t
+        keep = self.b.op("sshr %s, %s" % (sel, self.b.const("i64", 63)))
+        return self.select(keep, t, d)
+
+    def mul(self, a, bv):
+        """a * b * 2^-256 mod m (CIOS, Koc-Acar-Kaliski 1996, 64-bit words)."""
+        b = self.b
+        t = [None] * 4
+        t4 = t5 = None
+        for i in range(4):
+            carry = None
+            for j in range(4):
+                lo = b.op("imul %s, %s" % (a[j], bv[i]))
+                hi = b.op("umulhi %s, %s" % (a[j], bv[i]))
+                if t[j] is not None:
+                    lo, c1 = self.add2(lo, t[j])
+                    hi = b.op("iadd %s, %s" % (hi, self.ext(c1)))
+                if carry is not None:
+                    lo, c2 = self.add2(lo, carry)
+                    hi = b.op("iadd %s, %s" % (hi, self.ext(c2)))
+                t[j] = lo
+                carry = hi
+            if t4 is None:
+                t4, t5 = carry, self.zero
+            else:
+                t4, c = self.add2(t4, carry)
+                t5 = self.ext(c)
+            q = b.op("imul %s, %s" % (t[0], self.mprime))
+            lo = b.op("imul %s, %s" % (q, self.m[0]))
+            hi = b.op("umulhi %s, %s" % (q, self.m[0]))
+            _, c = self.add2(lo, t[0])
+            carry = b.op("iadd %s, %s" % (hi, self.ext(c)))
+            for j in range(1, 4):
+                lo = b.op("imul %s, %s" % (q, self.m[j]))
+                hi = b.op("umulhi %s, %s" % (q, self.m[j]))
+                lo, c1 = self.add2(lo, t[j])
+                hi = b.op("iadd %s, %s" % (hi, self.ext(c1)))
+                lo, c2 = self.add2(lo, carry)
+                hi = b.op("iadd %s, %s" % (hi, self.ext(c2)))
+                t[j - 1] = lo
+                carry = hi
+            t[3], c = self.add2(t4, carry)
+            t4 = b.op("iadd %s, %s" % (t5, self.ext(c)))
+        return self.reduce_once(t, t4)
+
+    def add(self, a, bv):
+        s, c = [], None
+        for j in range(4):
+            sj, c = self.adc(a[j], bv[j], c)
+            s.append(sj)
+        return self.reduce_once(s, self.ext(c))
+
+    def sub(self, a, bv):
+        d, w = [], None
+        for j in range(4):
+            dj, w = self.sbb(a[j], bv[j], w)
+            d.append(dj)
+        mask = self.b.op("isub %s, %s" % (self.zero, self.ext(w)))    # all ones on borrow
+        out, c = [], None
+        for j in range(4):
+            mj = self.b.op("band %s, %s" % (self.m[j], mask))
+            oj, c = self.adc(d[j], mj, c)
+            out.append(oj)
+        return out
+
+
+def load4(b, base, offset):
+    """Four i64 limbs at u32 offset `offset` (an int) from the address `base`."""
+    return [b.op("load.i64 %s+%d" % (base, 4 * offset + 8 * j), "f") for j in range(4)]
+
+
+def store4(b, base, offset, limbs):
+    for j, v in enumerate(limbs):
+        b.raw("store %s, %s+%d" % (v, base, 4 * offset + 8 * j))
+
+
+def dyn_address(b, wp, param):
+    """Payload address of the u32 limb offset held in parameter `param`."""
+    return b.op("iadd %s, %s" % (wp, b.op("ishl %s, %s" % (param, b.const("i64", 2)))), "at")
+
+
+def modarith_kernels():
+    """Generic n = 8 kernels over a ModArith workspace: modulus at limb 0, -m^-1 mod 2^64 at
+    limbs 9..11. %0 w, %1 out, %2 a, %3 b (limb offsets)."""
+    out = []
+    for name, op in (("Mul8", "mul"), ("Add8", "add"), ("Sub8", "sub")):
+        b = Block()
+        wp = b.op("payload %0", "wp")
+        field = Field(b, load4(b, wp, 0), b.op("load.i64 %s+36" % wp, "mprime"))
+        x = load4(b, dyn_address(b, wp, "%2"), 0)
+        y = load4(b, dyn_address(b, wp, "%3"), 0)
+        r = getattr(field, op)(x, y)
+        store4(b, dyn_address(b, wp, "%1"), 0, r)
+        b.raw("return %s" % b.const("i64", 0))
+        out.append(function("i64 %s(u32[] w, i64 out, i64 a, i64 b)" % name, b,
+                            "/// `w[out] = w[a] %s w[b]` for width 8 (four 64-bit limbs)." % {"mul": "* R^-1 *", "add": "+", "sub": "-"}[op]))
+    # Square-and-multiply for a public exponent: one inline block per step.
+    sq, mu = Block(), Block()
+    for blk, op in ((sq, "sq"), (mu, "mul")):
+        wp = blk.op("payload %0", "wp")
+        mp = blk.op("payload %2", "mp")
+        field = Field(blk, load4(blk, wp, 0), blk.op("load.i64 %s+36" % wp, "mprime"))
+        acc_off = blk.op("load.i64 %s+16" % mp, "acc")
+        acc_at = blk.op("iadd %s, %s" % (wp, blk.op("ishl %s, %s" % (acc_off, blk.const("i64", 2)))), "at")
+        acc = load4(blk, acc_at, 0)
+        if op == "sq":
+            r = field.mul(acc, acc)
+        else:
+            base_off = blk.op("load.i64 %s+24" % mp, "base")
+            base_at = blk.op("iadd %s, %s" % (wp, blk.op("ishl %s, %s" % (base_off, blk.const("i64", 2)))), "at")
+            r = field.mul(acc, load4(blk, base_at, 0))
+        store4(blk, acc_at, 0, r)
+        blk.raw("return %s" % blk.const("i64", 0))
+    ind = "                "
+    out.append(
+        "/// `w[meta[2]] = w[meta[2]] ^ e` (Montgomery form) for the big-endian public exponent `e`,\n"
+        "/// width 8: square, then multiply by `w[meta[3]]` when the bit is set. `meta[0]` is the\n"
+        "/// byte index and `meta[1]` the bit index (7 down to 0). The time depends only on `e`.\n"
+        "i64 Pow8(u32[] w, u8[] e, i64[] meta) {\n"
+        "    mut i64 last = 0_i64;\n"
+        "    i64 len = Slice.Len(e);\n"
+        "    while meta[0] < len {\n"
+        "        u8 byte = e[meta[0]];\n"
+        "        mut i64 bit = 7_i64;\n"
+        "        while bit >= 0_i64 {\n"
+        "            last = clif {\n%s\n            };\n"
+        "            if ((byte >> u8(bit)) & u8(1)) == u8(1) {\n"
+        "                last = clif {\n%s\n                };\n"
+        "            }\n"
+        "            bit = bit - 1_i64;\n"
+        "        }\n"
+        "        meta[0] = meta[0] + 1_i64;\n"
+        "    }\n"
+        "    return last;\n"
+        "}\n" % (sq.render(ind), mu.render(ind + "    ")))
+    return "\n".join(out)
+
+
+def p256_double(f, p, bcoef):
+    """Renes-Costello-Batina 2016 algorithm 6 (a = -3), as in P256.Double."""
+    px, py, pz = p
+    mul, add, sub = f.mul, f.add, f.sub
+    t0 = mul(px, px); t1 = mul(py, py); t2 = mul(pz, pz)
+    t3 = mul(px, py); t3 = add(t3, t3)
+    z3 = mul(px, pz); z3 = add(z3, z3)
+    y3 = mul(bcoef, t2); y3 = sub(y3, z3)
+    x3 = add(y3, y3); y3 = add(x3, y3)
+    x3 = sub(t1, y3); y3 = add(t1, y3)
+    y3 = mul(x3, y3); x3 = mul(x3, t3)
+    t3 = add(t2, t2); t2 = add(t2, t3)
+    z3 = mul(bcoef, z3); z3 = sub(z3, t2); z3 = sub(z3, t0)
+    t3 = add(z3, z3); z3 = add(z3, t3)
+    t3 = add(t0, t0); t0 = add(t3, t0); t0 = sub(t0, t2)
+    t0 = mul(t0, z3); y3 = add(y3, t0)
+    t0 = mul(py, pz); t0 = add(t0, t0)
+    z3 = mul(t0, z3); x3 = sub(x3, z3)
+    z3 = mul(t0, t1); z3 = add(z3, z3); z3 = add(z3, z3)
+    return x3, y3, z3
+
+
+def p256_add(f, p, q, bcoef):
+    """Renes-Costello-Batina 2016 algorithm 4 (a = -3), as in P256.Add."""
+    px, py, pz = p
+    qx, qy, qz = q
+    mul, add, sub = f.mul, f.add, f.sub
+    t0 = mul(px, qx); t1 = mul(py, qy); t2 = mul(pz, qz)
+    t3 = add(px, py); t4 = add(qx, qy); t3 = mul(t3, t4)
+    t4 = add(t0, t1); t3 = sub(t3, t4)
+    t4 = add(py, pz); x3 = add(qy, qz); t4 = mul(t4, x3)
+    x3 = add(t1, t2); t4 = sub(t4, x3)
+    x3 = add(px, pz); y3 = add(qx, qz); x3 = mul(x3, y3)
+    y3 = add(t0, t2); y3 = sub(x3, y3)
+    z3 = mul(bcoef, t2); x3 = sub(y3, z3)
+    z3 = add(x3, x3); x3 = add(x3, z3)
+    z3 = sub(t1, x3); x3 = add(t1, x3)
+    y3 = mul(bcoef, y3)
+    t1 = add(t2, t2); t2 = add(t1, t2)
+    y3 = sub(y3, t2); y3 = sub(y3, t0)
+    t1 = add(y3, y3); y3 = add(t1, y3)
+    t1 = add(t0, t0); t0 = add(t1, t0); t0 = sub(t0, t2)
+    t1 = mul(t4, y3); t2 = mul(t0, y3)
+    y3 = mul(x3, z3); y3 = add(y3, t2)
+    x3 = mul(t3, x3); x3 = sub(x3, t1)
+    z3 = mul(t4, z3); t1 = mul(t3, t0); z3 = add(z3, t1)
+    return x3, y3, z3
+
+
+def load_point(b, at):
+    return tuple(load4(b, at, 8 * c) for c in range(3))
+
+
+def store_point(b, at, point):
+    for c in range(3):
+        store4(b, at, 8 * c, point[c])
+
+
+def p256_select(b, wp, table_at, index):
+    """Constant-time read of entry `index` (i64, 0..15) of 16 registers (24 limbs) at table_at:
+    every entry is loaded and masked."""
+    acc = [b.const("i64", 0)] * 12
+    for e in range(16):
+        eq = b.op("icmp eq %s, %s" % (index, b.const("i64", e)))
+        mask = b.op("bmask.i64 %s" % eq)
+        for j in range(12):
+            v = b.op("load.i64 %s+%d" % (table_at, 96 * e + 8 * j))
+            acc[j] = b.op("bor %s, %s" % (acc[j], b.op("band %s, %s" % (v, mask))))
+    return tuple(acc[4 * c:4 * c + 4] for c in range(3))
+
+
+def p256_kernels():
+    n = 8
+    slot_b = wslot(n, 0)
+    out = []
+    # Point functions with dynamic register offsets (u32 limbs): used to build tables.
+    b = Block()
+    wp = b.op("payload %0", "wp")
+    f = Field.constant(b, P256_P)
+    r = p256_double(f, load_point(b, dyn_address(b, wp, "%2")), load4(b, wp, slot_b))
+    store_point(b, dyn_address(b, wp, "%1"), r)
+    b.raw("return %s" % b.const("i64", 0))
+    out.append(function("i64 DoubleKernel(u32[] w, i64 out, i64 p)", b,
+                        "/// Register `out` = 2 * register `p` (complete formula, constant time)."))
+    b = Block()
+    wp = b.op("payload %0", "wp")
+    f = Field.constant(b, P256_P)
+    r = p256_add(f, load_point(b, dyn_address(b, wp, "%2")), load_point(b, dyn_address(b, wp, "%3")),
+                 load4(b, wp, slot_b))
+    store_point(b, dyn_address(b, wp, "%1"), r)
+    b.raw("return %s" % b.const("i64", 0))
+    out.append(function("i64 AddKernel(u32[] w, i64 out, i64 p, i64 q)", b,
+                        "/// Register `out` = register `p` + register `q` (complete formula, constant time)."))
+
+    # Fixed-window scalar multiplication loop: meta = [i (nibble index 63..0), doublings left,
+    # scalar count, scalar j, acc, table0, table1], scalars %1 = k1 || k2 (8 limbs each).
+    dbl, sel, addb = Block(), Block(), Block()
+    for blk in (dbl, sel, addb):
+        blk.wp = blk.op("payload %0", "wp")
+        blk.mp = blk.op("payload %2", "mp")
+        blk.acc_at = blk.op("iadd %s, %s" % (blk.wp, blk.op("ishl %s, %s" % (
+            blk.op("load.i64 %s+32" % blk.mp, "acc"), blk.const("i64", 2)))), "acc")
+    f = Field.constant(dbl, P256_P)
+    r = p256_double(f, load_point(dbl, dbl.acc_at), load4(dbl, dbl.wp, slot_b))
+    store_point(dbl, dbl.acc_at, r)
+    left = dbl.op("load.i64 %s+8" % dbl.mp, "left")
+    nl = dbl.op("isub %s, %s" % (left, dbl.const("i64", 1)), "next")
+    dbl.raw("store %s, %s+8" % (nl, dbl.mp))
+    dbl.raw("return %s" % nl)
+    # select: pick = table_j[nibble i of scalar j] into the scratch register right after acc.
+    kp = sel.op("payload %1", "kp")
+    i = sel.op("load.i64 %s" % sel.mp, "i")
+    j = sel.op("load.i64 %s+24" % sel.mp, "j")
+    word_at = sel.op("iadd %s, %s" % (kp, sel.op("ishl %s, %s" % (
+        sel.op("iadd %s, %s" % (sel.op("ishl %s, %s" % (j, sel.const("i64", 3))),
+                                 sel.op("ushr %s, %s" % (i, sel.const("i64", 3))))), sel.const("i64", 2)))), "kw")
+    word = sel.op("uload32.i64 %s" % word_at, "word")
+    shift = sel.op("ishl %s, %s" % (sel.op("band %s, %s" % (i, sel.const("i64", 7))), sel.const("i64", 2)))
+    nib = sel.op("band %s, %s" % (sel.op("ushr %s, %s" % (word, shift)), sel.const("i64", 15)), "nib")
+    table_off = sel.op("load.i64 %s" % sel.op("iadd %s, %s" % (sel.mp, sel.op("ishl %s, %s" % (
+        sel.op("iadd %s, %s" % (j, sel.const("i64", 5))), sel.const("i64", 3)))), "tm"), "table")
+    table_at = sel.op("iadd %s, %s" % (sel.wp, sel.op("ishl %s, %s" % (table_off, sel.const("i64", 2)))), "tab")
+    pick = p256_select(sel, sel.wp, table_at, nib)
+    for c in range(3):
+        store4(sel, sel.acc_at, 24 + 8 * c, pick[c])
+    sel.raw("return %s" % nib)
+    # add: acc = acc + pick (pick is the register after acc), then advance j.
+    f = Field.constant(addb, P256_P)
+    r = p256_add(f, load_point(addb, addb.acc_at), tuple(load4(addb, addb.acc_at, 24 + 8 * c) for c in range(3)),
+                 load4(addb, addb.wp, slot_b))
+    store_point(addb, addb.acc_at, r)
+    j = addb.op("load.i64 %s+24" % addb.mp, "j")
+    nj = addb.op("iadd %s, %s" % (j, addb.const("i64", 1)), "next")
+    addb.raw("store %s, %s+24" % (nj, addb.mp))
+    addb.raw("return %s" % nj)
+    ind = "            "
+    out.append(
+        "/// The shared double-and-add chain of `ScalarMult`/`DoubleScalarMult`: for each nibble from\n"
+        "/// 63 down to 0, four doublings of the accumulator, then for each scalar j < meta[2] a\n"
+        "/// constant-time table read and a complete addition. `scalars` holds 8 limbs per scalar;\n"
+        "/// meta = [nibble, doublings left, scalar count, j, acc register, table 0, table 1].\n"
+        "i64 MultLoop(u32[] w, u32[] scalars, i64[] meta) {\n"
+        "    mut i64 last = 0_i64;\n"
+        "    while meta[0] >= 0_i64 {\n"
+        "        meta[1] = 4_i64;\n"
+        "        while meta[1] > 0_i64 {\n"
+        "            last = clif {\n%s\n            };\n"
+        "        }\n"
+        "        meta[3] = 0_i64;\n"
+        "        while meta[3] < meta[2] {\n"
+        "            last = clif {\n%s\n            };\n"
+        "            last = clif {\n%s\n            };\n"
+        "        }\n"
+        "        meta[0] = meta[0] - 1_i64;\n"
+        "    }\n"
+        "    return last;\n"
+        "}\n" % (dbl.render(ind + "    "), sel.render(ind + "    "), addb.render(ind + "    ")))
+    return "\n".join(out)
+
+
+def x25519_ladder():
+    """RFC 7748 5 Montgomery ladder over the ModArith workspace (Montgomery form mod
+    2^255 - 19): x1, x2, z2, x3, z3, a24 in slots 0..5. One step per iteration; the scalar
+    bit index t is meta[0] (254 down to 0), the pending swap bit meta[1]."""
+    n = 8
+    b = Block()
+    wp = b.op("payload %0", "wp")
+    kp = b.op("payload %1", "kp")
+    mp = b.op("payload %2", "mp")
+    f = Field.constant(b, X25519_P)
+    t = b.op("load.i64 %s" % mp, "t")
+    byte = b.op("uload8.i64 %s" % b.op("iadd %s, %s" % (kp, b.op("ushr %s, %s" % (t, b.const("i64", 3)))), "kb"), "byte")
+    bit = b.op("band %s, %s" % (b.op("ushr %s, %s" % (byte, b.op("band %s, %s" % (t, b.const("i64", 7))))), b.const("i64", 1)), "bit")
+    swap = b.op("bxor %s, %s" % (b.op("load.i64 %s+8" % mp, "swap"), bit))
+    mask = b.op("isub %s, %s" % (b.const("i64", 0), swap), "mask")
+    slot = lambda i: wslot(n, i)
+    x1 = load4(b, wp, slot(0))
+    x2, z2, x3, z3 = (load4(b, wp, slot(i)) for i in (1, 2, 3, 4))
+    a24 = load4(b, wp, slot(5))
+    x2, x3 = f.select(mask, x3, x2), f.select(mask, x2, x3)
+    z2, z3 = f.select(mask, z3, z2), f.select(mask, z2, z3)
+    a = f.add(x2, z2); aa = f.mul(a, a)
+    bb_ = f.sub(x2, z2); bb = f.mul(bb_, bb_)
+    e = f.sub(aa, bb)
+    c = f.add(x3, z3); d = f.sub(x3, z3)
+    da = f.mul(d, a); cb = f.mul(c, bb_)
+    s = f.add(da, cb); nx3 = f.mul(s, s)
+    df = f.sub(da, cb); nz3 = f.mul(f.mul(df, df), x1)
+    nx2 = f.mul(aa, bb)
+    nz2 = f.mul(e, f.add(aa, f.mul(a24, e)))
+    for i, v in ((1, nx2), (2, nz2), (3, nx3), (4, nz3)):
+        store4(b, wp, slot(i), v)
+    b.raw("store %s, %s+8" % (bit, mp))
+    nt = b.op("isub %s, %s" % (t, b.const("i64", 1)), "next")
+    b.raw("store %s, %s" % (nt, mp))
+    b.raw("return %s" % nt)
+    return looped("i64 LadderLoop(u32[] w, u8[] k, i64[] meta)",
+                  "/// The X25519 ladder steps for scalar bits meta[0] down to 0 (constant time: masked\n"
+                  "/// swaps, fixed operation sequence). Leaves the last swap bit in meta[1].",
+                  "meta[0] >= 0_i64", b)
+
+
+def gen_pk():
+    replace_region("ModArith.bd", "ModArithKernels", modarith_kernels())
+    replace_region("P256.bd", "P256Kernels", p256_kernels())
+    replace_region("X25519.bd", "X25519Kernels", x25519_ladder())
+
+
+GENERATORS = {"sha": gen_sha, "chacha": gen_chacha, "aes": gen_aes, "pk": gen_pk}
 
 if __name__ == "__main__":
     names = sys.argv[1:] or sorted(GENERATORS)

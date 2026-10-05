@@ -58,3 +58,28 @@ Symptom: ICE `no ISLE lowering rule or fact for AssignExpression` for
 (`Varint { value, length }`) bound by the match arm. The same assignment with a
 local `i64` instead of `v.length` lowers fine.
 Workaround: read the field into a local, or use a value already in scope.
+
+## 2026-10-05, codec: contract value stored in a struct field, or forwarded with `this`
+
+Symptom A: `internal compiler error: no ISLE lowering rule or fact for StructLiteralExpression`
+when a struct literal initializes a field whose declared type is a contract
+(`pub type Holder { Reader source, ... }` with `source: MemReader { ... }`); using
+such a value later gives `semantic fact abi_type is unavailable`.
+Workaround: pass the `Reader` as an argument to every operation.
+
+Symptom B: `semantic fact call_abi_signature is unavailable` for a method that forwards
+`this` plus a contract argument to a module function:
+```
+pub type G { i64 q,
+  pub Result<i64, IoError> M(Reader r, u8[] b) { return DoM(this, r, b); }
+}
+Result<i64, IoError> DoM(G self, Reader r, u8[] b) { return IO.Read(r, b, 0_i64, 1_i64); }
+```
+Calling `DoM(h, r, b)` directly (not from a method) works, as does forwarding `this.q`
+instead of `this`. Workaround: operations that take a contract are module functions
+(`Buffered.ReadLine(reader, source, max)`), not methods.
+
+## 2026-10-05, codec: integer narrowing does not truncate
+
+`u8(0x100000041_i64)` and `u32(0x100000041_i64)` are not equal to 0x41 (no wraparound
+on narrowing from i64). Workaround: mask with `& 255_i64` / `& 0xFFFFFFFF_i64` first.

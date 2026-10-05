@@ -6,56 +6,67 @@ use Core.Results;
 use Codec.Errors;
 use Codec.Line;
 
-/// Incremental reader over a `Core.IO.Reader` with a fixed-capacity buffer.
+/// Incremental read buffer over a `Core.IO.Reader` with a fixed capacity. The source is passed to
+/// each call because 0.5.2 cannot store a contract value in a struct field (see COMPILER-GAPS.md).
 /// Peek and delimiter scans never buffer more than `capacity` bytes, so a hostile
 /// peer cannot grow memory. `ReadExact` may exceed the capacity by reading the
 /// remainder straight from the source, bounded by the caller's `maxLength`.
-pub type BufferedReader: Reader {
-    Reader source,
+pub type BufferedReader {
     u8[] buf,
     i64 start,
     i64 stop,
     bool eof,
-
-    pub i64 Buffered() { return this.stop - this.start; }
-    pub i64 Capacity() { return Slice.Len(this.buf); }
+    pub i64 Buffered() { return DoBuffered(this); }
+    pub i64 Capacity() { return DoCapacity(this); }
     // True once the source reported end of stream (buffered bytes may remain).
-    pub bool AtEof() { return this.eof; }
-
+    pub bool AtEof() { return DoAtEof(this); }
     // Moves buffered bytes to the front of the buffer.
-    pub unit Compact() {
-        if this.start == 0_i64 { return; }
-        i64 count = this.stop - this.start;
-        if count > 0_i64 { Slice.Copy(this.buf, 0_i64, this.buf, this.start, count); }
-        this.start = 0_i64;
-        this.stop = count;
+    pub unit Compact() { return DoCompact(this); }
+}
+
+// Operations that take a `Reader` are module functions, not methods: a method forwarding `this`
+// together with a contract argument fails to lower in 0.5.2 (see COMPILER-GAPS.md).
+i64 DoBuffered(BufferedReader self) {
+    return self.stop - self.start;
+}
+
+i64 DoCapacity(BufferedReader self) {
+    return Slice.Len(self.buf);
+}
+
+bool DoAtEof(BufferedReader self) {
+    return self.eof;
+}
+
+unit DoCompact(BufferedReader self) {
+        if self.start == 0_i64 { return; }
+        i64 count = self.stop - self.start;
+        if count > 0_i64 { Slice.Copy(self.buf, 0_i64, self.buf, self.start, count); }
+        self.start = 0_i64;
+        self.stop = count;
     }
 
-    // Reads once from the source into the free space. Returns the byte count; 0 means
-    // end of stream. BufferFull when no free space is left.
-    pub Result<i64, CodecError> Fill() {
-        if this.eof { return Result::Ok(0_i64); }
-        this.Compact();
-        i64 free = Slice.Len(this.buf) - this.stop;
+pub Result<i64, CodecError> Fill(BufferedReader self, Reader source) {
+        if self.eof { return Result::Ok(0_i64); }
+        DoCompact(self);
+        i64 free = Slice.Len(self.buf) - self.stop;
         if free <= 0_i64 { return Result::Error(CodecError::BufferFull()); }
-        Result<i64, IoError> got = IO.Read(this.source, this.buf, this.stop, free);
+        Result<i64, IoError> got = IO.Read(source, self.buf, self.stop, free);
         match got {
             Result::Error(error) => { return Result::Error(Errors.FromIoError(error)); },
             Result::Ok(count) => {
-                if count == 0_i64 { this.eof = true; }
-                this.stop = this.stop + count;
+                if count == 0_i64 { self.eof = true; }
+                self.stop = self.stop + count;
                 return Result::Ok(count);
             },
         };
     }
 
-    // Fills until at least `count` bytes are buffered. Truncated on EOF, BufferFull
-    // when `count` exceeds the capacity.
-    pub Result<unit, CodecError> Ensure(i64 count) {
+pub Result<unit, CodecError> Ensure(BufferedReader self, Reader source, i64 count) {
         if count < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
-        if count > Slice.Len(this.buf) { return Result::Error(CodecError::BufferFull()); }
-        while this.stop - this.start < count {
-            Result<i64, CodecError> got = this.Fill();
+        if count > Slice.Len(self.buf) { return Result::Error(CodecError::BufferFull()); }
+        while self.stop - self.start < count {
+            Result<i64, CodecError> got = Fill(self, source);
             match got {
                 Result::Error(error) => { return Result::Error(error); },
                 Result::Ok(n) => { if n == 0_i64 { return Result::Error(CodecError::Truncated()); } },
@@ -64,82 +75,75 @@ pub type BufferedReader: Reader {
         return Result::Ok(());
     }
 
-    // Copies the next `count` bytes without consuming them.
-    pub Result<u8[], CodecError> Peek(i64 count) {
-        Result<unit, CodecError> ok = this.Ensure(count);
+pub Result<u8[], CodecError> Peek(BufferedReader self, Reader source, i64 count) {
+        Result<unit, CodecError> ok = Ensure(self, source, count);
         match ok {
             Result::Error(error) => { return Result::Error(error); },
             Result::Ok(_) => {},
         };
-        return Result::Ok(Slice.SubSlice(this.buf, this.start, count));
+        return Result::Ok(Slice.SubSlice(self.buf, self.start, count));
     }
 
-    pub Result<i64, CodecError> Peek8() {
-        Result<unit, CodecError> ok = this.Ensure(1_i64);
+pub Result<i64, CodecError> Peek8(BufferedReader self, Reader source) {
+        Result<unit, CodecError> ok = Ensure(self, source, 1_i64);
         match ok {
             Result::Error(error) => { return Result::Error(error); },
             Result::Ok(_) => {},
         };
-        return Result::Ok(i64(this.buf[this.start]));
+        return Result::Ok(i64(self.buf[self.start]));
     }
 
-    pub Result<unit, CodecError> Skip(i64 count) {
-        Result<unit, CodecError> ok = this.Ensure(count);
+pub Result<unit, CodecError> Skip(BufferedReader self, Reader source, i64 count) {
+        Result<unit, CodecError> ok = Ensure(self, source, count);
         match ok {
             Result::Error(error) => { return Result::Error(error); },
             Result::Ok(_) => {},
         };
-        this.start = this.start + count;
+        self.start = self.start + count;
         return Result::Ok(());
     }
 
-    // Reads exactly `count` bytes. LimitExceeded when `count` > `maxLength`,
-    // Truncated on EOF. Counts above the buffer capacity are read from the source
-    // directly after draining the buffer.
-    pub Result<u8[], CodecError> ReadExact(i64 count, i64 maxLength) {
+pub Result<u8[], CodecError> ReadExact(BufferedReader self, Reader source, i64 count, i64 maxLength) {
         if count < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
         if count > maxLength { return Result::Error(CodecError::LimitExceeded()); }
-        if count <= Slice.Len(this.buf) {
-            Result<unit, CodecError> ok = this.Ensure(count);
+        if count <= Slice.Len(self.buf) {
+            Result<unit, CodecError> ok = Ensure(self, source, count);
             match ok {
                 Result::Error(error) => { return Result::Error(error); },
                 Result::Ok(_) => {},
             };
-            u8[] out = Slice.SubSlice(this.buf, this.start, count);
-            this.start = this.start + count;
+            u8[] out = Slice.SubSlice(self.buf, self.start, count);
+            self.start = self.start + count;
             return Result::Ok(out);
         }
         u8[] out = Slice.New(count);
-        i64 have = this.stop - this.start;
-        Slice.Copy(out, 0_i64, this.buf, this.start, have);
-        this.start = this.stop;
-        Result<unit, IoError> rest = IO.ReadExact(this.source, out, have, count - have);
+        i64 have = self.stop - self.start;
+        Slice.Copy(out, 0_i64, self.buf, self.start, have);
+        self.start = self.stop;
+        Result<unit, IoError> rest = IO.ReadExact(source, out, have, count - have);
         return match rest {
             Result::Error(error) => Result::Error(Errors.FromIoError(error)),
             Result::Ok(_) => Result::Ok(out),
         };
     }
 
-    // Reads up to (excluding) the next `delimiter` byte and consumes the delimiter.
-    // LimitExceeded when more than `maxLength` bytes precede it (also bounded by the
-    // buffer capacity); Truncated on EOF first.
-    pub Result<u8[], CodecError> ReadUntil(u8 delimiter, i64 maxLength) {
+pub Result<u8[], CodecError> ReadUntil(BufferedReader self, Reader source, u8 delimiter, i64 maxLength) {
         if maxLength < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
         mut i64 scanned = 0_i64;
         while true {
-            while this.start + scanned < this.stop {
-                if this.buf[this.start + scanned] == delimiter {
-                    u8[] out = Slice.SubSlice(this.buf, this.start, scanned);
-                    this.start = this.start + scanned + 1_i64;
+            while self.start + scanned < self.stop {
+                if self.buf[self.start + scanned] == delimiter {
+                    u8[] out = Slice.SubSlice(self.buf, self.start, scanned);
+                    self.start = self.start + scanned + 1_i64;
                     return Result::Ok(out);
                 }
                 scanned = scanned + 1_i64;
                 if scanned > maxLength { return Result::Error(CodecError::LimitExceeded()); }
             }
-            Result<i64, CodecError> got = this.Fill();
+            Result<i64, CodecError> got = Fill(self, source);
             match got {
                 Result::Error(error) => {
-                    if scanned >= Slice.Len(this.buf) { return Result::Error(CodecError::LimitExceeded()); }
+                    if scanned >= Slice.Len(self.buf) { return Result::Error(CodecError::LimitExceeded()); }
                     return Result::Error(error);
                 },
                 Result::Ok(n) => { if n == 0_i64 { return Result::Error(CodecError::Truncated()); } },
@@ -148,21 +152,20 @@ pub type BufferedReader: Reader {
         return Result::Error(CodecError::Truncated());
     }
 
-    // Reads one CRLF-terminated line without its terminator. See Line.FindLineEnd.
-    pub Result<u8[], CodecError> ReadLine(i64 maxLength) {
+pub Result<u8[], CodecError> ReadLine(BufferedReader self, Reader source, i64 maxLength) {
         while true {
-            Result<i64, CodecError> found = Line.FindLineEnd(this.buf, this.start, this.stop, maxLength);
+            Result<i64, CodecError> found = Line.FindLineEnd(self.buf, self.start, self.stop, maxLength);
             match found {
                 Result::Error(error) => { return Result::Error(error); },
                 Result::Ok(cr) => {
                     if cr >= 0_i64 {
-                        u8[] out = Slice.SubSlice(this.buf, this.start, cr - this.start);
-                        this.start = cr + 2_i64;
+                        u8[] out = Slice.SubSlice(self.buf, self.start, cr - self.start);
+                        self.start = cr + 2_i64;
                         return Result::Ok(out);
                     }
                 },
             };
-            Result<i64, CodecError> got = this.Fill();
+            Result<i64, CodecError> got = Fill(self, source);
             match got {
                 Result::Error(error) => { return Result::Error(error); },
                 Result::Ok(n) => { if n == 0_i64 { return Result::Error(CodecError::Truncated()); } },
@@ -171,24 +174,23 @@ pub type BufferedReader: Reader {
         return Result::Error(CodecError::Truncated());
     }
 
-    // Core.IO.Reader: serves buffered bytes first, then reads the source directly.
-    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) {
-        i64 have = this.stop - this.start;
+pub Result<i64, IoError> ReadSome(BufferedReader self, Reader source, u8[] destination, i64 offset, i64 count) {
+        i64 have = self.stop - self.start;
         if have > 0_i64 {
             mut i64 n = count;
             if have < n { n = have; }
-            Slice.Copy(destination, offset, this.buf, this.start, n);
-            this.start = this.start + n;
+            Slice.Copy(destination, offset, self.buf, self.start, n);
+            self.start = self.start + n;
             return Result::Ok(n);
         }
-        if this.eof { return Result::Ok(0_i64); }
-        return this.source.Read(destination, offset, count);
+        if self.eof { return Result::Ok(0_i64); }
+        return IO.Read(source, destination, offset, count);
     }
-}
+
 
 /// A buffered reader with a `capacity` byte buffer (at least 1).
-pub BufferedReader New(Reader source, i64 capacity) {
+pub BufferedReader New(i64 capacity) {
     mut i64 size = capacity;
     if size < 1_i64 { size = 1_i64; }
-    return BufferedReader { source: source, buf: Slice.New(size), start: 0_i64, stop: 0_i64, eof: false };
+    return BufferedReader { buf: Slice.New(size), start: 0_i64, stop: 0_i64, eof: false };
 }

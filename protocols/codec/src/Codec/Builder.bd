@@ -1,0 +1,140 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Codec.Be;
+use Codec.Errors;
+use Codec.Varint;
+
+/// Marks where a length prefix was reserved (see BeginVec / EndVec).
+pub type VecMark { pub i64 position, pub i64 prefixBytes, }
+
+/// A growable, optionally bounded byte writer. Every writer reports LimitExceeded
+/// instead of growing past `limit`; a failed write leaves the content unchanged.
+pub type ByteBuilder {
+    u8[] data,
+    i64 limit,
+
+    pub i64 Length() { return Slice.Len(this.data); }
+
+    // Copy of the bytes written so far.
+    pub u8[] ToArray() { return Slice.SubSlice(this.data, 0_i64, Slice.Len(this.data)); }
+
+    pub Result<unit, CodecError> Reserve(i64 count) {
+        if count < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
+        if this.limit >= 0_i64 && count > this.limit - Slice.Len(this.data) {
+            return Result::Error(CodecError::LimitExceeded());
+        }
+        return Result::Ok(());
+    }
+
+    pub Result<unit, CodecError> Uint(i64 width, i64 value) {
+        if width < 1_i64 || width > 8_i64 { return Result::Error(CodecError::InvalidValue()); }
+        Result<unit, CodecError> room = this.Reserve(width);
+        match room {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        Result<u8[], CodecError> encoded = Be.Encode(width, value);
+        match encoded {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(bytes) => {
+                mut i64 i = 0_i64;
+                while i < width { Array.Append<u8>(this.data, bytes[i]); i = i + 1_i64; }
+                return Result::Ok(());
+            },
+        };
+    }
+
+    pub Result<unit, CodecError> U8(i64 value) { return this.Uint(1_i64, value); }
+    pub Result<unit, CodecError> U16(i64 value) { return this.Uint(2_i64, value); }
+    pub Result<unit, CodecError> U24(i64 value) { return this.Uint(3_i64, value); }
+    pub Result<unit, CodecError> U32(i64 value) { return this.Uint(4_i64, value); }
+    pub Result<unit, CodecError> U48(i64 value) { return this.Uint(6_i64, value); }
+    pub Result<unit, CodecError> U64(i64 value) { return this.Uint(8_i64, value); }
+
+    // Appends a QUIC variable-length integer in its minimal encoding.
+    pub Result<unit, CodecError> QuicVarint(i64 value) {
+        Result<u8[], CodecError> encoded = Varint.Encode(value);
+        match encoded {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(bytes) => { return this.Bytes(bytes); },
+        };
+    }
+
+    pub Result<unit, CodecError> BytesRange(u8[] source, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(CodecError::InvalidValue()); }
+        Result<unit, CodecError> room = this.Reserve(count);
+        match room {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        mut i64 i = 0_i64;
+        while i < count { Array.Append<u8>(this.data, source[offset + i]); i = i + 1_i64; }
+        return Result::Ok(());
+    }
+
+    pub Result<unit, CodecError> Bytes(u8[] source) {
+        return this.BytesRange(source, 0_i64, Slice.Len(source));
+    }
+
+    // Overwrites `width` already-written bytes at `offset` (back-patching).
+    pub Result<unit, CodecError> Patch(i64 offset, i64 width, i64 value) {
+        if !Slice.IsValidRange(Slice.Len(this.data), offset, width) { return Result::Error(CodecError::InvalidValue()); }
+        return Be.WriteUint(this.data, offset, width, value);
+    }
+
+    // Reserves a zeroed length prefix of `prefixBytes` (1..4) and returns its mark.
+    pub Result<VecMark, CodecError> BeginVec(i64 prefixBytes) {
+        if prefixBytes < 1_i64 || prefixBytes > 4_i64 { return Result::Error(CodecError::InvalidValue()); }
+        i64 position = Slice.Len(this.data);
+        Result<unit, CodecError> wrote = this.Uint(prefixBytes, 0_i64);
+        return match wrote {
+            Result::Error(error) => Result::Error(error),
+            Result::Ok(_) => Result::Ok(VecMark { position: position, prefixBytes: prefixBytes }),
+        };
+    }
+
+    // Back-patches the prefix with the body length written since BeginVec.
+    // InvalidLength when the body is outside min..max; Overflow when it does not
+    // fit the prefix width. The prefix keeps its placeholder on failure.
+    pub Result<unit, CodecError> EndVec(VecMark mark, i64 min, i64 max) {
+        i64 bodyLength = Slice.Len(this.data) - mark.position - mark.prefixBytes;
+        if bodyLength < min || bodyLength > max { return Result::Error(CodecError::InvalidLength()); }
+        return this.Patch(mark.position, mark.prefixBytes, bodyLength);
+    }
+
+    // Writes a complete vector in one call.
+    pub Result<unit, CodecError> Vec(i64 prefixBytes, i64 min, i64 max, u8[] body) {
+        i64 length = Slice.Len(body);
+        if length < min || length > max { return Result::Error(CodecError::InvalidLength()); }
+        Result<unit, CodecError> room = this.Reserve(prefixBytes + length);
+        match room {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        Result<unit, CodecError> prefix = this.Uint(prefixBytes, length);
+        match prefix {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        return this.Bytes(body);
+    }
+
+    // Appends a CRLF.
+    pub Result<unit, CodecError> Crlf() {
+        Result<unit, CodecError> room = this.Reserve(2_i64);
+        match room {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        Array.Append<u8>(this.data, u8(13));
+        Array.Append<u8>(this.data, u8(10));
+        return Result::Ok(());
+    }
+}
+
+/// An unbounded builder.
+pub ByteBuilder New() { return ByteBuilder { data: Array.Empty<u8>(), limit: -1_i64 }; }
+
+/// A builder that refuses to grow past `limit` bytes.
+pub ByteBuilder WithLimit(i64 limit) { return ByteBuilder { data: Array.Empty<u8>(), limit: limit }; }

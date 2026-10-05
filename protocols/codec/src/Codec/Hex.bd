@@ -1,0 +1,66 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Codec.Errors;
+
+// Lowercase hexadecimal helpers (test vectors, diagnostics).
+
+i64 Nibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return i64(c) - 48_i64; }
+    if c >= u8(97) && c <= u8(102) { return i64(c) - 87_i64; }
+    if c >= u8(65) && c <= u8(70) { return i64(c) - 55_i64; }
+    return -1_i64;
+}
+
+/// Decodes an even-length hex string; ASCII spaces are ignored. InvalidValue otherwise.
+pub Result<u8[], CodecError> Decode(string text) {
+    mut i64 digits = 0_i64;
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        u8 c = String.ByteAt(text, i);
+        if c != u8(32) {
+            if Nibble(c) < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
+            digits = digits + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    if digits % 2_i64 != 0_i64 { return Result::Error(CodecError::InvalidValue()); }
+    u8[] out = Slice.New(digits / 2_i64);
+    mut i64 pending = -1_i64;
+    mut i64 at = 0_i64;
+    i = 0_i64;
+    while i < String.Len(text) {
+        u8 c = String.ByteAt(text, i);
+        if c != u8(32) {
+            i64 n = Nibble(c);
+            if pending < 0_i64 { pending = n; } else {
+                out[at] = u8(pending * 16_i64 + n);
+                at = at + 1_i64;
+                pending = -1_i64;
+            }
+        }
+        i = i + 1_i64;
+    }
+    return Result::Ok(out);
+}
+
+/// Hex of `data`, two lowercase digits per byte.
+pub string Encode(u8[] data) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice("0123456789abcdef", b / 16_i64, 1_i64) + String.SubSlice("0123456789abcdef", b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+/// Decodes known-good literal; an invalid literal yields an empty array.
+pub u8[] Of(string text) {
+    Result<u8[], CodecError> decoded = Decode(text);
+    return match decoded {
+        Result::Ok(bytes) => bytes,
+        Result::Error(_) => Slice.New(0_i64),
+    };
+}

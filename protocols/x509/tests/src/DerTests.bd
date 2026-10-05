@@ -1,0 +1,208 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use X509.Der;
+use X509.X509Errors;
+use TestSupport;
+
+string ErrorOf(DerParser p) { return X509Errors.Name(Der.Error(p)); }
+
+/// Reads one element spanning the whole input and returns the error name.
+string ReadAll(string hex) {
+    u8[] d = TestSupport.Hex(hex);
+    DerParser p = Der.New(d);
+    DerElement e = Der.Read(p, 0_i64, Slice.Len(d));
+    if Der.Ok(p) && e.end != Slice.Len(d) { return "Short"; }
+    return ErrorOf(p);
+}
+
+string IntegerCheck(string hex) {
+    u8[] d = TestSupport.Hex(hex);
+    DerParser p = Der.New(d);
+    DerElement e = Der.Read(p, 0_i64, Slice.Len(d));
+    Der.CheckInteger(p, e);
+    return ErrorOf(p);
+}
+
+test der_lengths_short_and_long {
+    Assert.True(ReadAll("04 00") == "None", "empty octet string");
+    Assert.True(ReadAll("04 03 01 02 03") == "None", "short form");
+    u8[] big = Slice.New(131_i64);
+    big[0] = 0x04_u8; big[1] = 0x81_u8; big[2] = 0x80_u8;
+    DerParser p = Der.New(big);
+    DerElement e = Der.Read(p, 0_i64, 131_i64);
+    Assert.True(Der.Ok(p), "0x81 0x80 is minimal");
+    Assert.Equal<i64>(e.length, 128_i64, "length 128");
+    Assert.Equal<i64>(e.content, 3_i64, "content offset");
+}
+
+test der_rejects_non_minimal_length {
+    Assert.True(ReadAll("04 81 03 01 02 03") == "BadLength", "long form below 128");
+    Assert.True(ReadAll("04 82 00 03 01 02 03") == "BadLength", "leading zero length octet");
+    Assert.True(ReadAll("30 80 00 00") == "BadLength", "indefinite length");
+    Assert.True(ReadAll("04 85 00 00 00 00 01 00") == "BadLength", "five length octets");
+}
+
+test der_rejects_truncation {
+    Assert.True(ReadAll("04 05 01 02") == "Truncated", "content short");
+    Assert.True(ReadAll("04") == "Truncated", "no length");
+    Assert.True(ReadAll("04 82 01") == "Truncated", "length octets short");
+}
+
+test der_tags {
+    Assert.True(ReadAll("9F 1F 00") == "None", "high tag 31");
+    Assert.True(ReadAll("9F 80 1F 00") == "BadTag", "leading 0x80 in tag");
+    Assert.True(ReadAll("9F 1E 00") == "BadTag", "high form for low number");
+    Assert.True(ReadAll("BF 81 00 00") == "None", "constructed context tag 128");
+    u8[] d = TestSupport.Hex("BF 81 00 00");
+    DerParser p = Der.New(d);
+    DerElement e = Der.Read(p, 0_i64, 4_i64);
+    Assert.Equal<i64>(e.tagNumber, 128_i64, "tag 128");
+    Assert.Equal<i64>(e.tagClass, Der.ClassContext(), "context");
+    Assert.True(e.constructed, "constructed");
+    Assert.True(ReadAll("22 00") == "BadConstruction", "constructed OCTET STRING");
+    Assert.True(ReadAll("10 00") == "BadConstruction", "primitive SEQUENCE");
+}
+
+test der_integers {
+    Assert.True(IntegerCheck("02 01 00") == "None", "zero");
+    Assert.True(IntegerCheck("02 02 00 80") == "None", "128 needs pad");
+    Assert.True(IntegerCheck("02 02 00 7F") == "BadInteger", "redundant zero");
+    Assert.True(IntegerCheck("02 02 FF 80") == "BadInteger", "redundant FF");
+    Assert.True(IntegerCheck("02 02 FF 7F") == "None", "negative ok");
+    Assert.True(IntegerCheck("02 00") == "BadInteger", "empty integer");
+    u8[] d = TestSupport.Hex("02 03 01 00 01");
+    DerParser p = Der.New(d);
+    Assert.Equal<i64>(Der.ReadSmallInteger(p, 0_i64, 5_i64), 65537_i64, "65537");
+    u8[] neg = TestSupport.Hex("02 01 FF");
+    DerParser q = Der.New(neg);
+    Der.ReadSmallInteger(q, 0_i64, 3_i64);
+    Assert.True(ErrorOf(q) == "BadInteger", "negative rejected as small integer");
+}
+
+test der_bit_strings_and_booleans {
+    u8[] ku = TestSupport.Hex("03 02 01 86");
+    DerParser p = Der.New(ku);
+    DerElement e = Der.Read(p, 0_i64, 4_i64);
+    // keyCertSign (5) | cRLSign (6) | digitalSignature (0): 0x86 = 1000 0110, unused 1
+    Assert.Equal<i64>(Der.NamedBits(p, e), 97_i64, "bits 0, 5, 6");
+    u8[] bad = TestSupport.Hex("03 02 01 87");
+    DerParser q = Der.New(bad);
+    DerElement f = Der.Read(q, 0_i64, 4_i64);
+    Der.CheckBitString(q, f);
+    Assert.True(ErrorOf(q) == "BadBitString", "padding bit set");
+    u8[] b8 = TestSupport.Hex("03 01 08");
+    DerParser r = Der.New(b8);
+    Der.CheckBitString(r, Der.Read(r, 0_i64, 3_i64));
+    Assert.True(ErrorOf(r) == "BadBitString", "unused > 7");
+    u8[] t = TestSupport.Hex("01 01 FF");
+    DerParser s = Der.New(t);
+    Assert.True(Der.ReadBoolean(s, Der.Read(s, 0_i64, 3_i64)), "true");
+    u8[] t1 = TestSupport.Hex("01 01 01");
+    DerParser s1 = Der.New(t1);
+    Der.ReadBoolean(s1, Der.Read(s1, 0_i64, 3_i64));
+    Assert.True(ErrorOf(s1) == "BadBoolean", "BER true rejected");
+    u8[] n = TestSupport.Hex("05 01 00");
+    DerParser s2 = Der.New(n);
+    Der.CheckNull(s2, Der.Read(s2, 0_i64, 3_i64));
+    Assert.True(ErrorOf(s2) == "BadNull", "NULL with content");
+}
+
+test der_oids {
+    u8[] d = TestSupport.Hex("06 09 2A 86 48 86 F7 0D 01 01 0B");
+    DerParser p = Der.New(d);
+    Assert.True(Der.ReadOid(p, 0_i64, 11_i64) == "1.2.840.113549.1.1.11", "sha256WithRSAEncryption");
+    u8[] e = TestSupport.Hex("06 03 55 1D 13");
+    DerParser q = Der.New(e);
+    Assert.True(Der.ReadOid(q, 0_i64, 5_i64) == "2.5.29.19", "basicConstraints");
+    u8[] bad = TestSupport.Hex("06 03 2A 80 01");
+    DerParser r = Der.New(bad);
+    Der.ReadOid(r, 0_i64, 5_i64);
+    Assert.True(ErrorOf(r) == "BadOid", "non-minimal arc");
+    u8[] open = TestSupport.Hex("06 02 2A 86");
+    DerParser s = Der.New(open);
+    Der.ReadOid(s, 0_i64, 4_i64);
+    Assert.True(ErrorOf(s) == "BadOid", "unterminated arc");
+}
+
+test der_times {
+    // 250101000000Z
+    u8[] u = TestSupport.Hex("17 0D 32 35 30 31 30 31 30 30 30 30 30 30 5A");
+    DerParser p = Der.New(u);
+    Assert.Equal<i64>(Der.ReadTime(p, 0_i64, 15_i64), 1735689600_i64, "2025-01-01");
+    // 20500101000000Z
+    u8[] g = TestSupport.Hex("18 0F 32 30 35 30 30 31 30 31 30 30 30 30 30 30 5A");
+    DerParser q = Der.New(g);
+    Assert.Equal<i64>(Der.ReadTime(q, 0_i64, 17_i64), 2524608000_i64, "2050-01-01");
+    // 491231235959Z is 2049
+    u8[] u2 = TestSupport.Hex("17 0D 34 39 31 32 33 31 32 33 35 39 35 39 5A");
+    DerParser r = Der.New(u2);
+    Assert.Equal<i64>(Der.ReadTime(r, 0_i64, 15_i64), 2524607999_i64, "2049-12-31T23:59:59");
+    // 500101000000Z is 1950
+    u8[] u3 = TestSupport.Hex("17 0D 35 30 30 31 30 31 30 30 30 30 30 30 5A");
+    DerParser s = Der.New(u3);
+    Assert.Equal<i64>(Der.ReadTime(s, 0_i64, 15_i64), -631152000_i64, "1950-01-01");
+    // Feb 30 rejected
+    u8[] bad = TestSupport.Hex("17 0D 32 35 30 32 33 30 30 30 30 30 30 30 5A");
+    DerParser t = Der.New(bad);
+    Der.ReadTime(t, 0_i64, 15_i64);
+    Assert.True(ErrorOf(t) == "BadTime", "Feb 30");
+    // no Z
+    u8[] noz = TestSupport.Hex("17 0D 32 35 30 31 30 31 30 30 30 30 30 30 30");
+    DerParser v = Der.New(noz);
+    Der.ReadTime(v, 0_i64, 15_i64);
+    Assert.True(ErrorOf(v) == "BadTime", "missing Z");
+    // 2024-02-29 leap day ok
+    u8[] leap = TestSupport.Hex("17 0D 32 34 30 32 32 39 31 32 30 30 30 30 5A");
+    DerParser w = Der.New(leap);
+    Assert.Equal<i64>(Der.ReadTime(w, 0_i64, 15_i64), 1709208000_i64, "2024-02-29T12:00");
+}
+
+test der_strings {
+    u8[] ps = TestSupport.Hex("13 03 41 42 43");
+    DerParser p = Der.New(ps);
+    Assert.True(Der.ReadString(p, Der.Read(p, 0_i64, 5_i64)) == "ABC", "printable");
+    u8[] bad = TestSupport.Hex("13 01 40");
+    DerParser q = Der.New(bad);
+    Der.ReadString(q, Der.Read(q, 0_i64, 3_i64));
+    Assert.True(ErrorOf(q) == "BadString", "@ not printable");
+    u8[] utf = TestSupport.Hex("0C 02 C3 B3");
+    DerParser r = Der.New(utf);
+    string fromUtf8 = Der.ReadString(r, Der.Read(r, 0_i64, 4_i64));
+    u8[] bmp1 = TestSupport.Hex("1E 02 00 F3");
+    DerParser r2 = Der.New(bmp1);
+    Assert.True(fromUtf8 == Der.ReadString(r2, Der.Read(r2, 0_i64, 4_i64)), "utf8 equals bmp");
+    u8[] badUtf = TestSupport.Hex("0C 01 C3");
+    DerParser s = Der.New(badUtf);
+    Der.ReadString(s, Der.Read(s, 0_i64, 3_i64));
+    Assert.True(ErrorOf(s) == "BadString", "invalid utf8");
+    u8[] bmp = TestSupport.Hex("1E 04 00 41 00 F3");
+    DerParser t = Der.New(bmp);
+    string decoded = Der.ReadString(t, Der.Read(t, 0_i64, 6_i64));
+    Assert.True(Der.Ok(t), "bmp ok");
+    u8[] same = TestSupport.Hex("0C 03 41 C3 B3");
+    DerParser t2 = Der.New(same);
+    Assert.True(decoded == Der.ReadString(t2, Der.Read(t2, 0_i64, 5_i64)), "bmp to utf8");
+}
+
+test der_tree_depth_and_trailing {
+    // 30 03 30 01 ... nested too deep: build 30 nesting 30 levels.
+    i64 levels = 30_i64;
+    u8[] d = Slice.New(levels * 2_i64);
+    mut i64 i = 0_i64;
+    while i < levels {
+        d[i * 2_i64] = 0x30_u8;
+        d[i * 2_i64 + 1_i64] = u8((levels - i - 1_i64) * 2_i64);
+        i = i + 1_i64;
+    }
+    DerParser p = Der.New(d);
+    Der.CheckTree(p, 0_i64, Slice.Len(d));
+    Assert.True(ErrorOf(p) == "TooDeep", "depth bound");
+    u8[] t = TestSupport.Hex("30 00 00");
+    DerParser q = Der.New(t);
+    Der.CheckTree(q, 0_i64, 3_i64);
+    Assert.True(ErrorOf(q) == "TrailingData", "trailing byte");
+    u8[] inner = TestSupport.Hex("30 04 04 03 01 02");
+    DerParser r = Der.New(inner);
+    Der.CheckTree(r, 0_i64, 6_i64);
+    Assert.True(ErrorOf(r) == "Truncated", "child overruns parent");
+}

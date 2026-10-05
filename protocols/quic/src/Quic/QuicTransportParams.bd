@@ -1,0 +1,173 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Quic.QuicErrors;
+use Quic.QuicWire;
+
+// QUIC transport parameters (RFC 9000 section 18): encoding, decoding and validation.
+// Integer parameters live in `values` indexed by parameter id 0x00..0x10 (-1 = absent);
+// byte-string parameters live in `blobs` (see the Blob* indices).
+
+pub i64 OriginalDcid() { return 0_i64; }
+pub i64 MaxIdleTimeout() { return 1_i64; }
+pub i64 StatelessResetToken() { return 2_i64; }
+pub i64 MaxUdpPayloadSize() { return 3_i64; }
+pub i64 InitialMaxData() { return 4_i64; }
+pub i64 InitialMaxStreamDataBidiLocal() { return 5_i64; }
+pub i64 InitialMaxStreamDataBidiRemote() { return 6_i64; }
+pub i64 InitialMaxStreamDataUni() { return 7_i64; }
+pub i64 InitialMaxStreamsBidi() { return 8_i64; }
+pub i64 InitialMaxStreamsUni() { return 9_i64; }
+pub i64 AckDelayExponent() { return 10_i64; }
+pub i64 MaxAckDelay() { return 11_i64; }
+pub i64 DisableActiveMigration() { return 12_i64; }
+pub i64 PreferredAddress() { return 13_i64; }
+pub i64 ActiveConnectionIdLimit() { return 14_i64; }
+pub i64 InitialScid() { return 15_i64; }
+pub i64 RetryScid() { return 16_i64; }
+
+pub type ParamBlob { pub u8[] data, }
+
+pub type TransportParams {
+    /// Integer parameters by id (0x00..0x10); -1 when absent. Ids 0, 2, 13, 15, 16 are blobs
+    /// and hold 1 when present.
+    pub i64[] values,
+    /// Byte-string parameters by id (same indices).
+    pub ParamBlob[] blobs,
+}
+
+bool IsBlob(i64 id) { return id == 0_i64 || id == 2_i64 || id == 13_i64 || id == 15_i64 || id == 16_i64; }
+
+/// An empty parameter set (every parameter absent).
+pub TransportParams Empty() {
+    mut i64[] values = Array.Empty<i64>();
+    mut ParamBlob[] blobs = Array.Empty<ParamBlob>();
+    mut i64 i = 0_i64;
+    while i < 17_i64 {
+        Array.Append<i64>(values, -1_i64);
+        Array.Append<ParamBlob>(blobs, ParamBlob { data: Slice.New(0_i64) });
+        i = i + 1_i64;
+    }
+    return TransportParams { values: values, blobs: blobs };
+}
+
+pub unit Set(TransportParams p, i64 id, i64 value) { p.values[id] = value; return; }
+
+pub unit SetBytes(TransportParams p, i64 id, u8[] data) {
+    p.values[id] = 1_i64;
+    p.blobs[id] = ParamBlob { data: data };
+    return;
+}
+
+pub bool Has(TransportParams p, i64 id) { return p.values[id] >= 0_i64; }
+
+pub u8[] Bytes(TransportParams p, i64 id) {
+    ParamBlob b = p.blobs[id];
+    return b.data;
+}
+
+/// The value, or the RFC default when absent (max_udp_payload_size 65527, ack_delay_exponent 3,
+/// max_ack_delay 25 ms, active_connection_id_limit 2, otherwise 0).
+pub i64 Get(TransportParams p, i64 id) {
+    i64 v = p.values[id];
+    if v >= 0_i64 { return v; }
+    if id == 3_i64 { return 65527_i64; }
+    if id == 10_i64 { return 3_i64; }
+    if id == 11_i64 { return 25_i64; }
+    if id == 14_i64 { return 2_i64; }
+    return 0_i64;
+}
+
+/// Encodes the present parameters in id order.
+pub u8[] Encode(TransportParams p) {
+    u8[] buf = Slice.New(512_i64);
+    Writer w = QuicWire.NewWriter(buf, 0_i64, 512_i64);
+    mut i64 id = 0_i64;
+    while id < 17_i64 {
+        i64 v = p.values[id];
+        if v >= 0_i64 {
+            QuicWire.PutVar(w, id);
+            if IsBlob(id) {
+                u8[] data = Bytes(p, id);
+                QuicWire.PutVar(w, Slice.Len(data));
+                QuicWire.PutAll(w, data);
+            } else {
+                if id == 12_i64 { QuicWire.PutVar(w, 0_i64); } else {
+                    QuicWire.PutVar(w, QuicWire.VarLen(v));
+                    QuicWire.PutVar(w, v);
+                }
+            }
+        }
+        id = id + 1_i64;
+    }
+    return QuicWire.CopyOf(buf, 0_i64, QuicWire.WPos(w));
+}
+
+/// Decodes and validates parameters sent by the peer. `fromServer` enables the server-only
+/// parameters; a client sending them, a duplicate, or an out-of-range value fails with
+/// TRANSPORT_PARAMETER_ERROR. Unknown (including reserved) parameters are ignored.
+pub Result<TransportParams, QuicError> Decode(u8[] data, bool fromServer) {
+    TransportParams p = Empty();
+    i64 code = DecodeInto(p, data, fromServer);
+    if code != 0_i64 { return Result::Error(QuicError::Transport(code)); }
+    return Result::Ok(p);
+}
+
+i64 DecodeInto(TransportParams p, u8[] data, bool fromServer) {
+    Reader r = QuicWire.NewReader(data, 0_i64, Slice.Len(data));
+    mut i64[] seen = Array.Empty<i64>();
+    while !QuicWire.AtEnd(r) {
+        i64 id = QuicWire.Var(r);
+        i64 length = QuicWire.Var(r);
+        i64 start = QuicWire.Skip(r, length);
+        if !QuicWire.Ok(r) { return 8_i64; }
+        mut i64 k = 0_i64;
+        while k < Array.Len<i64>(seen) { if seen[k] == id { return 8_i64; } k = k + 1_i64; }
+        Array.Append<i64>(seen, id);
+        if id <= 16_i64 {
+            if !fromServer && (id == 0_i64 || id == 2_i64 || id == 13_i64 || id == 16_i64) { return 8_i64; }
+            if IsBlob(id) {
+                if id == 2_i64 && length != 16_i64 { return 8_i64; }
+                if (id == 0_i64 || id == 15_i64 || id == 16_i64) && length > 20_i64 { return 8_i64; }
+                if id == 13_i64 && length < 41_i64 { return 8_i64; }
+                SetBytes(p, id, QuicWire.CopyOf(data, start, length));
+            } else {
+                if id == 12_i64 {
+                    if length != 0_i64 { return 8_i64; }
+                    p.values[12] = 1_i64;
+                } else {
+                    Reader v = QuicWire.NewReader(data, start, start + length);
+                    i64 value = QuicWire.Var(v);
+                    if !QuicWire.Ok(v) || !QuicWire.AtEnd(v) { return 8_i64; }
+                    if !InRange(id, value) { return 8_i64; }
+                    p.values[id] = value;
+                }
+            }
+        }
+    }
+    return 0_i64;
+}
+
+bool InRange(i64 id, i64 value) {
+    if id == 3_i64 { return value >= 1200_i64; }
+    if id == 10_i64 { return value <= 20_i64; }
+    if id == 11_i64 { return value < 16384_i64; }
+    if id == 14_i64 { return value >= 2_i64; }
+    if id == 8_i64 || id == 9_i64 { return value <= 1152921504606846976_i64; }
+    return true;
+}
+
+/// Connection ID authentication (RFC 9000 section 7.3). `expectedOdcid` and `expectedRetryScid`
+/// apply to server parameters (pass an empty retry SCID when no Retry happened).
+/// Returns 0 or TRANSPORT_PARAMETER_ERROR / PROTOCOL_VIOLATION.
+pub i64 CheckConnectionIds(TransportParams p, bool fromServer, u8[] peerScid, u8[] expectedOdcid, u8[] expectedRetryScid, bool retried) {
+    if !Has(p, 15_i64) || !QuicWire.Equal(Bytes(p, 15_i64), peerScid) { return 8_i64; }
+    if !fromServer { return 0_i64; }
+    if !Has(p, 0_i64) || !QuicWire.Equal(Bytes(p, 0_i64), expectedOdcid) { return 8_i64; }
+    if retried {
+        if !Has(p, 16_i64) || !QuicWire.Equal(Bytes(p, 16_i64), expectedRetryScid) { return 8_i64; }
+    } else {
+        if Has(p, 16_i64) { return 8_i64; }
+    }
+    return 0_i64;
+}

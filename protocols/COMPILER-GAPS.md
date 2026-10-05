@@ -55,8 +55,15 @@ Append: date, slice, symptom, minimal repro, workaround.
 - Workaround: keep mutable state in array fields (`i64[] meta`), which are mutable
   through a plain parameter; hash, MAC, and GHASH states use this layout.
 
-### No sized array allocation outside corelib
+### No sized array allocation outside corelib; append growth is quadratic and capped
 
-- Symptom: `__array_new<u8>(n)` is rejected in package code; `Slice.New(n)`
-  appends `n` times. Hot loops avoid it by allocating scratch arrays once per
-  key or state.
+- Symptom: `__array_new<u8>(n)` is rejected in package code, so every buffer comes
+  from `Slice.New(n)`, which appends `n` times. Measured on macOS arm64:
+  32 x `Slice.New(16384)` takes ~5.5 s while 128 x `Slice.New(4096)` (same bytes)
+  takes ~1.2 s, so the cost grows with the square of the size. A single array of
+  ~180 KiB, or a few live 64 KiB arrays, traps with
+  `out_of_memory (5): R1 req=180224 live=180224 committed=1073741824 cap=1073741824`.
+- Repro: `test t { Assert.Equal<i64>(Slice.Len(Slice.New(200000_i64)), 200000_i64, "len"); }`
+- Workaround: allocate scratch once per key/state, and use the in-place AEAD APIs
+  (`ChaCha20Poly1305.SealInto/OpenInto`, `AesGcm.SealInto/OpenInto`) with a reused
+  record buffer. With that, 16 KiB records seal and open at several MB/s under JIT.

@@ -39,20 +39,58 @@ u8[] Tag(Poly1305State mac, u8[] aad, u8[] ciphertext, i64 offset, i64 count) {
     return Poly1305.Finish(mac);
 }
 
-/// Encrypts `plaintext` and returns ciphertext || tag.
-pub Result<u8[], CryptoError> Seal(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext) {
+/// Encrypts `count` bytes of `input` at `inputOffset` and writes ciphertext || tag
+/// (`count` + 16 bytes) to `output` at `outputOffset`. Input and output may be the
+/// same buffer at the same offset. Use this with a reused record buffer: Beskid 0.5.2
+/// allocates `u8[]` by repeated append, so a fresh large buffer per record is slow.
+pub Result<unit, CryptoError> SealInto(u8[] key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
+    if !Slice.IsValidRange(Slice.Len(input), inputOffset, count) { return Result::Error(CryptoError::InvalidLength()); }
+    if count > 9223372036854775807_i64 - 16_i64 || !Slice.IsValidRange(Slice.Len(output), outputOffset, count + 16_i64) {
+        return Result::Error(CryptoError::InvalidLength());
+    }
     return match MacState(key, nonce) {
         Result::Error(error) => Result::Error(error),
         Result::Ok(mac) => {
-            i64 count = Slice.Len(plaintext);
-            u8[] out = Slice.New(count + 16_i64);
-            if !ChaCha20.XorInto(key, 1_u32, nonce, plaintext, 0_i64, count, out, 0_i64) {
+            if !ChaCha20.XorInto(key, 1_u32, nonce, input, inputOffset, count, output, outputOffset) {
                 return Result::Error(CryptoError::InvalidLength());
             }
-            u8[] tag = Tag(mac, aad, out, 0_i64, count);
-            Slice.Copy(out, count, tag, 0_i64, 16_i64);
-            return Result::Ok(out);
+            u8[] tag = Tag(mac, aad, output, outputOffset, count);
+            Slice.Copy(output, outputOffset + count, tag, 0_i64, 16_i64);
+            return Result::Ok(());
         },
+    };
+}
+
+/// Verifies `sealedCount` bytes of ciphertext || tag at `sealedOffset` in constant time
+/// and only then writes `sealedCount - 16` plaintext bytes to `output` at `outputOffset`.
+/// Returns the plaintext length; a wrong tag returns AuthenticationFailed and writes nothing.
+pub Result<i64, CryptoError> OpenInto(u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset) {
+    if !Slice.IsValidRange(Slice.Len(sealed), sealedOffset, sealedCount) { return Result::Error(CryptoError::InvalidLength()); }
+    if sealedCount < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
+    i64 count = sealedCount - 16_i64;
+    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count) { return Result::Error(CryptoError::InvalidLength()); }
+    return match MacState(key, nonce) {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(mac) => {
+            u8[] expected = Tag(mac, aad, sealed, sealedOffset, count);
+            if !ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64) {
+                return Result::Error(CryptoError::AuthenticationFailed());
+            }
+            if !ChaCha20.XorInto(key, 1_u32, nonce, sealed, sealedOffset, count, output, outputOffset) {
+                return Result::Error(CryptoError::InvalidLength());
+            }
+            return Result::Ok(count);
+        },
+    };
+}
+
+/// Encrypts `plaintext` and returns ciphertext || tag.
+pub Result<u8[], CryptoError> Seal(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext) {
+    i64 count = Slice.Len(plaintext);
+    u8[] out = Slice.New(count + 16_i64);
+    return match SealInto(key, nonce, aad, plaintext, 0_i64, count, out, 0_i64) {
+        Result::Ok(_) => Result::Ok(out),
+        Result::Error(error) => Result::Error(error),
     };
 }
 
@@ -61,19 +99,9 @@ pub Result<u8[], CryptoError> Seal(u8[] key, u8[] nonce, u8[] aad, u8[] plaintex
 pub Result<u8[], CryptoError> Open(u8[] key, u8[] nonce, u8[] aad, u8[] sealed) {
     i64 total = Slice.Len(sealed);
     if total < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
-    i64 count = total - 16_i64;
-    return match MacState(key, nonce) {
+    u8[] out = Slice.New(total - 16_i64);
+    return match OpenInto(key, nonce, aad, sealed, 0_i64, total, out, 0_i64) {
+        Result::Ok(_) => Result::Ok(out),
         Result::Error(error) => Result::Error(error),
-        Result::Ok(mac) => {
-            u8[] expected = Tag(mac, aad, sealed, 0_i64, count);
-            if !ConstantTime.EqualRange(expected, 0_i64, sealed, count, 16_i64) {
-                return Result::Error(CryptoError::AuthenticationFailed());
-            }
-            u8[] out = Slice.New(count);
-            if !ChaCha20.XorInto(key, 1_u32, nonce, sealed, 0_i64, count, out, 0_i64) {
-                return Result::Error(CryptoError::InvalidLength());
-            }
-            return Result::Ok(out);
-        },
     };
 }

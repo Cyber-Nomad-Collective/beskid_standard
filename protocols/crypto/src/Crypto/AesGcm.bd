@@ -178,17 +178,47 @@ u8[] InitialCounter(u8[] nonce) {
 /// Maximum plaintext per invocation: 2^32 - 2 blocks (SP 800-38D section 5.2.1.1).
 i64 MaxPlaintext() { return 68719476704_i64; }
 
+/// Encrypts `count` bytes of `input` at `inputOffset` and writes ciphertext || tag
+/// (`count` + 16 bytes) to `output` at `outputOffset`; in-place use is allowed.
+/// Prefer this with a reused record buffer (see `ChaCha20Poly1305.SealInto`).
+pub Result<unit, CryptoError> SealInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
+    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
+    if count > MaxPlaintext() || !Slice.IsValidRange(Slice.Len(input), inputOffset, count) { return Result::Error(CryptoError::InvalidLength()); }
+    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count + 16_i64) { return Result::Error(CryptoError::InvalidLength()); }
+    u8[] j0 = InitialCounter(nonce);
+    Ctr(key, j0, input, inputOffset, count, output, outputOffset);
+    u8[] tag = ComputeTag(key, j0, aad, output, outputOffset, count);
+    Slice.Copy(output, outputOffset + count, tag, 0_i64, 16_i64);
+    return Result::Ok(());
+}
+
+/// Verifies ciphertext || tag (`sealedCount` bytes at `sealedOffset`) in constant time, then
+/// writes the plaintext to `output` at `outputOffset` and returns its length.
+/// A wrong tag returns AuthenticationFailed and writes nothing.
+pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset) {
+    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
+    if !Slice.IsValidRange(Slice.Len(sealed), sealedOffset, sealedCount) { return Result::Error(CryptoError::InvalidLength()); }
+    if sealedCount < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
+    i64 count = sealedCount - 16_i64;
+    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count) { return Result::Error(CryptoError::InvalidLength()); }
+    u8[] j0 = InitialCounter(nonce);
+    u8[] expected = ComputeTag(key, j0, aad, sealed, sealedOffset, count);
+    if !ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64) {
+        return Result::Error(CryptoError::AuthenticationFailed());
+    }
+    Ctr(key, j0, sealed, sealedOffset, count, output, outputOffset);
+    return Result::Ok(count);
+}
+
 /// Encrypts `plaintext` and returns ciphertext || tag. The nonce must be 12 bytes and unique per key.
 pub Result<u8[], CryptoError> Seal(AesGcmKey key, u8[] nonce, u8[] aad, u8[] plaintext) {
-    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
     i64 count = Slice.Len(plaintext);
     if count > MaxPlaintext() { return Result::Error(CryptoError::InvalidLength()); }
-    u8[] j0 = InitialCounter(nonce);
     u8[] out = Slice.New(count + 16_i64);
-    Ctr(key, j0, plaintext, 0_i64, count, out, 0_i64);
-    u8[] tag = ComputeTag(key, j0, aad, out, 0_i64, count);
-    Slice.Copy(out, count, tag, 0_i64, 16_i64);
-    return Result::Ok(out);
+    return match SealInto(key, nonce, aad, plaintext, 0_i64, count, out, 0_i64) {
+        Result::Ok(_) => Result::Ok(out),
+        Result::Error(error) => Result::Error(error),
+    };
 }
 
 /// Verifies the tag of ciphertext || tag in constant time, then decrypts.
@@ -197,13 +227,9 @@ pub Result<u8[], CryptoError> Open(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sea
     if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
     i64 total = Slice.Len(sealed);
     if total < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
-    i64 count = total - 16_i64;
-    u8[] j0 = InitialCounter(nonce);
-    u8[] expected = ComputeTag(key, j0, aad, sealed, 0_i64, count);
-    if !ConstantTime.EqualRange(expected, 0_i64, sealed, count, 16_i64) {
-        return Result::Error(CryptoError::AuthenticationFailed());
-    }
-    u8[] out = Slice.New(count);
-    Ctr(key, j0, sealed, 0_i64, count, out, 0_i64);
-    return Result::Ok(out);
+    u8[] out = Slice.New(total - 16_i64);
+    return match OpenInto(key, nonce, aad, sealed, 0_i64, total, out, 0_i64) {
+        Result::Ok(_) => Result::Ok(out),
+        Result::Error(error) => Result::Error(error),
+    };
 }

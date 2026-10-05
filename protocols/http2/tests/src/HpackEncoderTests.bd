@@ -1,0 +1,293 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Http2.Hpack;
+use Http2.HpackDecoder;
+use Http2.HpackEncoder;
+
+// Shared test helpers (each target is compiled on its own).
+
+i64 HexDigit(u8 b) {
+    if b >= 48_u8 && b <= 57_u8 { return i64(b - 48_u8); }
+    if b >= 97_u8 && b <= 102_u8 { return i64(b - 97_u8) + 10_i64; }
+    if b >= 65_u8 && b <= 70_u8 { return i64(b - 65_u8) + 10_i64; }
+    return -1_i64;
+}
+
+u8[] Hex(string text) {
+    mut u8[] out = [];
+    mut i64 high = -1_i64;
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 digit = HexDigit(String.ByteAt(text, i));
+        if digit >= 0_i64 {
+            if high < 0_i64 { high = digit; } else { Array.Append<u8>(out, u8(high * 16_i64 + digit)); high = -1_i64; }
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+string HexText(u8[] data) {
+    string digits = "0123456789abcdef";
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice(digits, b / 16_i64, 1_i64) + String.SubSlice(digits, b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+unit ExpectBytes(u8[] actual, string expectedHex, string because) {
+    Assert.True(Hpack.BytesEqual(actual, Hex(expectedHex)), because + ": got " + HexText(actual) + " want " + HexText(Hex(expectedHex)));
+    return;
+}
+
+string Text(u8[] data) {
+    return match Convert.BytesToString(data) { Result::Ok(text) => text, Result::Error(_) => "<binary " + HexText(data) + ">", };
+}
+
+unit ExpectField(HeaderField field, string name, string value, string because) {
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)) && Hpack.BytesEqual(field.value, Convert.StringToBytes(value)),
+        because + ": got " + Text(field.name) + ": " + Text(field.value) + " want " + name + ": " + value);
+    return;
+}
+
+/// `expected` alternates names and values.
+unit ExpectFields(HeaderField[] fields, string[] expected, string because) {
+    Assert.Equal<i64>(Array.Len<HeaderField>(fields) * 2_i64, Array.Len<string>(expected), because + ": field count");
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        ExpectField(Array.Get<HeaderField>(fields, i), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+HeaderField[] Fields(string[] pairs) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    mut i64 i = 0_i64;
+    while i + 1_i64 < Array.Len<string>(pairs) {
+        Array.Append<HeaderField>(out, Hpack.Field(Array.Get<string>(pairs, i), Array.Get<string>(pairs, i + 1_i64)));
+        i = i + 2_i64;
+    }
+    return out;
+}
+
+Decoder NewTestDecoder(i64 tableSize) {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.settingsTableSize = tableSize;
+    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
+    match created {
+        Result::Ok(decoder) => { return decoder; },
+        Result::Error(_) => { Assert.Fail("NewDecoder"); },
+    };
+    return NewTestDecoder(4096_i64);
+}
+
+Encoder NewTestEncoder(EncoderPolicy policy) {
+    Result<Encoder,HpackError> created = HpackEncoder.NewEncoder(policy);
+    match created {
+        Result::Ok(encoder) => { return encoder; },
+        Result::Error(_) => { Assert.Fail("NewEncoder"); },
+    };
+    return NewTestEncoder(HpackEncoder.DefaultEncoderPolicy());
+}
+
+HeaderField[] DecodeOk(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(fields) => { return fields; },
+        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
+    };
+    return Array.Empty<HeaderField>();
+}
+
+HpackError DecodeErr(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(_) => { Assert.Fail(because + ": decode succeeded"); },
+        Result::Error(error) => { return error; },
+    };
+    return HpackError::Truncated;
+}
+
+/// Dynamic table expectations: `expected` alternates names and values, newest first.
+unit ExpectTable(Decoder decoder, string[] expected, i64 size, string because) {
+    Assert.Equal<i64>(HpackDecoder.TableSize(decoder), size, because + ": table size");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder) * 2_i64, Array.Len<string>(expected), because + ": table count");
+    mut i64 i = 0_i64;
+    while i < HpackDecoder.TableCount(decoder) {
+        ExpectField(HpackDecoder.TableEntry(decoder, i + 1_i64), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because + ": table entry");
+        i = i + 1_i64;
+    }
+    return;
+}
+
+EncoderPolicy RfcPolicy(i64 tableSize, bool huffman) {
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    policy.tableSize = tableSize;
+    if huffman { policy.huffman = HuffmanMode::Always; } else { policy.huffman = HuffmanMode::Never; }
+    return policy;
+}
+
+/// Stable numbers for HpackError variants, for compact assertions.
+i64 ErrorCode(HpackError error) {
+    return match error {
+        HpackError::Truncated => 1_i64,
+        HpackError::IntegerOverflow => 2_i64,
+        HpackError::InvalidIndex(_) => 3_i64,
+        HpackError::StringTooLong(_) => 4_i64,
+        HpackError::HuffmanPaddingTooLong => 5_i64,
+        HpackError::HuffmanInvalidPadding => 6_i64,
+        HpackError::HuffmanEos => 7_i64,
+        HpackError::SizeUpdateNotAtStart => 8_i64,
+        HpackError::SizeUpdateExceedsLimit(_) => 9_i64,
+        HpackError::SizeUpdateMissing => 10_i64,
+        HpackError::HeaderListTooLarge(_) => 11_i64,
+        HpackError::TooManyFields => 12_i64,
+        HpackError::InvalidText => 13_i64,
+        HpackError::DecoderFailed => 14_i64,
+        HpackError::InvalidLimit(_) => 15_i64,
+    };
+}
+
+unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string because) {
+    HpackError error = DecodeErr(decoder, blockHex, because);
+    Assert.Equal<i64>(ErrorCode(error), code, because);
+    return;
+}
+use Http.Types;
+
+// Encoder policy: never-indexed fields, Huffman choice, table size updates,
+// and conversion to and from corelib Http.Types.Header.
+
+HeaderField[] One(HeaderField field) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(out, field);
+    return out;
+}
+
+unit SetSize(mut Encoder encoder, i64 size) {
+    Result<unit,HpackError> r = HpackEncoder.SetMaxTableSize(encoder, size);
+    match r { Result::Ok(_) => (), Result::Error(_) => { Assert.Fail("SetMaxTableSize"); }, };
+    return;
+}
+
+test authorization_is_never_indexed {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "secret"])), "1f0806736563726574", "never-indexed with static name 23");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "not inserted");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "secret"])), "1f0806736563726574", "still a literal");
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] fields = DecodeOk(decoder, "1f0806736563726574", "decode");
+    HeaderField first = Array.Get<HeaderField>(fields, 0_i64);
+    Assert.True(first.sensitive, "decoded as sensitive");
+}
+
+test short_cookies_are_never_indexed_long_ones_are {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"])), "1f1103613d62", "short cookie");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "short cookie not inserted");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "601461616161616161616161616161616161616161", "long cookie indexed");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "long cookie inserted");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "be", "then indexed");
+}
+
+test decoded_sensitive_fields_stay_never_indexed {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] fields = DecodeOk(decoder, "100870617373776f726406736563726574", "C.2.3");
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, fields), "100870617373776f726406736563726574", "re-encoded never indexed");
+}
+
+test custom_never_index_names {
+    mut EncoderPolicy policy = RfcPolicy(4096_i64, false);
+    policy.neverIndexNames = ["x-token"];
+    mut Encoder encoder = NewTestEncoder(policy);
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["x-token", "t"])), "1007782d746f6b656e0174", "custom never-index");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "t"])), "57" + "0174", "authorization indexed when not listed");
+}
+
+test huffman_only_when_shorter {
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    mut Encoder encoder = NewTestEncoder(policy);
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":authority", "www.example.com"])), "418cf1e3c2e5f23a6ba0ab90f4ff", "Huffman is shorter");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["user-agent", "~~~~"])), "7a047e7e7e7e", "raw is shorter");
+}
+
+test size_updates_start_the_next_block {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    u8[] first = HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header"]));
+    HeaderField[] a = DecodeOk(decoder, HexText(first), "first");
+    SetSize(encoder, 0_i64);
+    SetSize(encoder, 256_i64);
+    u8[] second = HpackEncoder.Encode(encoder, Fields([":method", "GET"]));
+    ExpectBytes(second, "203fe10182", "minimum then final update");
+    HeaderField[] b = DecodeOk(decoder, HexText(second), "second");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 0_i64, "decoder evicted");
+    Assert.Equal<i64>(HpackDecoder.TableMaxSize(decoder), 256_i64, "decoder max 256");
+    SetSize(encoder, 1000_i64);
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "3f490782", "single update");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "82", "no update afterwards");
+}
+
+test reduced_table_evicts_in_encoder {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    u8[] first = HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header", "x-a", "1"]));
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 2_i64, "two entries");
+    SetSize(encoder, 40_i64);
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "only x-a fits");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 36_i64, "size 36");
+}
+
+test http_header_conversion {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Content-Type", value: "text/html" });
+    Array.Append<Header>(headers, Header { name: "x-ok", value: "1" });
+    HeaderField[] fields = Hpack.FromHttpHeaders(headers);
+    ExpectFields(fields, ["content-type", "text/html", "x-ok", "1"], "lowercased");
+    Result<Header[],HpackError> back = Hpack.ToHttpHeaders(fields);
+    match back {
+        Result::Error(_) => { Assert.Fail("ToHttpHeaders"); },
+        Result::Ok(items) => {
+            Assert.Equal<i64>(Array.Len<Header>(items), 2_i64, "two headers");
+            Header h = Array.Get<Header>(items, 0_i64);
+            Assert.True(h.name == "content-type" && h.value == "text/html", "first header");
+        },
+    };
+    u8[] bad = [0xff_u8];
+    Result<Header,HpackError> invalid = Hpack.ToHttpHeader(HeaderField { name: bad, value: bad, sensitive: false });
+    match invalid {
+        Result::Ok(_) => { Assert.Fail("non-UTF-8 accepted"); },
+        Result::Error(error) => { Assert.Equal<i64>(ErrorCode(error), 13_i64, "InvalidText"); },
+    };
+}
+
+test long_round_trip_with_eviction {
+    string digits = "0123456789";
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    policy.tableSize = 256_i64;
+    mut Encoder encoder = NewTestEncoder(policy);
+    mut Decoder decoder = NewTestDecoder(256_i64);
+    mut i64 i = 0_i64;
+    while i < 60_i64 {
+        string n = String.SubSlice(digits, i % 10_i64, 1_i64) + String.SubSlice(digits, (i / 10_i64) % 10_i64, 1_i64);
+        string[] pairs = [":status", "200", "x-request-id", "req-" + n, "cache-control", "private", "authorization", "Bearer " + n, "x-n" + String.SubSlice(digits, i % 7_i64, 1_i64), n];
+        u8[] wire = HpackEncoder.Encode(encoder, Fields(pairs));
+        Result<HeaderField[],HpackError> decoded = HpackDecoder.Decode(decoder, wire);
+        match decoded {
+            Result::Ok(fields) => { ExpectFields(fields, pairs, "round trip"); },
+            Result::Error(_) => { Assert.Fail("round trip decode"); },
+        };
+        Assert.Equal<i64>(HpackDecoder.TableSize(decoder), HpackEncoder.EncoderTableSize(encoder), "tables agree");
+        Assert.True(HpackDecoder.TableSize(decoder) <= 256_i64, "bounded");
+        i = i + 1_i64;
+    }
+}

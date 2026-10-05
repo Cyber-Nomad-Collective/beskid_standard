@@ -1,0 +1,285 @@
+use Concurrency;
+use Core.Output;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Connect;
+use Connect.Failures;
+use Connect.Policy;
+use Testing.Assert;
+
+// ---- shared loopback helpers (duplicated per target; targets are independent roots) ----
+
+pub SocketAddress Loopback4(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+pub SocketAddress Loopback6(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32), port: value };
+}
+
+pub Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+// A port that refuses connections: bind, read the port, close.
+pub Result<SocketAddress, NetworkError> ClosedPort4() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    listener.Close()?;
+    return Result::Ok(address);
+}
+
+// A listener whose accept queue is full, so new connects hang until their deadline.
+pub type Blackhole {
+    TcpListener listener,
+    TcpStream[] fillers,
+    SocketAddress address,
+}
+
+pub Result<Blackhole, NetworkError> OpenBlackhole() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    mut TcpStream[] fillers = Array.Empty<TcpStream>();
+    mut i64 tries = 0_i64;
+    mut bool hanging = false;
+    while !hanging && tries < 16_i64 {
+        match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(100_i64)) {
+            Result::Ok(stream) => { Array.Append<TcpStream>(fillers, stream); },
+            Result::Error(_) => { hanging = true; },
+        };
+        tries = tries + 1_i64;
+    }
+    Assert.True(hanging, "a full accept queue makes new connects hang");
+    return Result::Ok(Blackhole { listener: listener, fillers: fillers, address: address });
+}
+
+pub unit CloseBlackhole(Blackhole hole) {
+    mut i64 index = 0_i64;
+    while index < Array.Len<TcpStream>(hole.fillers) {
+        TcpStream filler = hole.fillers[index];
+        filler.Close();
+        index = index + 1_i64;
+    }
+    hole.listener.Close();
+    return;
+}
+
+// Accepts the connection a race produced, proves bytes flow, and closes both ends.
+pub Result<unit, NetworkError> Exchange(TcpListener listener, TcpStream client) {
+    TcpStream accepted = listener.Accept(Within(2000_i64))?;
+    Assert.True(match IO.WriteAll(accepted, [42_u8], 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "server writes one byte");
+    u8[] bytes = Slice.New(1_i64);
+    Assert.True(match IO.ReadExact(client, bytes, 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "client reads the byte");
+    Assert.Equal<u8>(bytes[0], 42_u8, "byte survives the winning stream");
+    accepted.Close();
+    client.Close();
+    return Result::Ok(());
+}
+
+pub i64 PeerPort(TcpStream stream) {
+    return match stream.PeerAddress() { Result::Ok(address) => address.port.Value(), Result::Error(_) => -1_i64, };
+}
+
+pub bool PeerIsV6(TcpStream stream) {
+    return match stream.PeerAddress() {
+        Result::Ok(address) => match address.address { IpAddress::V6(_, _, _, _) => true, _ => false, },
+        Result::Error(_) => false,
+    };
+}
+
+// Error kinds as small codes so tests compare without nested pattern matches.
+pub i64 ErrorKind(ConnectError error) {
+    return match error {
+        ConnectError::InvalidPolicy => 1_i64,
+        ConnectError::ResolutionFailed(_) => 2_i64,
+        ConnectError::NoAddresses => 3_i64,
+        ConnectError::AllAttemptsFailed(_) => 4_i64,
+        ConnectError::DeadlineExceeded(_) => 5_i64,
+        ConnectError::Cancelled(_) => 6_i64,
+    };
+}
+
+pub i64 NetworkKind(NetworkError error) {
+    return match error {
+        NetworkError::ConnectionRefused => 1_i64,
+        NetworkError::TimedOut => 2_i64,
+        NetworkError::Cancelled => 3_i64,
+        NetworkError::HostNotFound => 4_i64,
+        _ => 9_i64,
+    };
+}
+
+pub SocketAddress[] List1(SocketAddress a) {
+    mut SocketAddress[] result = Array.Empty<SocketAddress>();
+    Array.Append<SocketAddress>(result, a);
+    return result;
+}
+
+pub SocketAddress[] List2(SocketAddress a, SocketAddress b) {
+    mut SocketAddress[] result = List1(a);
+    Array.Append<SocketAddress>(result, b);
+    return result;
+}
+
+// ---- end shared helpers ----
+
+ConnectPolicy Fast() {
+    return Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(5000_i64));
+}
+
+Result<unit, NetworkError> AddressesV4Result() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    SocketAddress[] candidates = List1(address);
+    match Connect.ConnectAddresses(candidates, Fast()) {
+        Result::Ok(stream) => {
+            Assert.Equal<i64>(PeerPort(stream), address.port.Value(), "winner is the listener");
+            Exchange(listener, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("loopback IPv4 connect succeeds"),
+    };
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit AddressesV4() {
+    match AddressesV4Result() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("IPv4 scenario has no NetworkError"), };
+}
+
+test connect_addresses_ipv4_loopback {
+    Fiber<unit> scenario = spawn AddressesV4();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "IPv4 scenario joins");
+}
+
+Result<unit, NetworkError> HostLiteralResult() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    match Connect.ConnectHost("127.0.0.1", address.port, Fast()) {
+        Result::Ok(stream) => {
+            Assert.Equal<i64>(PeerPort(stream), address.port.Value(), "literal host reaches the listener");
+            Exchange(listener, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("ConnectHost with an IPv4 literal succeeds"),
+    };
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit HostLiteral() {
+    match HostLiteralResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("literal scenario has no NetworkError"), };
+}
+
+test connect_host_ipv4_literal_resolves_both_families {
+    Fiber<unit> scenario = spawn HostLiteral();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "literal scenario joins");
+}
+
+// localhost answers ::1 and 127.0.0.1; only IPv4 listens, so the IPv6 attempt is
+// refused and the IPv4 attempt starts at once instead of after the 2 s delay.
+Result<unit, NetworkError> LocalhostFallbackResult() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    ConnectPolicy slow = Policy.WithAttemptDelay(Fast(), Time.FromMilliseconds(2000_i64));
+    i64 before = Concurrency.NowMillis();
+    match Connect.ConnectHost("localhost", address.port, slow) {
+        Result::Ok(stream) => {
+            i64 elapsed = Concurrency.NowMillis() - before;
+            Assert.True(elapsed < 1500_i64, "refused IPv6 falls back without waiting for the attempt delay");
+            Assert.False(PeerIsV6(stream), "IPv4 listener wins");
+            Exchange(listener, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("localhost connect falls back to IPv4"),
+    };
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit LocalhostFallback() {
+    match LocalhostFallbackResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("localhost scenario has no NetworkError"), };
+}
+
+test connect_host_localhost_falls_back_to_ipv4 {
+    Fiber<unit> scenario = spawn LocalhostFallback();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "localhost scenario joins");
+}
+
+// IPv6 loopback may be disabled on a host; detect it by binding ::1 and skip if absent.
+Result<unit, NetworkError> DualStackResult(AddressFamily preferred, bool expectV6) {
+    Result<TcpListener, NetworkError> bound6 = TcpListener.Bind(Loopback6(0_i64), 8_i64);
+    if !(match bound6 { Result::Ok(_) => true, Result::Error(_) => false, }) {
+        Output.WriteLine("skip: IPv6 loopback is unavailable on this host");
+        return Result::Ok(());
+    }
+    TcpListener listener6 = bound6?;
+    TcpListener listener4 = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress address6 = listener6.LocalAddress()?;
+    SocketAddress address4 = listener4.LocalAddress()?;
+    ConnectPolicy policy = Policy.WithPreferredFamily(Fast(), preferred);
+    match Connect.ConnectAddresses(List2(address4, address6), policy) {
+        Result::Ok(stream) => {
+            Assert.Equal<bool>(PeerIsV6(stream), expectV6, "preferred family wins when both answer");
+            if expectV6 { Exchange(listener6, stream)?; } else { Exchange(listener4, stream)?; }
+        },
+        Result::Error(_) => Assert.Fail("dual-stack loopback connect succeeds"),
+    };
+    listener6.Close()?;
+    listener4.Close()?;
+    return Result::Ok(());
+}
+
+unit DualStack(AddressFamily preferred, bool expectV6) {
+    match DualStackResult(preferred, expectV6) { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("dual-stack scenario has no NetworkError"), };
+}
+
+test connect_addresses_dual_stack_prefers_ipv6 {
+    Fiber<unit> scenario = spawn (() => DualStack(AddressFamily::V6(), true));
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "IPv6-preferred scenario joins");
+}
+
+test connect_addresses_dual_stack_prefers_ipv4_by_policy {
+    Fiber<unit> scenario = spawn (() => DualStack(AddressFamily::V4(), false));
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "IPv4-preferred scenario joins");
+}
+
+Result<unit, NetworkError> Ipv6OnlyResult() {
+    Result<TcpListener, NetworkError> bound6 = TcpListener.Bind(Loopback6(0_i64), 8_i64);
+    if !(match bound6 { Result::Ok(_) => true, Result::Error(_) => false, }) {
+        Output.WriteLine("skip: IPv6 loopback is unavailable on this host");
+        return Result::Ok(());
+    }
+    TcpListener listener6 = bound6?;
+    SocketAddress address6 = listener6.LocalAddress()?;
+    match Connect.ConnectHost("::1", address6.port, Fast()) {
+        Result::Ok(stream) => {
+            Assert.True(PeerIsV6(stream), "IPv6 literal reaches ::1");
+            Exchange(listener6, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("ConnectHost with an IPv6 literal succeeds"),
+    };
+    listener6.Close()?;
+    return Result::Ok(());
+}
+
+unit Ipv6Only() {
+    match Ipv6OnlyResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("IPv6 literal scenario has no NetworkError"), };
+}
+
+test connect_host_ipv6_literal {
+    Fiber<unit> scenario = spawn Ipv6Only();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "IPv6 literal scenario joins");
+}

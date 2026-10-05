@@ -1,0 +1,270 @@
+use Concurrency;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Core.IO;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
+use Network.Types;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Testing.Assert;
+use WebSocket.WsErrors;
+use WebSocket.WsConnection;
+use WebSocket.WsHandshake;
+use WebSocket.WsTransport;
+
+// A raw TCP server answers the Beskid client with hand-made bytes: the client
+// must reject bad 101 responses and server frames that break the rules, and
+// must honour its close and read deadlines.
+
+SocketAddress Loopback4(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+string Crlf() { return String.FromUtf8CodeUnits([13_u8, 10_u8]); }
+
+u8[] Upgrade(string version, bool withKey) {
+    string nl = Crlf();
+    mut string head = "GET /raw HTTP/1.1" + nl + "Host: 127.0.0.1" + nl + "Upgrade: websocket" + nl + "Connection: Upgrade" + nl;
+    if withKey { head = head + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" + nl; }
+    head = head + "Sec-WebSocket-Version: " + version + nl + nl;
+    return Convert.StringToBytes(head);
+}
+
+bool WriteRaw(TcpStream s, u8[] bytes) {
+    return match IO.WriteAll(s, bytes, 0_i64, Slice.Len(bytes)) { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+// Reads a head byte by byte up to and including CRLF CRLF (at most 4096 bytes).
+string ReadHeadRaw(TcpStream s) {
+    mut u8[] out = Array.Empty<u8>();
+    u8[] one = Slice.New(1_i64);
+    mut i64 n = 0_i64;
+    while n < 4096_i64 {
+        match IO.ReadExact(s, one, 0_i64, 1_i64) {
+            Result::Error(_) => { return String.FromUtf8CodeUnits(out); },
+            Result::Ok(_) => {},
+        };
+        Array.Append<u8>(out, one[0]);
+        n = n + 1_i64;
+        if n >= 4_i64 && out[n - 1_i64] == 10_u8 && out[n - 2_i64] == 13_u8 && out[n - 3_i64] == 10_u8 && out[n - 4_i64] == 13_u8 {
+            return String.FromUtf8CodeUnits(out);
+        }
+    }
+    return String.FromUtf8CodeUnits(out);
+}
+
+// Close code of the server's close frame (unmasked, 2-byte payload), or a negative marker.
+i64 ReadCloseCode(TcpStream s) {
+    u8[] frame = Slice.New(4_i64);
+    return match IO.ReadExact(s, frame, 0_i64, 4_i64) {
+        Result::Error(_) => -1_i64,
+        Result::Ok(_) => CloseCodeIn(frame),
+    };
+}
+
+i64 CloseCodeIn(u8[] frame) {
+    if frame[0] != 0x88_u8 || frame[1] != 0x02_u8 { return -2_i64; }
+    return (i64(frame[2]) << 8_i64) | i64(frame[3]);
+}
+
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(-v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+string AcceptFor(string head) {
+    i64 at = String.IndexOfFrom(head, 0_i64, "Sec-WebSocket-Key: ");
+    if at < 0_i64 { return ""; }
+    return WsHandshake.AcceptKey(String.SubSlice(head, at + 19_i64, 24_i64));
+}
+
+// Response kinds: 0 status 200, 1 wrong accept, 2 extension, 3 good 101 then a
+// masked text frame, 4 good 101 then silence (deadline tests), 5 good 101 then
+// a 1-byte close payload.
+string Response(i64 kind, string accept) {
+    string nl = Crlf();
+    if kind == 0_i64 { return "HTTP/1.1 200 OK" + nl + "Content-Length: 0" + nl + nl; }
+    mut string value = accept;
+    if kind == 1_i64 { value = "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="; }
+    mut string head = "HTTP/1.1 101 Switching Protocols" + nl + "Upgrade: websocket" + nl + "Connection: Upgrade" + nl + "Sec-WebSocket-Accept: " + value + nl;
+    if kind == 2_i64 { head = head + "Sec-WebSocket-Extensions: permessage-deflate" + nl; }
+    return head + nl;
+}
+
+// Raw server: per connection writes Response(kinds[i]) and the follow-up bytes,
+// then records in results[i] the close code the client sent back (0 none).
+unit RawServe(TcpListener listener, i64[] kinds, i64[] results) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(kinds) {
+        match listener.Accept(Within(10000_i64)) {
+            Result::Error(_) => { results[i] = -100_i64; },
+            Result::Ok(stream) => { results[i] = RawOne(stream, kinds[i]); },
+        };
+        i = i + 1_i64;
+    }
+    return;
+}
+
+i64 RawOne(TcpStream s, i64 kind) {
+    s.SetDeadlines(TransferDeadlines { read: Within(5000_i64), write: Within(5000_i64) });
+    string head = ReadHeadRaw(s);
+    WriteRaw(s, Convert.StringToBytes(Response(kind, AcceptFor(head))));
+    if kind == 3_i64 { WriteRaw(s, [0x81_u8, 0x82_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0x48_u8, 0x69_u8]); }
+    if kind == 5_i64 { WriteRaw(s, [0x88_u8, 0x01_u8, 0x03_u8]); }
+    mut i64 code = 0_i64;
+    if kind >= 3_i64 { code = ReadMaskedCloseCode(s); }
+    // Kind 4 never answers the close: wait for the client to give up and close.
+    if kind == 4_i64 { u8[] rest = Slice.New(1_i64); IO.Read(s, rest, 0_i64, 1_i64); }
+    s.Close();
+    return code;
+}
+
+// Close code of a masked client close frame with a 2-byte payload, -1 on EOF/timeout.
+i64 ReadMaskedCloseCode(TcpStream s) {
+    u8[] frame = Slice.New(8_i64);
+    return match IO.ReadExact(s, frame, 0_i64, 8_i64) {
+        Result::Error(_) => -1_i64,
+        Result::Ok(_) => MaskedCode(frame),
+    };
+}
+
+u8 XorByte(u8 a, u8 b) { return (a | b) - (a & b); }
+
+i64 MaskedCode(u8[] frame) {
+    if frame[0] != 0x88_u8 || frame[1] != 0x82_u8 { return -2_i64; }
+    return (i64(XorByte(frame[6], frame[2])) << 8_i64) | i64(XorByte(frame[7], frame[3]));
+}
+
+Result<WsConnection, WsError> Dial(SocketAddress address, WsOptions options) {
+    return match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(2000_i64)) {
+        Result::Error(_) => Result::Error(WsError::ConnectFailed),
+        Result::Ok(stream) => WsConnection.ClientHandshake(WsTransport::Tcp(stream), "127.0.0.1", "/", options),
+    };
+}
+
+i64 DialCode(SocketAddress address) {
+    return match Dial(address, WsConnection.DefaultOptions()) {
+        Result::Error(e) => WsErrors.Code(e) * 1000_i64 + WsErrors.Detail(e),
+        Result::Ok(_) => 0_i64,
+    };
+}
+
+// Code*1000+Detail of the first Receive failure, 0 if a message arrived.
+i64 ReceiveCode(SocketAddress address, WsOptions options) {
+    return match Dial(address, options) {
+        Result::Error(e) => -WsErrors.Code(e),
+        Result::Ok(conn) => FirstFailure(conn),
+    };
+}
+
+i64 FirstFailure(WsConnection conn) {
+    return match conn.Receive() {
+        Result::Error(e) => WsErrors.Code(e) * 1000_i64 + WsErrors.Detail(e),
+        Result::Ok(_) => 0_i64,
+    };
+}
+
+i64 CloseCode(SocketAddress address, WsOptions options) {
+    return match Dial(address, options) {
+        Result::Error(e) => -WsErrors.Code(e),
+        Result::Ok(conn) => CloseFailure(conn),
+    };
+}
+
+i64 CloseFailure(WsConnection conn) {
+    return match conn.Close(1000_i64, "") {
+        Result::Error(e) => WsErrors.Code(e),
+        Result::Ok(_) => 0_i64,
+    };
+}
+
+unit ClientRejections(TcpListener listener) {
+    match listener.LocalAddress() {
+        Result::Error(_) => { Assert.Fail("address"); },
+        Result::Ok(address) => {
+            SocketAddress target = address;
+            TcpListener l = listener;
+            i64[] kinds = [0_i64, 1_i64, 2_i64, 3_i64, 5_i64];
+            i64[] results = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+            Fiber<unit> server = spawn (() => RawServe(l, kinds, results));
+            Assert.Equal<i64>(DialCode(target), 8200_i64, "status 200 is Rejected(200)");
+            Assert.Equal<i64>(DialCode(target), 7005_i64, "wrong accept");
+            Assert.Equal<i64>(DialCode(target), 7006_i64, "extension not offered");
+            Assert.Equal<i64>(ReceiveCode(target, WsConnection.DefaultOptions()), 10008_i64, "masked server frame is a protocol error");
+            Assert.Equal<i64>(ReceiveCode(target, WsConnection.DefaultOptions()), 10011_i64, "1-byte close payload is a protocol error");
+            server.Join();
+            Assert.Equal<i64>(results[3], 1002_i64, "client sent close 1002 after the masked frame");
+            Assert.Equal<i64>(results[4], 1002_i64, "client sent close 1002 after the bad close");
+            l.Close();
+        },
+    };
+    return;
+}
+
+unit RunClientRejections() {
+    match TcpListener.Bind(Loopback4(0_i64), 8_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => { ClientRejections(listener); },
+    };
+    return;
+}
+
+test client_rejects_bad_servers {
+    Fiber<unit> scenario = spawn RunClientRejections();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}
+
+unit Deadlines(TcpListener listener) {
+    match listener.LocalAddress() {
+        Result::Error(_) => { Assert.Fail("address"); },
+        Result::Ok(address) => {
+            SocketAddress target = address;
+            TcpListener l = listener;
+            i64[] kinds = [4_i64, 4_i64];
+            i64[] results = [0_i64, 0_i64];
+            Fiber<unit> server = spawn (() => RawServe(l, kinds, results));
+            WsOptions quick = WsConnection.WithTimeouts(WsConnection.DefaultOptions(), 2000_i64, 300_i64, 300_i64);
+            i64 before = Concurrency.NowMillis();
+            i64 rc = ReceiveCode(target, quick);
+            i64 middle = Concurrency.NowMillis();
+            i64 cc = CloseCode(target, quick);
+            i64 after = Concurrency.NowMillis();
+            Assert.Equal<i64>(rc, 6000_i64, "Receive hits its read deadline");
+            Assert.Equal<i64>(cc, 6_i64, "Close hits its close deadline");
+            Assert.Equal<i64>((middle - before) / 1000_i64 * 100_i64 + (after - middle) / 1000_i64, 0_i64, "both deadlines are short");
+            server.Join();
+            Assert.Equal<i64>(results[1], 1000_i64, "the close frame was sent before waiting");
+            l.Close();
+        },
+    };
+    return;
+}
+
+unit RunDeadlines() {
+    match TcpListener.Bind(Loopback4(0_i64), 8_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => { Deadlines(listener); },
+    };
+    return;
+}
+
+test client_deadlines {
+    Fiber<unit> scenario = spawn RunDeadlines();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}

@@ -360,3 +360,48 @@ without double or trailing underscores, and must be unique per target.
   path checks) 75-85 s of codegen per test, so x509 targets keep one heavy test each.
 - Workaround: single-exit functions, sticky `i64` error codes inside the parser
   (`Der.Fail(p, code)`, mapped to `X509Error` once at the API boundary), few tests per target.
+## 2026-10-05, websocket slice
+
+### W1. Array literal with computed elements inside a struct literal is reported as a StructLiteral ICE
+- Symptom: `no ISLE lowering rule or fact for StructLiteralExpression` on the whole struct literal,
+  not on the array (compare http2 gap 8, which reports `ArrayLiteralExpression`).
+- Repro: `return Conn { st: [0_i64, limit, options.readTimeoutMillis], ... };`
+- Workaround: build the array in a local from an all-literal array, assign the computed
+  elements by index, then use the local in the struct literal.
+
+### W2. Two imports with the same leaf (`Network.Types`, `Uri.Types`) silently pick one
+- Symptom: `Types.Empty()` (meant: `Uri.Types.Empty`) passes type checking but fails at
+  CLIF time with `no ISLE lowering rule or fact for CallExpression`; no ambiguity diagnostic.
+- Workaround: do not call through an ambiguous leaf; restructure so the value comes from a
+  match arm (`match Parse.Parse(url) { Result::Ok(u) => OpenUri(u, options), ... }`).
+
+### W3. Out-of-bounds array index ends the test process without a message
+- Symptom: `line[12]` on a 12-byte array stops the target after the test name is printed;
+  no trap line, no PASS/FAIL, no result summary.
+- Workaround: check lengths before indexing; when a target stops silently, look for an
+  index past the end.
+
+### W4. Assertion failures inside a spawned fiber are not reported
+- Symptom: a failing `Assert.Equal` inside a fiber does not print its own trap; the
+  parent only sees `Join` return an error ("should be true but was false" on the join check).
+- Workaround: for diagnosis, print values with a libc contract
+  (`[Extern(Abi:"C", Library:"libc")] contract D { i32 putchar(i32 c); i32 fflush(i64 s); }`,
+  then `fflush(0)`); or write observations to a shared `i64[]` and assert after `Join`.
+
+### W5. Runtime: about 160 KiB of live arrays per process
+- Symptom: `out_of_memory (5): R1 req=65536 live=100192 committed=1073741824 cap=1073741824`
+  when a client fiber holds a 64 KiB payload while a server fiber in the same process
+  allocates the 64 KiB receive buffer. `Slice.New` grows by doubling, so a 64 KiB buffer
+  briefly needs about 96 KiB. `Testing.Assert.CollectGarbage()` does not help.
+- Workaround: the WebSocket writer never copies a large frame (header write, then the
+  payload directly, or masked through a 4 KiB scratch buffer); loopback tests move 32 KiB
+  messages; 64 KiB messages are tested out of process (tests/interop).
+
+### W6. Library note: `String.CodeUnitChar` covers only ASCII letters and digits
+- Symptom: `String.CodeUnitChar(13_u8)` does not give CR, so a CRLF built from it is wrong.
+- Workaround: `String.FromUtf8CodeUnits([13_u8, 10_u8])`.
+
+### W7. Network waits in a test body fail at once outside a spawned fiber
+- Symptom: `TcpListener.Accept(deadline)` called directly in a `test` body returns an error
+  immediately instead of waiting; the same call inside `spawn` waits as expected.
+- Workaround: run network scenarios as `Fiber<unit> f = spawn Scenario(); f.Join();`.

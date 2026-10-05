@@ -3,11 +3,12 @@ use Core.Results;
 use Crypto.Errors;
 use Crypto.Scratch;
 
-/// Poly1305 (RFC 8439 section 2.5) with five 26-bit limbs held in i64.
-/// Limb products stay below 2^58, so no i64 overflow; the arithmetic has no
-/// data-dependent branches or lookups.
-/// `r` holds r0..r4 then 5*r1..5*r4, `h` the accumulator, `pad` the four s words,
-/// `meta[0]` buffered bytes, `meta[1]` 1 after `Finish`.
+/// Poly1305 (RFC 8439 section 2.5) in radix 2^64 as in OpenSSL `poly1305.c`: the
+/// accumulator is h0 + 2^64 h1 + 2^128 h2, products are 64x64->128 from `imul`/`umulhi`
+/// inside a CLIF kernel (tools/clifgen.py). No data-dependent branches or lookups.
+/// `r` holds r0, r1, r1 + (r1 >> 2); `h` the accumulator; `pad` the two s words;
+/// `meta[0]` buffered bytes, `meta[1]` 1 after `Finish`, `meta[2..5)` the kernel cursor
+/// (offset, end, pad bit).
 pub type Poly1305State {
     i64[] r,
     i64[] h,
@@ -16,57 +17,122 @@ pub type Poly1305State {
     i64[] meta,
 }
 
-i64 Le32(u8[] data, i64 offset) {
-    return i64(data[offset]) | (i64(data[offset + 1_i64]) << 8_i64) | (i64(data[offset + 2_i64]) << 16_i64) | (i64(data[offset + 3_i64]) << 24_i64);
+i64 Le64(u8[] data, i64 offset) {
+    mut i64 v = 0_i64;
+    mut i64 i = 7_i64;
+    while i >= 0_i64 { v = (v << 8_i64) | i64(data[offset + i]); i = i - 1_i64; }
+    return v;
 }
 
 /// Starts a one-time authenticator from a 32-byte key (r || s).
 pub Result<Poly1305State, CryptoError> New(u8[] key) {
     if Slice.Len(key) != 32_i64 { return Result::Error(CryptoError::InvalidKeyLength()); }
-    i64 r0 = Le32(key, 0_i64) & 0x3ffffff_i64;
-    i64 r1 = (Le32(key, 3_i64) >> 2_i64) & 0x3ffff03_i64;
-    i64 r2 = (Le32(key, 6_i64) >> 4_i64) & 0x3ffc0ff_i64;
-    i64 r3 = (Le32(key, 9_i64) >> 6_i64) & 0x3f03fff_i64;
-    i64 r4 = (Le32(key, 12_i64) >> 8_i64) & 0x00fffff_i64;
+    // Clamp r (RFC 8439 2.5.1).
+    i64 r0 = Le64(key, 0_i64) & 0x0ffffffc0fffffff_i64;
+    i64 r1 = Le64(key, 8_i64) & 0x0ffffffc0ffffffc_i64;
     return Result::Ok(Poly1305State {
-        r: [r0, r1, r2, r3, r4, r1 * 5_i64, r2 * 5_i64, r3 * 5_i64, r4 * 5_i64],
-        h: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
-        pad: [Le32(key, 16_i64), Le32(key, 20_i64), Le32(key, 24_i64), Le32(key, 28_i64)],
+        r: [r0, r1, r1 + (r1 >> 2_i64)],
+        h: [0_i64, 0_i64, 0_i64],
+        pad: [Le64(key, 16_i64), Le64(key, 24_i64)],
         buffer: Scratch.Bytes(16_i64),
-        meta: [0_i64, 0_i64],
+        meta: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
     });
 }
 
-/// Absorbs one 16-byte block at `offset`; `hibit` is 2^24 for full blocks, 0 for the padded final block.
-unit Block(Poly1305State state, u8[] m, i64 offset, i64 hibit) {
-    i64 mask = 0x3ffffff_i64;
-    i64[] r = state.r;
-    i64[] h = state.h;
-    i64 t0 = Le32(m, offset);
-    i64 t1 = Le32(m, offset + 4_i64);
-    i64 t2 = Le32(m, offset + 8_i64);
-    i64 t3 = Le32(m, offset + 12_i64);
-    i64 h0 = h[0] + (t0 & mask);
-    i64 h1 = h[1] + (((t0 >> 26_i64) | (t1 << 6_i64)) & mask);
-    i64 h2 = h[2] + (((t1 >> 20_i64) | (t2 << 12_i64)) & mask);
-    i64 h3 = h[3] + (((t2 >> 14_i64) | (t3 << 18_i64)) & mask);
-    i64 h4 = h[4] + ((t3 >> 8_i64) | hibit);
-    i64 r0 = r[0]; i64 r1 = r[1]; i64 r2 = r[2]; i64 r3 = r[3]; i64 r4 = r[4];
-    i64 s1 = r[5]; i64 s2 = r[6]; i64 s3 = r[7]; i64 s4 = r[8];
-    mut i64 d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
-    mut i64 d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
-    mut i64 d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
-    mut i64 d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
-    mut i64 d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
-    d1 = d1 + (d0 >> 26_i64); d0 = d0 & mask;
-    d2 = d2 + (d1 >> 26_i64); d1 = d1 & mask;
-    d3 = d3 + (d2 >> 26_i64); d2 = d2 & mask;
-    d4 = d4 + (d3 >> 26_i64); d3 = d3 & mask;
-    d0 = d0 + (d4 >> 26_i64) * 5_i64; d4 = d4 & mask;
-    d1 = d1 + (d0 >> 26_i64); d0 = d0 & mask;
-    h[0] = d0; h[1] = d1; h[2] = d2; h[3] = d3; h[4] = d4;
+/// Pad bit (2^128 at h2 scale) for a full 16-byte block.
+i64 FullBlockBit() { return 1_i64; }
+
+/// Absorbs the whole blocks of `m[offset, offset + length)`; `length` is a multiple of 16.
+unit Absorb(Poly1305State state, u8[] m, i64 offset, i64 length, i64 hibit) {
+    state.meta[2] = offset;
+    state.meta[3] = offset + length;
+    state.meta[4] = hibit;
+    Blocks(state.r, state.h, m, state.meta);
     return;
 }
+
+// BEGIN GENERATED Poly1305Blocks (tools/clifgen.py)
+/// Absorbs the 16-byte blocks of `data` from offset `meta[2]` up to `meta[3]` with pad
+/// bit `meta[4]` (radix 2^64). Precondition: the range is in bounds.
+i64 Blocks(i64[] r, i64[] h, u8[] data, i64[] meta) {
+    mut i64 last = 0_i64;
+    while meta[2] < meta[3] {
+        last = clif {
+            %rp1 = payload %0
+            %hp2 = payload %1
+            %dp3 = payload %2
+            %mp4 = payload %3
+            %pos5 = load.i64 %mp4+16
+            %pad6 = load.i64 %mp4+32
+            %src7 = iadd %dp3, %pos5
+            %r8 = load.i64 %rp1+0
+            %r9 = load.i64 %rp1+8
+            %r10 = load.i64 %rp1+16
+            %h11 = load.i64 %hp2+0
+            %h12 = load.i64 %hp2+8
+            %h13 = load.i64 %hp2+16
+            %c14 = iconst.i64 0
+            %m15 = load.i64 %src7
+            %m16 = load.i64 %src7+8
+            %s17, %c18 = uadd_overflow %h11, %m15
+            %s19, %c20 = uadd_overflow %h12, %m16
+            %v21 = uextend.i64 %c18
+            %s22, %c23 = uadd_overflow %s19, %v21
+            %v24 = bor %c20, %c23
+            %v25 = uextend.i64 %v24
+            %v26 = iadd %h13, %v25
+            %v27 = iadd %v26, %pad6
+            %v28 = imul %s17, %r8
+            %v29 = umulhi %s17, %r8
+            %v30 = imul %s22, %r10
+            %v31 = umulhi %s22, %r10
+            %s32, %c33 = uadd_overflow %v28, %v30
+            %v34 = iadd %v29, %v31
+            %v35 = uextend.i64 %c33
+            %v36 = iadd %v34, %v35
+            %v37 = imul %s17, %r9
+            %v38 = umulhi %s17, %r9
+            %v39 = imul %s22, %r8
+            %v40 = umulhi %s22, %r8
+            %s41, %c42 = uadd_overflow %v37, %v39
+            %v43 = iadd %v38, %v40
+            %v44 = uextend.i64 %c42
+            %v45 = iadd %v43, %v44
+            %v46 = imul %v27, %r10
+            %s47, %c48 = uadd_overflow %s41, %v46
+            %v49 = uextend.i64 %c48
+            %v50 = iadd %v45, %v49
+            %s51, %c52 = uadd_overflow %s47, %v36
+            %v53 = uextend.i64 %c52
+            %v54 = iadd %v50, %v53
+            %v55 = imul %v27, %r8
+            %v56 = iadd %v55, %v54
+            %c57 = iconst.i64 -4
+            %v58 = band %v56, %c57
+            %c59 = iconst.i64 2
+            %v60 = ushr %v56, %c59
+            %v61 = iadd %v58, %v60
+            %c62 = iconst.i64 3
+            %v63 = band %v56, %c62
+            %s64, %c65 = uadd_overflow %s32, %v61
+            %s66, %c67 = uadd_overflow %s51, %c14
+            %v68 = uextend.i64 %c65
+            %s69, %c70 = uadd_overflow %s66, %v68
+            %v71 = bor %c67, %c70
+            %v72 = uextend.i64 %v71
+            %v73 = iadd %v63, %v72
+            store %s64, %hp2+0
+            store %s69, %hp2+8
+            store %v73, %hp2+16
+            %c74 = iconst.i64 16
+            %next75 = iadd %pos5, %c74
+            store %next75, %mp4+16
+            return %next75
+        };
+    }
+    return last;
+}
+// END GENERATED Poly1305Blocks
 
 /// Absorbs `count` bytes of `data` at `offset`. Returns false for an invalid range or a finished state.
 pub bool UpdateRange(Poly1305State state, u8[] data, i64 offset, i64 count) {
@@ -78,10 +144,14 @@ pub bool UpdateRange(Poly1305State state, u8[] data, i64 offset, i64 count) {
     if buffered > 0_i64 {
         while buffered < 16_i64 && pos < end { state.buffer[buffered] = data[pos]; buffered = buffered + 1_i64; pos = pos + 1_i64; }
         if buffered < 16_i64 { state.meta[0] = buffered; return true; }
-        Block(state, state.buffer, 0_i64, 16777216_i64);
+        Absorb(state, state.buffer, 0_i64, 16_i64, FullBlockBit());
         buffered = 0_i64;
     }
-    while end - pos >= 16_i64 { Block(state, data, pos, 16777216_i64); pos = pos + 16_i64; }
+    i64 whole = ((end - pos) / 16_i64) * 16_i64;
+    if whole > 0_i64 {
+        Absorb(state, data, pos, whole, FullBlockBit());
+        pos = pos + whole;
+    }
     while pos < end { state.buffer[buffered] = data[pos]; buffered = buffered + 1_i64; pos = pos + 1_i64; }
     state.meta[0] = buffered;
     return true;
@@ -96,9 +166,14 @@ pub unit PadToBlock(Poly1305State state) {
     mut i64 buffered = state.meta[0];
     if buffered == 0_i64 || state.meta[1] != 0_i64 { return; }
     while buffered < 16_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
-    Block(state, state.buffer, 0_i64, 16777216_i64);
+    Absorb(state, state.buffer, 0_i64, 16_i64, FullBlockBit());
     state.meta[0] = 0_i64;
     return;
+}
+
+/// Carry of the unsigned 64-bit sum `a + b = sum`, as 0 or 1.
+i64 CarryOut(i64 a, i64 b, i64 sum) {
+    return (((a & b) | ((a | b) & (-1_i64 - sum))) >> 63_i64) & 1_i64;
 }
 
 /// Returns the 16-byte tag.
@@ -110,52 +185,35 @@ pub u8[] Finish(Poly1305State state) {
         state.buffer[buffered] = 1_u8;
         buffered = buffered + 1_i64;
         while buffered < 16_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
-        Block(state, state.buffer, 0_i64, 0_i64);
+        Absorb(state, state.buffer, 0_i64, 16_i64, 0_i64);
     }
     state.meta[1] = 1_i64;
-    i64 mask = 0x3ffffff_i64;
     i64[] h = state.h;
-    mut i64 h0 = h[0]; mut i64 h1 = h[1]; mut i64 h2 = h[2]; mut i64 h3 = h[3]; mut i64 h4 = h[4];
-    h2 = h2 + (h1 >> 26_i64); h1 = h1 & mask;
-    h3 = h3 + (h2 >> 26_i64); h2 = h2 & mask;
-    h4 = h4 + (h3 >> 26_i64); h3 = h3 & mask;
-    h0 = h0 + (h4 >> 26_i64) * 5_i64; h4 = h4 & mask;
-    h1 = h1 + (h0 >> 26_i64); h0 = h0 & mask;
-    // g = h + 5 - 2^130; select g when it did not borrow (h >= p).
-    mut i64 g0 = h0 + 5_i64;
-    mut i64 g1 = h1 + (g0 >> 26_i64); g0 = g0 & mask;
-    mut i64 g2 = h2 + (g1 >> 26_i64); g1 = g1 & mask;
-    mut i64 g3 = h3 + (g2 >> 26_i64); g2 = g2 & mask;
-    mut i64 g4 = h4 + (g3 >> 26_i64) - 67108864_i64; g3 = g3 & mask;
-    // Logical shift: 1 when g4 is negative (borrow), so select = 0 keeps h; else all ones selects g.
-    i64 select = (g4 >> 63_i64) - 1_i64;
+    mut i64 h0 = h[0]; mut i64 h1 = h[1]; i64 h2 = h[2];
+    // g = h + 5; when g reaches 2^130 (bit 2 of g2), h >= p and g - 2^130 is h mod p.
+    i64 g0 = h0 + 5_i64;
+    i64 c0 = CarryOut(h0, 5_i64, g0);
+    i64 g1 = h1 + c0;
+    i64 c1 = CarryOut(h1, c0, g1);
+    i64 g2 = h2 + c1;
+    i64 select = 0_i64 - (g2 >> 2_i64);
     i64 keep = -1_i64 - select;
     h0 = (h0 & keep) | (g0 & select);
     h1 = (h1 & keep) | (g1 & select);
-    h2 = (h2 & keep) | (g2 & select);
-    h3 = (h3 & keep) | (g3 & select);
-    h4 = (h4 & keep) | (g4 & select);
-    i64 w32 = 0xffffffff_i64;
-    i64 w0 = (h0 | (h1 << 26_i64)) & w32;
-    i64 w1 = ((h1 >> 6_i64) | (h2 << 20_i64)) & w32;
-    i64 w2 = ((h2 >> 12_i64) | (h3 << 14_i64)) & w32;
-    i64 w3 = ((h3 >> 18_i64) | (h4 << 8_i64)) & w32;
-    mut i64 f = w0 + state.pad[0];
-    WriteLe32(tag, 0_i64, f);
-    f = w1 + state.pad[1] + (f >> 32_i64);
-    WriteLe32(tag, 4_i64, f);
-    f = w2 + state.pad[2] + (f >> 32_i64);
-    WriteLe32(tag, 8_i64, f);
-    f = w3 + state.pad[3] + (f >> 32_i64);
-    WriteLe32(tag, 12_i64, f);
+    // (h + s) mod 2^128.
+    i64 sumLo = h0 + state.pad[0];
+    i64 sumHi = h1 + state.pad[1] + CarryOut(h0, state.pad[0], sumLo);
+    WriteLe64(tag, 0_i64, sumLo);
+    WriteLe64(tag, 8_i64, sumHi);
     return tag;
 }
 
-unit WriteLe32(u8[] out, i64 offset, i64 value) {
-    out[offset] = u8(value & 0xFF_i64);
-    out[offset + 1_i64] = u8((value >> 8_i64) & 0xFF_i64);
-    out[offset + 2_i64] = u8((value >> 16_i64) & 0xFF_i64);
-    out[offset + 3_i64] = u8((value >> 24_i64) & 0xFF_i64);
+unit WriteLe64(u8[] out, i64 offset, i64 value) {
+    mut i64 i = 0_i64;
+    while i < 8_i64 {
+        out[offset + i] = u8((value >> (i * 8_i64)) & 0xFF_i64);
+        i = i + 1_i64;
+    }
     return;
 }
 

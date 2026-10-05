@@ -152,17 +152,20 @@ def sha2_compress(ty, k, word_bytes, sigma0, sigma1, big0, big1, cursor):
     for i, v in enumerate([a, bb, c, d, e, f, g, hh]):
         s = b.op("iadd %s, %s" % (h[i], v))
         b.raw("store %s, %s+%d" % (s, hp, i * word_bytes))
-    b.raw("return %s" % b.op("iadd %s, %s" % (pos, b.const("i64", word_bytes * 16)), "next"))
+    nxt = b.op("iadd %s, %s" % (pos, b.const("i64", word_bytes * 16)), "next")
+    b.raw("store %s, %s+%d" % (nxt, mp, cursor * 8))
+    b.raw("return %s" % nxt)
     return b
 
 
-def looped(signature, doc, cond, block, assign):
+def looped(signature, doc, cond, block, assign=None):
     """A Beskid function that runs `block` inline while `cond` holds, so the per-call cost
     of array parameters (GC root registration) is paid once per call, not once per block.
-    The function returns i64: inside a loop the block takes its type from the function's
-    return type (COMPILER-GAPS C53-1)."""
-    return "%s\n%s {\n    while %s {\n        i64 next = clif {\n%s\n        };\n        %s = next;\n    }\n    return 0_i64;\n}\n" % (
-        doc, signature, cond, block.render("            "), assign)
+    The block advances its own cursor with a payload store: a Beskid store into an `i64[]`
+    calls the runtime write barrier (COMPILER-GAPS C53-2). The function returns i64: inside
+    a loop the block takes its type from the function's return type (COMPILER-GAPS C53-1)."""
+    return "%s\n%s {\n    mut i64 last = 0_i64;\n    while %s {\n        last = clif {\n%s\n        };\n    }\n    return last;\n}\n" % (
+        doc, signature, cond, block.render("            "))
 
 
 def gen_sha():
@@ -182,7 +185,210 @@ def gen_sha():
         "meta[4] < meta[5]", b, "meta[4]"))
 
 
-GENERATORS = {"sha": gen_sha}
+# ---------------------------------------------------------------- ChaCha20 / Poly1305
+
+
+def lane_mask(indices):
+    return "[" + " ".join(str(i) for i in indices) + "]"
+
+
+ROT16 = lane_mask([j * 4 + k for j in range(4) for k in (2, 3, 0, 1)])
+ROT8 = lane_mask([j * 4 + k for j in range(4) for k in (3, 0, 1, 2)])
+UNPACK_LO32 = lane_mask([0, 1, 2, 3, 16, 17, 18, 19, 4, 5, 6, 7, 20, 21, 22, 23])
+UNPACK_HI32 = lane_mask([8, 9, 10, 11, 24, 25, 26, 27, 12, 13, 14, 15, 28, 29, 30, 31])
+UNPACK_LO64 = lane_mask(list(range(0, 8)) + list(range(16, 24)))
+UNPACK_HI64 = lane_mask(list(range(8, 16)) + list(range(24, 32)))
+
+
+def chacha4():
+    """Four ChaCha20 blocks (RFC 8439 2.3) in i32x4 lanes, XORed into the output.
+    %0 state u32[20] (words 16..20 = 0, 1, 2, 3), %1 input, %2 output, %3 meta i64[]:
+    meta[0] input offset, meta[1] output offset minus input offset. Advances the counter
+    word by 4 and yields the next input offset."""
+    b = Block()
+    sp = b.op("payload %0", "sp")
+    ip = b.op("payload %1", "ip")
+    op = b.op("payload %2", "op")
+    mp = b.op("payload %3", "mp")
+    pos = b.op("load.i64 %s" % mp, "pos")
+    delta = b.op("load.i64 %s+8" % mp, "delta")
+    src = b.op("iadd %s, %s" % (ip, pos), "src")
+    dst0 = b.op("iadd %s, %s" % (op, pos), "dst")
+    dst = b.op("iadd %s, %s" % (dst0, delta), "dst")
+    lanes = b.op("load.i32x4 %s+64" % sp, "lanes")
+
+    def initial(i):
+        word = b.op("load.i32 %s+%d" % (sp, 4 * i))
+        v = b.op("splat.i32x4 %s" % word, "x")
+        if i == 12:
+            v = b.op("iadd %s, %s" % (v, lanes), "x")
+        return v
+
+    x = [initial(i) for i in range(16)]
+    c12 = b.const("i32", 12)
+    c20 = b.const("i32", 20)
+    c7 = b.const("i32", 7)
+    c25 = b.const("i32", 25)
+
+    def rot_bytes(v, mask):
+        bytes_ = b.op("bitcast.i8x16 little %s" % v)
+        shuffled = b.op("shuffle %s, %s, %s" % (bytes_, bytes_, mask))
+        return b.op("bitcast.i32x4 little %s" % shuffled)
+
+    def rot_shift(v, left, right):
+        return b.op("bor %s, %s" % (b.op("ishl %s, %s" % (v, left)), b.op("ushr %s, %s" % (v, right))))
+
+    def qr(a, bb, c, d):
+        x[a] = b.op("iadd %s, %s" % (x[a], x[bb]))
+        x[d] = rot_bytes(b.op("bxor %s, %s" % (x[d], x[a])), ROT16)
+        x[c] = b.op("iadd %s, %s" % (x[c], x[d]))
+        x[bb] = rot_shift(b.op("bxor %s, %s" % (x[bb], x[c])), c12, c20)
+        x[a] = b.op("iadd %s, %s" % (x[a], x[bb]))
+        x[d] = rot_bytes(b.op("bxor %s, %s" % (x[d], x[a])), ROT8)
+        x[c] = b.op("iadd %s, %s" % (x[c], x[d]))
+        x[bb] = rot_shift(b.op("bxor %s, %s" % (x[bb], x[c])), c7, c25)
+
+    for _ in range(10):
+        qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
+    y = [b.op("iadd %s, %s" % (x[i], initial(i)), "y") for i in range(16)]
+
+    def shuf(u, v, mask):
+        ub = b.op("bitcast.i8x16 little %s" % u)
+        vb = b.op("bitcast.i8x16 little %s" % v)
+        return b.op("shuffle %s, %s, %s" % (ub, vb, mask))
+
+    def as32(v):
+        return b.op("bitcast.i32x4 little %s" % v)
+
+    for g in range(4):
+        a, bb, c, d = y[4 * g:4 * g + 4]
+        t0 = as32(shuf(a, bb, UNPACK_LO32))
+        t1 = as32(shuf(c, d, UNPACK_LO32))
+        t2 = as32(shuf(a, bb, UNPACK_HI32))
+        t3 = as32(shuf(c, d, UNPACK_HI32))
+        blocks = [shuf(t0, t1, UNPACK_LO64), shuf(t0, t1, UNPACK_HI64),
+                  shuf(t2, t3, UNPACK_LO64), shuf(t2, t3, UNPACK_HI64)]
+        for j, ks in enumerate(blocks):
+            offset = 64 * j + 16 * g
+            data = b.op("load.i8x16 %s+%d" % (src, offset))
+            b.raw("store %s, %s+%d" % (b.op("bxor %s, %s" % (data, ks)), dst, offset))
+    counter = b.op("load.i32 %s+48" % sp)
+    b.raw("store %s, %s+48" % (b.op("iadd %s, %s" % (counter, b.const("i32", 4))), sp))
+    nxt = b.op("iadd %s, %s" % (pos, b.const("i64", 256)), "next")
+    b.raw("store %s, %s" % (nxt, mp))
+    b.raw("return %s" % nxt)
+    return b
+
+
+def chacha1():
+    """One ChaCha20 keystream block for the counter in word 12 of %0 into %1[0, 64)."""
+    b = Block()
+    sp = b.op("payload %0", "sp")
+    op = b.op("payload %1", "op")
+    s = [b.op("load.i32 %s+%d" % (sp, 4 * i), "s") for i in range(16)]
+    x = list(s)
+    rot = {n: b.const("i32", n) for n in (16, 12, 8, 7)}
+
+    def qr(a, bb, c, d):
+        for (p, q, r, n) in ((a, bb, d, 16), (c, d, bb, 12), (a, bb, d, 8), (c, d, bb, 7)):
+            x[p] = b.op("iadd %s, %s" % (x[p], x[q]))
+            x[r] = b.op("rotl %s, %s" % (b.op("bxor %s, %s" % (x[r], x[p])), rot[n]))
+
+    for _ in range(10):
+        qr(0, 4, 8, 12); qr(1, 5, 9, 13); qr(2, 6, 10, 14); qr(3, 7, 11, 15)
+        qr(0, 5, 10, 15); qr(1, 6, 11, 12); qr(2, 7, 8, 13); qr(3, 4, 9, 14)
+    for i in range(16):
+        b.raw("store %s, %s+%d" % (b.op("iadd %s, %s" % (x[i], s[i])), op, 4 * i))
+    b.raw("return %s" % b.const("i64", 0))
+    return b
+
+
+def poly1305_blocks():
+    """Poly1305 in radix 2^64 (as OpenSSL poly1305.c with 128-bit products) over the 16-byte
+    blocks of %2 from meta[2] to meta[3]. %0 r = [r0, r1, r1 + (r1 >> 2)], %1 h = [h0, h1, h2],
+    %3 meta i64[]; meta[4] is the 2^128 pad bit (1 for full blocks, 0 for the final one)."""
+    b = Block()
+    rp = b.op("payload %0", "rp")
+    hp = b.op("payload %1", "hp")
+    dp = b.op("payload %2", "dp")
+    mp = b.op("payload %3", "mp")
+    pos = b.op("load.i64 %s+16" % mp, "pos")
+    padbit = b.op("load.i64 %s+32" % mp, "pad")
+    src = b.op("iadd %s, %s" % (dp, pos), "src")
+    r0, r1, s1 = [b.op("load.i64 %s+%d" % (rp, 8 * i), "r") for i in range(3)]
+    h0, h1, h2 = [b.op("load.i64 %s+%d" % (hp, 8 * i), "h") for i in range(3)]
+    zero = b.const("i64", 0)
+
+    def add(x, y):
+        out, carry = b.fresh("s"), b.fresh("c")
+        b.raw("%s, %s = uadd_overflow %s, %s" % (out, carry, x, y))
+        return out, carry
+
+    def addc(x, y, cin):
+        # uadd_overflow_cin has no x64 lowering in Cranelift 0.136 (COMPILER-GAPS C53-3).
+        partial, c1 = add(x, y)
+        out, c2 = add(partial, b.op("uextend.i64 %s" % cin))
+        return out, b.op("bor %s, %s" % (c1, c2))
+
+    def ext(carry):
+        return b.op("uextend.i64 %s" % carry)
+
+    def mul(x, y):
+        return b.op("imul %s, %s" % (x, y)), b.op("umulhi %s, %s" % (x, y))
+
+    # h += m || padbit
+    t0 = b.op("load.i64 %s" % src, "m")
+    t1 = b.op("load.i64 %s+8" % src, "m")
+    h0, c = add(h0, t0)
+    h1, c = addc(h1, t1, c)
+    h2 = b.op("iadd %s, %s" % (b.op("iadd %s, %s" % (h2, ext(c))), padbit))
+    # h *= r mod p, with 2^130 = 5 folded into s1 = 5 r1 / 4 (r1 is a multiple of 4).
+    a_lo, a_hi = mul(h0, r0)
+    b_lo, b_hi = mul(h1, s1)
+    d0_lo, c = add(a_lo, b_lo)
+    d0_hi = b.op("iadd %s, %s" % (b.op("iadd %s, %s" % (a_hi, b_hi)), ext(c)))
+    e_lo, e_hi = mul(h0, r1)
+    f_lo, f_hi = mul(h1, r0)
+    d1_lo, c = add(e_lo, f_lo)
+    d1_hi = b.op("iadd %s, %s" % (b.op("iadd %s, %s" % (e_hi, f_hi)), ext(c)))
+    d1_lo, c = add(d1_lo, b.op("imul %s, %s" % (h2, s1)))
+    d1_hi = b.op("iadd %s, %s" % (d1_hi, ext(c)))
+    d1_lo, c = add(d1_lo, d0_hi)
+    d1_hi = b.op("iadd %s, %s" % (d1_hi, ext(c)))
+    h2 = b.op("iadd %s, %s" % (b.op("imul %s, %s" % (h2, r0)), d1_hi))
+    # Partial reduction: h2 * 2^128 = (h2 >> 2) * 5 * 2^0 + (h2 & 3) * 2^128.
+    hi_bits = b.op("band %s, %s" % (h2, b.const("i64", -4)))
+    fold = b.op("iadd %s, %s" % (hi_bits, b.op("ushr %s, %s" % (h2, b.const("i64", 2)))))
+    h2 = b.op("band %s, %s" % (h2, b.const("i64", 3)))
+    h0, c = add(d0_lo, fold)
+    h1, c = addc(d1_lo, zero, c)
+    h2 = b.op("iadd %s, %s" % (h2, ext(c)))
+    for i, v in enumerate((h0, h1, h2)):
+        b.raw("store %s, %s+%d" % (v, hp, 8 * i))
+    nxt = b.op("iadd %s, %s" % (pos, b.const("i64", 16)), "next")
+    b.raw("store %s, %s+16" % (nxt, mp))
+    b.raw("return %s" % nxt)
+    return b
+
+
+def gen_chacha():
+    replace_region("ChaCha20.bd", "ChaCha20Kernels", looped(
+        "i64 XorBlocks4(u32[] s, u8[] input, u8[] output, i64[] meta)",
+        "/// XORs the keystream of 4-block groups into `output` for input offsets `meta[0]` up to\n"
+        "/// `meta[2]` (a multiple of 256 past `meta[0]`); `meta[1]` is the output minus input offset.\n"
+        "/// Precondition: all ranges are in bounds; the block does not check.",
+        "meta[0] < meta[2]", chacha4(), "meta[0]") + "\n" + function(
+        "i64 KeystreamBlock(u32[] s, u8[] out)", chacha1(),
+        "/// The keystream block for the counter in `s[12]` into `out[0, 64)` (RFC 8439 2.3)."))
+    replace_region("Poly1305.bd", "Poly1305Blocks", looped(
+        "i64 Blocks(i64[] r, i64[] h, u8[] data, i64[] meta)",
+        "/// Absorbs the 16-byte blocks of `data` from offset `meta[2]` up to `meta[3]` with pad\n"
+        "/// bit `meta[4]` (radix 2^64). Precondition: the range is in bounds.",
+        "meta[2] < meta[3]", poly1305_blocks(), "meta[2]"))
+
+
+GENERATORS = {"sha": gen_sha, "chacha": gen_chacha}
 
 if __name__ == "__main__":
     names = sys.argv[1:] or sorted(GENERATORS)

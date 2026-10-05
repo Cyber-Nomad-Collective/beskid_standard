@@ -6,27 +6,44 @@
 /// algorithms 4 and 6), so no input needs a special case. Scalar multiplication is a fixed
 /// 4-bit window with a branch-free table scan: its time depends on neither the scalar nor
 /// the point. Public keys are uncompressed SEC 1 encodings (0x04 || X || Y, 65 bytes).
+///
+/// All field values live in one `ModArith` workspace (see the workspace notes there): a
+/// point is a register of three consecutive slots, addressed by limb offset.
 use Core.Bytes.Slice;
-use Core.Collections.Array;
 use Core.Results;
 use Crypto.BigNat;
 use Crypto.ModArith;
 use Crypto.PkErrors;
 
-/// A projective point; all three coordinates are eight limbs in Montgomery form mod p.
-pub type Point { pub u32[] x, pub u32[] y, pub u32[] z, }
-
-/// Curve contexts plus scratch. One `Curve` must not be shared between threads.
+/// The field and scalar workspaces. One `Curve` must not be shared between threads.
 pub type Curve {
-    /// Field arithmetic modulo p.
-    pub Mont fp,
-    /// Scalar arithmetic modulo the group order n.
-    pub Mont fn,
-    /// The curve coefficient b in Montgomery form.
-    pub u32[] b,
-    u32[] t0, u32[] t1, u32[] t2, u32[] t3, u32[] t4,
-    u32[] x3, u32[] y3, u32[] z3,
+    /// Field workspace modulo p with the slots and point registers below.
+    pub u32[] w,
+    /// Scalar workspace modulo the group order n with `ScalarSlots()` slots.
+    pub u32[] s,
 }
+
+pub i64 ScalarSlots() { return 4_i64; }
+
+/// Field slots: the coefficient b, formula temporaries, general scratch, and point registers.
+i64 Slot(i64 index) { return ModArith.WSlot(8_i64, index); }
+i64 SlotB() { return Slot(0_i64); }
+i64 SlotPowAcc() { return Slot(13_i64); }
+i64 Scratch(i64 index) { return Slot(9_i64 + index); }
+i64 RegisterCount() { return 36_i64; }
+
+/// Limb offset of point register `index` (X, then Y at +8, then Z at +16).
+pub i64 Reg(i64 index) { return Slot(14_i64 + 3_i64 * index); }
+i64 RegAcc() { return Reg(0_i64); }
+i64 RegPick() { return Reg(1_i64); }
+/// Register holding the generator after `NewCurve`.
+pub i64 RegGenerator() { return Reg(2_i64); }
+/// A free register for callers.
+pub i64 RegA() { return Reg(3_i64); }
+/// The scalar multiplication accumulator; results may be written here (out == RegB()).
+pub i64 RegB() { return RegAcc(); }
+i64 TableP() { return Reg(4_i64); }
+i64 TableQ() { return Reg(20_i64); }
 
 /// Length of private keys, scalars and shared secrets.
 pub i64 ScalarLength() { return 32_i64; }
@@ -45,192 +62,161 @@ u32[] GeneratorY() { return [0x37BF51F5_u32, 0xCBB64068_u32, 0x6B315ECE_u32, 0x2
 pub u8[] InverseExponent(u32[] m) {
     u32[] e = BigNat.Copy(m);
     BigNat.SubInPlace(e, [2_u32]);
-    u8[] out = Slice.New(32_i64);
+    u8[] out = BigNat.ZeroBytes(32_i64);
     BigNat.WriteBytes(e, out, 0_i64, 32_i64);
     return out;
 }
 
 pub Result<Curve, PkError> NewCurve() {
-    Result<Mont, PkError> fieldCtx = ModArith.New(FieldPrime());
-    Result<Mont, PkError> orderCtx = ModArith.New(Order());
-    return match fieldCtx {
+    Result<u32[], PkError> fieldWs = ModArith.NewWorkspace(FieldPrime(), 14_i64 + 3_i64 * RegisterCount());
+    Result<u32[], PkError> orderCtx = ModArith.NewWorkspace(Order(), ScalarSlots());
+    return match fieldWs {
         Result::Error(error) => Result::Error(error),
-        Result::Ok(fp) => match orderCtx {
+        Result::Ok(w) => match orderCtx {
             Result::Error(error) => Result::Error(error),
-            Result::Ok(fn) => {
-                u32[] b = BigNat.Zeros(8_i64);
-                ModArith.ToMont(fp, b, CoefficientB());
-                return Result::Ok(Curve {
-                    fp: fp, fn: fn, b: b,
-                    t0: BigNat.Zeros(8_i64), t1: BigNat.Zeros(8_i64), t2: BigNat.Zeros(8_i64), t3: BigNat.Zeros(8_i64), t4: BigNat.Zeros(8_i64),
-                    x3: BigNat.Zeros(8_i64), y3: BigNat.Zeros(8_i64), z3: BigNat.Zeros(8_i64),
-                });
+            Result::Ok(sw) => {
+                i64 n = 8_i64;
+                ModArith.WLoad(w, n, SlotB(), CoefficientB());
+                ModArith.WToMont(w, n, SlotB(), SlotB());
+                i64 g = RegGenerator();
+                ModArith.WLoad(w, n, g, GeneratorX());
+                ModArith.WToMont(w, n, g, g);
+                ModArith.WLoad(w, n, g + 8_i64, GeneratorY());
+                ModArith.WToMont(w, n, g + 8_i64, g + 8_i64);
+                ModArith.WToMont(w, n, g + 16_i64, ModArith.WOne(n));
+                return Result::Ok(Curve { w: w, s: sw });
             },
         },
     };
 }
 
-pub Point Identity(Curve c) {
-    Mont fp = c.fp;
-    u32[] y = BigNat.Zeros(8_i64);
-    ModArith.ToMont(fp, y, fp.one);
-    return Point { x: BigNat.Zeros(8_i64), y: y, z: BigNat.Zeros(8_i64) };
-}
-
-pub Point Generator(Curve c) {
-    Mont fp = c.fp;
-    Point g = Identity(c);
-    ModArith.ToMont(fp, g.x, GeneratorX());
-    ModArith.ToMont(fp, g.y, GeneratorY());
-    ModArith.ToMont(fp, g.z, fp.one);
-    return g;
-}
-
-pub Point CopyPoint(Point p) { return Point { x: BigNat.Copy(p.x), y: BigNat.Copy(p.y), z: BigNat.Copy(p.z) }; }
-
-pub unit AssignPoint(Point dst, Point src) {
-    BigNat.Assign(dst.x, src.x);
-    BigNat.Assign(dst.y, src.y);
-    BigNat.Assign(dst.z, src.z);
+/// Register `r` = the identity (0:1:0).
+pub unit SetIdentity(u32[] w, i64 r) {
+    ModArith.WSetSmall(w, 8_i64, r, 0_u32);
+    ModArith.WToMont(w, 8_i64, r + 8_i64, ModArith.WOne(8_i64));
+    ModArith.WSetSmall(w, 8_i64, r + 16_i64, 0_u32);
     return;
 }
 
+pub unit CopyReg(u32[] w, i64 dst, i64 src) { ModArith.WCopy(w, 24_i64, dst, src); return; }
+
 /// 1 for the identity (Z = 0), else 0.
-pub u32 IsIdentityBit(Point p) { return ModArith.IsZeroBit(p.z); }
+pub u32 IsIdentityBit(u32[] w, i64 r) { return ModArith.WIsZeroBit(w, 8_i64, r + 16_i64); }
 
 /// `out = p + q`; complete, any inputs, `out` may alias either.
-pub unit Add(Curve c, Point out, Point p, Point q) {
-    Mont f = c.fp;
-    u32[] b = c.b;
-    u32[] t0 = c.t0; u32[] t1 = c.t1; u32[] t2 = c.t2; u32[] t3 = c.t3; u32[] t4 = c.t4;
-    u32[] x3 = c.x3; u32[] y3 = c.y3; u32[] z3 = c.z3;
-    u32[] px = p.x; u32[] py = p.y; u32[] pz = p.z;
-    u32[] qx = q.x; u32[] qy = q.y; u32[] qz = q.z;
-    ModArith.Mul(f, t0, px, qx);
-    ModArith.Mul(f, t1, py, qy);
-    ModArith.Mul(f, t2, pz, qz);
-    ModArith.Add(f, t3, px, py);
-    ModArith.Add(f, t4, qx, qy);
-    ModArith.Mul(f, t3, t3, t4);
-    ModArith.Add(f, t4, t0, t1);
-    ModArith.Sub(f, t3, t3, t4);
-    ModArith.Add(f, t4, py, pz);
-    ModArith.Add(f, x3, qy, qz);
-    ModArith.Mul(f, t4, t4, x3);
-    ModArith.Add(f, x3, t1, t2);
-    ModArith.Sub(f, t4, t4, x3);
-    ModArith.Add(f, x3, px, pz);
-    ModArith.Add(f, y3, qx, qz);
-    ModArith.Mul(f, x3, x3, y3);
-    ModArith.Add(f, y3, t0, t2);
-    ModArith.Sub(f, y3, x3, y3);
-    ModArith.Mul(f, z3, b, t2);
-    ModArith.Sub(f, x3, y3, z3);
-    ModArith.Add(f, z3, x3, x3);
-    ModArith.Add(f, x3, x3, z3);
-    ModArith.Sub(f, z3, t1, x3);
-    ModArith.Add(f, x3, t1, x3);
-    ModArith.Mul(f, y3, b, y3);
-    ModArith.Add(f, t1, t2, t2);
-    ModArith.Add(f, t2, t1, t2);
-    ModArith.Sub(f, y3, y3, t2);
-    ModArith.Sub(f, y3, y3, t0);
-    ModArith.Add(f, t1, y3, y3);
-    ModArith.Add(f, y3, t1, y3);
-    ModArith.Add(f, t1, t0, t0);
-    ModArith.Add(f, t0, t1, t0);
-    ModArith.Sub(f, t0, t0, t2);
-    ModArith.Mul(f, t1, t4, y3);
-    ModArith.Mul(f, t2, t0, y3);
-    ModArith.Mul(f, y3, x3, z3);
-    ModArith.Add(f, y3, y3, t2);
-    ModArith.Mul(f, x3, t3, x3);
-    ModArith.Sub(f, x3, x3, t1);
-    ModArith.Mul(f, z3, t4, z3);
-    ModArith.Mul(f, t1, t3, t0);
-    ModArith.Add(f, z3, z3, t1);
-    BigNat.Assign(out.x, x3);
-    BigNat.Assign(out.y, y3);
-    BigNat.Assign(out.z, z3);
+pub unit Add(u32[] w, i64 out, i64 p, i64 q) {
+    i64 n = 8_i64;
+    i64 b = SlotB();
+    i64 t0 = Slot(1_i64); i64 t1 = Slot(2_i64); i64 t2 = Slot(3_i64); i64 t3 = Slot(4_i64); i64 t4 = Slot(5_i64);
+    i64 x3 = Slot(6_i64); i64 y3 = Slot(7_i64); i64 z3 = Slot(8_i64);
+    i64 px = p; i64 py = p + 8_i64; i64 pz = p + 16_i64;
+    i64 qx = q; i64 qy = q + 8_i64; i64 qz = q + 16_i64;
+    ModArith.WMul(w, n, t0, px, qx);
+    ModArith.WMul(w, n, t1, py, qy);
+    ModArith.WMul(w, n, t2, pz, qz);
+    ModArith.WAdd(w, n, t3, px, py);
+    ModArith.WAdd(w, n, t4, qx, qy);
+    ModArith.WMul(w, n, t3, t3, t4);
+    ModArith.WAdd(w, n, t4, t0, t1);
+    ModArith.WSub(w, n, t3, t3, t4);
+    ModArith.WAdd(w, n, t4, py, pz);
+    ModArith.WAdd(w, n, x3, qy, qz);
+    ModArith.WMul(w, n, t4, t4, x3);
+    ModArith.WAdd(w, n, x3, t1, t2);
+    ModArith.WSub(w, n, t4, t4, x3);
+    ModArith.WAdd(w, n, x3, px, pz);
+    ModArith.WAdd(w, n, y3, qx, qz);
+    ModArith.WMul(w, n, x3, x3, y3);
+    ModArith.WAdd(w, n, y3, t0, t2);
+    ModArith.WSub(w, n, y3, x3, y3);
+    ModArith.WMul(w, n, z3, b, t2);
+    ModArith.WSub(w, n, x3, y3, z3);
+    ModArith.WAdd(w, n, z3, x3, x3);
+    ModArith.WAdd(w, n, x3, x3, z3);
+    ModArith.WSub(w, n, z3, t1, x3);
+    ModArith.WAdd(w, n, x3, t1, x3);
+    ModArith.WMul(w, n, y3, b, y3);
+    ModArith.WAdd(w, n, t1, t2, t2);
+    ModArith.WAdd(w, n, t2, t1, t2);
+    ModArith.WSub(w, n, y3, y3, t2);
+    ModArith.WSub(w, n, y3, y3, t0);
+    ModArith.WAdd(w, n, t1, y3, y3);
+    ModArith.WAdd(w, n, y3, t1, y3);
+    ModArith.WAdd(w, n, t1, t0, t0);
+    ModArith.WAdd(w, n, t0, t1, t0);
+    ModArith.WSub(w, n, t0, t0, t2);
+    ModArith.WMul(w, n, t1, t4, y3);
+    ModArith.WMul(w, n, t2, t0, y3);
+    ModArith.WMul(w, n, y3, x3, z3);
+    ModArith.WAdd(w, n, y3, y3, t2);
+    ModArith.WMul(w, n, x3, t3, x3);
+    ModArith.WSub(w, n, x3, x3, t1);
+    ModArith.WMul(w, n, z3, t4, z3);
+    ModArith.WMul(w, n, t1, t3, t0);
+    ModArith.WAdd(w, n, z3, z3, t1);
+    // x3 y3 z3 are consecutive slots, like a register.
+    ModArith.WCopy(w, 24_i64, out, x3);
     return;
 }
 
 /// `out = 2p`; complete, `out` may alias `p`.
-pub unit Double(Curve c, Point out, Point p) {
-    Mont f = c.fp;
-    u32[] b = c.b;
-    u32[] t0 = c.t0; u32[] t1 = c.t1; u32[] t2 = c.t2; u32[] t3 = c.t3;
-    u32[] x3 = c.x3; u32[] y3 = c.y3; u32[] z3 = c.z3;
-    u32[] px = p.x; u32[] py = p.y; u32[] pz = p.z;
-    ModArith.Mul(f, t0, px, px);
-    ModArith.Mul(f, t1, py, py);
-    ModArith.Mul(f, t2, pz, pz);
-    ModArith.Mul(f, t3, px, py);
-    ModArith.Add(f, t3, t3, t3);
-    ModArith.Mul(f, z3, px, pz);
-    ModArith.Add(f, z3, z3, z3);
-    ModArith.Mul(f, y3, b, t2);
-    ModArith.Sub(f, y3, y3, z3);
-    ModArith.Add(f, x3, y3, y3);
-    ModArith.Add(f, y3, x3, y3);
-    ModArith.Sub(f, x3, t1, y3);
-    ModArith.Add(f, y3, t1, y3);
-    ModArith.Mul(f, y3, x3, y3);
-    ModArith.Mul(f, x3, x3, t3);
-    ModArith.Add(f, t3, t2, t2);
-    ModArith.Add(f, t2, t2, t3);
-    ModArith.Mul(f, z3, b, z3);
-    ModArith.Sub(f, z3, z3, t2);
-    ModArith.Sub(f, z3, z3, t0);
-    ModArith.Add(f, t3, z3, z3);
-    ModArith.Add(f, z3, z3, t3);
-    ModArith.Add(f, t3, t0, t0);
-    ModArith.Add(f, t0, t3, t0);
-    ModArith.Sub(f, t0, t0, t2);
-    ModArith.Mul(f, t0, t0, z3);
-    ModArith.Add(f, y3, y3, t0);
-    ModArith.Mul(f, t0, py, pz);
-    ModArith.Add(f, t0, t0, t0);
-    ModArith.Mul(f, z3, t0, z3);
-    ModArith.Sub(f, x3, x3, z3);
-    ModArith.Mul(f, z3, t0, t1);
-    ModArith.Add(f, z3, z3, z3);
-    ModArith.Add(f, z3, z3, z3);
-    BigNat.Assign(out.x, x3);
-    BigNat.Assign(out.y, y3);
-    BigNat.Assign(out.z, z3);
+pub unit Double(u32[] w, i64 out, i64 p) {
+    i64 n = 8_i64;
+    i64 b = SlotB();
+    i64 t0 = Slot(1_i64); i64 t1 = Slot(2_i64); i64 t2 = Slot(3_i64); i64 t3 = Slot(4_i64);
+    i64 x3 = Slot(6_i64); i64 y3 = Slot(7_i64); i64 z3 = Slot(8_i64);
+    i64 px = p; i64 py = p + 8_i64; i64 pz = p + 16_i64;
+    ModArith.WMul(w, n, t0, px, px);
+    ModArith.WMul(w, n, t1, py, py);
+    ModArith.WMul(w, n, t2, pz, pz);
+    ModArith.WMul(w, n, t3, px, py);
+    ModArith.WAdd(w, n, t3, t3, t3);
+    ModArith.WMul(w, n, z3, px, pz);
+    ModArith.WAdd(w, n, z3, z3, z3);
+    ModArith.WMul(w, n, y3, b, t2);
+    ModArith.WSub(w, n, y3, y3, z3);
+    ModArith.WAdd(w, n, x3, y3, y3);
+    ModArith.WAdd(w, n, y3, x3, y3);
+    ModArith.WSub(w, n, x3, t1, y3);
+    ModArith.WAdd(w, n, y3, t1, y3);
+    ModArith.WMul(w, n, y3, x3, y3);
+    ModArith.WMul(w, n, x3, x3, t3);
+    ModArith.WAdd(w, n, t3, t2, t2);
+    ModArith.WAdd(w, n, t2, t2, t3);
+    ModArith.WMul(w, n, z3, b, z3);
+    ModArith.WSub(w, n, z3, z3, t2);
+    ModArith.WSub(w, n, z3, z3, t0);
+    ModArith.WAdd(w, n, t3, z3, z3);
+    ModArith.WAdd(w, n, z3, z3, t3);
+    ModArith.WAdd(w, n, t3, t0, t0);
+    ModArith.WAdd(w, n, t0, t3, t0);
+    ModArith.WSub(w, n, t0, t0, t2);
+    ModArith.WMul(w, n, t0, t0, z3);
+    ModArith.WAdd(w, n, y3, y3, t0);
+    ModArith.WMul(w, n, t0, py, pz);
+    ModArith.WAdd(w, n, t0, t0, t0);
+    ModArith.WMul(w, n, z3, t0, z3);
+    ModArith.WSub(w, n, x3, x3, z3);
+    ModArith.WMul(w, n, z3, t0, t1);
+    ModArith.WAdd(w, n, z3, z3, z3);
+    ModArith.WAdd(w, n, z3, z3, z3);
+    ModArith.WCopy(w, 24_i64, out, x3);
     return;
 }
 
-/// The multiples 0P .. 15P for the 4-bit window.
-Point[] Table(Curve c, Point p) {
-    mut Point[] table = [Identity(c)];
-    Array.Append<Point>(table, CopyPoint(p));
+/// Fills the 16 registers at `table` with 0P .. 15P.
+unit BuildTable(u32[] w, i64 table, i64 p) {
+    SetIdentity(w, table);
+    CopyReg(w, table + 24_i64, p);
     mut i64 i = 2_i64;
     while i < 16_i64 {
-        Point next = Identity(c);
+        i64 entry = table + 24_i64 * i;
         if (i & 1_i64) == 0_i64 {
-            Double(c, next, table[i / 2_i64]);
+            Double(w, entry, table + 24_i64 * (i / 2_i64));
         } else {
-            Add(c, next, table[i - 1_i64], p);
+            Add(w, entry, table + 24_i64 * (i - 1_i64), p);
         }
-        Array.Append<Point>(table, next);
         i = i + 1_i64;
-    }
-    return table;
-}
-
-/// `out = table[index]` by scanning every entry with a mask.
-unit Select(Point out, Point[] table, u32 index) {
-    mut u32 j = 0_u32;
-    while j < 16_u32 {
-        u32 diff = ModArith.Xor(j, index);
-        u32 hit = 1_u32 - ((diff | (0_u32 - diff)) >> 31_u32);
-        Point entry = table[i64(j)];
-        ModArith.CondAssign(out.x, entry.x, hit);
-        ModArith.CondAssign(out.y, entry.y, hit);
-        ModArith.CondAssign(out.z, entry.z, hit);
-        j = j + 1_u32;
     }
     return;
 }
@@ -239,69 +225,78 @@ u32 Nibble(u32[] scalar, i64 index) {
     return (scalar[index / 8_i64] >> u32((index % 8_i64) * 4_i64)) & 15_u32;
 }
 
-/// `k * p` for a plain (not Montgomery) eight-limb scalar `k`. Constant-time.
-pub Point ScalarMult(Curve c, u32[] k, Point p) {
-    Point[] table = Table(c, p);
-    Point acc = Identity(c);
-    Point pick = Identity(c);
+/// Register `out` = `k * p` for a plain (not Montgomery) eight-limb scalar. Constant-time.
+/// `out` and `p` are registers of `c.w`; `out` may alias `p`.
+pub unit ScalarMult(Curve c, i64 out, u32[] k, i64 p) {
+    u32[] w = c.w;
+    BuildTable(w, TableP(), p);
+    i64 acc = RegAcc();
+    i64 pick = RegPick();
+    SetIdentity(w, acc);
     mut i64 i = 63_i64;
     while i >= 0_i64 {
-        Double(c, acc, acc);
-        Double(c, acc, acc);
-        Double(c, acc, acc);
-        Double(c, acc, acc);
-        Select(pick, table, Nibble(k, i));
-        Add(c, acc, acc, pick);
+        Double(w, acc, acc);
+        Double(w, acc, acc);
+        Double(w, acc, acc);
+        Double(w, acc, acc);
+        ModArith.WSelect(w, 24_i64, pick, TableP(), 16_i64, Nibble(k, i));
+        Add(w, acc, acc, pick);
         i = i - 1_i64;
     }
-    return acc;
+    CopyReg(w, out, acc);
+    return;
 }
 
-/// `k1 * p + k2 * q` with one shared doubling chain. Constant-time.
-pub Point DoubleScalarMult(Curve c, u32[] k1, Point p, u32[] k2, Point q) {
-    Point[] tableP = Table(c, p);
-    Point[] tableQ = Table(c, q);
-    Point acc = Identity(c);
-    Point pick = Identity(c);
+/// Register `out` = `k1 * p + k2 * q` with one shared doubling chain. Constant-time.
+pub unit DoubleScalarMult(Curve c, i64 out, u32[] k1, i64 p, u32[] k2, i64 q) {
+    u32[] w = c.w;
+    BuildTable(w, TableP(), p);
+    BuildTable(w, TableQ(), q);
+    i64 acc = RegAcc();
+    i64 pick = RegPick();
+    SetIdentity(w, acc);
     mut i64 i = 63_i64;
     while i >= 0_i64 {
-        Double(c, acc, acc);
-        Double(c, acc, acc);
-        Double(c, acc, acc);
-        Double(c, acc, acc);
-        Select(pick, tableP, Nibble(k1, i));
-        Add(c, acc, acc, pick);
-        Select(pick, tableQ, Nibble(k2, i));
-        Add(c, acc, acc, pick);
+        Double(w, acc, acc);
+        Double(w, acc, acc);
+        Double(w, acc, acc);
+        Double(w, acc, acc);
+        ModArith.WSelect(w, 24_i64, pick, TableP(), 16_i64, Nibble(k1, i));
+        Add(w, acc, acc, pick);
+        ModArith.WSelect(w, 24_i64, pick, TableQ(), 16_i64, Nibble(k2, i));
+        Add(w, acc, acc, pick);
         i = i - 1_i64;
     }
-    return acc;
+    CopyReg(w, out, acc);
+    return;
 }
 
-/// Affine coordinates as plain (not Montgomery) limbs; fails for the identity.
-pub Result<Point, PkError> ToAffine(Curve c, Point p) {
-    if IsIdentityBit(p) == 1_u32 { return Result::Error(PkError::InvalidPoint()); }
-    Mont f = c.fp;
-    u32[] inv = BigNat.Zeros(8_i64);
-    ModArith.PowPublic(f, inv, p.z, InverseExponent(FieldPrime()));
-    u32[] x = BigNat.Zeros(8_i64);
-    u32[] y = BigNat.Zeros(8_i64);
-    ModArith.Mul(f, x, p.x, inv);
-    ModArith.Mul(f, y, p.y, inv);
-    ModArith.FromMont(f, x, x);
-    ModArith.FromMont(f, y, y);
-    u32[] one = BigNat.Zeros(8_i64);
-    one[0] = 1_u32;
-    return Result::Ok(Point { x: x, y: y, z: one });
+/// Affine coordinates of a non-identity point as plain eight-limb values.
+pub type Affine { pub u32[] x, pub u32[] y, }
+
+/// The affine form of register `r`; fails for the identity.
+pub Result<Affine, PkError> ToAffine(Curve c, i64 r) {
+    u32[] w = c.w;
+    i64 n = 8_i64;
+    if IsIdentityBit(w, r) == 1_u32 { return Result::Error(PkError::InvalidPoint()); }
+    i64 inv = Scratch(0_i64);
+    i64 x = Scratch(1_i64);
+    i64 y = Scratch(2_i64);
+    ModArith.WPowPublic(w, n, inv, r + 16_i64, SlotPowAcc(), InverseExponent(FieldPrime()));
+    ModArith.WMul(w, n, x, r, inv);
+    ModArith.WMul(w, n, y, r + 8_i64, inv);
+    ModArith.WFromMont(w, n, x, x);
+    ModArith.WFromMont(w, n, y, y);
+    return Result::Ok(Affine { x: ModArith.WStore(w, n, x), y: ModArith.WStore(w, n, y) });
 }
 
-/// Uncompressed SEC 1 encoding; fails for the identity.
-pub Result<u8[], PkError> Encode(Curve c, Point p) {
-    Result<Point, PkError> affine = ToAffine(c, p);
+/// Uncompressed SEC 1 encoding of register `r`; fails for the identity.
+pub Result<u8[], PkError> Encode(Curve c, i64 r) {
+    Result<Affine, PkError> affine = ToAffine(c, r);
     return match affine {
         Result::Error(error) => Result::Error(error),
         Result::Ok(a) => {
-            u8[] out = Slice.New(65_i64);
+            u8[] out = BigNat.ZeroBytes(65_i64);
             out[0] = u8(4);
             BigNat.WriteBytes(a.x, out, 1_i64, 32_i64);
             BigNat.WriteBytes(a.y, out, 33_i64, 32_i64);
@@ -310,48 +305,45 @@ pub Result<u8[], PkError> Encode(Curve c, Point p) {
     };
 }
 
-/// Decodes an uncompressed SEC 1 point and checks it: 65 bytes, prefix 0x04, both
-/// coordinates below p, and y^2 = x^3 - 3x + b. The identity has no such encoding.
-pub Result<Point, PkError> Decode(Curve c, u8[] encoded) {
+/// Decodes an uncompressed SEC 1 point into register `r` and checks it: 65 bytes, prefix
+/// 0x04, both coordinates below p, and y^2 = x^3 - 3x + b. The identity has no encoding.
+pub Result<unit, PkError> Decode(Curve c, i64 r, u8[] encoded) {
     if Slice.Len(encoded) != 65_i64 { return Result::Error(PkError::InvalidPoint()); }
     if encoded[0] != u8(4) { return Result::Error(PkError::InvalidPoint()); }
-    Result<u32[], PkError> xr = BigNat.FromBytes(Slice.SubSlice(encoded, 1_i64, 32_i64));
-    Result<u32[], PkError> yr = BigNat.FromBytes(Slice.SubSlice(encoded, 33_i64, 32_i64));
+    Result<u32[], PkError> xr = BigNat.FromBytesFixed(Slice.SubSlice(encoded, 1_i64, 32_i64), 8_i64);
+    Result<u32[], PkError> yr = BigNat.FromBytesFixed(Slice.SubSlice(encoded, 33_i64, 32_i64), 8_i64);
     return match xr {
         Result::Error(_) => Result::Error(PkError::InvalidPoint()),
         Result::Ok(x) => match yr {
             Result::Error(_) => Result::Error(PkError::InvalidPoint()),
-            Result::Ok(y) => FromAffine(c, x, y),
+            Result::Ok(y) => FromAffine(c, r, x, y),
         },
     };
 }
 
-Result<Point, PkError> FromAffine(Curve c, u32[] x, u32[] y) {
+Result<unit, PkError> FromAffine(Curve c, i64 r, u32[] x, u32[] y) {
     u32[] p = FieldPrime();
     if ModArith.LessBit(x, p) == 0_u32 || ModArith.LessBit(y, p) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
-    Mont f = c.fp;
-    Point pt = Identity(c);
-    ModArith.ToMont(f, pt.x, x);
-    ModArith.ToMont(f, pt.y, y);
-    ModArith.ToMont(f, pt.z, f.one);
-    if OnCurveBit(c, pt.x, pt.y) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
-    return Result::Ok(pt);
-}
-
-/// 1 when Montgomery-form affine (x, y) satisfies y^2 = x^3 - 3x + b.
-u32 OnCurveBit(Curve c, u32[] x, u32[] y) {
-    Mont f = c.fp;
-    u32[] lhs = BigNat.Zeros(8_i64);
-    u32[] rhs = BigNat.Zeros(8_i64);
-    u32[] three = BigNat.Zeros(8_i64);
-    ModArith.Mul(f, lhs, y, y);
-    ModArith.Mul(f, rhs, x, x);
-    ModArith.Mul(f, rhs, rhs, x);
-    ModArith.Add(f, three, x, x);
-    ModArith.Add(f, three, three, x);
-    ModArith.Sub(f, rhs, rhs, three);
-    ModArith.Add(f, rhs, rhs, c.b);
-    return ModArith.EqualBit(lhs, rhs);
+    u32[] w = c.w;
+    i64 n = 8_i64;
+    ModArith.WLoad(w, n, r, x);
+    ModArith.WToMont(w, n, r, r);
+    ModArith.WLoad(w, n, r + 8_i64, y);
+    ModArith.WToMont(w, n, r + 8_i64, r + 8_i64);
+    ModArith.WToMont(w, n, r + 16_i64, ModArith.WOne(n));
+    // y^2 = x^3 - 3x + b in Montgomery form.
+    i64 lhs = Scratch(0_i64);
+    i64 rhs = Scratch(1_i64);
+    i64 three = Scratch(2_i64);
+    ModArith.WMul(w, n, lhs, r + 8_i64, r + 8_i64);
+    ModArith.WMul(w, n, rhs, r, r);
+    ModArith.WMul(w, n, rhs, rhs, r);
+    ModArith.WAdd(w, n, three, r, r);
+    ModArith.WAdd(w, n, three, three, r);
+    ModArith.WSub(w, n, rhs, rhs, three);
+    ModArith.WAdd(w, n, rhs, rhs, SlotB());
+    if ModArith.WEqualBit(w, n, lhs, rhs) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
+    return Result::Ok(());
 }
 
 /// A private scalar as eight plain limbs; fails unless it is 32 bytes in [1, n-1].
@@ -375,7 +367,10 @@ pub Result<u8[], PkError> PublicKey(u8[] privateKey) {
         Result::Error(error) => Result::Error(error),
         Result::Ok(d) => match curve {
             Result::Error(error) => Result::Error(error),
-            Result::Ok(c) => Encode(c, ScalarMult(c, d, Generator(c))),
+            Result::Ok(c) => {
+                ScalarMult(c, RegA(), d, RegGenerator());
+                return Encode(c, RegA());
+            },
         },
     };
 }
@@ -386,7 +381,7 @@ pub Result<unit, PkError> ValidatePublicKey(u8[] publicKey) {
     return match curve {
         Result::Error(error) => Result::Error(error),
         Result::Ok(c) => {
-            Result<Point, PkError> decoded = Decode(c, publicKey);
+            Result<unit, PkError> decoded = Decode(c, RegA(), publicKey);
             return match decoded { Result::Error(error) => Result::Error(error), Result::Ok(_) => Result::Ok(()), };
         },
     };
@@ -402,15 +397,16 @@ pub Result<u8[], PkError> SharedSecret(u8[] privateKey, u8[] peerPublicKey) {
         Result::Ok(d) => match curve {
             Result::Error(error) => Result::Error(error),
             Result::Ok(c) => {
-                Result<Point, PkError> peer = Decode(c, peerPublicKey);
+                Result<unit, PkError> peer = Decode(c, RegA(), peerPublicKey);
                 return match peer {
                     Result::Error(error) => Result::Error(error),
-                    Result::Ok(q) => {
-                        Result<Point, PkError> affine = ToAffine(c, ScalarMult(c, d, q));
+                    Result::Ok(_) => {
+                        ScalarMult(c, RegB(), d, RegA());
+                        Result<Affine, PkError> affine = ToAffine(c, RegB());
                         return match affine {
                             Result::Error(_) => Result::Error(PkError::ZeroSharedSecret()),
                             Result::Ok(a) => {
-                                u8[] out = Slice.New(32_i64);
+                                u8[] out = BigNat.ZeroBytes(32_i64);
                                 BigNat.WriteBytes(a.x, out, 0_i64, 32_i64);
                                 return Result::Ok(out);
                             },

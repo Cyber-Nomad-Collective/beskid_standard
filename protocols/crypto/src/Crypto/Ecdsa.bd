@@ -37,25 +37,36 @@ u32[] ReduceOnce(u32[] x) {
     return r;
 }
 
+/// Scalar workspace slot offsets (n = 8).
+i64 S(i64 index) { return ModArith.WSlot(8_i64, index); }
+
 /// `a^-1 mod n` in plain form for plain `a` in [1, n-1]. Fermat; constant-time in `a`.
 u32[] InverseModN(Curve c, u32[] a) {
-    Mont fn = c.fn;
-    u32[] am = BigNat.Zeros(8_i64);
-    ModArith.ToMont(fn, am, a);
-    u32[] inv = BigNat.Zeros(8_i64);
-    ModArith.PowPublic(fn, inv, am, P256.InverseExponent(P256.Order()));
-    ModArith.FromMont(fn, inv, inv);
-    return inv;
+    u32[] s = c.s;
+    ModArith.WLoad(s, 8_i64, S(0_i64), a);
+    ModArith.WToMont(s, 8_i64, S(0_i64), S(0_i64));
+    ModArith.WPowPublic(s, 8_i64, S(1_i64), S(0_i64), S(2_i64), P256.InverseExponent(P256.Order()));
+    ModArith.WFromMont(s, 8_i64, S(1_i64), S(1_i64));
+    return ModArith.WStore(s, 8_i64, S(1_i64));
 }
 
 /// Plain `a * b mod n` for plain `a`, `b` below n.
 u32[] MulModN(Curve c, u32[] a, u32[] b) {
-    Mont fn = c.fn;
-    u32[] bm = BigNat.Zeros(8_i64);
-    ModArith.ToMont(fn, bm, b);
-    u32[] out = BigNat.Zeros(8_i64);
-    ModArith.Mul(fn, out, a, bm);
-    return out;
+    u32[] s = c.s;
+    ModArith.WLoad(s, 8_i64, S(0_i64), a);
+    ModArith.WLoad(s, 8_i64, S(1_i64), b);
+    ModArith.WToMont(s, 8_i64, S(1_i64), S(1_i64));
+    ModArith.WMul(s, 8_i64, S(2_i64), S(0_i64), S(1_i64));
+    return ModArith.WStore(s, 8_i64, S(2_i64));
+}
+
+/// Plain `a + b mod n` for plain `a`, `b` below n.
+u32[] AddModN(Curve c, u32[] a, u32[] b) {
+    u32[] s = c.s;
+    ModArith.WLoad(s, 8_i64, S(0_i64), a);
+    ModArith.WLoad(s, 8_i64, S(1_i64), b);
+    ModArith.WAdd(s, 8_i64, S(2_i64), S(0_i64), S(1_i64));
+    return ModArith.WStore(s, 8_i64, S(2_i64));
 }
 
 bool InScalarRange(u32[] v) { return !BigNat.IsZero(v) && BigNat.Compare(v, P256.Order()) < 0_i64; }
@@ -90,16 +101,16 @@ Result<unit, PkError> VerifyScalars(u8[] publicKey, u8[] digest, u32[] r, u32[] 
     return match curve {
         Result::Error(error) => Result::Error(error),
         Result::Ok(c) => {
-            Result<Point, PkError> decoded = P256.Decode(c, publicKey);
+            Result<unit, PkError> decoded = P256.Decode(c, P256.RegA(), publicKey);
             return match decoded {
                 Result::Error(error) => Result::Error(error),
-                Result::Ok(q) => {
+                Result::Ok(_) => {
                     u32[] z = ReduceOnce(BitsToInt(digest));
                     u32[] w = InverseModN(c, s);
                     u32[] u1 = MulModN(c, z, w);
                     u32[] u2 = MulModN(c, r, w);
-                    Point sum = P256.DoubleScalarMult(c, u1, P256.Generator(c), u2, q);
-                    Result<Point, PkError> affine = P256.ToAffine(c, sum);
+                    P256.DoubleScalarMult(c, P256.RegB(), u1, P256.RegGenerator(), u2, P256.RegA());
+                    Result<Affine, PkError> affine = P256.ToAffine(c, P256.RegB());
                     return match affine {
                         Result::Error(_) => Result::Error(PkError::BadSignature()),
                         Result::Ok(a) => {
@@ -138,14 +149,14 @@ pub Result<u8[], PkError> SignDer(u8[] privateKey, u8[] digest, NonceMac mac) {
 }
 
 u8[] Concat(u8[] a, u8[] b) {
-    u8[] out = Slice.New(Slice.Len(a) + Slice.Len(b));
+    u8[] out = BigNat.ZeroBytes(Slice.Len(a) + Slice.Len(b));
     Slice.Copy(out, 0_i64, a, 0_i64, Slice.Len(a));
     Slice.Copy(out, Slice.Len(a), b, 0_i64, Slice.Len(b));
     return out;
 }
 
 u8[] Scalar32(u32[] v) {
-    u8[] out = Slice.New(32_i64);
+    u8[] out = BigNat.ZeroBytes(32_i64);
     BigNat.WriteBytes(v, out, 0_i64, 32_i64);
     return out;
 }
@@ -157,8 +168,8 @@ Result<u8[], PkError> SignWith(Curve c, u32[] d, u8[] digest, NonceMac mac) {
     u8[] probe = mac.Mac([u8(0)], [u8(0)]);
     i64 hlen = Slice.Len(probe);
     if hlen < 32_i64 { return Result::Error(PkError::SigningFailed()); }
-    mut u8[] v = Slice.Fill(Slice.New(hlen), 0_i64, hlen, u8(1));
-    mut u8[] k = Slice.New(hlen);
+    mut u8[] v = Slice.Fill(BigNat.ZeroBytes(hlen), 0_i64, hlen, u8(1));
+    mut u8[] k = BigNat.ZeroBytes(hlen);
     k = mac.Mac(k, Concat(Concat(Concat(v, [u8(0)]), x), h));
     v = mac.Mac(k, v);
     k = mac.Mac(k, Concat(Concat(Concat(v, [u8(1)]), x), h));
@@ -169,15 +180,14 @@ Result<u8[], PkError> SignWith(Curve c, u32[] d, u8[] digest, NonceMac mac) {
         v = mac.Mac(k, v);
         u32[] nonce = BitsToInt(v);
         if InScalarRange(nonce) {
-            Result<Point, PkError> affine = P256.ToAffine(c, P256.ScalarMult(c, nonce, P256.Generator(c)));
+            P256.ScalarMult(c, P256.RegB(), nonce, P256.RegGenerator());
+            Result<Affine, PkError> affine = P256.ToAffine(c, P256.RegB());
             match affine {
                 Result::Error(_) => {},
                 Result::Ok(a) => {
                     u32[] r = ReduceOnce(a.x);
                     if !BigNat.IsZero(r) {
-                        Mont fn = c.fn;
-                        u32[] sum = BigNat.Zeros(8_i64);
-                        ModArith.Add(fn, sum, z, MulModN(c, r, d));
+                        u32[] sum = AddModN(c, z, MulModN(c, r, d));
                         u32[] s = MulModN(c, InverseModN(c, nonce), sum);
                         if !BigNat.IsZero(s) { return Result::Ok(Concat(Scalar32(r), Scalar32(s))); }
                     }
@@ -218,7 +228,7 @@ i64 DerIntegerLength(u8[] raw, i64 offset) {
 pub Result<u8[], PkError> RawToDer(u8[] raw) {
     if Slice.Len(raw) != 64_i64 { return Result::Error(PkError::MalformedSignature()); }
     i64 body = DerIntegerLength(raw, 0_i64) + DerIntegerLength(raw, 32_i64);
-    u8[] out = Slice.New(2_i64 + body);
+    u8[] out = BigNat.ZeroBytes(2_i64 + body);
     out[0] = u8(48);
     out[1] = u8(body);
     i64 next = WriteDerInteger(out, 2_i64, raw, 0_i64);
@@ -253,7 +263,7 @@ pub Result<u8[], PkError> DerToRaw(u8[] der) {
     i64 total = Slice.Len(der);
     if total < 8_i64 || total > 72_i64 { return Result::Error(PkError::MalformedSignature()); }
     if der[0] != u8(48) || i64(der[1]) != total - 2_i64 { return Result::Error(PkError::MalformedSignature()); }
-    u8[] raw = Slice.New(64_i64);
+    u8[] raw = BigNat.ZeroBytes(64_i64);
     Result<i64, PkError> afterR = ReadDerInteger(der, 2_i64, raw, 0_i64);
     return match afterR {
         Result::Error(error) => Result::Error(error),

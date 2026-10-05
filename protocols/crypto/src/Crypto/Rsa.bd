@@ -85,18 +85,21 @@ pub Result<PublicKey, PkError> NewPublicKey(u8[] modulus, u8[] exponent) {
 pub Result<u8[], PkError> PublicOperation(PublicKey key, u8[] signature) {
     if Slice.Len(signature) != key.size { return Result::Error(PkError::MalformedSignature()); }
     Result<u32[], PkError> decoded = BigNat.FromBytes(signature);
-    Result<Mont, PkError> created = ModArith.New(key.n);
+    Result<u32[], PkError> created = ModArith.NewWorkspace(key.n, 3_i64);
     return match decoded {
         Result::Error(_) => Result::Error(PkError::MalformedSignature()),
         Result::Ok(s) => match created {
             Result::Error(error) => Result::Error(error),
-            Result::Ok(c) => {
+            Result::Ok(w) => {
                 if BigNat.Compare(s, key.n) >= 0_i64 { return Result::Error(PkError::MalformedSignature()); }
-                u32[] sm = BigNat.Zeros(c.n);
-                ModArith.ToMont(c, sm, BigNat.Resize(s, c.n));
-                ModArith.PowPublic(c, sm, sm, key.e);
-                ModArith.FromMont(c, sm, sm);
-                return BigNat.ToBytes(sm, key.size);
+                i64 n = BigNat.SignificantLimbs(key.n);
+                i64 base = ModArith.WSlot(n, 0_i64);
+                i64 out = ModArith.WSlot(n, 1_i64);
+                ModArith.WLoad(w, n, base, BigNat.Resize(s, n));
+                ModArith.WToMont(w, n, base, base);
+                ModArith.WPowPublic(w, n, out, base, ModArith.WSlot(n, 2_i64), key.e);
+                ModArith.WFromMont(w, n, out, out);
+                return BigNat.ToBytes(ModArith.WStore(w, n, out), key.size);
             },
         },
     };
@@ -115,7 +118,7 @@ pub Result<unit, PkError> VerifyPkcs1v15(PublicKey key, RsaHash hash, u8[] diges
         Result::Error(error) => Result::Error(error),
         Result::Ok(em) => {
             i64 k = key.size;
-            u8[] expected = Slice.Fill(Slice.New(k), 2_i64, k - tlen - 3_i64, u8(255));
+            u8[] expected = Slice.Fill(BigNat.ZeroBytes(k), 2_i64, k - tlen - 3_i64, u8(255));
             expected[1] = u8(1);
             Slice.Copy(expected, k - tlen, prefix, 0_i64, Slice.Len(prefix));
             Slice.Copy(expected, k - hlen, digest, 0_i64, hlen);
@@ -138,9 +141,9 @@ bool SameBytes(u8[] a, u8[] b) {
 
 /// MGF1 (RFC 8017 appendix B.2.1): `length` bytes of Hash(seed || counter) blocks.
 pub u8[] Mgf1(PssDigest hash, u8[] seed, i64 length) {
-    u8[] out = Slice.New(length);
+    u8[] out = BigNat.ZeroBytes(length);
     i64 seedLen = Slice.Len(seed);
-    u8[] input = Slice.New(seedLen + 4_i64);
+    u8[] input = BigNat.ZeroBytes(seedLen + 4_i64);
     Slice.Copy(input, 0_i64, seed, 0_i64, seedLen);
     mut i64 done = 0_i64;
     mut i64 counter = 0_i64;
@@ -207,7 +210,7 @@ Result<unit, PkError> EmsaPssVerify(PssDigest hash, u8[] mHash, u8[] em, i64 emB
         i = i + 1_i64;
     }
     if db[psLen] != u8(1) { return Result::Error(PkError::BadSignature()); }
-    u8[] mPrime = Slice.New(8_i64 + hlen + sLen);
+    u8[] mPrime = BigNat.ZeroBytes(8_i64 + hlen + sLen);
     Slice.Copy(mPrime, 8_i64, mHash, 0_i64, hlen);
     Slice.Copy(mPrime, 8_i64 + hlen, db, dbLen - sLen, sLen);
     u8[] hPrime = hash.Digest(mPrime);

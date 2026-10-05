@@ -1,46 +1,53 @@
 /// Constant-time Montgomery arithmetic modulo an odd modulus over fixed-width `u32[]` limbs.
 ///
-/// A `Mont` context fixes the modulus width `n` limbs. Every operand and output passed to
-/// the context functions has exactly `n` limbs and holds a value below the modulus.
-/// Outputs may alias inputs. Multiplication is CIOS (Koc, Acar, Kaliski 1996) with a
-/// branch-free final subtraction; add, subtract and select are branch-free too, so the
-/// running time depends only on `n`, never on operand values.
+/// All modular arithmetic runs on a workspace: one `u32[]` that holds the modulus, the
+/// Montgomery constants, scratch, and numbered caller slots of `n` limbs each. The W
+/// functions take the workspace and limb offsets. Under the 0.5.2 JIT every array argument
+/// of a call costs roughly 40 ns and struct types with array fields are slow to compile,
+/// so this shape keeps both small (see protocols/COMPILER-GAPS.md).
 ///
-/// A context owns scratch storage, so one context must not be used by two threads at once.
+/// Multiplication is CIOS (Koc, Acar, Kaliski 1996) with a branch-free final subtraction;
+/// add, subtract, select and swap are branch-free too, so the running time depends only on
+/// `n`, never on operand values. Slot values are below the modulus; outputs may alias
+/// inputs. A workspace must not be used by two threads at once.
+///
+/// Layout for modulus width n (offsets in limbs):
+///   [0, n)          modulus m
+///   n               -m^-1 mod 2^32
+///   [n+1, 2n+3)     CIOS accumulator (n + 2 limbs)
+///   [2n+3, 3n+3)    add/sub scratch
+///   [3n+3, 4n+3)    R^2 mod m, R = 2^(32n)
+///   [4n+3, 5n+3)    the integer 1
+///   5n+3 + i*n      caller slot i
+use Core.Bytes.Slice;
 use Core.Collections.Array;
 use Core.Results;
 use Crypto.BigNat;
 use Crypto.PkErrors;
-
-pub type Mont {
-    /// The modulus, `n` limbs.
-    pub u32[] m,
-    pub i64 n,
-    /// `-m^-1 mod 2^32`.
-    pub u32 m0inv,
-    /// `R^2 mod m` with `R = 2^(32n)`.
-    pub u32[] rr,
-    /// The integer 1 (not in Montgomery form), used to leave Montgomery form.
-    pub u32[] one,
-    /// CIOS accumulator, `n + 2` limbs.
-    pub u32[] t,
-    /// Scratch for add/sub, `n` limbs.
-    pub u32[] s,
-}
 
 pub u32 Xor(u32 a, u32 b) { return (a | b) - (a & b); }
 
 /// All-ones when `bit` is 1, zero when `bit` is 0.
 pub u32 MaskOf(u32 bit) { return 0_u32 - bit; }
 
-/// Creates a context for an odd modulus `m > 1` of at most `BigNat.MaxLimbs()` limbs.
-/// The context width is the significant limb count of `m`.
-pub Result<Mont, PkError> New(u32[] modulus) {
+pub i64 WRr(i64 n) { return 3_i64 * n + 3_i64; }
+pub i64 WOne(i64 n) { return 4_i64 * n + 3_i64; }
+pub i64 WSlot(i64 n, i64 index) { return 5_i64 * n + 3_i64 + index * n; }
+
+/// A workspace for an odd modulus `m > 1` of at most `BigNat.MaxLimbs()` significant limbs,
+/// with `slots` zeroed caller slots. Its width n is the significant limb count of `m`.
+pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
     u32[] m = BigNat.Normalize(modulus);
-    i64 n = Array.Len<u32>(m);
-    if n > BigNat.MaxLimbs() { return Result::Error(PkError::InvalidModulus()); }
-    if !BigNat.IsOdd(m) { return Result::Error(PkError::InvalidModulus()); }
+    i64 n = BigNat.SignificantLimbs(m);
+    if n > BigNat.MaxLimbs() || !BigNat.IsOdd(m) { return Result::Error(PkError::InvalidModulus()); }
     if n == 1_i64 && m[0] == 1_u32 { return Result::Error(PkError::InvalidModulus()); }
+    u32[] w = BigNat.Zeros(WSlot(n, slots));
+    mut i64 j = 0_i64;
+    while j < n {
+        w[j] = m[j];
+        j = j + 1_i64;
+    }
+    // -m^-1 mod 2^32 by Newton iteration: each step doubles the correct low bits.
     u32 m0 = m[0];
     mut u32 inv = m0;
     mut i64 k = 0_i64;
@@ -48,12 +55,8 @@ pub Result<Mont, PkError> New(u32[] modulus) {
         inv = inv * (2_u32 - m0 * inv);
         k = k + 1_i64;
     }
-    u32[] one = BigNat.Zeros(n);
-    one[0] = 1_u32;
-    Mont c = Mont {
-        m: m, n: n, m0inv: 0_u32 - inv, rr: BigNat.Zeros(n), one: one,
-        t: BigNat.Zeros(n + 2_i64), s: BigNat.Zeros(n),
-    };
+    w[n] = 0_u32 - inv;
+    w[WOne(n)] = 1_u32;
     // R^2 mod m (public modulus: variable time is fine). Write 32n = odd * 2^s. Start from
     // 2^(bits-1) < m and double up to R * 2^odd mod m; each Montgomery squaring then maps
     // R * 2^t to R * 2^2t, so s squarings reach R * 2^(32n) = R^2.
@@ -72,126 +75,156 @@ pub Result<Mont, PkError> New(u32[] modulus) {
         if BigNat.Compare(x, m) >= 0_i64 { BigNat.SubInPlace(x, m); }
         d = d + 1_i64;
     }
-    u32[] rr = c.rr;
-    BigNat.Assign(rr, x);
-    mut i64 k2 = 0_i64;
-    while k2 < squarings {
-        Mul(c, rr, rr, rr);
-        k2 = k2 + 1_i64;
+    i64 rr = WRr(n);
+    j = 0_i64;
+    while j < n {
+        w[rr + j] = x[j];
+        j = j + 1_i64;
     }
-    return Result::Ok(c);
+    k = 0_i64;
+    while k < squarings {
+        WMul(w, n, rr, rr, rr);
+        k = k + 1_i64;
+    }
+    return Result::Ok(w);
 }
 
-/// `out = a * b * R^-1 mod m`.
-pub unit Mul(Mont c, u32[] out, u32[] a, u32[] b) {
-    i64 n = c.n;
-    u32[] t = c.t;
-    u32[] m = c.m;
-    i64 m0inv = i64(c.m0inv);
-    i64 mask = 4294967295_i64;
+/// Copies `src` (n limbs) into slot offset `dst`.
+pub unit WLoad(u32[] w, i64 n, i64 dst, u32[] src) {
     mut i64 j = 0_i64;
-    while j < n + 2_i64 {
-        t[j] = 0_u32;
-        j = j + 1_i64;
-    }
-    mut i64 i = 0_i64;
-    while i < n {
-        i64 bi = i64(b[i]);
-        mut i64 carry = 0_i64;
-        j = 0_i64;
-        while j < n {
-            i64 s = i64(t[j]) + i64(a[j]) * bi + carry;
-            t[j] = u32(s & mask);
-            carry = s >> 32_i64;
-            j = j + 1_i64;
-        }
-        i64 top = i64(t[n]) + carry;
-        t[n] = u32(top & mask);
-        t[n + 1_i64] = u32(top >> 32_i64);
-        i64 q = (i64(t[0]) * m0inv) & mask;
-        i64 first = i64(t[0]) + q * i64(m[0]);
-        carry = first >> 32_i64;
-        j = 1_i64;
-        while j < n {
-            i64 s = i64(t[j]) + q * i64(m[j]) + carry;
-            t[j - 1_i64] = u32(s & mask);
-            carry = s >> 32_i64;
-            j = j + 1_i64;
-        }
-        i64 last = i64(t[n]) + carry;
-        t[n - 1_i64] = u32(last & mask);
-        t[n] = u32((i64(t[n + 1_i64]) + (last >> 32_i64)) & mask);
-        i = i + 1_i64;
-    }
-    // t < 2m: out = t - m unless that borrows.
-    mut i64 borrow = 0_i64;
-    j = 0_i64;
     while j < n {
-        i64 d = i64(t[j]) - i64(m[j]) - borrow;
-        out[j] = u32(d & mask);
-        borrow = (d >> 63_i64) & 1_i64;
-        j = j + 1_i64;
-    }
-    i64 high = i64(t[n]) - borrow;
-    u32 keepT = MaskOf(u32((high >> 63_i64) & 1_i64));
-    j = 0_i64;
-    while j < n {
-        out[j] = (t[j] & keepT) | (out[j] & (4294967295_u32 - keepT));
+        w[dst + j] = src[j];
         j = j + 1_i64;
     }
     return;
 }
 
-pub unit Square(Mont c, u32[] out, u32[] a) { Mul(c, out, a, a); return; }
+/// Copies slot offset `src` into a fresh n-limb array.
+pub u32[] WStore(u32[] w, i64 n, i64 src) {
+    u32[] out = BigNat.Zeros(n);
+    mut i64 j = 0_i64;
+    while j < n {
+        out[j] = w[src + j];
+        j = j + 1_i64;
+    }
+    return out;
+}
 
-/// `out = a * R mod m` (enter Montgomery form); `a` must be below `m`.
-pub unit ToMont(Mont c, u32[] out, u32[] a) { Mul(c, out, a, c.rr); return; }
+pub unit WCopy(u32[] w, i64 n, i64 dst, i64 src) {
+    mut i64 j = 0_i64;
+    while j < n {
+        w[dst + j] = w[src + j];
+        j = j + 1_i64;
+    }
+    return;
+}
 
-/// `out = a * R^-1 mod m` (leave Montgomery form).
-pub unit FromMont(Mont c, u32[] out, u32[] a) { Mul(c, out, a, c.one); return; }
+/// Sets slot `dst` to the small value `v` (plain, not Montgomery form).
+pub unit WSetSmall(u32[] w, i64 n, i64 dst, u32 v) {
+    mut i64 j = 0_i64;
+    while j < n {
+        w[dst + j] = 0_u32;
+        j = j + 1_i64;
+    }
+    w[dst] = v;
+    return;
+}
 
-/// `out = a + b mod m`.
-pub unit Add(Mont c, u32[] out, u32[] a, u32[] b) {
-    i64 n = c.n;
-    u32[] s = c.s;
-    u32[] m = c.m;
+/// `w[out] = w[a] * w[b] * R^-1 mod m` (CIOS, branch-free final subtraction).
+pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
+    i64 t = n + 1_i64;
+    i64 m0inv = i64(w[n]);
+    i64 mask = 4294967295_i64;
+    mut i64 j = 0_i64;
+    while j < n + 2_i64 {
+        w[t + j] = 0_u32;
+        j = j + 1_i64;
+    }
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 bi = i64(w[b + i]);
+        mut i64 carry = 0_i64;
+        j = 0_i64;
+        while j < n {
+            i64 s = i64(w[t + j]) + i64(w[a + j]) * bi + carry;
+            w[t + j] = u32(s & mask);
+            carry = s >> 32_i64;
+            j = j + 1_i64;
+        }
+        i64 top = i64(w[t + n]) + carry;
+        w[t + n] = u32(top & mask);
+        w[t + n + 1_i64] = u32(top >> 32_i64);
+        i64 t0 = i64(w[t]);
+        i64 q = (t0 * m0inv) & mask;
+        carry = (t0 + q * i64(w[0])) >> 32_i64;
+        j = 1_i64;
+        while j < n {
+            i64 s = i64(w[t + j]) + q * i64(w[j]) + carry;
+            w[t + j - 1_i64] = u32(s & mask);
+            carry = s >> 32_i64;
+            j = j + 1_i64;
+        }
+        i64 last = i64(w[t + n]) + carry;
+        w[t + n - 1_i64] = u32(last & mask);
+        w[t + n] = u32((i64(w[t + n + 1_i64]) + (last >> 32_i64)) & mask);
+        i = i + 1_i64;
+    }
+    mut i64 borrow = 0_i64;
+    j = 0_i64;
+    while j < n {
+        i64 d = i64(w[t + j]) - i64(w[j]) - borrow;
+        w[out + j] = u32(d & mask);
+        borrow = (d >> 63_i64) & 1_i64;
+        j = j + 1_i64;
+    }
+    u32 keepT = MaskOf(u32(((i64(w[t + n]) - borrow) >> 63_i64) & 1_i64));
+    u32 keepD = 4294967295_u32 - keepT;
+    j = 0_i64;
+    while j < n {
+        w[out + j] = (w[t + j] & keepT) | (w[out + j] & keepD);
+        j = j + 1_i64;
+    }
+    return;
+}
+
+/// `w[out] = w[a] + w[b] mod m`.
+pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
+    i64 s = 2_i64 * n + 3_i64;
     i64 mask = 4294967295_i64;
     mut i64 carry = 0_i64;
     mut i64 j = 0_i64;
     while j < n {
-        i64 v = i64(a[j]) + i64(b[j]) + carry;
-        s[j] = u32(v & mask);
+        i64 v = i64(w[a + j]) + i64(w[b + j]) + carry;
+        w[s + j] = u32(v & mask);
         carry = v >> 32_i64;
         j = j + 1_i64;
     }
     mut i64 borrow = 0_i64;
     j = 0_i64;
     while j < n {
-        i64 d = i64(s[j]) - i64(m[j]) - borrow;
-        out[j] = u32(d & mask);
+        i64 d = i64(w[s + j]) - i64(w[j]) - borrow;
+        w[out + j] = u32(d & mask);
         borrow = (d >> 63_i64) & 1_i64;
         j = j + 1_i64;
     }
-    i64 high = carry - borrow;
-    u32 keepS = MaskOf(u32((high >> 63_i64) & 1_i64));
+    u32 keepS = MaskOf(u32(((carry - borrow) >> 63_i64) & 1_i64));
+    u32 keepD = 4294967295_u32 - keepS;
     j = 0_i64;
     while j < n {
-        out[j] = (s[j] & keepS) | (out[j] & (4294967295_u32 - keepS));
+        w[out + j] = (w[s + j] & keepS) | (w[out + j] & keepD);
         j = j + 1_i64;
     }
     return;
 }
 
-/// `out = a - b mod m`.
-pub unit Sub(Mont c, u32[] out, u32[] a, u32[] b) {
-    i64 n = c.n;
-    u32[] m = c.m;
+/// `w[out] = w[a] - w[b] mod m`.
+pub unit WSub(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     i64 mask = 4294967295_i64;
     mut i64 borrow = 0_i64;
     mut i64 j = 0_i64;
     while j < n {
-        i64 d = i64(a[j]) - i64(b[j]) - borrow;
-        out[j] = u32(d & mask);
+        i64 d = i64(w[a + j]) - i64(w[b + j]) - borrow;
+        w[out + j] = u32(d & mask);
         borrow = (d >> 63_i64) & 1_i64;
         j = j + 1_i64;
     }
@@ -199,18 +232,101 @@ pub unit Sub(Mont c, u32[] out, u32[] a, u32[] b) {
     mut i64 carry = 0_i64;
     j = 0_i64;
     while j < n {
-        i64 v = i64(out[j]) + i64(m[j] & addM) + carry;
-        out[j] = u32(v & mask);
+        i64 v = i64(w[out + j]) + i64(w[j] & addM) + carry;
+        w[out + j] = u32(v & mask);
         carry = v >> 32_i64;
         j = j + 1_i64;
     }
     return;
 }
 
-/// `out = 0 - a mod m`.
-pub unit Neg(Mont c, u32[] out, u32[] a) {
-    u32[] zero = BigNat.Zeros(c.n);
-    Sub(c, out, zero, a);
+pub unit WToMont(u32[] w, i64 n, i64 out, i64 a) { WMul(w, n, out, a, WRr(n)); return; }
+pub unit WFromMont(u32[] w, i64 n, i64 out, i64 a) { WMul(w, n, out, a, WOne(n)); return; }
+
+/// `w[dst, dst+count) = w[src, src+count)` when `bit` is 1. Branch-free.
+pub unit WCondAssign(u32[] w, i64 count, i64 dst, i64 src, u32 bit) {
+    u32 mask = MaskOf(bit);
+    u32 keep = 4294967295_u32 - mask;
+    mut i64 j = 0_i64;
+    while j < count {
+        w[dst + j] = (w[src + j] & mask) | (w[dst + j] & keep);
+        j = j + 1_i64;
+    }
+    return;
+}
+
+/// Swaps `w[a, a+count)` and `w[b, b+count)` when `bit` is 1. Branch-free.
+pub unit WCondSwap(u32[] w, i64 count, i64 a, i64 b, u32 bit) {
+    u32 mask = MaskOf(bit);
+    mut i64 j = 0_i64;
+    while j < count {
+        u32 x = Xor(w[a + j], w[b + j]) & mask;
+        w[a + j] = Xor(w[a + j], x);
+        w[b + j] = Xor(w[b + j], x);
+        j = j + 1_i64;
+    }
+    return;
+}
+
+/// `w[dst, dst+stride) = entry `index` of the table of `entries` records of `stride` limbs
+/// starting at `table`. Every entry is read with a mask, so the access pattern does not
+/// depend on `index`.
+pub unit WSelect(u32[] w, i64 stride, i64 dst, i64 table, i64 entries, u32 index) {
+    mut i64 e = 0_i64;
+    while e < entries {
+        u32 diff = Xor(u32(e), index);
+        u32 mask = MaskOf(1_u32 - ((diff | (0_u32 - diff)) >> 31_u32));
+        u32 keep = 4294967295_u32 - mask;
+        i64 base = table + e * stride;
+        mut i64 j = 0_i64;
+        while j < stride {
+            w[dst + j] = (w[base + j] & mask) | (w[dst + j] & keep);
+            j = j + 1_i64;
+        }
+        e = e + 1_i64;
+    }
+    return;
+}
+
+/// 1 when `w[a, a+count)` is all zero, else 0. Branch-free.
+pub u32 WIsZeroBit(u32[] w, i64 count, i64 a) {
+    mut u32 acc = 0_u32;
+    mut i64 j = 0_i64;
+    while j < count {
+        acc = acc | w[a + j];
+        j = j + 1_i64;
+    }
+    return 1_u32 - ((acc | (0_u32 - acc)) >> 31_u32);
+}
+
+/// 1 when slots `a` and `b` are equal, else 0. Branch-free.
+pub u32 WEqualBit(u32[] w, i64 n, i64 a, i64 b) {
+    mut u32 acc = 0_u32;
+    mut i64 j = 0_i64;
+    while j < n {
+        acc = acc | Xor(w[a + j], w[b + j]);
+        j = j + 1_i64;
+    }
+    return 1_u32 - ((acc | (0_u32 - acc)) >> 31_u32);
+}
+
+/// `w[out] = w[base]^exp` in Montgomery form for a big-endian public exponent; `acc` is a
+/// scratch slot distinct from `base`. The time depends on `exp`, never on `w[base]`.
+pub unit WPowPublic(u32[] w, i64 n, i64 out, i64 base, i64 acc, u8[] exp) {
+    WToMont(w, n, acc, WOne(n));
+    i64 len = Slice.Len(exp);
+    mut i64 i = 0_i64;
+    while i < len {
+        u8 byte = exp[i];
+        mut i64 bit = 7_i64;
+        while bit >= 0_i64 {
+            WMul(w, n, acc, acc, acc);
+            if ((byte >> u8(bit)) & u8(1)) == u8(1) { WMul(w, n, acc, acc, base); }
+            bit = bit - 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    WCopy(w, n, out, acc);
     return;
 }
 
@@ -278,25 +394,3 @@ pub u32 LessBit(u32[] a, u32[] b) {
     return u32(borrow);
 }
 
-/// `out = base^exp mod m` with `base` and `out` in Montgomery form and `exp` a big-endian
-/// public exponent. Square-and-multiply: the time depends on `exp`, never on `base`.
-pub unit PowPublic(Mont c, u32[] out, u32[] base, u8[] exp) {
-    u32[] acc = BigNat.Zeros(c.n);
-    u32[] b = BigNat.Copy(base);
-    // acc = 1 in Montgomery form = R mod m.
-    ToMont(c, acc, c.one);
-    i64 len = Array.Len<u8>(exp);
-    mut i64 i = 0_i64;
-    while i < len {
-        u8 byte = exp[i];
-        mut i64 bit = 7_i64;
-        while bit >= 0_i64 {
-            Mul(c, acc, acc, acc);
-            if ((byte >> u8(bit)) & u8(1)) == u8(1) { Mul(c, acc, acc, b); }
-            bit = bit - 1_i64;
-        }
-        i = i + 1_i64;
-    }
-    BigNat.Assign(out, acc);
-    return;
-}

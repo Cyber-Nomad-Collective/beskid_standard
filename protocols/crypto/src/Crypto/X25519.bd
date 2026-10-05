@@ -19,7 +19,7 @@ u32[] FieldPrime() {
 
 /// p - 2 big-endian, the Fermat inversion exponent.
 u8[] InverseExponent() {
-    u8[] e = Slice.Fill(Slice.New(32_i64), 0_i64, 32_i64, u8(255));
+    u8[] e = Slice.Fill(BigNat.ZeroBytes(32_i64), 0_i64, 32_i64, u8(255));
     e[0] = u8(127);
     e[31] = u8(235);
     return e;
@@ -39,7 +39,7 @@ u32[] DecodeLittleEndian(u8[] bytes) {
 }
 
 u8[] EncodeLittleEndian(u32[] limbs) {
-    u8[] out = Slice.New(32_i64);
+    u8[] out = BigNat.ZeroBytes(32_i64);
     mut i64 i = 0_i64;
     while i < 32_i64 {
         out[i] = u8((limbs[i / 4_i64] >> u32((i % 4_i64) * 8_i64)) & 255_u32);
@@ -50,7 +50,7 @@ u8[] EncodeLittleEndian(u32[] limbs) {
 
 /// RFC 7748 decodeScalar25519: clear bits 0, 1, 2 and 255, set bit 254.
 u8[] Clamp(u8[] scalar) {
-    u8[] k = Slice.New(32_i64);
+    u8[] k = BigNat.ZeroBytes(32_i64);
     Slice.Copy(k, 0_i64, scalar, 0_i64, 32_i64);
     k[0] = k[0] & u8(248);
     k[31] = (k[31] & u8(127)) | u8(64);
@@ -62,85 +62,78 @@ u8[] Clamp(u8[] scalar) {
 /// The all-zero output is returned as is; key agreement uses `SharedSecret`, which rejects it.
 pub Result<u8[], PkError> ScalarMult(u8[] scalar, u8[] u) {
     if Slice.Len(scalar) != 32_i64 || Slice.Len(u) != 32_i64 { return Result::Error(PkError::InvalidLength()); }
-    Result<Mont, PkError> created = ModArith.New(FieldPrime());
+    Result<u32[], PkError> created = ModArith.NewWorkspace(FieldPrime(), 18_i64);
     return match created {
         Result::Error(error) => Result::Error(error),
-        Result::Ok(c) => Result::Ok(Ladder(c, Clamp(scalar), u)),
+        Result::Ok(w) => Result::Ok(Ladder(w, Clamp(scalar), u)),
     };
 }
 
-u8[] Ladder(Mont c, u8[] k, u8[] u) {
-    u32[] p = FieldPrime();
-    u32[] raw = DecodeLittleEndian(u);
-    // raw < 2^255 < 2p: one branch-free conditional subtraction makes it canonical.
-    u32[] reduced = BigNat.Copy(raw);
-    i64 borrow = BigNat.SubInPlace(reduced, p);
-    ModArith.CondAssign(raw, reduced, 1_u32 - u32(borrow));
+/// Workspace slot offsets (n = 8).
+i64 S(i64 index) { return ModArith.WSlot(8_i64, index); }
 
-    u32[] x1 = BigNat.Zeros(8_i64);
-    ModArith.ToMont(c, x1, raw);
-    u32[] x2 = BigNat.Zeros(8_i64);
-    ModArith.ToMont(c, x2, c.one);
-    u32[] z2 = BigNat.Zeros(8_i64);
-    u32[] x3 = BigNat.Copy(x1);
-    u32[] z3 = BigNat.Copy(x2);
-    u32[] a24 = BigNat.Zeros(8_i64);
-    u32[] a24raw = BigNat.Zeros(8_i64);
-    a24raw[0] = 121665_u32;
-    ModArith.ToMont(c, a24, a24raw);
+u8[] Ladder(u32[] w, u8[] k, u8[] u) {
+    i64 n = 8_i64;
+    i64 x1 = S(0_i64); i64 x2 = S(1_i64); i64 z2 = S(2_i64); i64 x3 = S(3_i64); i64 z3 = S(4_i64);
+    i64 a24 = S(5_i64); i64 a = S(6_i64); i64 aa = S(7_i64); i64 b = S(8_i64); i64 bb = S(9_i64);
+    i64 e = S(10_i64); i64 cc = S(11_i64); i64 d = S(12_i64); i64 da = S(13_i64); i64 cb = S(14_i64);
+    i64 raw = S(15_i64); i64 reduced = S(16_i64); i64 acc = S(17_i64);
+    // raw < 2^255 < 2p: one branch-free conditional subtraction (raw - p) makes it canonical.
+    u32[] limbs = DecodeLittleEndian(u);
+    ModArith.WLoad(w, n, raw, limbs);
+    u32[] minusP = BigNat.Copy(limbs);
+    i64 borrow = BigNat.SubInPlace(minusP, FieldPrime());
+    ModArith.WLoad(w, n, reduced, minusP);
+    ModArith.WCondAssign(w, n, raw, reduced, 1_u32 - u32(borrow));
 
-    u32[] a = BigNat.Zeros(8_i64);
-    u32[] aa = BigNat.Zeros(8_i64);
-    u32[] b = BigNat.Zeros(8_i64);
-    u32[] bb = BigNat.Zeros(8_i64);
-    u32[] e = BigNat.Zeros(8_i64);
-    u32[] cc = BigNat.Zeros(8_i64);
-    u32[] d = BigNat.Zeros(8_i64);
-    u32[] da = BigNat.Zeros(8_i64);
-    u32[] cb = BigNat.Zeros(8_i64);
+    ModArith.WToMont(w, n, x1, raw);
+    ModArith.WToMont(w, n, x2, ModArith.WOne(n));
+    ModArith.WSetSmall(w, n, z2, 0_u32);
+    ModArith.WCopy(w, n, x3, x1);
+    ModArith.WCopy(w, n, z3, x2);
+    ModArith.WSetSmall(w, n, a24, 121665_u32);
+    ModArith.WToMont(w, n, a24, a24);
 
     mut u32 swap = 0_u32;
     mut i64 t = 254_i64;
     while t >= 0_i64 {
         u32 kt = u32((k[t / 8_i64] >> u8(t % 8_i64)) & u8(1));
         swap = ModArith.Xor(swap, kt);
-        ModArith.CondSwap(x2, x3, swap);
-        ModArith.CondSwap(z2, z3, swap);
+        // x2 z2 and x3 z3 are adjacent slots, so one swap of 2n limbs swaps both pairs.
+        ModArith.WCondSwap(w, 2_i64 * n, x2, x3, swap);
         swap = kt;
 
-        ModArith.Add(c, a, x2, z2);
-        ModArith.Mul(c, aa, a, a);
-        ModArith.Sub(c, b, x2, z2);
-        ModArith.Mul(c, bb, b, b);
-        ModArith.Sub(c, e, aa, bb);
-        ModArith.Add(c, cc, x3, z3);
-        ModArith.Sub(c, d, x3, z3);
-        ModArith.Mul(c, da, d, a);
-        ModArith.Mul(c, cb, cc, b);
-        ModArith.Add(c, x3, da, cb);
-        ModArith.Mul(c, x3, x3, x3);
-        ModArith.Sub(c, z3, da, cb);
-        ModArith.Mul(c, z3, z3, z3);
-        ModArith.Mul(c, z3, z3, x1);
-        ModArith.Mul(c, x2, aa, bb);
-        ModArith.Mul(c, z2, a24, e);
-        ModArith.Add(c, z2, z2, aa);
-        ModArith.Mul(c, z2, z2, e);
+        ModArith.WAdd(w, n, a, x2, z2);
+        ModArith.WMul(w, n, aa, a, a);
+        ModArith.WSub(w, n, b, x2, z2);
+        ModArith.WMul(w, n, bb, b, b);
+        ModArith.WSub(w, n, e, aa, bb);
+        ModArith.WAdd(w, n, cc, x3, z3);
+        ModArith.WSub(w, n, d, x3, z3);
+        ModArith.WMul(w, n, da, d, a);
+        ModArith.WMul(w, n, cb, cc, b);
+        ModArith.WAdd(w, n, x3, da, cb);
+        ModArith.WMul(w, n, x3, x3, x3);
+        ModArith.WSub(w, n, z3, da, cb);
+        ModArith.WMul(w, n, z3, z3, z3);
+        ModArith.WMul(w, n, z3, z3, x1);
+        ModArith.WMul(w, n, x2, aa, bb);
+        ModArith.WMul(w, n, z2, a24, e);
+        ModArith.WAdd(w, n, z2, z2, aa);
+        ModArith.WMul(w, n, z2, z2, e);
         t = t - 1_i64;
     }
-    ModArith.CondSwap(x2, x3, swap);
-    ModArith.CondSwap(z2, z3, swap);
+    ModArith.WCondSwap(w, 2_i64 * n, x2, x3, swap);
 
-    u32[] inv = BigNat.Zeros(8_i64);
-    ModArith.PowPublic(c, inv, z2, InverseExponent());
-    ModArith.Mul(c, x2, x2, inv);
-    ModArith.FromMont(c, x2, x2);
-    return EncodeLittleEndian(x2);
+    ModArith.WPowPublic(w, n, z2, z2, acc, InverseExponent());
+    ModArith.WMul(w, n, x2, x2, z2);
+    ModArith.WFromMont(w, n, x2, x2);
+    return EncodeLittleEndian(ModArith.WStore(w, n, x2));
 }
 
 /// The X25519 public key for a 32-byte private key: `ScalarMult(privateKey, 9)`.
 pub Result<u8[], PkError> PublicKey(u8[] privateKey) {
-    u8[] basePoint = Slice.New(32_i64);
+    u8[] basePoint = BigNat.ZeroBytes(32_i64);
     basePoint[0] = u8(9);
     return ScalarMult(privateKey, basePoint);
 }

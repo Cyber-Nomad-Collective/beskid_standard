@@ -1,0 +1,170 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.Errors;
+
+/// Poly1305 (RFC 8439 section 2.5) with five 26-bit limbs held in i64.
+/// Limb products stay below 2^58, so no i64 overflow; the arithmetic has no
+/// data-dependent branches or lookups.
+/// `r` holds r0..r4 then 5*r1..5*r4, `h` the accumulator, `pad` the four s words,
+/// `meta[0]` buffered bytes, `meta[1]` 1 after `Finish`.
+pub type Poly1305State {
+    i64[] r,
+    i64[] h,
+    i64[] pad,
+    u8[] buffer,
+    i64[] meta,
+}
+
+i64 Le32(u8[] data, i64 offset) {
+    return i64(data[offset]) | (i64(data[offset + 1_i64]) << 8_i64) | (i64(data[offset + 2_i64]) << 16_i64) | (i64(data[offset + 3_i64]) << 24_i64);
+}
+
+/// Starts a one-time authenticator from a 32-byte key (r || s).
+pub Result<Poly1305State, CryptoError> New(u8[] key) {
+    if Slice.Len(key) != 32_i64 { return Result::Error(CryptoError::InvalidKeyLength()); }
+    i64 r0 = Le32(key, 0_i64) & 0x3ffffff_i64;
+    i64 r1 = (Le32(key, 3_i64) >> 2_i64) & 0x3ffff03_i64;
+    i64 r2 = (Le32(key, 6_i64) >> 4_i64) & 0x3ffc0ff_i64;
+    i64 r3 = (Le32(key, 9_i64) >> 6_i64) & 0x3f03fff_i64;
+    i64 r4 = (Le32(key, 12_i64) >> 8_i64) & 0x00fffff_i64;
+    return Result::Ok(Poly1305State {
+        r: [r0, r1, r2, r3, r4, r1 * 5_i64, r2 * 5_i64, r3 * 5_i64, r4 * 5_i64],
+        h: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
+        pad: [Le32(key, 16_i64), Le32(key, 20_i64), Le32(key, 24_i64), Le32(key, 28_i64)],
+        buffer: Slice.New(16_i64),
+        meta: [0_i64, 0_i64],
+    });
+}
+
+/// Absorbs one 16-byte block at `offset`; `hibit` is 2^24 for full blocks, 0 for the padded final block.
+unit Block(Poly1305State state, u8[] m, i64 offset, i64 hibit) {
+    i64 mask = 0x3ffffff_i64;
+    i64[] r = state.r;
+    i64[] h = state.h;
+    i64 t0 = Le32(m, offset);
+    i64 t1 = Le32(m, offset + 4_i64);
+    i64 t2 = Le32(m, offset + 8_i64);
+    i64 t3 = Le32(m, offset + 12_i64);
+    i64 h0 = h[0] + (t0 & mask);
+    i64 h1 = h[1] + (((t0 >> 26_i64) | (t1 << 6_i64)) & mask);
+    i64 h2 = h[2] + (((t1 >> 20_i64) | (t2 << 12_i64)) & mask);
+    i64 h3 = h[3] + (((t2 >> 14_i64) | (t3 << 18_i64)) & mask);
+    i64 h4 = h[4] + ((t3 >> 8_i64) | hibit);
+    i64 r0 = r[0]; i64 r1 = r[1]; i64 r2 = r[2]; i64 r3 = r[3]; i64 r4 = r[4];
+    i64 s1 = r[5]; i64 s2 = r[6]; i64 s3 = r[7]; i64 s4 = r[8];
+    mut i64 d0 = h0 * r0 + h1 * s4 + h2 * s3 + h3 * s2 + h4 * s1;
+    mut i64 d1 = h0 * r1 + h1 * r0 + h2 * s4 + h3 * s3 + h4 * s2;
+    mut i64 d2 = h0 * r2 + h1 * r1 + h2 * r0 + h3 * s4 + h4 * s3;
+    mut i64 d3 = h0 * r3 + h1 * r2 + h2 * r1 + h3 * r0 + h4 * s4;
+    mut i64 d4 = h0 * r4 + h1 * r3 + h2 * r2 + h3 * r1 + h4 * r0;
+    d1 = d1 + (d0 >> 26_i64); d0 = d0 & mask;
+    d2 = d2 + (d1 >> 26_i64); d1 = d1 & mask;
+    d3 = d3 + (d2 >> 26_i64); d2 = d2 & mask;
+    d4 = d4 + (d3 >> 26_i64); d3 = d3 & mask;
+    d0 = d0 + (d4 >> 26_i64) * 5_i64; d4 = d4 & mask;
+    d1 = d1 + (d0 >> 26_i64); d0 = d0 & mask;
+    h[0] = d0; h[1] = d1; h[2] = d2; h[3] = d3; h[4] = d4;
+    return;
+}
+
+/// Absorbs `count` bytes of `data` at `offset`. Returns false for an invalid range or a finished state.
+pub bool UpdateRange(Poly1305State state, u8[] data, i64 offset, i64 count) {
+    if state.meta[1] != 0_i64 { return false; }
+    if !Slice.IsValidRange(Slice.Len(data), offset, count) { return false; }
+    mut i64 pos = offset;
+    i64 end = offset + count;
+    mut i64 buffered = state.meta[0];
+    if buffered > 0_i64 {
+        while buffered < 16_i64 && pos < end { state.buffer[buffered] = data[pos]; buffered = buffered + 1_i64; pos = pos + 1_i64; }
+        if buffered < 16_i64 { state.meta[0] = buffered; return true; }
+        Block(state, state.buffer, 0_i64, 16777216_i64);
+        buffered = 0_i64;
+    }
+    while end - pos >= 16_i64 { Block(state, data, pos, 16777216_i64); pos = pos + 16_i64; }
+    while pos < end { state.buffer[buffered] = data[pos]; buffered = buffered + 1_i64; pos = pos + 1_i64; }
+    state.meta[0] = buffered;
+    return true;
+}
+
+pub bool Update(Poly1305State state, u8[] data) {
+    return UpdateRange(state, data, 0_i64, Slice.Len(data));
+}
+
+/// Zero-pads the buffered input to a 16-byte boundary (the AEAD pad16 construction).
+pub unit PadToBlock(Poly1305State state) {
+    mut i64 buffered = state.meta[0];
+    if buffered == 0_i64 || state.meta[1] != 0_i64 { return; }
+    while buffered < 16_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
+    Block(state, state.buffer, 0_i64, 16777216_i64);
+    state.meta[0] = 0_i64;
+    return;
+}
+
+/// Returns the 16-byte tag.
+pub u8[] Finish(Poly1305State state) {
+    u8[] tag = Slice.New(16_i64);
+    if state.meta[1] != 0_i64 { return tag; }
+    mut i64 buffered = state.meta[0];
+    if buffered > 0_i64 {
+        state.buffer[buffered] = 1_u8;
+        buffered = buffered + 1_i64;
+        while buffered < 16_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
+        Block(state, state.buffer, 0_i64, 0_i64);
+    }
+    state.meta[1] = 1_i64;
+    i64 mask = 0x3ffffff_i64;
+    i64[] h = state.h;
+    mut i64 h0 = h[0]; mut i64 h1 = h[1]; mut i64 h2 = h[2]; mut i64 h3 = h[3]; mut i64 h4 = h[4];
+    h2 = h2 + (h1 >> 26_i64); h1 = h1 & mask;
+    h3 = h3 + (h2 >> 26_i64); h2 = h2 & mask;
+    h4 = h4 + (h3 >> 26_i64); h3 = h3 & mask;
+    h0 = h0 + (h4 >> 26_i64) * 5_i64; h4 = h4 & mask;
+    h1 = h1 + (h0 >> 26_i64); h0 = h0 & mask;
+    // g = h + 5 - 2^130; select g when it did not borrow (h >= p).
+    mut i64 g0 = h0 + 5_i64;
+    mut i64 g1 = h1 + (g0 >> 26_i64); g0 = g0 & mask;
+    mut i64 g2 = h2 + (g1 >> 26_i64); g1 = g1 & mask;
+    mut i64 g3 = h3 + (g2 >> 26_i64); g2 = g2 & mask;
+    mut i64 g4 = h4 + (g3 >> 26_i64) - 67108864_i64; g3 = g3 & mask;
+    // Logical shift: 1 when g4 is negative (borrow), so select = 0 keeps h; else all ones selects g.
+    i64 select = (g4 >> 63_i64) - 1_i64;
+    i64 keep = -1_i64 - select;
+    h0 = (h0 & keep) | (g0 & select);
+    h1 = (h1 & keep) | (g1 & select);
+    h2 = (h2 & keep) | (g2 & select);
+    h3 = (h3 & keep) | (g3 & select);
+    h4 = (h4 & keep) | (g4 & select);
+    i64 w32 = 0xffffffff_i64;
+    i64 w0 = (h0 | (h1 << 26_i64)) & w32;
+    i64 w1 = ((h1 >> 6_i64) | (h2 << 20_i64)) & w32;
+    i64 w2 = ((h2 >> 12_i64) | (h3 << 14_i64)) & w32;
+    i64 w3 = ((h3 >> 18_i64) | (h4 << 8_i64)) & w32;
+    mut i64 f = w0 + state.pad[0];
+    WriteLe32(tag, 0_i64, f);
+    f = w1 + state.pad[1] + (f >> 32_i64);
+    WriteLe32(tag, 4_i64, f);
+    f = w2 + state.pad[2] + (f >> 32_i64);
+    WriteLe32(tag, 8_i64, f);
+    f = w3 + state.pad[3] + (f >> 32_i64);
+    WriteLe32(tag, 12_i64, f);
+    return tag;
+}
+
+unit WriteLe32(u8[] out, i64 offset, i64 value) {
+    out[offset] = u8(value & 0xFF_i64);
+    out[offset + 1_i64] = u8((value >> 8_i64) & 0xFF_i64);
+    out[offset + 2_i64] = u8((value >> 16_i64) & 0xFF_i64);
+    out[offset + 3_i64] = u8((value >> 24_i64) & 0xFF_i64);
+    return;
+}
+
+/// One-shot Poly1305 tag of `message` under a 32-byte one-time key.
+pub Result<u8[], CryptoError> Mac(u8[] key, u8[] message) {
+    return match New(key) {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(state) => {
+            Update(state, message);
+            return Result::Ok(Finish(state));
+        },
+    };
+}

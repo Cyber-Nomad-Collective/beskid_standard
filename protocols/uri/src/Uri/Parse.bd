@@ -1,0 +1,208 @@
+use Core.Results;
+use Core.String;
+use Uri.Chars;
+use Uri.Errors;
+use Uri.Host;
+use Uri.Types;
+
+// RFC 3986 URI-reference parser. Strict and fail-closed: every byte of every component
+// is checked, percent escapes are validated, hosts are classified, ports are range checked.
+
+/// Default input bound for Parse and ParseReference.
+pub i64 DefaultMaxLength() { return 65536_i64; }
+
+type AuthorityParts {
+    bool hasUserinfo,
+    string userinfo,
+    string hostName,
+    bool hasPort,
+    i64 port,
+}
+
+bool AllBytes(string text, i64 start, i64 stop, i64 kind) {
+    // kind 0: userinfo chars, 1: pchar or "/", 2: pchar or "/" or "?" (query, fragment)
+    mut i64 i = start;
+    while i < stop {
+        i64 c = Chars.B(text, i);
+        mut bool ok = false;
+        if c == 37_i64 { ok = true; }
+        if Chars.IsUnreserved(c) || Chars.IsSubDelim(c) { ok = true; }
+        if kind == 0_i64 && c == 58_i64 { ok = true; }
+        if kind >= 1_i64 && (c == 58_i64 || c == 64_i64 || c == 47_i64) { ok = true; }
+        if kind == 2_i64 && c == 63_i64 { ok = true; }
+        if !ok { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+Result<i64, UriError> ParsePort(string text, i64 start, i64 stop) {
+    if start >= stop { return Result::Ok(-1_i64); }
+    mut i64 value = 0_i64;
+    mut i64 i = start;
+    while i < stop {
+        i64 c = Chars.B(text, i);
+        if !Chars.IsDigit(c) { return Result::Error(UriError::InvalidPort()); }
+        value = value * 10_i64 + (c - 48_i64);
+        if value > 65535_i64 { return Result::Error(UriError::PortOutOfRange()); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(value);
+}
+
+Result<AuthorityParts, UriError> ParseAuthority(string text, i64 start, i64 stop, bool allowFuture) {
+    mut bool hasUserinfo = false;
+    mut string userinfo = "";
+    mut i64 hostStart = start;
+    i64 at = Chars.IndexOf(text, 64_i64, start, stop);
+    if at >= 0_i64 {
+        if !AllBytes(text, start, at, 0_i64) { return Result::Error(UriError::InvalidUserinfo()); }
+        hasUserinfo = true;
+        userinfo = Chars.Sub(text, start, at);
+        hostStart = at + 1_i64;
+    }
+    mut string hostName = "";
+    mut i64 portStart = stop;
+    mut i64 portStop = stop;
+    mut bool hasPort = false;
+    if hostStart < stop && Chars.B(text, hostStart) == 91_i64 {
+        i64 close = Chars.IndexOf(text, 93_i64, hostStart, stop);
+        if close < 0_i64 { return Result::Error(UriError::InvalidHost()); }
+        string inner = Chars.Sub(text, hostStart + 1_i64, close);
+        mut i64 first = 0_i64;
+        if String.Len(inner) > 0_i64 { first = Chars.B(inner, 0_i64); }
+        if first == 118_i64 || first == 86_i64 {
+            if !allowFuture { return Result::Error(UriError::IpvFutureNotAllowed()); }
+            if !Host.IsIpvFuture(inner) { return Result::Error(UriError::InvalidHost()); }
+        } else {
+            if !Host.IsIpv6(inner) { return Result::Error(UriError::InvalidIpv6()); }
+        }
+        hostName = Chars.Sub(text, hostStart, close + 1_i64);
+        if close + 1_i64 < stop {
+            if Chars.B(text, close + 1_i64) != 58_i64 { return Result::Error(UriError::InvalidAuthority()); }
+            hasPort = true;
+            portStart = close + 2_i64;
+        }
+    } else {
+        i64 colon = Chars.LastIndexOf(text, 58_i64, hostStart, stop);
+        mut i64 hostStop = stop;
+        if colon >= 0_i64 {
+            hostStop = colon;
+            hasPort = true;
+            portStart = colon + 1_i64;
+        }
+        mut i64 i = hostStart;
+        while i < hostStop {
+            if !Host.IsRegNameByte(Chars.B(text, i)) { return Result::Error(UriError::InvalidHost()); }
+            i = i + 1_i64;
+        }
+        hostName = Chars.Sub(text, hostStart, hostStop);
+        if Host.LooksNumeric(hostName) && !Host.IsIpv4(hostName) { return Result::Error(UriError::InvalidIpv4()); }
+    }
+    mut i64 port = -1_i64;
+    if hasPort {
+        Result<i64, UriError> parsed = ParsePort(text, portStart, portStop);
+        match parsed {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(p) => { port = p; },
+        };
+    }
+    return Result::Ok(AuthorityParts { hasUserinfo: hasUserinfo, userinfo: userinfo, hostName: hostName, hasPort: hasPort, port: port });
+}
+
+bool ValidScheme(string text, i64 start, i64 stop) {
+    if stop <= start { return false; }
+    if !Chars.IsAlpha(Chars.B(text, start)) { return false; }
+    mut i64 i = start + 1_i64;
+    while i < stop {
+        i64 c = Chars.B(text, i);
+        if !(Chars.IsAlpha(c) || Chars.IsDigit(c) || c == 43_i64 || c == 45_i64 || c == 46_i64) { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+/// Parses a URI reference with explicit options. `requireScheme` makes it an absolute-URI parse.
+pub Result<UriRef, UriError> ParseWith(string text, i64 maxLength, bool allowIpvFuture, bool requireScheme) {
+    i64 n = String.Len(text);
+    if n > maxLength { return Result::Error(UriError::TooLong()); }
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 c = Chars.B(text, i);
+        if !Chars.IsUriByte(c) { return Result::Error(UriError::InvalidCharacter(i)); }
+        if c == 37_i64 {
+            if i + 2_i64 >= n || !Chars.IsHex(Chars.B(text, i + 1_i64)) || !Chars.IsHex(Chars.B(text, i + 2_i64)) {
+                return Result::Error(UriError::InvalidPercentEncoding(i));
+            }
+        }
+        i = i + 1_i64;
+    }
+    mut bool hasScheme = false;
+    mut string scheme = "";
+    mut i64 rest = 0_i64;
+    mut i64 k = 0_i64;
+    while k < n {
+        i64 c = Chars.B(text, k);
+        if c == 58_i64 || c == 47_i64 || c == 63_i64 || c == 35_i64 { break; }
+        k = k + 1_i64;
+    }
+    if k < n && Chars.B(text, k) == 58_i64 {
+        if !ValidScheme(text, 0_i64, k) { return Result::Error(UriError::InvalidScheme()); }
+        hasScheme = true;
+        scheme = Chars.Sub(text, 0_i64, k);
+        rest = k + 1_i64;
+    }
+    if requireScheme && !hasScheme { return Result::Error(UriError::NotAbsolute()); }
+    mut i64 hierStop = n;
+    mut bool hasFragment = false;
+    mut string fragment = "";
+    i64 hash = Chars.IndexOf(text, 35_i64, rest, n);
+    if hash >= 0_i64 {
+        hasFragment = true;
+        hierStop = hash;
+        if !AllBytes(text, hash + 1_i64, n, 2_i64) { return Result::Error(UriError::InvalidFragment()); }
+        fragment = Chars.Sub(text, hash + 1_i64, n);
+    }
+    mut bool hasQuery = false;
+    mut string query = "";
+    mut i64 pathStop = hierStop;
+    i64 qmark = Chars.IndexOf(text, 63_i64, rest, hierStop);
+    if qmark >= 0_i64 {
+        hasQuery = true;
+        pathStop = qmark;
+        if !AllBytes(text, qmark + 1_i64, hierStop, 2_i64) { return Result::Error(UriError::InvalidQuery()); }
+        query = Chars.Sub(text, qmark + 1_i64, hierStop);
+    }
+    mut bool hasAuthority = false;
+    mut AuthorityParts parts = AuthorityParts { hasUserinfo: false, userinfo: "", hostName: "", hasPort: false, port: -1_i64 };
+    mut i64 pathStart = rest;
+    if Chars.StartsAt(text, rest, "//") && rest + 2_i64 <= pathStop {
+        mut i64 authorityStop = Chars.IndexOf(text, 47_i64, rest + 2_i64, pathStop);
+        if authorityStop < 0_i64 { authorityStop = pathStop; }
+        Result<AuthorityParts, UriError> parsed = ParseAuthority(text, rest + 2_i64, authorityStop, allowIpvFuture);
+        match parsed {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(p) => { parts = p; },
+        };
+        hasAuthority = true;
+        pathStart = authorityStop;
+    }
+    if !AllBytes(text, pathStart, pathStop, 1_i64) { return Result::Error(UriError::InvalidPath()); }
+    string path = Chars.Sub(text, pathStart, pathStop);
+    return Result::Ok(UriRef {
+        hasScheme: hasScheme, scheme: scheme,
+        hasAuthority: hasAuthority, hasUserinfo: parts.hasUserinfo, userinfo: parts.userinfo,
+        hostName: parts.hostName, hasPort: parts.hasPort, port: parts.port,
+        path: path, hasQuery: hasQuery, query: query, hasFragment: hasFragment, fragment: fragment,
+    });
+}
+
+/// Parses a URI-reference (absolute or relative).
+pub Result<UriRef, UriError> ParseReference(string text) {
+    return ParseWith(text, 65536_i64, false, false);
+}
+
+/// Parses an absolute URI: the scheme is required.
+pub Result<UriRef, UriError> Parse(string text) {
+    return ParseWith(text, 65536_i64, false, true);
+}

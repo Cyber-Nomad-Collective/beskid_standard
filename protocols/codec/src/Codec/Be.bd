@@ -1,0 +1,59 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Codec.Errors;
+
+/// Reads `width` (1..8) big-endian bytes at `offset`.
+pub Result<i64, CodecError> ReadUint(u8[] buf, i64 offset, i64 width) {
+    if width < 1_i64 || width > 8_i64 { return Result::Error(CodecError::InvalidValue()); }
+    if !Slice.IsValidRange(Slice.Len(buf), offset, width) { return Result::Error(CodecError::Truncated()); }
+    mut i64 acc = 0_i64;
+    mut i64 i = 0_i64;
+    while i < width {
+        acc = (acc << 8_i64) | i64(buf[offset + i]);
+        i = i + 1_i64;
+    }
+    return Result::Ok(acc);
+}
+
+/// Writes `value` as `width` (1..8) big-endian bytes at `offset`. For width < 8 the
+/// value must be in 0 .. 2^(8*width)-1, otherwise Overflow.
+pub Result<unit, CodecError> WriteUint(u8[] buf, i64 offset, i64 width, i64 value) {
+    if width < 1_i64 || width > 8_i64 { return Result::Error(CodecError::InvalidValue()); }
+    if !Slice.IsValidRange(Slice.Len(buf), offset, width) { return Result::Error(CodecError::Truncated()); }
+    if width < 8_i64 {
+        i64 limit = 1_i64 << (8_i64 * width);
+        if value < 0_i64 || value >= limit { return Result::Error(CodecError::Overflow()); }
+    }
+    mut i64 i = 0_i64;
+    while i < width {
+        i64 shift = 8_i64 * (width - 1_i64 - i);
+        buf[offset + i] = u8((value >> shift) & 255_i64);
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+/// Encodes `value` into a fresh array of `width` bytes.
+pub Result<u8[], CodecError> Encode(i64 width, i64 value) {
+    if width < 1_i64 || width > 8_i64 { return Result::Error(CodecError::InvalidValue()); }
+    u8[] out = Slice.New(width);
+    Result<unit, CodecError> written = WriteUint(out, 0_i64, width, value);
+    return match written {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(_) => Result::Ok(out),
+    };
+}
+
+pub Result<i64, CodecError> ReadU8(u8[] buf, i64 offset) { return ReadUint(buf, offset, 1_i64); }
+pub Result<i64, CodecError> ReadU16(u8[] buf, i64 offset) { return ReadUint(buf, offset, 2_i64); }
+pub Result<i64, CodecError> ReadU24(u8[] buf, i64 offset) { return ReadUint(buf, offset, 3_i64); }
+pub Result<i64, CodecError> ReadU32(u8[] buf, i64 offset) { return ReadUint(buf, offset, 4_i64); }
+pub Result<i64, CodecError> ReadU48(u8[] buf, i64 offset) { return ReadUint(buf, offset, 6_i64); }
+pub Result<i64, CodecError> ReadU64(u8[] buf, i64 offset) { return ReadUint(buf, offset, 8_i64); }
+
+pub Result<unit, CodecError> WriteU8(u8[] buf, i64 offset, i64 value) { return WriteUint(buf, offset, 1_i64, value); }
+pub Result<unit, CodecError> WriteU16(u8[] buf, i64 offset, i64 value) { return WriteUint(buf, offset, 2_i64, value); }
+pub Result<unit, CodecError> WriteU24(u8[] buf, i64 offset, i64 value) { return WriteUint(buf, offset, 3_i64, value); }
+pub Result<unit, CodecError> WriteU32(u8[] buf, i64 offset, i64 value) { return WriteUint(buf, offset, 4_i64, value); }
+pub Result<unit, CodecError> WriteU48(u8[] buf, i64 offset, i64 value) { return WriteUint(buf, offset, 6_i64, value); }
+pub Result<unit, CodecError> WriteU64(u8[] buf, i64 offset, i64 value) { return WriteUint(buf, offset, 8_i64, value); }

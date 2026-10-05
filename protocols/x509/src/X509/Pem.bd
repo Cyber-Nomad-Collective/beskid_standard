@@ -1,0 +1,127 @@
+/// PEM (RFC 7468) decoding of CERTIFICATE blocks.
+///
+/// Text outside the blocks is ignored, and so are blocks with other labels. Inside a
+/// CERTIFICATE block only Base64 characters and whitespace may appear; the padding must
+/// be canonical. Decoding is incremental (`Next`) so a large bundle such as
+/// /etc/ssl/cert.pem is handled one certificate at a time.
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.String;
+use Core.Results;
+use X509.Der;
+use X509.X509Errors;
+
+pub string BeginCertificate() { return "-----BEGIN CERTIFICATE-----"; }
+pub string EndCertificate() { return "-----END CERTIFICATE-----"; }
+
+/// One step of a PEM scan. `found` is false when no further block exists; then `error`
+/// is None at a clean end of input. `next` is where the following scan starts.
+pub type PemStep {
+    pub bool found,
+    pub u8[] der,
+    pub X509Error error,
+    pub i64 next,
+}
+
+/// A decoded certificate block.
+pub type DerBlob { pub u8[] der, }
+
+PemStep Stop(X509Error error, i64 next) {
+    return PemStep { found: false, der: Slice.New(0_i64), error: error, next: next };
+}
+
+bool IsSpace(u8 c) { return c == 32_u8 || c == 9_u8 || c == 10_u8 || c == 13_u8; }
+
+i64 Value(u8 c) {
+    if c >= 65_u8 && c <= 90_u8 { return i64(c - 65_u8); }
+    if c >= 97_u8 && c <= 122_u8 { return i64(c - 97_u8) + 26_i64; }
+    if c >= 48_u8 && c <= 57_u8 { return i64(c - 48_u8) + 52_i64; }
+    if c == 43_u8 { return 62_i64; }
+    if c == 47_u8 { return 63_i64; }
+    if c == 61_u8 { return 64_i64; }
+    return -1_i64;
+}
+
+/// Decodes the next CERTIFICATE block at or after `from`.
+pub PemStep Next(string text, i64 from) {
+    i64 begin = String.IndexOfFrom(text, from, BeginCertificate());
+    if begin < 0_i64 { return Stop(X509Error::None, String.Len(text)); }
+    i64 bodyStart = begin + String.Len(BeginCertificate());
+    i64 end = String.IndexOfFrom(text, bodyStart, EndCertificate());
+    if end < 0_i64 { return Stop(X509Error::BadPem, String.Len(text)); }
+    i64 next = end + String.Len(EndCertificate());
+    // The armor line must end right after the label.
+    if bodyStart < end && !IsSpace(String.ByteAt(text, bodyStart)) { return Stop(X509Error::BadPem, next); }
+    // First pass: validate characters and count the Base64 symbols.
+    mut i64 symbols = 0_i64;
+    mut i64 pad = 0_i64;
+    mut i64 i = bodyStart;
+    while i < end {
+        u8 c = String.ByteAt(text, i);
+        if !IsSpace(c) {
+            i64 v = Value(c);
+            if v < 0_i64 { return Stop(X509Error::BadPem, next); }
+            if v == 64_i64 { pad = pad + 1_i64; }
+            else if pad > 0_i64 { return Stop(X509Error::BadPem, next); }
+            symbols = symbols + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    if symbols == 0_i64 || symbols % 4_i64 != 0_i64 || pad > 2_i64 { return Stop(X509Error::BadPem, next); }
+    i64 size = symbols / 4_i64 * 3_i64 - pad;
+    if size > Der.MaxObjectSize() { return Stop(X509Error::TooLarge, next); }
+    u8[] out = Slice.New(size);
+    mut i64 o = 0_i64;
+    mut i64 acc = 0_i64;
+    mut i64 n = 0_i64;
+    mut i64 seen = 0_i64;
+    i = bodyStart;
+    while i < end {
+        u8 c = String.ByteAt(text, i);
+        if !IsSpace(c) {
+            mut i64 v = Value(c);
+            seen = seen + 1_i64;
+            if v == 64_i64 { v = 0_i64; }
+            acc = acc * 64_i64 + v;
+            n = n + 1_i64;
+            if n == 4_i64 {
+                bool last = seen == symbols;
+                i64 b0 = (acc >> 16_i64) & 255_i64;
+                i64 b1 = (acc >> 8_i64) & 255_i64;
+                i64 b2 = acc & 255_i64;
+                out[o] = u8(b0);
+                o = o + 1_i64;
+                if !last || pad < 2_i64 { out[o] = u8(b1); o = o + 1_i64; }
+                else if b1 != 0_i64 { return Stop(X509Error::BadPem, next); }
+                if !last || pad < 1_i64 { out[o] = u8(b2); o = o + 1_i64; }
+                else if b2 != 0_i64 { return Stop(X509Error::BadPem, next); }
+                acc = 0_i64;
+                n = 0_i64;
+            }
+        }
+        i = i + 1_i64;
+    }
+    return PemStep { found: true, der: out, error: X509Error::None, next: next };
+}
+
+/// Decodes every CERTIFICATE block. Fails with BadPem when there is none or when any
+/// block is malformed.
+pub Result<DerBlob[], X509Error> DecodeAll(string text) {
+    mut DerBlob[] blobs = Array.Empty<DerBlob>();
+    mut i64 pos = 0_i64;
+    mut bool more = true;
+    while more {
+        PemStep step = Next(text, pos);
+        if step.found {
+            Array.Append<DerBlob>(blobs, DerBlob { der: step.der });
+            pos = step.next;
+        } else {
+            X509Error error = step.error;
+            bool clean = match error { X509Error::None => true, _ => false, };
+            if !clean { return Result::Error(error); }
+            more = false;
+        }
+    }
+    if Array.Len<DerBlob>(blobs) == 0_i64 { return Result::Error(X509Error::BadPem); }
+    return Result::Ok(blobs);
+}

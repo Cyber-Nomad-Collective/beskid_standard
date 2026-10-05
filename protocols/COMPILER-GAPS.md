@@ -332,3 +332,31 @@ without double or trailing underscores, and must be unique per target.
   on a generated, fully unrolled 8-limb Montgomery multiply (~230 statements, ~45 `i64`
   locals, no loops) taking `(u32[] w, i64 out, i64 a, i64 b)`. Codegen time per test also rose by ~5 s.
 - Workaround: keep the looped `ModArith.WMul`; the unrolled variant was dropped.
+
+## 2026-10-05, x509 slice
+
+### X1. Match on an indexed field path is an ICE
+- Symptom: `no ISLE lowering rule or fact for MatchExpression`.
+- Repro: `bool isB = match s.list[0].kind { Kind::B() => true, _ => false, };`
+- Workaround: bind locals first (`Holder h0 = s.list[0]; Kind k0 = h0.kind; match k0 { ... }`).
+
+### X2. No nested array types
+- Symptom: parse error `expected Identifier` on `u8[][] items`.
+- Workaround: wrap the inner array in a struct (`pub type IpBytes { pub u8[] bytes, }`) and use `IpBytes[]`.
+
+### X3. Appending to a `mut T[]` parameter is rejected (by design, but easy to hit)
+- Symptom: semantic error "the grown handle of a `mut T[]` parameter is discarded and the body
+  never publishes the parameter"; without `mut` the call compiles but the caller never sees the
+  growth.
+- Workaround: build the list in the function that owns it and return it in a small struct
+  (`Subtrees`, `AltNames` in `X509/Certificate.bd`).
+
+### X4. Compile cost of early `return <struct>` and enum construction
+- Symptom: codegen per test is dominated by reachable library code. Measured on a loaded host:
+  a 60-line DER header reader with 14 `{ Fail(p, X509Error::X); return Empty(limit); }` exits
+  took ~4.0 s of "Generate CLIF"; the same reader with one failure exit and `i64` error codes
+  took ~0.7 s. An enum variant construction costs ~30 ms, a struct-valued early return ~60 ms.
+  Certificate parsing still costs 30-50 s and a full chain validation (parsing, RSA, ECDSA,
+  path checks) 75-85 s of codegen per test, so x509 targets keep one heavy test each.
+- Workaround: single-exit functions, sticky `i64` error codes inside the parser
+  (`Der.Fail(p, code)`, mapped to `X509Error` once at the API boundary), few tests per target.

@@ -1,0 +1,198 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+
+// RFC 7541 Appendix B Huffman code. The code is canonical: symbols sorted by
+// (code length, symbol) receive consecutive codes, so decoding walks one bit
+// at a time and checks the per-length code window.
+
+/// Appendix B codes, indexed by symbol 0..256 (256 is EOS), right-aligned.
+u32[] Codes() {
+    return [
+        0x1ff8_u32, 0x7fffd8_u32, 0xfffffe2_u32, 0xfffffe3_u32, 0xfffffe4_u32, 0xfffffe5_u32, 0xfffffe6_u32, 0xfffffe7_u32,
+        0xfffffe8_u32, 0xffffea_u32, 0x3ffffffc_u32, 0xfffffe9_u32, 0xfffffea_u32, 0x3ffffffd_u32, 0xfffffeb_u32, 0xfffffec_u32,
+        0xfffffed_u32, 0xfffffee_u32, 0xfffffef_u32, 0xffffff0_u32, 0xffffff1_u32, 0xffffff2_u32, 0x3ffffffe_u32, 0xffffff3_u32,
+        0xffffff4_u32, 0xffffff5_u32, 0xffffff6_u32, 0xffffff7_u32, 0xffffff8_u32, 0xffffff9_u32, 0xffffffa_u32, 0xffffffb_u32,
+        0x14_u32, 0x3f8_u32, 0x3f9_u32, 0xffa_u32, 0x1ff9_u32, 0x15_u32, 0xf8_u32, 0x7fa_u32,
+        0x3fa_u32, 0x3fb_u32, 0xf9_u32, 0x7fb_u32, 0xfa_u32, 0x16_u32, 0x17_u32, 0x18_u32,
+        0x0_u32, 0x1_u32, 0x2_u32, 0x19_u32, 0x1a_u32, 0x1b_u32, 0x1c_u32, 0x1d_u32,
+        0x1e_u32, 0x1f_u32, 0x5c_u32, 0xfb_u32, 0x7ffc_u32, 0x20_u32, 0xffb_u32, 0x3fc_u32,
+        0x1ffa_u32, 0x21_u32, 0x5d_u32, 0x5e_u32, 0x5f_u32, 0x60_u32, 0x61_u32, 0x62_u32,
+        0x63_u32, 0x64_u32, 0x65_u32, 0x66_u32, 0x67_u32, 0x68_u32, 0x69_u32, 0x6a_u32,
+        0x6b_u32, 0x6c_u32, 0x6d_u32, 0x6e_u32, 0x6f_u32, 0x70_u32, 0x71_u32, 0x72_u32,
+        0xfc_u32, 0x73_u32, 0xfd_u32, 0x1ffb_u32, 0x7fff0_u32, 0x1ffc_u32, 0x3ffc_u32, 0x22_u32,
+        0x7ffd_u32, 0x3_u32, 0x23_u32, 0x4_u32, 0x24_u32, 0x5_u32, 0x25_u32, 0x26_u32,
+        0x27_u32, 0x6_u32, 0x74_u32, 0x75_u32, 0x28_u32, 0x29_u32, 0x2a_u32, 0x7_u32,
+        0x2b_u32, 0x76_u32, 0x2c_u32, 0x8_u32, 0x9_u32, 0x2d_u32, 0x77_u32, 0x78_u32,
+        0x79_u32, 0x7a_u32, 0x7b_u32, 0x7ffe_u32, 0x7fc_u32, 0x3ffd_u32, 0x1ffd_u32, 0xffffffc_u32,
+        0xfffe6_u32, 0x3fffd2_u32, 0xfffe7_u32, 0xfffe8_u32, 0x3fffd3_u32, 0x3fffd4_u32, 0x3fffd5_u32, 0x7fffd9_u32,
+        0x3fffd6_u32, 0x7fffda_u32, 0x7fffdb_u32, 0x7fffdc_u32, 0x7fffdd_u32, 0x7fffde_u32, 0xffffeb_u32, 0x7fffdf_u32,
+        0xffffec_u32, 0xffffed_u32, 0x3fffd7_u32, 0x7fffe0_u32, 0xffffee_u32, 0x7fffe1_u32, 0x7fffe2_u32, 0x7fffe3_u32,
+        0x7fffe4_u32, 0x1fffdc_u32, 0x3fffd8_u32, 0x7fffe5_u32, 0x3fffd9_u32, 0x7fffe6_u32, 0x7fffe7_u32, 0xffffef_u32,
+        0x3fffda_u32, 0x1fffdd_u32, 0xfffe9_u32, 0x3fffdb_u32, 0x3fffdc_u32, 0x7fffe8_u32, 0x7fffe9_u32, 0x1fffde_u32,
+        0x7fffea_u32, 0x3fffdd_u32, 0x3fffde_u32, 0xfffff0_u32, 0x1fffdf_u32, 0x3fffdf_u32, 0x7fffeb_u32, 0x7fffec_u32,
+        0x1fffe0_u32, 0x1fffe1_u32, 0x3fffe0_u32, 0x1fffe2_u32, 0x7fffed_u32, 0x3fffe1_u32, 0x7fffee_u32, 0x7fffef_u32,
+        0xfffea_u32, 0x3fffe2_u32, 0x3fffe3_u32, 0x3fffe4_u32, 0x7ffff0_u32, 0x3fffe5_u32, 0x3fffe6_u32, 0x7ffff1_u32,
+        0x3ffffe0_u32, 0x3ffffe1_u32, 0xfffeb_u32, 0x7fff1_u32, 0x3fffe7_u32, 0x7ffff2_u32, 0x3fffe8_u32, 0x1ffffec_u32,
+        0x3ffffe2_u32, 0x3ffffe3_u32, 0x3ffffe4_u32, 0x7ffffde_u32, 0x7ffffdf_u32, 0x3ffffe5_u32, 0xfffff1_u32, 0x1ffffed_u32,
+        0x7fff2_u32, 0x1fffe3_u32, 0x3ffffe6_u32, 0x7ffffe0_u32, 0x7ffffe1_u32, 0x3ffffe7_u32, 0x7ffffe2_u32, 0xfffff2_u32,
+        0x1fffe4_u32, 0x1fffe5_u32, 0x3ffffe8_u32, 0x3ffffe9_u32, 0xffffffd_u32, 0x7ffffe3_u32, 0x7ffffe4_u32, 0x7ffffe5_u32,
+        0xfffec_u32, 0xfffff3_u32, 0xfffed_u32, 0x1fffe6_u32, 0x3fffe9_u32, 0x1fffe7_u32, 0x1fffe8_u32, 0x7ffff3_u32,
+        0x3fffea_u32, 0x3fffeb_u32, 0x1ffffee_u32, 0x1ffffef_u32, 0xfffff4_u32, 0xfffff5_u32, 0x3ffffea_u32, 0x7ffff4_u32,
+        0x3ffffeb_u32, 0x7ffffe6_u32, 0x3ffffec_u32, 0x3ffffed_u32, 0x7ffffe7_u32, 0x7ffffe8_u32, 0x7ffffe9_u32, 0x7ffffea_u32,
+        0x7ffffeb_u32, 0xffffffe_u32, 0x7ffffec_u32, 0x7ffffed_u32, 0x7ffffee_u32, 0x7ffffef_u32, 0x7fffff0_u32, 0x3ffffee_u32,
+        0x3fffffff_u32
+    ];
+}
+
+/// Appendix B code lengths in bits, indexed by symbol.
+u8[] Lengths() {
+    return [
+        13_u8, 23_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 24_u8, 30_u8, 28_u8, 28_u8, 30_u8, 28_u8, 28_u8,
+        28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 30_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8, 28_u8,
+        6_u8, 10_u8, 10_u8, 12_u8, 13_u8, 6_u8, 8_u8, 11_u8, 10_u8, 10_u8, 8_u8, 11_u8, 8_u8, 6_u8, 6_u8, 6_u8,
+        5_u8, 5_u8, 5_u8, 6_u8, 6_u8, 6_u8, 6_u8, 6_u8, 6_u8, 6_u8, 7_u8, 8_u8, 15_u8, 6_u8, 12_u8, 10_u8,
+        13_u8, 6_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8,
+        7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 8_u8, 7_u8, 8_u8, 13_u8, 19_u8, 13_u8, 14_u8, 6_u8,
+        15_u8, 5_u8, 6_u8, 5_u8, 6_u8, 5_u8, 6_u8, 6_u8, 6_u8, 5_u8, 7_u8, 7_u8, 6_u8, 6_u8, 6_u8, 5_u8,
+        6_u8, 7_u8, 6_u8, 5_u8, 5_u8, 6_u8, 7_u8, 7_u8, 7_u8, 7_u8, 7_u8, 15_u8, 11_u8, 14_u8, 13_u8, 28_u8,
+        20_u8, 22_u8, 20_u8, 20_u8, 22_u8, 22_u8, 22_u8, 23_u8, 22_u8, 23_u8, 23_u8, 23_u8, 23_u8, 23_u8, 24_u8, 23_u8,
+        24_u8, 24_u8, 22_u8, 23_u8, 24_u8, 23_u8, 23_u8, 23_u8, 23_u8, 21_u8, 22_u8, 23_u8, 22_u8, 23_u8, 23_u8, 24_u8,
+        22_u8, 21_u8, 20_u8, 22_u8, 22_u8, 23_u8, 23_u8, 21_u8, 23_u8, 22_u8, 22_u8, 24_u8, 21_u8, 22_u8, 23_u8, 23_u8,
+        21_u8, 21_u8, 22_u8, 21_u8, 23_u8, 22_u8, 23_u8, 23_u8, 20_u8, 22_u8, 22_u8, 22_u8, 23_u8, 22_u8, 22_u8, 23_u8,
+        26_u8, 26_u8, 20_u8, 19_u8, 22_u8, 23_u8, 22_u8, 25_u8, 26_u8, 26_u8, 26_u8, 27_u8, 27_u8, 26_u8, 24_u8, 25_u8,
+        19_u8, 21_u8, 26_u8, 27_u8, 27_u8, 26_u8, 27_u8, 24_u8, 21_u8, 21_u8, 26_u8, 26_u8, 28_u8, 27_u8, 27_u8, 27_u8,
+        20_u8, 24_u8, 20_u8, 21_u8, 22_u8, 21_u8, 21_u8, 23_u8, 22_u8, 22_u8, 25_u8, 25_u8, 24_u8, 24_u8, 26_u8, 23_u8,
+        26_u8, 27_u8, 26_u8, 26_u8, 27_u8, 27_u8, 27_u8, 27_u8, 27_u8, 28_u8, 27_u8, 27_u8, 27_u8, 27_u8, 27_u8, 26_u8,
+        30_u8
+    ];
+}
+
+/// First canonical code of each bit length 0..30.
+i64[] FirstCodes() {
+    return [
+        0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 20_i64, 92_i64,
+        248_i64, 0_i64, 1016_i64, 2042_i64, 4090_i64, 8184_i64, 16380_i64, 32764_i64,
+        0_i64, 0_i64, 0_i64, 524272_i64, 1048550_i64, 2097116_i64, 4194258_i64, 8388568_i64,
+        16777194_i64, 33554412_i64, 67108832_i64, 134217694_i64, 268435426_i64, 0_i64, 1073741820_i64
+    ];
+}
+
+/// Number of symbols of each bit length 0..30.
+i64[] LengthCounts() {
+    return [
+        0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 10_i64, 26_i64, 32_i64, 6_i64, 0_i64, 5_i64, 3_i64, 2_i64, 6_i64, 2_i64, 3_i64,
+        0_i64, 0_i64, 0_i64, 3_i64, 8_i64, 13_i64, 26_i64, 29_i64, 12_i64, 4_i64, 15_i64, 19_i64, 29_i64, 0_i64, 4_i64
+    ];
+}
+
+/// Index into SortedSymbols of the first symbol of each bit length 0..30.
+i64[] LengthOffsets() {
+    return [
+        0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 10_i64, 36_i64, 68_i64, 74_i64, 74_i64, 79_i64, 82_i64, 84_i64, 90_i64, 92_i64,
+        95_i64, 95_i64, 95_i64, 95_i64, 98_i64, 106_i64, 119_i64, 145_i64, 174_i64, 186_i64, 190_i64, 205_i64, 224_i64, 253_i64, 253_i64
+    ];
+}
+
+/// Symbols sorted by (code length, symbol).
+i64[] SortedSymbols() {
+    return [
+        48_i64, 49_i64, 50_i64, 97_i64, 99_i64, 101_i64, 105_i64, 111_i64, 115_i64, 116_i64, 32_i64, 37_i64, 45_i64, 46_i64, 47_i64, 51_i64,
+        52_i64, 53_i64, 54_i64, 55_i64, 56_i64, 57_i64, 61_i64, 65_i64, 95_i64, 98_i64, 100_i64, 102_i64, 103_i64, 104_i64, 108_i64, 109_i64,
+        110_i64, 112_i64, 114_i64, 117_i64, 58_i64, 66_i64, 67_i64, 68_i64, 69_i64, 70_i64, 71_i64, 72_i64, 73_i64, 74_i64, 75_i64, 76_i64,
+        77_i64, 78_i64, 79_i64, 80_i64, 81_i64, 82_i64, 83_i64, 84_i64, 85_i64, 86_i64, 87_i64, 89_i64, 106_i64, 107_i64, 113_i64, 118_i64,
+        119_i64, 120_i64, 121_i64, 122_i64, 38_i64, 42_i64, 44_i64, 59_i64, 88_i64, 90_i64, 33_i64, 34_i64, 40_i64, 41_i64, 63_i64, 39_i64,
+        43_i64, 124_i64, 35_i64, 62_i64, 0_i64, 36_i64, 64_i64, 91_i64, 93_i64, 126_i64, 94_i64, 125_i64, 60_i64, 96_i64, 123_i64, 92_i64,
+        195_i64, 208_i64, 128_i64, 130_i64, 131_i64, 162_i64, 184_i64, 194_i64, 224_i64, 226_i64, 153_i64, 161_i64, 167_i64, 172_i64, 176_i64, 177_i64,
+        179_i64, 209_i64, 216_i64, 217_i64, 227_i64, 229_i64, 230_i64, 129_i64, 132_i64, 133_i64, 134_i64, 136_i64, 146_i64, 154_i64, 156_i64, 160_i64,
+        163_i64, 164_i64, 169_i64, 170_i64, 173_i64, 178_i64, 181_i64, 185_i64, 186_i64, 187_i64, 189_i64, 190_i64, 196_i64, 198_i64, 228_i64, 232_i64,
+        233_i64, 1_i64, 135_i64, 137_i64, 138_i64, 139_i64, 140_i64, 141_i64, 143_i64, 147_i64, 149_i64, 150_i64, 151_i64, 152_i64, 155_i64, 157_i64,
+        158_i64, 165_i64, 166_i64, 168_i64, 174_i64, 175_i64, 180_i64, 182_i64, 183_i64, 188_i64, 191_i64, 197_i64, 231_i64, 239_i64, 9_i64, 142_i64,
+        144_i64, 145_i64, 148_i64, 159_i64, 171_i64, 206_i64, 215_i64, 225_i64, 236_i64, 237_i64, 199_i64, 207_i64, 234_i64, 235_i64, 192_i64, 193_i64,
+        200_i64, 201_i64, 202_i64, 205_i64, 210_i64, 213_i64, 218_i64, 219_i64, 238_i64, 240_i64, 242_i64, 243_i64, 255_i64, 203_i64, 204_i64, 211_i64,
+        212_i64, 214_i64, 221_i64, 222_i64, 223_i64, 241_i64, 244_i64, 245_i64, 246_i64, 247_i64, 248_i64, 250_i64, 251_i64, 252_i64, 253_i64, 254_i64,
+        2_i64, 3_i64, 4_i64, 5_i64, 6_i64, 7_i64, 8_i64, 11_i64, 12_i64, 14_i64, 15_i64, 16_i64, 17_i64, 18_i64, 19_i64, 20_i64,
+        21_i64, 23_i64, 24_i64, 25_i64, 26_i64, 27_i64, 28_i64, 29_i64, 30_i64, 31_i64, 127_i64, 220_i64, 249_i64, 10_i64, 13_i64, 22_i64,
+        256_i64
+    ];
+}
+
+/// Decoding tables built once and shared by a decoder.
+pub type HuffmanTables { pub i64[] first, pub i64[] counts, pub i64[] offsets, pub i64[] symbols, pub u32[] codes, pub u8[] lengths, }
+
+pub HuffmanTables NewHuffmanTables() {
+    return HuffmanTables { first: FirstCodes(), counts: LengthCounts(), offsets: LengthOffsets(), symbols: SortedSymbols(), codes: Codes(), lengths: Lengths() };
+}
+
+/// Decodes `count` octets at `offset`. Output longer than `maxOutput` is
+/// StringTooLong; EOS is HuffmanEos; padding longer than 7 bits or not all
+/// ones is rejected (RFC 7541 section 5.2).
+pub Result<u8[],HpackError> HuffmanDecode(HuffmanTables tables, u8[] src, i64 offset, i64 count, i64 maxOutput) {
+    mut u8[] out = [];
+    mut i64 produced = 0_i64;
+    mut i64 code = 0_i64;
+    mut i64 bits = 0_i64;
+    mut i64 i = 0_i64;
+    while i < count {
+        i64 octet = i64(src[offset + i]);
+        mut i64 bit = 7_i64;
+        while bit >= 0_i64 {
+            code = code * 2_i64 + ((octet >> bit) & 1_i64);
+            bits = bits + 1_i64;
+            i64 window = tables.counts[bits];
+            if window > 0_i64 {
+                i64 position = code - tables.first[bits];
+                if position >= 0_i64 && position < window {
+                    i64 symbol = tables.symbols[tables.offsets[bits] + position];
+                    if symbol == 256_i64 { return Result::Error(HpackError::HuffmanEos); }
+                    if produced >= maxOutput { return Result::Error(HpackError::StringTooLong(produced + 1_i64)); }
+                    Array.Append<u8>(out, u8(symbol));
+                    produced = produced + 1_i64;
+                    code = 0_i64;
+                    bits = 0_i64;
+                }
+            }
+            // The code is complete, so no prefix exceeds the 30-bit EOS code.
+            if bits >= 30_i64 { return Result::Error(HpackError::HuffmanEos); }
+            bit = bit - 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    if bits > 7_i64 { return Result::Error(HpackError::HuffmanPaddingTooLong); }
+    if code != (1_i64 << bits) - 1_i64 { return Result::Error(HpackError::HuffmanInvalidPadding); }
+    return Result::Ok(out);
+}
+
+/// Octets needed to Huffman-encode `data`.
+pub i64 HuffmanEncodedLength(HuffmanTables tables, u8[] data) {
+    mut i64 total = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) { total = total + i64(tables.lengths[i64(data[i])]); i = i + 1_i64; }
+    return (total + 7_i64) / 8_i64;
+}
+
+/// Appends the Huffman encoding of `data`, padded with the EOS prefix (all ones).
+/// Returns the grown buffer.
+pub u8[] HuffmanEncode(HuffmanTables tables, mut u8[] out, u8[] data) {
+    mut i64 acc = 0_i64;
+    mut i64 pending = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 symbol = i64(data[i]);
+        i64 length = i64(tables.lengths[symbol]);
+        acc = (acc << length) | i64(tables.codes[symbol]);
+        pending = pending + length;
+        while pending >= 8_i64 {
+            pending = pending - 8_i64;
+            Array.Append<u8>(out, u8((acc >> pending) & 255_i64));
+        }
+        acc = acc & ((1_i64 << pending) - 1_i64);
+        i = i + 1_i64;
+    }
+    if pending > 0_i64 {
+        i64 padBits = 8_i64 - pending;
+        Array.Append<u8>(out, u8(((acc << padBits) | ((1_i64 << padBits) - 1_i64)) & 255_i64));
+    }
+    return out;
+}

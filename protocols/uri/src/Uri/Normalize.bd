@@ -1,0 +1,99 @@
+use Core.String;
+use Uri.Chars;
+use Uri.Host;
+use Uri.Pct;
+use Uri.Scheme;
+use Uri.Types;
+
+// RFC 3986 section 6.2.2 syntax-based normalization and section 5.2.4 dot-segment removal.
+
+/// Drops the last path segment of `out` together with its leading "/".
+string DropLastSegment(string out) {
+    i64 slash = Chars.LastIndexOf(out, 47_i64, 0_i64, String.Len(out));
+    if slash < 0_i64 { return ""; }
+    return Chars.Sub(out, 0_i64, slash);
+}
+
+/// remove_dot_segments of RFC 3986 section 5.2.4.
+pub string RemoveDotSegments(string path) {
+    mut string input = path;
+    mut string out = "";
+    while String.Len(input) > 0_i64 {
+        i64 n = String.Len(input);
+        if Chars.StartsAt(input, 0_i64, "../") {
+            input = Chars.Sub(input, 3_i64, n);
+        } else if Chars.StartsAt(input, 0_i64, "./") {
+            input = Chars.Sub(input, 2_i64, n);
+        } else if Chars.StartsAt(input, 0_i64, "/./") {
+            input = "/" + Chars.Sub(input, 3_i64, n);
+        } else if input == "/." {
+            input = "/";
+        } else if Chars.StartsAt(input, 0_i64, "/../") {
+            input = "/" + Chars.Sub(input, 4_i64, n);
+            out = DropLastSegment(out);
+        } else if input == "/.." {
+            input = "/";
+            out = DropLastSegment(out);
+        } else if input == "." || input == ".." {
+            input = "";
+        } else {
+            mut i64 stop = Chars.IndexOf(input, 47_i64, 1_i64, n);
+            if stop < 0_i64 { stop = n; }
+            out = out + Chars.Sub(input, 0_i64, stop);
+            input = Chars.Sub(input, stop, n);
+        }
+    }
+    return out;
+}
+
+/// Case and percent-encoding normalization of every component, plus dot-segment removal
+/// for URIs that have a scheme (a relative path keeps its dots: they carry meaning).
+/// Scheme and registered host become lowercase, IPv6 hex becomes lowercase, `%xx` hex
+/// becomes uppercase, escapes of unreserved octets are decoded, an empty port is dropped.
+pub UriRef Normalize(UriRef u) {
+    mut string hostName = u.hostName;
+    if u.hasAuthority {
+        HostKind kind = Host.Classify(u.hostName);
+        match kind {
+            HostKind::RegName => { hostName = Pct.NormalizeText(u.hostName, true); },
+            HostKind::Ipv4 => { hostName = u.hostName; },
+            _ => { hostName = Chars.LowerAscii(u.hostName); },
+        };
+    }
+    mut string path = Pct.NormalizeText(u.path, false);
+    if u.hasScheme { path = RemoveDotSegments(path); }
+    mut string userinfo = u.userinfo;
+    if u.hasUserinfo { userinfo = Pct.NormalizeText(u.userinfo, false); }
+    mut bool hasPort = u.hasPort;
+    if u.hasPort && u.port < 0_i64 { hasPort = false; }
+    mut string query = u.query;
+    if u.hasQuery { query = Pct.NormalizeText(u.query, false); }
+    mut string fragment = u.fragment;
+    if u.hasFragment { fragment = Pct.NormalizeText(u.fragment, false); }
+    mut string scheme = u.scheme;
+    if u.hasScheme { scheme = Chars.LowerAscii(u.scheme); }
+    return UriRef {
+        hasScheme: u.hasScheme, scheme: scheme,
+        hasAuthority: u.hasAuthority, hasUserinfo: u.hasUserinfo, userinfo: userinfo,
+        hostName: hostName, hasPort: hasPort, port: u.port,
+        path: path, hasQuery: u.hasQuery, query: query, hasFragment: u.hasFragment, fragment: fragment,
+    };
+}
+
+/// Syntax-based plus scheme-based normalization (RFC 3986 section 6.2.3) for http, https,
+/// ws and wss: the default port is dropped and an empty path becomes "/".
+pub UriRef NormalizeForScheme(UriRef u) {
+    UriRef n = Normalize(u);
+    if !n.hasScheme || !Scheme.IsWebScheme(n.scheme) { return n; }
+    mut bool hasPort = n.hasPort;
+    mut i64 port = n.port;
+    if n.hasPort && n.port == Scheme.DefaultPort(n.scheme) { hasPort = false; port = -1_i64; }
+    mut string path = n.path;
+    if n.hasAuthority && String.Len(n.path) == 0_i64 { path = "/"; }
+    return UriRef {
+        hasScheme: n.hasScheme, scheme: n.scheme,
+        hasAuthority: n.hasAuthority, hasUserinfo: n.hasUserinfo, userinfo: n.userinfo,
+        hostName: n.hostName, hasPort: hasPort, port: port,
+        path: path, hasQuery: n.hasQuery, query: n.query, hasFragment: n.hasFragment, fragment: n.fragment,
+    };
+}

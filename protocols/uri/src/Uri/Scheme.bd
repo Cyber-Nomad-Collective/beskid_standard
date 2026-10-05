@@ -1,0 +1,76 @@
+use Core.Results;
+use Core.String;
+use Uri.Chars;
+use Uri.Errors;
+use Uri.Host;
+use Uri.Pct;
+use Uri.Types;
+
+// Scheme knowledge for http, https, ws and wss, and the Authority value used by
+// the HTTP and connect packages.
+
+/// Default port of a (case-insensitive) scheme: http 80, https 443, ws 80, wss 443; -1 otherwise.
+pub i64 DefaultPort(string scheme) {
+    string s = Chars.LowerAscii(scheme);
+    if s == "http" || s == "ws" { return 80_i64; }
+    if s == "https" || s == "wss" { return 443_i64; }
+    return -1_i64;
+}
+
+/// True for schemes that run over TLS (https, wss).
+pub bool IsSecure(string scheme) {
+    string s = Chars.LowerAscii(scheme);
+    return s == "https" || s == "wss";
+}
+
+/// True for http, https, ws and wss.
+pub bool IsWebScheme(string scheme) { return DefaultPort(scheme) > 0_i64; }
+
+/// Network endpoint of an absolute URI: host without brackets, effective port, TLS flag.
+/// Registered names are percent-decoded only for unreserved octets and lowercased; any
+/// remaining escape (non-ASCII, reserved) is InvalidHost because there is no IDNA here.
+/// MissingAuthority when the URI has no authority or an empty host; MissingPort when the
+/// scheme has no default and no port was given (or the port is empty and has no default).
+pub Result<Authority, UriError> AuthorityOf(UriRef u) {
+    if !u.hasAuthority || String.Len(u.hostName) == 0_i64 { return Result::Error(UriError::MissingAuthority()); }
+    HostKind kind = Host.Classify(u.hostName);
+    mut string name = Host.BareHost(u.hostName);
+    match kind {
+        HostKind::RegName => {
+            name = Pct.NormalizeText(name, true);
+            if String.Len(name) > 0_i64 && Chars.IndexOf(name, 37_i64, 0_i64, String.Len(name)) >= 0_i64 {
+                return Result::Error(UriError::InvalidHost());
+            }
+        },
+        HostKind::Ipv6 => { name = Chars.LowerAscii(name); },
+        _ => {},
+    };
+    mut i64 port = u.port;
+    if !u.hasPort || port < 0_i64 { port = DefaultPort(u.scheme); }
+    if port < 0_i64 { return Result::Error(UriError::MissingPort()); }
+    return Result::Ok(Authority { hostName: name, kind: kind, port: port, secure: IsSecure(u.scheme) });
+}
+
+/// "host:port" for a socket address string, brackets around IPv6.
+pub string HostPort(Authority a) {
+    mut string h = a.hostName;
+    match a.kind {
+        HostKind::Ipv6 => { h = "[" + h + "]"; },
+        _ => {},
+    };
+    return h + ":" + Chars.DecimalText(a.port);
+}
+
+/// Value for an HTTP `Host` header: brackets for IPv6 and the port only when it is not
+/// the default of the scheme.
+pub string HostHeader(Authority a) {
+    mut string h = a.hostName;
+    match a.kind {
+        HostKind::Ipv6 => { h = "[" + h + "]"; },
+        _ => {},
+    };
+    i64 dflt = 80_i64;
+    if a.secure { dflt = 443_i64; }
+    if a.port == dflt { return h; }
+    return h + ":" + Chars.DecimalText(a.port);
+}

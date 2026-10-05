@@ -1,0 +1,217 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Uri.Chars;
+use Uri.Errors;
+
+// Host forms of RFC 3986 section 3.2.2: IPv4 literal, bracketed IPv6 / IPvFuture, reg-name.
+
+/// How a hostName was written.
+pub enum HostKind { RegName(), Ipv4(), Ipv6(), IpvFuture(), }
+
+/// Value of a `dec-octet` (0..255, no leading zeros) in text[start, stop), or -1.
+i64 DecOctet(string text, i64 start, i64 stop) {
+    i64 length = stop - start;
+    if length < 1_i64 || length > 3_i64 { return -1_i64; }
+    if length > 1_i64 && Chars.B(text, start) == 48_i64 { return -1_i64; }
+    mut i64 value = 0_i64;
+    mut i64 i = start;
+    while i < stop {
+        i64 c = Chars.B(text, i);
+        if !Chars.IsDigit(c) { return -1_i64; }
+        value = value * 10_i64 + (c - 48_i64);
+        i = i + 1_i64;
+    }
+    if value > 255_i64 { return -1_i64; }
+    return value;
+}
+
+/// Strict IPv4address in text[start, stop): four dec-octets separated by dots.
+/// Returns the 32 bit value, or -1 when the text is not an IPv4 address.
+pub i64 Ipv4ValueRange(string text, i64 start, i64 stop) {
+    mut i64 acc = 0_i64;
+    mut i64 parts = 0_i64;
+    mut i64 cursor = start;
+    while parts < 4_i64 {
+        mut i64 dot = cursor;
+        while dot < stop && Chars.B(text, dot) != 46_i64 { dot = dot + 1_i64; }
+        i64 octet = DecOctet(text, cursor, dot);
+        if octet < 0_i64 { return -1_i64; }
+        acc = acc * 256_i64 + octet;
+        parts = parts + 1_i64;
+        if parts < 4_i64 {
+            if dot >= stop { return -1_i64; }
+            cursor = dot + 1_i64;
+        } else {
+            if dot != stop { return -1_i64; }
+        }
+    }
+    return acc;
+}
+
+/// Parses a strict dotted-decimal IPv4 address into its 32 bit value (a non-negative i64).
+pub Result<i64, UriError> ParseIpv4(string text) {
+    i64 value = Ipv4ValueRange(text, 0_i64, String.Len(text));
+    if value < 0_i64 { return Result::Error(UriError::InvalidIpv4()); }
+    return Result::Ok(value);
+}
+
+pub bool IsIpv4(string text) { return Ipv4ValueRange(text, 0_i64, String.Len(text)) >= 0_i64; }
+
+/// Number of hex digits (1..4) of an h16 in text[start, stop), or -1.
+i64 H16Value(string text, i64 start, i64 stop) {
+    i64 length = stop - start;
+    if length < 1_i64 || length > 4_i64 { return -1_i64; }
+    mut i64 value = 0_i64;
+    mut i64 i = start;
+    while i < stop {
+        i64 h = Chars.HexValue(Chars.B(text, i));
+        if h < 0_i64 { return -1_i64; }
+        value = value * 16_i64 + h;
+        i = i + 1_i64;
+    }
+    return value;
+}
+
+pub i64[] EmptyGroups() { return Array.Empty<i64>(); }
+
+/// Parses the RFC 3986 IPv6address grammar (without brackets, without zone) into 16 octets.
+/// Handles `::` compression and an embedded IPv4 tail. Anything else is InvalidIpv6.
+pub Result<u8[], UriError> ParseIpv6(string text) {
+    i64 n = String.Len(text);
+    if n < 2_i64 { return Result::Error(UriError::InvalidIpv6()); }
+    mut i64[] head = Array.Empty<i64>();
+    mut i64[] tail = Array.Empty<i64>();
+    mut bool compressed = false;
+    mut i64 i = 0_i64;
+    if Chars.B(text, 0_i64) == 58_i64 {
+        if Chars.B(text, 1_i64) != 58_i64 { return Result::Error(UriError::InvalidIpv6()); }
+        compressed = true;
+        i = 2_i64;
+        if n == 2_i64 { return Result::Ok(Slice.New(16_i64)); }
+    }
+    while i < n {
+        mut i64 j = i;
+        while j < n && Chars.B(text, j) != 58_i64 { j = j + 1_i64; }
+        if j == i { return Result::Error(UriError::InvalidIpv6()); }
+        bool last = j == n;
+        if last {
+            i64 dot = Chars.IndexOf(text, 46_i64, i, j);
+            if dot >= 0_i64 {
+                i64 v4 = Ipv4ValueRange(text, i, j);
+                if v4 < 0_i64 { return Result::Error(UriError::InvalidIpv6()); }
+                if compressed { Array.Append<i64>(tail, v4 / 65536_i64); Array.Append<i64>(tail, v4 % 65536_i64); }
+                else { Array.Append<i64>(head, v4 / 65536_i64); Array.Append<i64>(head, v4 % 65536_i64); }
+            } else {
+                i64 h = H16Value(text, i, j);
+                if h < 0_i64 { return Result::Error(UriError::InvalidIpv6()); }
+                if compressed { Array.Append<i64>(tail, h); } else { Array.Append<i64>(head, h); }
+            }
+            i = n;
+        } else {
+            i64 h = H16Value(text, i, j);
+            if h < 0_i64 { return Result::Error(UriError::InvalidIpv6()); }
+            if compressed { Array.Append<i64>(tail, h); } else { Array.Append<i64>(head, h); }
+            if j + 1_i64 < n && Chars.B(text, j + 1_i64) == 58_i64 {
+                if compressed { return Result::Error(UriError::InvalidIpv6()); }
+                compressed = true;
+                i = j + 2_i64;
+            } else {
+                i = j + 1_i64;
+                if i == n { return Result::Error(UriError::InvalidIpv6()); }
+            }
+        }
+    }
+    i64 total = Array.Len<i64>(head) + Array.Len<i64>(tail);
+    if compressed { if total > 7_i64 { return Result::Error(UriError::InvalidIpv6()); } }
+    else { if total != 8_i64 { return Result::Error(UriError::InvalidIpv6()); } }
+    u8[] out = Slice.New(16_i64);
+    mut i64 g = 0_i64;
+    while g < Array.Len<i64>(head) {
+        i64 v = Array.Get<i64>(head, g);
+        out[g * 2_i64] = u8(v / 256_i64);
+        out[g * 2_i64 + 1_i64] = u8(v % 256_i64);
+        g = g + 1_i64;
+    }
+    i64 tailStart = 8_i64 - Array.Len<i64>(tail);
+    mut i64 t = 0_i64;
+    while t < Array.Len<i64>(tail) {
+        i64 v = Array.Get<i64>(tail, t);
+        out[(tailStart + t) * 2_i64] = u8(v / 256_i64);
+        out[(tailStart + t) * 2_i64 + 1_i64] = u8(v % 256_i64);
+        t = t + 1_i64;
+    }
+    return Result::Ok(out);
+}
+
+pub bool IsIpv6(string text) {
+    Result<u8[], UriError> r = ParseIpv6(text);
+    return match r { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+/// IPvFuture = "v" 1*HEXDIG "." 1*( unreserved / sub-delims / ":" ), text without brackets.
+pub bool IsIpvFuture(string text) {
+    i64 n = String.Len(text);
+    if n < 4_i64 { return false; }
+    i64 first = Chars.B(text, 0_i64);
+    if first != 118_i64 && first != 86_i64 { return false; }
+    mut i64 i = 1_i64;
+    while i < n && Chars.IsHex(Chars.B(text, i)) { i = i + 1_i64; }
+    if i == 1_i64 || i >= n - 1_i64 || Chars.B(text, i) != 46_i64 { return false; }
+    i = i + 1_i64;
+    while i < n {
+        i64 c = Chars.B(text, i);
+        if !(Chars.IsUnreserved(c) || Chars.IsSubDelim(c) || c == 58_i64) { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+/// reg-name = *( unreserved / pct-encoded / sub-delims ); percent escapes are validated by the parser.
+pub bool IsRegNameByte(i64 c) { return Chars.IsUnreserved(c) || Chars.IsSubDelim(c) || c == 37_i64; }
+
+/// True when the last label of `hostName` is all digits or a `0x` hex number. Such hosts are
+/// interpreted as IPv4 by common resolvers (inet_aton: `127.1`, `0177.0.0.1`, `0x7f.1`,
+/// `2130706433`), so the parser accepts them only as strict dotted-decimal IPv4.
+pub bool LooksNumeric(string hostName) {
+    i64 n = String.Len(hostName);
+    mut i64 stop = n;
+    if stop > 0_i64 && Chars.B(hostName, stop - 1_i64) == 46_i64 { stop = stop - 1_i64; }
+    if stop <= 0_i64 { return false; }
+    i64 dot = Chars.LastIndexOf(hostName, 46_i64, 0_i64, stop);
+    i64 start = dot + 1_i64;
+    if start >= stop { return false; }
+    mut bool digits = true;
+    mut i64 i = start;
+    while i < stop { if !Chars.IsDigit(Chars.B(hostName, i)) { digits = false; } i = i + 1_i64; }
+    if digits { return true; }
+    if stop - start >= 2_i64 && Chars.B(hostName, start) == 48_i64 && (Chars.B(hostName, start + 1_i64) == 120_i64 || Chars.B(hostName, start + 1_i64) == 88_i64) {
+        mut bool hex = true;
+        mut i64 k = start + 2_i64;
+        while k < stop { if !Chars.IsHex(Chars.B(hostName, k)) { hex = false; } k = k + 1_i64; }
+        return hex;
+    }
+    return false;
+}
+
+/// Classifies a hostName exactly as stored in a UriRef (IP literals keep their brackets).
+pub HostKind Classify(string hostName) {
+    i64 n = String.Len(hostName);
+    if n >= 2_i64 && Chars.B(hostName, 0_i64) == 91_i64 {
+        i64 first = Chars.B(hostName, 1_i64);
+        if first == 118_i64 || first == 86_i64 { return HostKind::IpvFuture(); }
+        return HostKind::Ipv6();
+    }
+    if IsIpv4(hostName) { return HostKind::Ipv4(); }
+    return HostKind::RegName();
+}
+
+/// Host text without the IP-literal brackets.
+pub string BareHost(string hostName) {
+    i64 n = String.Len(hostName);
+    if n >= 2_i64 && Chars.B(hostName, 0_i64) == 91_i64 && Chars.B(hostName, n - 1_i64) == 93_i64 {
+        return Chars.Sub(hostName, 1_i64, n - 1_i64);
+    }
+    return hostName;
+}

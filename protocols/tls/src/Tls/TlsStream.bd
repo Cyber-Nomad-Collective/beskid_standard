@@ -1,0 +1,140 @@
+use Core.IO.Closer;
+use Core.IO.IoError;
+use Core.IO.Reader;
+use Core.IO.Stream;
+use Core.IO.TransferFailure;
+use Core.IO.Writer;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Time.Deadline;
+use Network.Errors;
+use Network.Tcp.TcpStream;
+use Network.Types;
+use Tls.Connection;
+use Tls.Handshake;
+use Tls.Suites;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+
+/// A TLS 1.3 connection over a TCP stream, usable wherever a `Core.IO.Stream` is expected.
+/// Read returns 0 after the peer's close_notify; Close sends close_notify and closes TCP.
+/// A TLS failure is reported as ReadFailed/WriteFailed(Unspecified) (transport failures keep
+/// their cause); `Failure` returns the typed TlsError.
+pub type TlsStream: Stream, Reader, Writer, Closer {
+    TcpStream tcp,
+    TlsConnection conn,
+
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) { return StreamRead(this, destination, offset, count); }
+    pub Result<i64, IoError> Write(u8[] source, i64 offset, i64 count) { return StreamWrite(this, source, offset, count); }
+    pub Result<unit, IoError> Close() { return StreamClose(this); }
+}
+
+IoError ReadError(TlsError e) {
+    return match e {
+        TlsError::Io(cause) => cause,
+        TlsError::Closed => IoError::ReadFailed(TransferFailure::Closed),
+        _ => IoError::ReadFailed(TransferFailure::Unspecified),
+    };
+}
+
+IoError WriteError(TlsError e) {
+    return match e {
+        TlsError::Io(cause) => cause,
+        TlsError::Closed => IoError::WriteFailed(TransferFailure::Closed),
+        _ => IoError::WriteFailed(TransferFailure::Unspecified),
+    };
+}
+
+Result<i64, IoError> StreamRead(TlsStream s, u8[] destination, i64 offset, i64 count) {
+    TcpStream t = s.tcp;
+    Result<i64, TlsError> r = Connection.Read(s.conn, t, destination, offset, count);
+    return match r { Result::Ok(n) => Result::Ok(n), Result::Error(e) => Result::Error(ReadError(e)), };
+}
+
+Result<i64, IoError> StreamWrite(TlsStream s, u8[] source, i64 offset, i64 count) {
+    TcpStream t = s.tcp;
+    Result<i64, TlsError> r = Connection.Write(s.conn, t, source, offset, count);
+    return match r { Result::Ok(n) => Result::Ok(n), Result::Error(e) => Result::Error(WriteError(e)), };
+}
+
+Result<unit, IoError> StreamClose(TlsStream s) {
+    TcpStream t = s.tcp;
+    Connection.CloseNotify(s.conn, t);
+    return t.Close();
+}
+
+/// Wraps an already handshaken connection.
+pub TlsStream Wrap(TcpStream tcp, TlsConnection conn) { return TlsStream { tcp: tcp, conn: conn }; }
+
+pub TcpStream Transport(TlsStream s) { return s.tcp; }
+pub TlsConnection ConnectionOf(TlsStream s) { return s.conn; }
+
+/// Negotiated ALPN protocol, or "".
+pub string NegotiatedAlpn(TlsStream s) { return Handshake.NegotiatedAlpn(Connection.Engine(s.conn)); }
+pub CipherSuite NegotiatedSuite(TlsStream s) { return Handshake.NegotiatedSuite(Connection.Engine(s.conn)); }
+pub i64 NegotiatedGroup(TlsStream s) { return Handshake.NegotiatedGroup(Connection.Engine(s.conn)); }
+pub bool UsedHelloRetry(TlsStream s) { return Handshake.UsedHelloRetry(Connection.Engine(s.conn)); }
+pub string ReceivedServerName(TlsStream s) { return Handshake.ReceivedServerName(Connection.Engine(s.conn)); }
+pub Blob[] PeerCertificates(TlsStream s) { return Handshake.PeerCertificates(Connection.Engine(s.conn)); }
+
+/// The TlsError that failed the stream (Closed when none was recorded).
+pub TlsError Failure(TlsStream s) { return Connection.Failure(s.conn); }
+
+/// TLS-Exporter keying material (RFC 8446 section 7.5).
+pub Result<u8[], TlsError> ExportKeyingMaterial(TlsStream s, string label, u8[] context, i64 length) {
+    return Handshake.ExportKeyingMaterial(Connection.Engine(s.conn), label, context, length);
+}
+
+/// Sends a KeyUpdate; `requestPeer` asks the peer to update its keys too.
+pub Result<unit, TlsError> UpdateKeys(TlsStream s, bool requestPeer) {
+    TcpStream t = s.tcp;
+    return Connection.UpdateKeys(s.conn, t, requestPeer);
+}
+
+Result<unit, TlsError> SetDeadline(TcpStream tcp, Option<Deadline> deadline) {
+    TransferDeadlines policy = TransferDeadlines { read: deadline, write: deadline };
+    Result<unit, NetworkError> r = tcp.SetDeadlines(policy);
+    return match r {
+        Result::Ok(_) => Result::Ok(()),
+        Result::Error(_) => Result::Error(TlsError::Io(IoError::ReadFailed(TransferFailure::Unspecified))),
+    };
+}
+
+/// Runs a handshake on `tcp` with `engine`. The deadline bounds the whole handshake and is
+/// removed afterwards. On failure the TCP stream is closed.
+pub Result<TlsStream, TlsError> Establish(TcpStream tcp, HandshakeEngine engine, Option<Deadline> deadline) {
+    Result<TlsConnection, TlsError> made = Connection.New(engine);
+    match made {
+        Result::Error(e) => { tcp.Close(); return Result::Error(e); },
+        Result::Ok(conn) => {
+            Result<unit, TlsError> armed = SetDeadline(tcp, deadline);
+            match armed { Result::Error(e) => { tcp.Close(); return Result::Error(e); }, Result::Ok(_) => {}, };
+            Result<unit, TlsError> done = Connection.Handshake(conn, tcp);
+            match done {
+                Result::Error(e) => { tcp.Close(); return Result::Error(e); },
+                Result::Ok(_) => {
+                    SetDeadline(tcp, Option.Empty<Deadline>());
+                    return Result::Ok(Wrap(tcp, conn));
+                },
+            };
+        },
+    };
+}
+
+/// Client handshake (see `Tls.Connect`).
+pub Result<TlsStream, TlsError> Connect(TcpStream tcp, TlsClientConfig config, Option<Deadline> deadline) {
+    Result<HandshakeEngine, TlsError> engine = Handshake.NewClient(config);
+    match engine {
+        Result::Error(e) => { tcp.Close(); return Result::Error(e); },
+        Result::Ok(h) => { return Establish(tcp, h, deadline); },
+    };
+}
+
+/// Server handshake (see `Tls.Accept`).
+pub Result<TlsStream, TlsError> Accept(TcpStream tcp, TlsServerConfig config, Option<Deadline> deadline) {
+    Result<HandshakeEngine, TlsError> engine = Handshake.NewServer(config);
+    match engine {
+        Result::Error(e) => { tcp.Close(); return Result::Error(e); },
+        Result::Ok(h) => { return Establish(tcp, h, deadline); },
+    };
+}

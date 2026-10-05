@@ -1,0 +1,176 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Codec.Hex;
+use Testing.Assert;
+use Tls.Handshake;
+use Tls.Suites;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsPk;
+use Tls.Wire;
+
+bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
+
+TlsClientConfig TraceConfig() {
+    TlsClientConfig c = TlsConfig.Client("server", TlsConfig.AcceptAnyCertificateForTestsOnly());
+    c.cipherSuites = [Suites.Aes128(), Suites.ChaCha(), Suites.Aes256()];
+    c.minRsaBits = 1024_i64;
+    return c;
+}
+
+// Drains events; returns the concatenated Send payloads and records the last secrets in `out`
+// ([0] read handshake, [1] write handshake, [2] read app, [3] write app, [4] connected flag).
+u8[] Drain(HandshakeEngine e, Blob[] out) {
+    mut u8[] sent = Slice.New(0_i64);
+    while Handshake.HasEvent(e) {
+        TlsEvent ev = Handshake.TakeEvent(e);
+        match ev {
+            TlsEvent::Send(_, data) => { sent = data; },
+            TlsEvent::ReadSecret(level, secret) => { if level == 2_i64 { out[0] = Blob { data: secret }; } else { out[2] = Blob { data: secret }; } },
+            TlsEvent::WriteSecret(level, secret) => { if level == 2_i64 { out[1] = Blob { data: secret }; } else { out[3] = Blob { data: secret }; } },
+            TlsEvent::Connected => { out[4] = Blob { data: [1_u8] }; },
+        };
+    }
+    return sent;
+}
+
+i64 Code(Result<unit, TlsError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => TlsErrors.Code(e), }; }
+
+u8[] BlobData(Blob[] list, i64 i) { Blob b = list[i]; return b.data; }
+
+test rfc8448_client_engine_replays_full_handshake {
+    Result<KeyShare, TlsError> share = TlsPk.FromPrivate(Wire.GroupX25519(), ClientPrivate());
+    match share {
+        Result::Error(_) => { Assert.Fail("x25519 key"); },
+        Result::Ok(ks) => {
+            Assert.True(Same(ks.publicKey, ClientPublic()), "x25519 public key matches the trace");
+            match Handshake.NewClientAfterHello(TraceConfig(), ks, VClientHello()) {
+                Result::Error(_) => { Assert.Fail("engine"); },
+                Result::Ok(e) => {
+                    Blob[] out = [Blob { data: Slice.New(0_i64) }, Blob { data: Slice.New(0_i64) }, Blob { data: Slice.New(0_i64) }, Blob { data: Slice.New(0_i64) }, Blob { data: Slice.New(0_i64) }];
+                    u8[] sh = VServerHello();
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh))), 0_i64, "ServerHello accepted");
+                    Drain(e, out);
+                    Assert.True(Same(BlobData(out, 0), ServerHsTraffic()), "server handshake secret event");
+                    Assert.True(Same(BlobData(out, 1), ClientHsTraffic()), "client handshake secret event");
+                    u8[] flight = ServerFlight();
+                    // Feed in two pieces to exercise reassembly.
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 2_i64, flight, 0_i64, 100_i64)), 0_i64, "first fragment");
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 2_i64, flight, 100_i64, Slice.Len(flight) - 100_i64)), 0_i64, "rest of flight");
+                    u8[] fin = Drain(e, out);
+                    Assert.True(Same(fin, VClientFinished()), "client Finished matches RFC 8448");
+                    Assert.True(Same(BlobData(out, 2), ServerApTraffic()), "server app secret");
+                    Assert.True(Same(BlobData(out, 3), ClientApTraffic()), "client app secret");
+                    Assert.True(Handshake.IsConnected(e), "connected");
+                    Assert.True(Same(Handshake.ResumptionMasterSecret(e), ResumptionMaster()), "resumption master");
+                    u8[] nst = VNewSessionTicket();
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 3_i64, nst, 0_i64, Slice.Len(nst))), 0_i64, "ticket accepted and ignored");
+                },
+            };
+        },
+    };
+}
+
+test rfc8448_tampered_server_finished_is_decrypt_error {
+    Result<KeyShare, TlsError> share = TlsPk.FromPrivate(Wire.GroupX25519(), ClientPrivate());
+    match share {
+        Result::Error(_) => { Assert.Fail("x25519 key"); },
+        Result::Ok(ks) => {
+            match Handshake.NewClientAfterHello(TraceConfig(), ks, VClientHello()) {
+                Result::Error(_) => { Assert.Fail("engine"); },
+                Result::Ok(e) => {
+                    u8[] sh = VServerHello();
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh))), 0_i64, "ServerHello");
+                    u8[] flight = ServerFlight();
+                    i64 n = Slice.Len(flight);
+                    flight[n - 1_i64] = flight[n - 1_i64] + 1_u8;
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 2_i64, flight, 0_i64, n)), 1051_i64, "decrypt_error");
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 2_i64, flight, 0_i64, 1_i64)), 4000_i64, "engine is closed after failure");
+                },
+            };
+        },
+    };
+}
+
+test rfc8448_tampered_certificate_verify_is_decrypt_error {
+    Result<KeyShare, TlsError> share = TlsPk.FromPrivate(Wire.GroupX25519(), ClientPrivate());
+    match share {
+        Result::Error(_) => { Assert.Fail("x25519 key"); },
+        Result::Ok(ks) => {
+            match Handshake.NewClientAfterHello(TraceConfig(), ks, VClientHello()) {
+                Result::Error(_) => { Assert.Fail("engine"); },
+                Result::Ok(e) => {
+                    u8[] sh = VServerHello();
+                    Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh));
+                    u8[] flight = ServerFlight();
+                    // Inside the CertificateVerify signature (EE 40 + Certificate 445 + 8 header bytes).
+                    flight[500] = flight[500] + 1_u8;
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 2_i64, flight, 0_i64, Slice.Len(flight))), 1051_i64, "decrypt_error");
+                },
+            };
+        },
+    };
+}
+
+test rfc8448_rsa_1024_rejected_by_default_policy {
+    Result<KeyShare, TlsError> share = TlsPk.FromPrivate(Wire.GroupX25519(), ClientPrivate());
+    match share {
+        Result::Error(_) => { Assert.Fail("x25519 key"); },
+        Result::Ok(ks) => {
+            TlsClientConfig c = TraceConfig();
+            c.minRsaBits = 2048_i64;
+            match Handshake.NewClientAfterHello(c, ks, VClientHello()) {
+                Result::Error(_) => { Assert.Fail("engine"); },
+                Result::Ok(e) => {
+                    u8[] sh = VServerHello();
+                    Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh));
+                    u8[] flight = ServerFlight();
+                    Assert.Equal<i64>(Code(Handshake.Feed(e, 2_i64, flight, 0_i64, Slice.Len(flight))), 1071_i64, "insufficient_security");
+                },
+            };
+        },
+    };
+}
+
+// RFC 8448 section 3 values.
+pub u8[] ClientPrivate() { return Hex.Of("49af42ba7f7994852d713ef2784bcbcaa7911de26adc5642cb634540e7ea5005"); }
+pub u8[] ClientPublic() { return Hex.Of("99381de560e4bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c"); }
+pub u8[] VClientHello() {
+    string s = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006"
+        + "736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e"
+        + "435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e0403050306030203080408050806040105010601020104020502"
+        + "06020202002d00020101001c00024001";
+    return Hex.Of(s);
+}
+pub u8[] VServerHello() {
+    string s = "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe"
+        + "66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304";
+    return Hex.Of(s);
+}
+pub u8[] ClientHsTraffic() { return Hex.Of("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21"); }
+pub u8[] ServerHsTraffic() { return Hex.Of("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38"); }
+pub u8[] ServerFlight() {
+    string s = "080000240022000a00140012001d00170018001901000101010201030104001c00024001000000000b0001b9000001b50001b0308201ac30820115a0"
+        + "03020102020102300d06092a864886f70d01010b0500300e310c300a06035504031303727361301e170d3136303733303031323335395a170d323630"
+        + "3733303031323335395a300e310c300a0603550403130372736130819f300d06092a864886f70d010101050003818d0030818902818100b4bb498f82"
+        + "79303d980836399b36c6988c0c68de55e1bdb826d3901a2461eafd2de49a91d015abbc9a95137ace6c1af19eaa6af98c7ced43120998e187a80ee0cc"
+        + "b0524b1b018c3e0b63264d449a6d38e22a5fda430846748030530ef0461c8ca9d9efbfae8ea6d1d03e2bd193eff0ab9a8002c47428a6d35a8d88d79f"
+        + "7f1e3f0203010001a31a301830090603551d1304023000300b0603551d0f0404030205a0300d06092a864886f70d01010b05000381810085aad2a0e5"
+        + "b9276b908c65f73a7267170618a54c5f8a7b337d2df7a594365417f2eae8f8a58c8f8172f9319cf36b7fd6c55b80f21a03015156726096fd335e5e67"
+        + "f2dbf102702e608ccae6bec1fc63a42a99be5c3eb7107c3c54e9b9eb2bd5203b1c3b84e0a8b2f759409ba3eac9d91d402dcc0cc8f8961229ac9187b4"
+        + "2b4de100000f000084080400805a747c5d88fa9bd2e55ab085a61015b7211f824cd484145ab3ff52f1fda8477b0b7abc90db78e2d33a5c141a078653"
+        + "fa6bef780c5ea248eeaaa785c4f394cab6d30bbe8d4859ee511f602957b15411ac027671459e46445c9ea58c181e818e95b8c3fb0bf3278409d3be15"
+        + "2a3da5043e063dda65cdf5aea20d53dfacd42f74f3140000209b9b141d906337fbd2cbdce71df4deda4ab42c309572cb7fffee5454b78f0718";
+    return Hex.Of(s);
+}
+pub u8[] ClientApTraffic() { return Hex.Of("9e40646ce79a7f9dc05af8889bce6552875afa0b06df0087f792ebb7c17504a5"); }
+pub u8[] ServerApTraffic() { return Hex.Of("a11af9f05531f856ad47116b45a950328204b4f44bfb6b3a4b4f1f3fcb631643"); }
+pub u8[] VClientFinished() { return Hex.Of("14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61"); }
+pub u8[] ResumptionMaster() { return Hex.Of("7df235f2031d2a051287d02b0241b0bfdaf86cc856231f2d5aba46c434ec196c"); }
+pub u8[] VNewSessionTicket() {
+    string s = "040000c90000001efad6aac502000000b22c035d829359ee5ff7af4ec900000000262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09"
+        + "a2be785abc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827db279cce145077d454a3664d4e6da4d29ee03725a6a4dafc"
+        + "d0fc67d2aea70529513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea617646fac5c03272e970727c621a79141ef5f7de6505e"
+        + "5bfbc388e93343694093934ae4d3570008002a000400000400";
+    return Hex.Of(s);
+}

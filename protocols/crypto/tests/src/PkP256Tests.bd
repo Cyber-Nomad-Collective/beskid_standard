@@ -1,0 +1,119 @@
+/// P-256 point, key and ECDH tests. Vectors: RFC 6979 A.2.5 key pair; ECDH pairs generated with
+/// Python cryptography 49 (random.seed(256); derive_private_key; exchange(ECDH())), see the slice report.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Crypto.P256;
+use Crypto.PkErrors;
+
+pub u8 PkNibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
+    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
+    if c >= u8(65) && c <= u8(70) { return c - u8(55); }
+    return u8(0);
+}
+
+/// Test-only hex decoder; an odd-length string gets an implicit leading zero nibble.
+pub u8[] Hex(string text) {
+    i64 len = String.Len(text);
+    i64 odd = len % 2_i64;
+    u8[] out = Slice.New((len + 1_i64) / 2_i64);
+    mut i64 i = 0_i64;
+    while i < len {
+        i64 pos = i + odd;
+        u8 nib = PkNibble(String.ByteAt(text, i));
+        i64 index = pos / 2_i64;
+        if pos % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string HexDigit(u8 v) {
+    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
+    return String.CodeUnitChar(v + u8(87));
+}
+
+pub string ToHex(u8[] bytes) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) {
+        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+pub i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+pub string Hx(Result<u8[], PkError> r) {
+    return match r { Result::Ok(v) => ToHex(v), Result::Error(_) => "error", };
+}
+
+pub bool Valid(string encoded) {
+    Result<unit, PkError> r = P256.ValidatePublicKey(Hex(encoded));
+    return match r { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+test pk_p256_generator_roundtrip {
+    // d = 1 gives G itself.
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("0000000000000000000000000000000000000000000000000000000000000001"))),
+        "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c2964fe342e2fe1a7f9b8ee7eb4a7c0f9e162bce33576b315ececbb6406837bf51f5", "1 * G");
+    // d = n - 1 gives -G.
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632550"))),
+        "046b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296b01cbd1c01e58065711814b583f061e9d431cca994cea1313449bf97c840ae0a", "(n-1) * G");
+}
+
+test pk_p256_rfc6979_public_key {
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"))),
+        "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299", "RFC 6979 A.2.5 public key");
+}
+
+test pk_p256_ecdh_vectors {
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("750b79840a35e888cea8684b60033cd65db233956ea88f4b4f72fd3f7d254db9"))), "04b0a1f58fe3e991c56fb54053ded00cba1f1caef91b1009f2b37dcf58bca519359d240905a3e6eb0b75bb669c3a2238d24487258e4dca0196ca1917a60ab603fc", "ecdh 0 public key");
+    Assert.Equal<string>(Hx(P256.SharedSecret(Hex("750b79840a35e888cea8684b60033cd65db233956ea88f4b4f72fd3f7d254db9"), Hex("0446eccbe9fa9b957f1a338c341e529480453f04f742bf4af271c2819731389a786212760b85334c16ca8d8d36031b726385a7b2e872156d0fb76406a49606b397"))), "93f4caecde586a44a6ca24a242f18bfa5bf3301d799937b0379a1d563a3530d5", "ecdh 0 shared secret");
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("d2aeeaf914c7d3fd9a1ac067541b8ee6f0969fe15284b2bf8e56916a518a4445"))), "044e44c477e8811f72009c089ea65f3c681787db692d440f9e31b9001dd4ae7841af182e2b55132ad5e5dbd9f7b1cbdab3792ba61ef84486c4385fc5fe38efec76", "ecdh 1 public key");
+    Assert.Equal<string>(Hx(P256.SharedSecret(Hex("d2aeeaf914c7d3fd9a1ac067541b8ee6f0969fe15284b2bf8e56916a518a4445"), Hex("04a8456063ce46558f17d782609d65eea2825c35c090762c581c89fa9a35959d4c8a8564d84105daed2478419f2f7577755b608868472376d0babee06126465a96"))), "ab1e36bcf030efb1d61543426481713bbc3e58d714fcb468b9372abef01bf77b", "ecdh 1 shared secret");
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("fde9c7e9675be2b6da6f2974beeb65d108c25300fecf0c9277eeb71d894a472c"))), "049d11d28b1ac56e4c3e8614fc7e956ba98a286db12a3e94806d00ce33f94f7ab73bd7dbdd3dddcb7c242bc8234be10cf46ce9547d4b8000845c686c55c5a1ff81", "ecdh 2 public key");
+    Assert.Equal<string>(Hx(P256.SharedSecret(Hex("fde9c7e9675be2b6da6f2974beeb65d108c25300fecf0c9277eeb71d894a472c"), Hex("04467d9adc23cffe297b5743b6a8f6a38154c3e9efcc5bf3477004e9987753706961f34c1c7f637519378cb5076f8285f714f4deb6338550b43785ff38cb1fd056"))), "9f3f2220203abbe77fedf9592f27ee3761eb5ccdf869ff71feab0329793326dc", "ecdh 2 shared secret");
+}
+
+test pk_p256_rejects_invalid_points {
+    string good = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
+    Assert.True(Valid(good), "valid point accepted");
+    Assert.False(Valid("0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462298"), "off-curve y rejected");
+    Assert.False(Valid("0560fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"), "bad prefix rejected");
+    Assert.False(Valid("0360fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb6"), "compressed form rejected");
+    Assert.False(Valid("04"), "short encoding rejected");
+    Assert.False(Valid("0400000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"), "zero point rejected");
+    // x = p (non-canonical) with any y.
+    Assert.False(Valid("04ffffffff00000001000000000000000000000000ffffffffffffffffffffffff7903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"), "x = p rejected");
+}
+
+test pk_p256_rejects_invalid_scalars {
+    string peer = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
+    Assert.Equal<string>(Hx(P256.SharedSecret(Hex("0000000000000000000000000000000000000000000000000000000000000000"), Hex(peer))), "error", "zero scalar");
+    Assert.Equal<string>(Hx(P256.SharedSecret(Hex("ffffffff00000000ffffffffffffffffbce6faada7179e84f3b9cac2fc632551"), Hex(peer))), "error", "scalar n");
+    Assert.Equal<string>(Hx(P256.PublicKey(Hex("01"))), "error", "short scalar");
+}
+
+test pk_p256_timing {
+    u8[] d = Hex("c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721");
+    u8[] peer = Hex("0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299");
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < 5_i64 {
+        Result<u8[], PkError> r = P256.SharedSecret(d, peer);
+        i = i + 1_i64;
+    }
+    Output.WriteLine("p256 ecdh: " + Dec((NowNanos() - start) / 5000_i64) + " us");
+    Assert.True(true, "timing printed");
+}

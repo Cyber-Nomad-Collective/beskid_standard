@@ -1,0 +1,219 @@
+/// RSA signature verification (RFC 8017): RSASSA-PKCS1-v1_5 and RSASSA-PSS with MGF1.
+///
+/// Callers pass the message digest; this module does no hashing of its own. PSS needs the
+/// hash for MGF1 and for H' = Hash(M'), so `VerifyPss` takes it as a `PssDigest` value.
+/// Moduli from 1024 to 4096 bits are accepted; callers that need a stricter floor (TLS
+/// certificate policy) check `PublicKey.bits`. Verification time depends only on public data.
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.BigNat;
+use Crypto.ModArith;
+use Crypto.PkErrors;
+
+/// The hash a PKCS#1 v1.5 DigestInfo names.
+pub enum RsaHash { Sha256(), Sha384(), Sha512(), }
+
+/// The hash used by PSS for MGF1 and H'. `Digest` returns the full digest of `data`.
+pub contract PssDigest {
+    u8[] Digest(u8[] data);
+}
+
+/// A validated RSA public key.
+pub type PublicKey {
+    /// The modulus as normalized little-endian limbs.
+    pub u32[] n,
+    /// The public exponent, big-endian without leading zeros.
+    pub u8[] e,
+    /// The modulus bit length.
+    pub i64 bits,
+    /// The modulus byte length k; signatures have exactly k bytes.
+    pub i64 size,
+}
+
+pub i64 MinModulusBits() { return 1024_i64; }
+pub i64 MaxModulusBits() { return 4096_i64; }
+
+pub i64 DigestLength(RsaHash hash) {
+    return match hash { RsaHash::Sha256() => 32_i64, RsaHash::Sha384() => 48_i64, RsaHash::Sha512() => 64_i64, };
+}
+
+/// DER DigestInfo prefix (RFC 8017 section 9.2 note 1) for the hash.
+u8[] DigestInfoPrefix(RsaHash hash) {
+    return match hash {
+        RsaHash::Sha256() => [u8(48), u8(49), u8(48), u8(13), u8(6), u8(9), u8(96), u8(134), u8(72), u8(1), u8(101), u8(3), u8(4), u8(2), u8(1), u8(5), u8(0), u8(4), u8(32)],
+        RsaHash::Sha384() => [u8(48), u8(65), u8(48), u8(13), u8(6), u8(9), u8(96), u8(134), u8(72), u8(1), u8(101), u8(3), u8(4), u8(2), u8(2), u8(5), u8(0), u8(4), u8(48)],
+        RsaHash::Sha512() => [u8(48), u8(81), u8(48), u8(13), u8(6), u8(9), u8(96), u8(134), u8(72), u8(1), u8(101), u8(3), u8(4), u8(2), u8(3), u8(5), u8(0), u8(4), u8(64)],
+    };
+}
+
+u8[] StripLeadingZeros(u8[] bytes) {
+    mut i64 start = 0_i64;
+    while start < Slice.Len(bytes) && bytes[start] == u8(0) { start = start + 1_i64; }
+    return Slice.SubSlice(bytes, start, Slice.Len(bytes) - start);
+}
+
+/// Validates and builds a public key from big-endian modulus and exponent bytes
+/// (leading zero bytes allowed). The modulus must be odd and 1024 to 4096 bits; the
+/// exponent must be odd, at least 3, and below the modulus.
+pub Result<PublicKey, PkError> NewPublicKey(u8[] modulus, u8[] exponent) {
+    Result<u32[], PkError> decoded = BigNat.FromBytes(modulus);
+    return match decoded {
+        Result::Error(_) => Result::Error(PkError::InvalidModulus()),
+        Result::Ok(raw) => {
+            u32[] n = BigNat.Normalize(raw);
+            i64 bits = BigNat.BitLength(n);
+            if bits < MinModulusBits() || bits > MaxModulusBits() || !BigNat.IsOdd(n) { return Result::Error(PkError::InvalidModulus()); }
+            u8[] e = StripLeadingZeros(exponent);
+            i64 elen = Slice.Len(e);
+            if elen == 0_i64 || elen > (bits + 7_i64) / 8_i64 { return Result::Error(PkError::InvalidExponent()); }
+            if (e[elen - 1_i64] & u8(1)) == u8(0) { return Result::Error(PkError::InvalidExponent()); }
+            if elen == 1_i64 && e[0] < u8(3) { return Result::Error(PkError::InvalidExponent()); }
+            Result<u32[], PkError> ev = BigNat.FromBytes(e);
+            return match ev {
+                Result::Error(_) => Result::Error(PkError::InvalidExponent()),
+                Result::Ok(evalue) => {
+                    if BigNat.Compare(evalue, n) >= 0_i64 { return Result::Error(PkError::InvalidExponent()); }
+                    return Result::Ok(PublicKey { n: n, e: e, bits: bits, size: (bits + 7_i64) / 8_i64 });
+                },
+            };
+        },
+    };
+}
+
+/// RSAVP1 + I2OSP: `signature^e mod n` as exactly `key.size` bytes. The signature must be
+/// exactly `key.size` bytes and, as an integer, below n.
+pub Result<u8[], PkError> PublicOperation(PublicKey key, u8[] signature) {
+    if Slice.Len(signature) != key.size { return Result::Error(PkError::MalformedSignature()); }
+    Result<u32[], PkError> decoded = BigNat.FromBytes(signature);
+    Result<u32[], PkError> created = ModArith.NewWorkspace(key.n, 3_i64);
+    return match decoded {
+        Result::Error(_) => Result::Error(PkError::MalformedSignature()),
+        Result::Ok(s) => match created {
+            Result::Error(error) => Result::Error(error),
+            Result::Ok(w) => {
+                if BigNat.Compare(s, key.n) >= 0_i64 { return Result::Error(PkError::MalformedSignature()); }
+                i64 n = BigNat.SignificantLimbs(key.n);
+                i64 base = ModArith.WSlot(n, 0_i64);
+                i64 out = ModArith.WSlot(n, 1_i64);
+                ModArith.WLoad(w, n, base, BigNat.Resize(s, n));
+                ModArith.WToMont(w, n, base, base);
+                ModArith.WPowPublic(w, n, out, base, ModArith.WSlot(n, 2_i64), key.e);
+                ModArith.WFromMont(w, n, out, out);
+                return BigNat.ToBytes(ModArith.WStore(w, n, out), key.size);
+            },
+        },
+    };
+}
+
+/// RSASSA-PKCS1-v1_5 verification (RFC 8017 section 8.2.2) by re-encoding: the recovered
+/// block must equal 0x00 0x01 0xFF.. 0x00 || DigestInfo(hash) || digest exactly.
+pub Result<unit, PkError> VerifyPkcs1v15(PublicKey key, RsaHash hash, u8[] digest, u8[] signature) {
+    i64 hlen = DigestLength(hash);
+    if Slice.Len(digest) != hlen { return Result::Error(PkError::InvalidDigest()); }
+    u8[] prefix = DigestInfoPrefix(hash);
+    i64 tlen = Slice.Len(prefix) + hlen;
+    if key.size < tlen + 11_i64 { return Result::Error(PkError::InvalidModulus()); }
+    Result<u8[], PkError> recovered = PublicOperation(key, signature);
+    return match recovered {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(em) => {
+            i64 k = key.size;
+            u8[] expected = Slice.Fill(BigNat.ZeroBytes(k), 2_i64, k - tlen - 3_i64, u8(255));
+            expected[1] = u8(1);
+            Slice.Copy(expected, k - tlen, prefix, 0_i64, Slice.Len(prefix));
+            Slice.Copy(expected, k - hlen, digest, 0_i64, hlen);
+            if !SameBytes(em, expected) { return Result::Error(PkError::BadSignature()); }
+            return Result::Ok(());
+        },
+    };
+}
+
+bool SameBytes(u8[] a, u8[] b) {
+    if Slice.Len(a) != Slice.Len(b) { return false; }
+    mut u8 diff = u8(0);
+    mut i64 i = 0_i64;
+    while i < Slice.Len(a) {
+        diff = diff | ((a[i] | b[i]) - (a[i] & b[i]));
+        i = i + 1_i64;
+    }
+    return diff == u8(0);
+}
+
+/// MGF1 (RFC 8017 appendix B.2.1): `length` bytes of Hash(seed || counter) blocks.
+pub u8[] Mgf1(PssDigest hash, u8[] seed, i64 length) {
+    u8[] out = BigNat.ZeroBytes(length);
+    i64 seedLen = Slice.Len(seed);
+    u8[] input = BigNat.ZeroBytes(seedLen + 4_i64);
+    Slice.Copy(input, 0_i64, seed, 0_i64, seedLen);
+    mut i64 done = 0_i64;
+    mut i64 counter = 0_i64;
+    while done < length {
+        input[seedLen] = u8((counter >> 24_i64) & 255_i64);
+        input[seedLen + 1_i64] = u8((counter >> 16_i64) & 255_i64);
+        input[seedLen + 2_i64] = u8((counter >> 8_i64) & 255_i64);
+        input[seedLen + 3_i64] = u8(counter & 255_i64);
+        u8[] block = hash.Digest(input);
+        mut i64 take = Slice.Len(block);
+        if take == 0_i64 { return out; }
+        if take > length - done { take = length - done; }
+        Slice.Copy(out, done, block, 0_i64, take);
+        done = done + take;
+        counter = counter + 1_i64;
+    }
+    return out;
+}
+
+/// RSASSA-PSS verification (RFC 8017 sections 8.1.2 and 9.1.2) with MGF1 over the same
+/// hash. `digest` is mHash = Hash(M); `saltLength` is the expected salt length (TLS 1.3
+/// requires the digest length).
+pub Result<unit, PkError> VerifyPss(PublicKey key, PssDigest hash, u8[] digest, u8[] signature, i64 saltLength) {
+    i64 hlen = Slice.Len(digest);
+    if hlen == 0_i64 { return Result::Error(PkError::InvalidDigest()); }
+    if saltLength < 0_i64 { return Result::Error(PkError::OutOfRange()); }
+    Result<u8[], PkError> recovered = PublicOperation(key, signature);
+    return match recovered {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(m) => {
+            i64 emBits = key.bits - 1_i64;
+            i64 emLen = (emBits + 7_i64) / 8_i64;
+            i64 k = key.size;
+            // When emLen < k the leading octet of the I2OSP output must be zero.
+            if emLen < k && m[0] != u8(0) { return Result::Error(PkError::BadSignature()); }
+            u8[] em = Slice.SubSlice(m, k - emLen, emLen);
+            return EmsaPssVerify(hash, digest, em, emBits, saltLength);
+        },
+    };
+}
+
+Result<unit, PkError> EmsaPssVerify(PssDigest hash, u8[] mHash, u8[] em, i64 emBits, i64 sLen) {
+    i64 hlen = Slice.Len(mHash);
+    i64 emLen = Slice.Len(em);
+    if emLen < hlen + sLen + 2_i64 { return Result::Error(PkError::BadSignature()); }
+    if em[emLen - 1_i64] != u8(188) { return Result::Error(PkError::BadSignature()); }
+    i64 dbLen = emLen - hlen - 1_i64;
+    u8[] h = Slice.SubSlice(em, dbLen, hlen);
+    i64 zeroBits = 8_i64 * emLen - emBits;
+    u8 topMask = u8((255_i64 << (8_i64 - zeroBits)) & 255_i64);
+    if (em[0] & topMask) != u8(0) { return Result::Error(PkError::BadSignature()); }
+    u8[] db = Mgf1(hash, h, dbLen);
+    if Slice.Len(db) != dbLen { return Result::Error(PkError::BadSignature()); }
+    mut i64 i = 0_i64;
+    while i < dbLen {
+        db[i] = (db[i] | em[i]) - (db[i] & em[i]);
+        i = i + 1_i64;
+    }
+    db[0] = db[0] & (u8(255) - topMask);
+    i64 psLen = emLen - hlen - sLen - 2_i64;
+    i = 0_i64;
+    while i < psLen {
+        if db[i] != u8(0) { return Result::Error(PkError::BadSignature()); }
+        i = i + 1_i64;
+    }
+    if db[psLen] != u8(1) { return Result::Error(PkError::BadSignature()); }
+    u8[] mPrime = BigNat.ZeroBytes(8_i64 + hlen + sLen);
+    Slice.Copy(mPrime, 8_i64, mHash, 0_i64, hlen);
+    Slice.Copy(mPrime, 8_i64 + hlen, db, dbLen - sLen, sLen);
+    u8[] hPrime = hash.Digest(mPrime);
+    if !SameBytes(h, hPrime) { return Result::Error(PkError::BadSignature()); }
+    return Result::Ok(());
+}

@@ -1,0 +1,25 @@
+use Testing.Assert;
+use X509.Certificate;
+use X509.Verify;
+use X509.X509Errors;
+use TestSupport;
+
+string Run(string leafName, Certificate[] intermediates, string serverName) {
+    Certificate leaf = TestSupport.Cert(leafName);
+    X509Error e = Verify.Check(leaf, intermediates, TestSupport.TestRoots(), Verify.ServerOptions(TestSupport.Now(), serverName));
+    return X509Errors.Name(e);
+}
+
+test rsa_chains {
+    Certificate[] ints = TestSupport.One(TestSupport.Cert("rsa-int.pem"));
+    Assert.True(Run("rsa-leaf.pem", ints, "www.example.test") == "None", "valid RSA chain");
+    Assert.True(Run("rsa-leaf.pem", ints, "foo.api.example.test") == "None", "wildcard SAN");
+    Assert.True(Run("rsa-leaf.pem", ints, "192.0.2.10") == "None", "IP SAN");
+    Assert.True(Run("rsa-leaf.pem", ints, "wrong.example.test") == "HostnameMismatch", "wrong host");
+    Assert.True(Run("rsa-leaf.pem", ints, "192.0.2.11") == "HostnameMismatch", "wrong IP");
+    Assert.True(Run("rsa-leafpss.pem", ints, "leaf.example.test") == "None", "PSS signature");
+    Assert.True(Run("rsa-leaf512.pem", ints, "leaf.example.test") == "None", "sha512 signature");
+    Assert.True(Run("rsa-leaf.pem", TestSupport.One(TestSupport.Cert("ec-int.pem")), "") == "UnknownIssuer", "missing intermediate");
+    Certificate[] deep = TestSupport.Two(TestSupport.Cert("rsa-sub.pem"), TestSupport.Cert("rsa-int.pem"));
+    Assert.True(Run("rsa-subleaf.pem", deep, "leaf.example.test") == "PathLengthExceeded", "pathLen 0 below sub CA");
+}

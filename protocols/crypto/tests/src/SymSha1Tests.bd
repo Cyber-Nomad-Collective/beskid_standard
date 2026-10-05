@@ -1,0 +1,65 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.String;
+use Crypto.Sha1;
+
+u8 Nibble(u8 c) {
+    if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
+    if c >= 97_u8 && c <= 102_u8 { return c - 87_u8; }
+    return c - 55_u8;
+}
+u8[] Hex(string text) {
+    i64 n = String.Len(text) / 2_i64;
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = Nibble(String.ByteAt(text, 2_i64 * i)) * 16_u8 + Nibble(String.ByteAt(text, 2_i64 * i + 1_i64)); i = i + 1_i64; }
+    return out;
+}
+u8[] Ascii(string text) {
+    i64 n = String.Len(text);
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = String.ByteAt(text, i); i = i + 1_i64; }
+    return out;
+}
+bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
+
+string Msg448() { return "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"; }
+string Msg896() { return "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"; }
+
+// FIPS 180-4 / NIST CSRC example vectors.
+test sha1_abc { Assert.True(Same(Sha1.Hash(Ascii("abc")), Hex("a9993e364706816aba3e25717850c26c9cd0d89d")), "abc"); }
+test sha1_empty { Assert.True(Same(Sha1.Hash(Ascii("")), Hex("da39a3ee5e6b4b0d3255bfef95601890afd80709")), "empty"); }
+test sha1_448 { Assert.True(Same(Sha1.Hash(Ascii(Msg448())), Hex("84983e441c3bd26ebaae4aa1f95129e5e54670f1")), "448"); }
+test sha1_896 { Assert.True(Same(Sha1.Hash(Ascii(Msg896())), Hex("a49b2446a02c645bf419f995b67091253a04a259")), "896"); }
+test sha1_incremental_split {
+    u8[] m = Ascii(Msg896());
+    mut i64 split = 0_i64;
+    while split <= Slice.Len(m) {
+        Sha1State s = Sha1.New();
+        Assert.True(Sha1.UpdateRange(s, m, 0_i64, split), "first part");
+        Assert.True(Sha1.UpdateRange(s, m, split, Slice.Len(m) - split), "second part");
+        Assert.True(Same(Sha1.Finish(s), Hex("a49b2446a02c645bf419f995b67091253a04a259")), "split digest");
+        split = split + 13_i64;
+    }
+}
+test sha1_websocket_accept_input {
+    // RFC 6455 section 1.3: SHA-1 of key + GUID, before base64.
+    u8[] d = Sha1.Hash(Ascii("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+    Assert.True(Same(d, Hex("b37a4f2cc0624f1690f64606cf385945b2bec4ea")), "accept digest");
+}
+test sha1_finish_twice_and_update_after {
+    Sha1State s = Sha1.New();
+    Sha1.Update(s, Ascii("abc"));
+    u8[] first = Sha1.Finish(s);
+    Assert.False(Sha1.Update(s, Ascii("x")), "no update after finish");
+    Assert.True(Same(Sha1.Finish(s), first), "same digest");
+}
+test sha1_million_a {
+    u8[] block = Slice.New(1000_i64);
+    Slice.Fill(block, 0_i64, 1000_i64, 97_u8);
+    Sha1State s = Sha1.New();
+    mut i64 i = 0_i64;
+    while i < 1000_i64 { Sha1.Update(s, block); i = i + 1_i64; }
+    Assert.True(Same(Sha1.Finish(s), Hex("34aa973cd4c4daa4f61eeb2bdbad27316534016f")), "million a");
+}

@@ -1,0 +1,136 @@
+use Core.Collections.Array;
+use Http2.Hpack;
+
+// RFC 9204 section 3.2: the QPACK dynamic table. Entries are addressed by
+// absolute index (0 for the first insertion ever). `entries[i]` holds the
+// entry with absolute index `base + i`; entries before `start` are evicted.
+// Insert count = base + Len(entries). Size accounting is name + value + 32.
+
+pub type DynTable {
+    pub HeaderField[] entries,
+    pub i64 base,
+    pub i64 start,
+    pub i64 size,
+    pub i64 capacity,
+    pub i64 maxCapacity,
+}
+
+/// An empty table with capacity 0 that may grow to `maxCapacity`
+/// (SETTINGS_QPACK_MAX_TABLE_CAPACITY).
+pub DynTable New(i64 maxCapacity) {
+    return DynTable { entries: Array.Empty<HeaderField>(), base: 0_i64, start: 0_i64, size: 0_i64, capacity: 0_i64, maxCapacity: maxCapacity };
+}
+
+/// Total number of insertions so far.
+pub i64 InsertCount(DynTable t) { return t.base + Array.Len<HeaderField>(t.entries); }
+
+/// Absolute index of the oldest live entry (= insert count when empty).
+pub i64 Dropped(DynTable t) { return t.base + t.start; }
+
+/// Number of live entries.
+pub i64 Count(DynTable t) { return Array.Len<HeaderField>(t.entries) - t.start; }
+
+/// MaxEntries of RFC 9204 section 4.5.1.1.
+pub i64 MaxEntries(DynTable t) { return t.maxCapacity / 32_i64; }
+
+/// The absolute index refers to a live entry.
+pub bool Has(DynTable t, i64 absolute) { return absolute >= Dropped(t) && absolute < InsertCount(t); }
+
+/// The live entry at `absolute`; the caller checks Has first.
+pub HeaderField Get(DynTable t, i64 absolute) { return Array.Get<HeaderField>(t.entries, absolute - t.base); }
+
+/// Drops evicted slots once they dominate the backing array.
+unit Compact(mut DynTable t) {
+    i64 total = Array.Len<HeaderField>(t.entries);
+    if t.start < 16_i64 || t.start * 2_i64 < total { return; }
+    mut HeaderField[] kept = Array.Empty<HeaderField>();
+    mut i64 i = t.start;
+    while i < total { Array.Append<HeaderField>(kept, Array.Get<HeaderField>(t.entries, i)); i = i + 1_i64; }
+    t.base = t.base + t.start;
+    t.entries = kept;
+    t.start = 0_i64;
+    return;
+}
+
+/// True when evicting only entries with absolute index below `limit` makes
+/// room for `room` more octets within the current capacity.
+pub bool CanMakeRoom(DynTable t, i64 room, i64 limit) {
+    mut i64 size = t.size;
+    mut i64 abs = Dropped(t);
+    while size + room > t.capacity {
+        if abs >= limit || abs >= InsertCount(t) { return false; }
+        HeaderField oldest = Get(t, abs);
+        size = size - Hpack.FieldSize(oldest);
+        abs = abs + 1_i64;
+    }
+    return true;
+}
+
+/// Evicts oldest entries until size + room <= capacity (or the table is empty).
+unit EvictFor(mut DynTable t, i64 room) {
+    while t.size + room > t.capacity && Count(t) > 0_i64 {
+        HeaderField oldest = Array.Get<HeaderField>(t.entries, t.start);
+        t.size = t.size - Hpack.FieldSize(oldest);
+        t.start = t.start + 1_i64;
+    }
+    Compact(t);
+    return;
+}
+
+/// Set Dynamic Table Capacity: false when above maxCapacity (section 4.3.1).
+pub bool SetCapacity(mut DynTable t, i64 capacity) {
+    if capacity < 0_i64 || capacity > t.maxCapacity { return false; }
+    t.capacity = capacity;
+    EvictFor(t, 0_i64);
+    return true;
+}
+
+/// Inserts `field`, evicting as needed. False when the entry is larger than
+/// the capacity (a QPACK_ENCODER_STREAM_ERROR on the decoder side).
+pub bool Insert(mut DynTable t, HeaderField field) {
+    i64 size = Hpack.FieldSize(field);
+    if size > t.capacity { return false; }
+    EvictFor(t, size);
+    mut HeaderField[] entries = t.entries;
+    Array.Append<HeaderField>(entries, HeaderField { name: field.name, value: field.value, sensitive: false });
+    t.entries = entries;
+    t.size = t.size + size;
+    return true;
+}
+
+/// Absolute index of the newest live entry equal to `field`, or -1.
+pub i64 FindExact(DynTable t, HeaderField field) {
+    mut i64 abs = InsertCount(t) - 1_i64;
+    while abs >= Dropped(t) {
+        HeaderField entry = Get(t, abs);
+        if Hpack.BytesEqual(entry.name, field.name) && Hpack.BytesEqual(entry.value, field.value) { return abs; }
+        abs = abs - 1_i64;
+    }
+    return -1_i64;
+}
+
+/// Absolute index of the newest live entry named `field.name`, or -1.
+pub i64 FindName(DynTable t, HeaderField field) {
+    mut i64 abs = InsertCount(t) - 1_i64;
+    while abs >= Dropped(t) {
+        HeaderField entry = Get(t, abs);
+        if Hpack.BytesEqual(entry.name, field.name) { return abs; }
+        abs = abs - 1_i64;
+    }
+    return -1_i64;
+}
+
+/// First absolute index that is not draining: entries below it lie in the
+/// oldest quarter of the capacity and should not gain new references
+/// (section 2.1.1.1).
+pub i64 DrainingLimit(DynTable t) {
+    i64 threshold = t.capacity / 4_i64;
+    mut i64 used = t.capacity - t.size;
+    mut i64 abs = Dropped(t);
+    while abs < InsertCount(t) && used < threshold {
+        HeaderField entry = Get(t, abs);
+        used = used + Hpack.FieldSize(entry);
+        abs = abs + 1_i64;
+    }
+    return abs;
+}

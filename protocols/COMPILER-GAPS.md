@@ -405,3 +405,34 @@ without double or trailing underscores, and must be unique per target.
 - Symptom: `TcpListener.Accept(deadline)` called directly in a `test` body returns an error
   immediately instead of waiting; the same call inside `spawn` waits as expected.
 - Workaround: run network scenarios as `Fiber<unit> f = spawn Scenario(); f.Join();`.
+
+## 2026-10-05, http3 slice
+
+### H1. Identifiers that start with `never` are split by the lexer
+- Symptom: `mut u8 neverName = 0_u8;` gives lint "binding `Name` should use
+  lowerCamelCase" and, at CLIF time, `no ISLE lowering rule or fact for LetStatement`.
+  Same family as C8 (`spawnIt`, `host`, `launch`).
+- Repro: `i64 F(bool c) { mut u8 neverName = 0_u8; if c { neverName = 16_u8; } return i64(neverName); }`
+- Workaround: do not start identifiers with a keyword (`never`, `spawn`, ...).
+
+### H2. A type named like its module leaf cannot be imported; type paths from path dependencies do not resolve
+- Symptom: `use Http3.QpackDecoder; use Http3.QpackDecoder.QpackDecoder;` is
+  "duplicate item `QpackDecoder`"; `use Http2.Hpack.HeaderField;` (a type in a
+  path dependency) is "unknown import path".
+- Workaround: `use Http2.Hpack;` already brings the module's types into scope
+  unqualified. Give types names that differ from every module leaf
+  (`QDecoder`, `QEncoder`, `DynTable`, `SettingValues`).
+
+### H3. Codegen cost of the HTTP/3 connection layer
+- Symptom: every test that reaches `H3Connection.Pump` spends 40-57 s in
+  "Generate CLIF" (QPACK, frames, mapping, connection, ~1500 lines reachable); a
+  target with 3-4 such tests takes about 3.5 minutes.
+- Workaround: few loopback tests per target, many assertions per test,
+  `--target-timeout 600`. Pure codec tests (QPACK, frames, mapping) stay cheap
+  (2-10 s per test).
+
+### H4. Tooling: editing sources during `beskid test` fails the run
+- Symptom: after the results print, the run ends with "prepared workspace
+  content mutated during phase `execute_target`" when a test file of the project
+  was edited while it ran.
+- Workaround: do not edit the project while its tests run; stage edits elsewhere.

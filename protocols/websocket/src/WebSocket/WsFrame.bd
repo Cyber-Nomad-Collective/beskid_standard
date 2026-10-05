@@ -1,0 +1,222 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use WebSocket.WsErrors;
+use WebSocket.WsUtf8;
+
+// RFC 6455 section 5 base framing: header codec, masking, close payloads.
+
+pub i64 OpContinuation() { return 0_i64; }
+pub i64 OpText() { return 1_i64; }
+pub i64 OpBinary() { return 2_i64; }
+pub i64 OpClose() { return 8_i64; }
+pub i64 OpPing() { return 9_i64; }
+pub i64 OpPong() { return 10_i64; }
+
+/// Largest control frame payload (section 5.5).
+pub i64 MaxControlPayload() { return 125_i64; }
+/// Largest frame header: 2 + 8 (64-bit length) + 4 (masking key).
+pub i64 MaxHeaderLength() { return 14_i64; }
+
+// ProtocolError reason codes.
+pub i64 ReasonReservedBits() { return 1_i64; }
+pub i64 ReasonReservedOpcode() { return 2_i64; }
+pub i64 ReasonFragmentedControl() { return 3_i64; }
+pub i64 ReasonControlTooLong() { return 4_i64; }
+pub i64 ReasonNonMinimalLength() { return 5_i64; }
+pub i64 ReasonLengthTooLarge() { return 6_i64; }
+pub i64 ReasonUnmaskedClientFrame() { return 7_i64; }
+pub i64 ReasonMaskedServerFrame() { return 8_i64; }
+pub i64 ReasonUnexpectedContinuation() { return 9_i64; }
+pub i64 ReasonInterleavedData() { return 10_i64; }
+pub i64 ReasonBadClosePayload() { return 11_i64; }
+pub i64 ReasonBadCloseCode() { return 12_i64; }
+
+/// A decoded frame header. `maskKey` is empty when the frame is not masked.
+pub type FrameHeader {
+    pub bool fin,
+    pub i64 rsv,
+    pub i64 opcode,
+    pub bool masked,
+    pub u8[] maskKey,
+    pub i64 payloadLength,
+    pub i64 headerLength,
+}
+
+pub bool IsControl(i64 opcode) { return opcode >= 8_i64; }
+
+pub bool IsKnownOpcode(i64 opcode) {
+    return opcode == 0_i64 || opcode == 1_i64 || opcode == 2_i64 || opcode == 8_i64 || opcode == 9_i64 || opcode == 10_i64;
+}
+
+/// Bytes needed for the complete header, from its first two bytes.
+pub i64 HeaderLengthFrom(u8 second) {
+    i64 b = i64(second);
+    mut i64 n = 2_i64;
+    i64 len7 = b & 127_i64;
+    if len7 == 126_i64 { n = n + 2_i64; }
+    if len7 == 127_i64 { n = n + 8_i64; }
+    if (b & 128_i64) != 0_i64 { n = n + 4_i64; }
+    return n;
+}
+
+/// Decodes and validates one header from `buf[start, stop)`. Incomplete when the
+/// window is too short. No extension is ever negotiated, so any RSV bit is a
+/// protocol error; reserved opcodes, fragmented or long control frames,
+/// non-minimal lengths and lengths with the top bit set are protocol errors.
+pub Result<FrameHeader, WsError> DecodeHeader(u8[] buf, i64 start, i64 stop) {
+    if start < 0_i64 || stop > Slice.Len(buf) || stop < start { return Result::Error(WsError::InvalidArgument()); }
+    if stop - start < 2_i64 { return Result::Error(WsError::Incomplete()); }
+    i64 b0 = i64(buf[start]);
+    i64 b1 = i64(buf[start + 1_i64]);
+    i64 headerLength = HeaderLengthFrom(buf[start + 1_i64]);
+    if stop - start < headerLength { return Result::Error(WsError::Incomplete()); }
+    bool fin = (b0 & 128_i64) != 0_i64;
+    i64 rsv = (b0 >> 4_i64) & 7_i64;
+    i64 opcode = b0 & 15_i64;
+    bool masked = (b1 & 128_i64) != 0_i64;
+    i64 len7 = b1 & 127_i64;
+    if rsv != 0_i64 { return Result::Error(WsError::ProtocolError(ReasonReservedBits())); }
+    if !IsKnownOpcode(opcode) { return Result::Error(WsError::ProtocolError(ReasonReservedOpcode())); }
+    mut i64 length = len7;
+    mut i64 pos = start + 2_i64;
+    if len7 == 126_i64 {
+        length = (i64(buf[pos]) << 8_i64) | i64(buf[pos + 1_i64]);
+        pos = pos + 2_i64;
+        if length < 126_i64 { return Result::Error(WsError::ProtocolError(ReasonNonMinimalLength())); }
+    } else if len7 == 127_i64 {
+        if (i64(buf[pos]) & 128_i64) != 0_i64 { return Result::Error(WsError::ProtocolError(ReasonLengthTooLarge())); }
+        mut i64 v = 0_i64;
+        mut i64 i = 0_i64;
+        while i < 8_i64 { v = (v << 8_i64) | i64(buf[pos + i]); i = i + 1_i64; }
+        pos = pos + 8_i64;
+        if v < 65536_i64 { return Result::Error(WsError::ProtocolError(ReasonNonMinimalLength())); }
+        length = v;
+    }
+    if IsControl(opcode) {
+        if !fin { return Result::Error(WsError::ProtocolError(ReasonFragmentedControl())); }
+        if length > MaxControlPayload() { return Result::Error(WsError::ProtocolError(ReasonControlTooLong())); }
+    }
+    mut u8[] key = Slice.New(0_i64);
+    if masked { key = Slice.SubSlice(buf, pos, 4_i64); }
+    return Result::Ok(FrameHeader { fin: fin, rsv: rsv, opcode: opcode, masked: masked, maskKey: key, payloadLength: length, headerLength: headerLength });
+}
+
+/// Role rule of section 5.1: a server rejects unmasked frames, a client rejects masked ones.
+pub Result<unit, WsError> CheckRole(bool masked, bool receiverIsServer) {
+    if receiverIsServer && !masked { return Result::Error(WsError::ProtocolError(ReasonUnmaskedClientFrame())); }
+    if !receiverIsServer && masked { return Result::Error(WsError::ProtocolError(ReasonMaskedServerFrame())); }
+    return Result::Ok(());
+}
+
+u8 XorByte(u8 a, u8 b) { return (a | b) - (a & b); }
+
+/// XORs `count` bytes from `offset` with the 4-byte key, starting at key position
+/// `keyIndex` (so a payload can be unmasked in pieces). Applying it twice restores the data.
+pub unit ApplyMask(u8[] data, i64 offset, i64 count, u8[] key, i64 keyIndex) {
+    mut i64 i = 0_i64;
+    while i < count {
+        data[offset + i] = XorByte(data[offset + i], key[(keyIndex + i) & 3_i64]);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+/// Header length for a payload of `count` bytes.
+pub i64 EncodedHeaderLength(i64 count, bool masked) {
+    mut i64 n = 2_i64;
+    if count >= 65536_i64 { n = 10_i64; } else if count >= 126_i64 { n = 4_i64; }
+    if masked { n = n + 4_i64; }
+    return n;
+}
+
+/// Encodes one frame: header (minimal length encoding) followed by the payload,
+/// masked with `maskKey` when it holds 4 bytes, unmasked when it is empty.
+pub Result<u8[], WsError> EncodeFrame(bool fin, i64 opcode, u8[] payload, i64 offset, i64 count, u8[] maskKey) {
+    if !IsKnownOpcode(opcode) || !Slice.IsValidRange(Slice.Len(payload), offset, count) { return Result::Error(WsError::InvalidArgument()); }
+    i64 keyLength = Slice.Len(maskKey);
+    if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
+    if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
+    bool masked = keyLength == 4_i64;
+    i64 headerLength = EncodedHeaderLength(count, masked);
+    u8[] out = Slice.New(headerLength + count);
+    mut i64 b0 = opcode;
+    if fin { b0 = b0 | 128_i64; }
+    out[0] = u8(b0);
+    mut i64 maskBit = 0_i64;
+    if masked { maskBit = 128_i64; }
+    mut i64 pos = 2_i64;
+    if count >= 65536_i64 {
+        out[1] = u8(maskBit | 127_i64);
+        mut i64 i = 0_i64;
+        while i < 8_i64 {
+            out[2_i64 + i] = u8((count >> ((7_i64 - i) * 8_i64)) & 255_i64);
+            i = i + 1_i64;
+        }
+        pos = 10_i64;
+    } else if count >= 126_i64 {
+        out[1] = u8(maskBit | 126_i64);
+        out[2] = u8((count >> 8_i64) & 255_i64);
+        out[3] = u8(count & 255_i64);
+        pos = 4_i64;
+    } else {
+        out[1] = u8(maskBit | count);
+    }
+    if masked {
+        Slice.Copy(out, pos, maskKey, 0_i64, 4_i64);
+        pos = pos + 4_i64;
+    }
+    Slice.Copy(out, pos, payload, offset, count);
+    if masked { ApplyMask(out, pos, count, maskKey, 0_i64); }
+    return Result::Ok(out);
+}
+
+/// True for close codes an endpoint may send or accept in a close frame (section
+/// 7.4): 1000-1003, 1007-1014 and 3000-4999. 1004, 1005, 1006 and 1015 are
+/// reserved for local use and never appear on the wire.
+pub bool ValidCloseCode(i64 code) {
+    if code >= 1000_i64 && code <= 1003_i64 { return true; }
+    if code >= 1007_i64 && code <= 1014_i64 { return true; }
+    if code >= 3000_i64 && code <= 4999_i64 { return true; }
+    return false;
+}
+
+/// Close code reported when a close frame has no status (section 7.1.5).
+pub i64 NoStatusCode() { return 1005_i64; }
+/// Close code reported when the connection ended without a close frame (section 7.1.5).
+pub i64 AbnormalCode() { return 1006_i64; }
+
+/// Close payload: 2-byte code then UTF-8 reason. Code 0 means an empty payload.
+pub Result<u8[], WsError> EncodeClosePayload(i64 code, u8[] reason) {
+    i64 n = Slice.Len(reason);
+    if code == 0_i64 {
+        if n != 0_i64 { return Result::Error(WsError::InvalidArgument()); }
+        return Result::Ok(Slice.New(0_i64));
+    }
+    if !ValidCloseCode(code) || n + 2_i64 > MaxControlPayload() { return Result::Error(WsError::InvalidArgument()); }
+    if !WsUtf8.IsValid(reason, 0_i64, n) { return Result::Error(WsError::InvalidUtf8()); }
+    u8[] out = Slice.New(n + 2_i64);
+    out[0] = u8((code >> 8_i64) & 255_i64);
+    out[1] = u8(code & 255_i64);
+    Slice.Copy(out, 2_i64, reason, 0_i64, n);
+    return Result::Ok(out);
+}
+
+/// Status code of a received close payload: NoStatusCode for an empty payload,
+/// ProtocolError for one byte or an invalid code, InvalidUtf8 for a bad reason.
+pub Result<i64, WsError> DecodeCloseCode(u8[] payload) {
+    i64 n = Slice.Len(payload);
+    if n == 0_i64 { return Result::Ok(NoStatusCode()); }
+    if n == 1_i64 { return Result::Error(WsError::ProtocolError(ReasonBadClosePayload())); }
+    i64 code = (i64(payload[0]) << 8_i64) | i64(payload[1]);
+    if !ValidCloseCode(code) { return Result::Error(WsError::ProtocolError(ReasonBadCloseCode())); }
+    if !WsUtf8.IsValid(payload, 2_i64, n - 2_i64) { return Result::Error(WsError::InvalidUtf8()); }
+    return Result::Ok(code);
+}
+
+/// Reason bytes of a valid close payload (empty when there is none).
+pub u8[] CloseReason(u8[] payload) {
+    i64 n = Slice.Len(payload);
+    if n <= 2_i64 { return Slice.New(0_i64); }
+    return Slice.SubSlice(payload, 2_i64, n - 2_i64);
+}

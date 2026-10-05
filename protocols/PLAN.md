@@ -84,6 +84,17 @@ target do not run).
   `__panic*` from package or test code (corelib-only service).
 - Extern C: `[Extern(Abi:"C", Library:"libc")] pub contract X { i32 f(i64 a); }`
   (see corelib `Core/Threading/Thread.bd`).
+- Buffers: `Slice.New(n)` appends n times (cost grows with n, sometimes
+  quadratically) and one array near 180 KiB, or several live 64 KiB arrays, traps
+  `out_of_memory`. Allocate record-sized buffers once and reuse them; use the
+  in-place crypto APIs (`SealInto`/`OpenInto`); never buffer a whole body or
+  stream; keep windows and flow-control limits at or below 64 KiB by default.
+- Struct fields cannot be `mut`; keep mutable state in array fields or pass `mut`
+  values. A `return` inside a block match arm is not treated as diverging.
+- Extern parameters must be primitives (`i32 i64 ...`, no `u32`, no arrays).
+- Available crypto (`protocols/crypto`): SHA-256/384/512, HMAC, HKDF with
+  `ExpandLabel`/`DeriveSecret`, ChaCha20-Poly1305, AES-128/256-GCM, AES block,
+  ChaCha20 block (QUIC header protection), ConstantTime, `Entropy.Fill`.
 - Idiom reference: corelib `packages/http/src/Http/*.bd`, `packages/network/src/Network/*.bd`,
   tests in `beskid_corelib/tests/corelib_tests/src/{http,network}`.
 

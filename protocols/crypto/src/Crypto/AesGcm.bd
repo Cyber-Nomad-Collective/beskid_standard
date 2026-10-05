@@ -3,6 +3,7 @@ use Core.Results;
 use Crypto.Aes;
 use Crypto.ConstantTime;
 use Crypto.Errors;
+use Crypto.Scratch;
 
 /// AES-GCM AEAD (NIST SP 800-38D) with a 96-bit IV and a 16-byte tag.
 /// GHASH uses Shoup's 4-bit tables (as in mbed TLS) on (high, low) i64 halves.
@@ -38,7 +39,7 @@ pub Result<AesGcmKey, CryptoError> New(u8[] key) {
     return match Aes.NewKey(key) {
         Result::Error(error) => Result::Error(error),
         Result::Ok(aes) => {
-            u8[] h = Slice.New(16_i64);
+            u8[] h = Scratch.Bytes(16_i64);
             Aes.EncryptBlock(aes, h, 0_i64, h, 0_i64);
             mut i64 vh = Be64(h, 0_i64);
             mut i64 vl = Be64(h, 8_i64);
@@ -125,14 +126,14 @@ unit Absorb(AesGcmKey key, u8[] y, u8[] data, i64 offset, i64 count) {
 }
 
 u8[] ComputeTag(AesGcmKey key, u8[] j0, u8[] aad, u8[] ciphertext, i64 offset, i64 count) {
-    u8[] y = Slice.New(16_i64);
+    u8[] y = Scratch.Bytes(16_i64);
     Absorb(key, y, aad, 0_i64, Slice.Len(aad));
     Absorb(key, y, ciphertext, offset, count);
-    u8[] lengths = Slice.New(16_i64);
+    u8[] lengths = Scratch.Bytes(16_i64);
     PutBe64(lengths, 0_i64, Slice.Len(aad) * 8_i64);
     PutBe64(lengths, 8_i64, count * 8_i64);
     Absorb(key, y, lengths, 0_i64, 16_i64);
-    u8[] mask = Slice.New(16_i64);
+    u8[] mask = Scratch.Bytes(16_i64);
     Aes.EncryptBlock(key.aes, j0, 0_i64, mask, 0_i64);
     mut i64 i = 0_i64;
     while i < 16_i64 { u8 a = y[i]; u8 b = mask[i]; y[i] = (a | b) - (a & b); i = i + 1_i64; }
@@ -141,8 +142,8 @@ u8[] ComputeTag(AesGcmKey key, u8[] j0, u8[] aad, u8[] ciphertext, i64 offset, i
 
 /// GCTR from counter block inc32(J0): XORs `count` bytes of `input` into `output`.
 unit Ctr(AesGcmKey key, u8[] j0, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
-    u8[] counter = Slice.SubSlice(j0, 0_i64, 16_i64);
-    u8[] stream = Slice.New(16_i64);
+    u8[] counter = Scratch.Sub(j0, 0_i64, 16_i64);
+    u8[] stream = Scratch.Bytes(16_i64);
     mut i64 done = 0_i64;
     while done < count {
         // inc32: increment the low 32 bits big-endian, modulo 2^32.
@@ -169,7 +170,7 @@ unit Ctr(AesGcmKey key, u8[] j0, u8[] input, i64 inputOffset, i64 count, u8[] ou
 }
 
 u8[] InitialCounter(u8[] nonce) {
-    u8[] j0 = Slice.New(16_i64);
+    u8[] j0 = Scratch.Bytes(16_i64);
     Slice.Copy(j0, 0_i64, nonce, 0_i64, 12_i64);
     j0[15] = 1_u8;
     return j0;
@@ -214,7 +215,7 @@ pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] 
 pub Result<u8[], CryptoError> Seal(AesGcmKey key, u8[] nonce, u8[] aad, u8[] plaintext) {
     i64 count = Slice.Len(plaintext);
     if count > MaxPlaintext() { return Result::Error(CryptoError::InvalidLength()); }
-    u8[] out = Slice.New(count + 16_i64);
+    u8[] out = Scratch.Bytes(count + 16_i64);
     return match SealInto(key, nonce, aad, plaintext, 0_i64, count, out, 0_i64) {
         Result::Ok(_) => Result::Ok(out),
         Result::Error(error) => Result::Error(error),
@@ -227,7 +228,7 @@ pub Result<u8[], CryptoError> Open(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sea
     if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength()); }
     i64 total = Slice.Len(sealed);
     if total < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed()); }
-    u8[] out = Slice.New(total - 16_i64);
+    u8[] out = Scratch.Bytes(total - 16_i64);
     return match OpenInto(key, nonce, aad, sealed, 0_i64, total, out, 0_i64) {
         Result::Ok(_) => Result::Ok(out),
         Result::Error(error) => Result::Error(error),

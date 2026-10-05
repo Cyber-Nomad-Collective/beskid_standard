@@ -1,21 +1,78 @@
 use Core.Collections.Array;
 use Core.Results;
+use Core.Time;
+use Core.Time.Instant;
+use X509.Certificate;
+use X509.TrustStore;
+use X509.Verify;
+use X509.X509Errors;
 use Tls.Alert;
 use Tls.PeerKeys;
 use Tls.TlsConfig;
 use Tls.TlsErrors;
 
-// Server certificate chain policy for the client. Returns the key that must have signed
-// CertificateVerify.
+// Server certificate chain policy for the client (RFC 8446 section 4.4.2.4). Returns the
+// key that must have signed CertificateVerify.
+
+/// The alert for a chain validation failure.
+pub i64 AlertFor(X509Error error) {
+    return match error {
+        X509Error::Expired => Alert.CertificateExpired(),
+        X509Error::UnknownIssuer => Alert.UnknownCa(),
+        X509Error::UnsupportedAlgorithm => Alert.UnsupportedCertificate(),
+        X509Error::UnsupportedKey => Alert.UnsupportedCertificate(),
+        X509Error::UnknownCriticalExtension => Alert.UnsupportedCertificate(),
+        X509Error::BadExtendedKeyUsage => Alert.UnsupportedCertificate(),
+        X509Error::BadKeyUsage => Alert.UnsupportedCertificate(),
+        _ => Alert.BadCertificate(),
+    };
+}
+
+i64 NowSeconds(TlsClientConfig config) {
+    if config.nowSeconds > 0_i64 { return config.nowSeconds; }
+    Instant now = Time.NowUtc();
+    return now.nanos / 1000000000_i64;
+}
+
+Result<unit, TlsError> CheckChain(TlsClientConfig config, Blob[] chain, TrustStore store) {
+    i64 n = Array.Len<Blob>(chain);
+    Blob leafBlob = chain[0];
+    Result<Certificate, X509Error> parsedLeaf = Certificate.Parse(leafBlob.data);
+    match parsedLeaf {
+        Result::Error(e) => { return Result::Error(TlsErrors.Fatal(AlertFor(e))); },
+        Result::Ok(leaf) => {
+            mut Certificate[] intermediates = Array.Empty<Certificate>();
+            mut i64 i = 1_i64;
+            while i < n {
+                Blob b = chain[i];
+                Result<Certificate, X509Error> parsed = Certificate.Parse(b.data);
+                match parsed {
+                    Result::Error(e) => { return Result::Error(TlsErrors.Fatal(AlertFor(e))); },
+                    Result::Ok(c) => { Array.Append<Certificate>(intermediates, c); },
+                };
+                i = i + 1_i64;
+            }
+            VerifyOptions options = Verify.ServerOptions(NowSeconds(config), config.serverName);
+            X509Error result = Verify.Check(leaf, intermediates, store, options);
+            return match result {
+                X509Error::None => Result::Ok(()),
+                _ => Result::Error(TlsErrors.Fatal(AlertFor(result))),
+            };
+        },
+    };
+}
 
 pub Result<PeerKey, TlsError> VerifyServerChain(TlsClientConfig config, Blob[] chain) {
     if Array.Len<Blob>(chain) == 0_i64 { return Result::Error(TlsErrors.Fatal(Alert.DecodeError())); }
     Blob leaf = chain[0];
     CertificateVerification mode = config.verification;
-    return match mode {
-        CertificateVerification::DangerousAcceptAnyCertificate => PeerKeys.FromCertificate(leaf.data),
-        // Chain building and RFC 6125 name checks need the X509 package; until it is wired
-        // in, anchor-based verification fails closed.
-        CertificateVerification::Anchors(_) => Result::Error(TlsErrors.Fatal(Alert.UnknownCa())),
+    match mode {
+        CertificateVerification::DangerousAcceptAnyCertificate => {},
+        CertificateVerification::Trust(store) => {
+            TrustStore anchors = store;
+            Result<unit, TlsError> checked = CheckChain(config, chain, anchors);
+            match checked { Result::Error(e) => { return Result::Error(e); }, Result::Ok(_) => {}, };
+        },
     };
+    return PeerKeys.FromCertificate(leaf.data);
 }

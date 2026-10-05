@@ -1,6 +1,10 @@
 use Core.Bytes.Slice;
 use Core.Collections.Array;
 use Core.String;
+use Core.Results;
+use X509.Certificate;
+use X509.TrustStore;
+use X509.X509Errors;
 use Tls.Suites;
 use Tls.Wire;
 
@@ -10,12 +14,10 @@ use Tls.Wire;
 
 pub type Blob { pub u8[] data, }
 
-/// Trust anchors as DER certificates (roots the chain must end at).
-pub type TrustAnchors { pub Blob[] certificates, }
-
 pub enum CertificateVerification {
-    // Validate the chain to one of these anchors and check the server name (RFC 6125).
-    Anchors(TrustAnchors anchors),
+    // Validate the chain (X.509, RFC 5280) to an anchor of this store and check the
+    // server name (RFC 6125).
+    Trust(TrustStore store),
     // Accept any certificate chain. Only the CertificateVerify signature is still checked,
     // which proves possession of the presented key but not who owns it. Tests only.
     DangerousAcceptAnyCertificate,
@@ -84,6 +86,26 @@ pub Blob[] Chain1(u8[] leaf) {
     Array.Append<Blob>(chain, Blob { data: leaf });
     return chain;
 }
+
+/// Verification against explicit DER trust anchors. Unparseable anchors are an error.
+pub Result<CertificateVerification, X509Error> Anchors(Blob[] anchors) {
+    mut TrustStore store = TrustStore.Empty();
+    i64 n = Array.Len<Blob>(anchors);
+    mut i64 i = 0_i64;
+    while i < n {
+        Blob b = anchors[i];
+        Result<Certificate, X509Error> parsed = Certificate.Parse(b.data);
+        match parsed {
+            Result::Error(e) => { return Result::Error(e); },
+            Result::Ok(cert) => { store = TrustStore.WithCertificate(store, cert); },
+        };
+        i = i + 1_i64;
+    }
+    return Result::Ok(CertificateVerification::Trust(store));
+}
+
+/// Verification against a trust store (for example `TrustStore.FromFile(TrustStore.SystemBundlePath())`).
+pub CertificateVerification WithTrustStore(TrustStore store) { return CertificateVerification::Trust(store); }
 
 pub CertificateVerification AcceptAnyCertificateForTestsOnly() { return CertificateVerification::DangerousAcceptAnyCertificate; }
 

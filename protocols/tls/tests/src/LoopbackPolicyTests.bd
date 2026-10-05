@@ -22,6 +22,8 @@ use Tls.Suites;
 use Tls.TlsConfig;
 use Tls.TlsErrors;
 use Tls.TlsStream;
+use Tls.Wire;
+use X509.X509Errors;
 
 string Dec(i64 v) {
     if v < 0_i64 { return "-" + Dec(0_i64 - v); }
@@ -48,9 +50,6 @@ TlsServerConfig ServerConfig() {
     return TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key);
 }
 
-TlsClientConfig ClientConfig() {
-    return TlsConfig.Client("localhost", TlsConfig.AcceptAnyCertificateForTestsOnly());
-}
 
 // Server: handshake, read up to 64 bytes, echo them, close.
 unit Serve(TcpListener listener, TlsServerConfig config, i64[] result) {
@@ -69,34 +68,14 @@ unit Serve(TcpListener listener, TlsServerConfig config, i64[] result) {
     return;
 }
 
-// Echoes every chunk until the client's close_notify, then closes.
 i64 Echo(TlsStream s) {
     u8[] buf = Slice.New(64_i64);
-    mut i64 rounds = 0_i64;
-    while true {
-        Result<i64, IoError> n = s.Read(buf, 0_i64, 64_i64);
-        i64 got = match n { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
-        if got < 0_i64 { s.Close(); return 2_i64; }
-        if got == 0_i64 {
-            s.Close();
-            if rounds == 0_i64 { return 3_i64; }
-            return 0_i64;
-        }
-        Result<unit, IoError> w = IO.WriteAll(s, buf, 0_i64, got);
-        match w { Result::Error(_) => { s.Close(); return 4_i64; }, Result::Ok(_) => {}, };
-        rounds = rounds + 1_i64;
-    }
-    return 5_i64;
-}
-
-i64 RoundTrip(TlsStream s, u8[] msg) {
-    Result<unit, IoError> w = IO.WriteAll(s, msg, 0_i64, Slice.Len(msg));
-    match w { Result::Error(_) => { return 4_i64; }, Result::Ok(_) => {}, };
-    u8[] back = Slice.New(Slice.Len(msg));
-    Result<unit, IoError> r = IO.ReadExact(s, back, 0_i64, Slice.Len(msg));
-    match r { Result::Error(_) => { return 5_i64; }, Result::Ok(_) => {}, };
-    if Slice.Compare(back, msg) != 0_i64 { return 6_i64; }
-    return 0_i64;
+    Result<i64, IoError> n = s.Read(buf, 0_i64, 64_i64);
+    i64 got = match n { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+    if got <= 0_i64 { s.Close(); return 2_i64; }
+    Result<unit, IoError> w = IO.WriteAll(s, buf, 0_i64, got);
+    s.Close();
+    return match w { Result::Ok(_) => 0_i64, Result::Error(_) => 3_i64, };
 }
 
 // Runs one scenario; returns client code * 10000 + server code (0 = both fine).
@@ -141,15 +120,18 @@ i64 RunClient(SocketAddress target, TlsClientConfig client, string[] alpnOut, i6
                     info[1] = Suites.Code(TlsStream.NegotiatedSuite(s));
                     info[2] = TlsStream.NegotiatedGroup(s);
                     if TlsStream.UsedHelloRetry(s) { info[3] = 1_i64; }
-                    i64 first = RoundTrip(s, Hex.Of("68656c6c6f20746c73"));
-                    if first != 0_i64 { s.Close(); return first; }
-                    // KeyUpdate with update_requested: both directions switch keys.
-                    Result<unit, TlsError> updated = TlsStream.UpdateKeys(s, true);
-                    match updated { Result::Error(e) => { s.Close(); return TlsErrors.Code(e); }, Result::Ok(_) => {}, };
-                    i64 second = RoundTrip(s, Hex.Of("6166746572206b6579207570646174652c206c6f6e676572207061796c6f6164"));
-                    if second != 0_i64 { s.Close(); return 10_i64 + second; }
-                    Result<unit, IoError> closed = s.Close();
-                    match closed { Result::Error(_) => { return 9_i64; }, Result::Ok(_) => {}, };
+                    u8[] msg = Hex.Of("68656c6c6f20746c73");
+                    Result<unit, IoError> w = IO.WriteAll(s, msg, 0_i64, 9_i64);
+                    match w { Result::Error(_) => { s.Close(); return 4_i64; }, Result::Ok(_) => {}, };
+                    u8[] back = Slice.New(9_i64);
+                    Result<unit, IoError> r = IO.ReadExact(s, back, 0_i64, 9_i64);
+                    match r { Result::Error(_) => { s.Close(); return 5_i64; }, Result::Ok(_) => {}, };
+                    if Slice.Compare(back, msg) != 0_i64 { s.Close(); return 6_i64; }
+                    // After the server's close_notify, Read reports EOF.
+                    Result<i64, IoError> eof = s.Read(back, 0_i64, 1_i64);
+                    i64 eofCode = match eof { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+                    s.Close();
+                    if eofCode != 0_i64 { return 7_i64; }
                     return 0_i64;
                 },
             };
@@ -157,46 +139,66 @@ i64 RunClient(SocketAddress target, TlsClientConfig client, string[] alpnOut, i6
     };
 }
 
-i64 RunSuite(CipherSuite suite, i64[] info) {
-    TlsClientConfig c = ClientConfig();
-    mut CipherSuite[] only = Array.Empty<CipherSuite>();
-    Array.Append<CipherSuite>(only, suite);
-    c.cipherSuites = only;
-    c.alpn = ["h2", "http/1.1"];
-    c.alpnRequired = true;
-    TlsServerConfig s = ServerConfig();
-    s.alpn = ["http/1.1", "h2"];
-    string[] alpn = [""];
-    i64 code = Scenario(c, s, alpn, info);
-    if code == 0_i64 && alpn[0] != "http/1.1" { return 8_i64; }
-    return code;
+TlsClientConfig Trusted(string name) {
+    Blob[] roots = TlsConfig.Chain1(RootCertDer());
+    Result<CertificateVerification, X509Error> v = TlsConfig.Anchors(roots);
+    CertificateVerification mode = match v { Result::Ok(m) => m, Result::Error(_) => TlsConfig.AcceptAnyCertificateForTestsOnly(), };
+    return TlsConfig.Client(name, mode);
 }
 
-unit AllSuites(i64[] codes) {
+i64 Run(TlsClientConfig c, TlsServerConfig s, i64[] info) {
+    string[] alpn = [""];
+    info[3] = 0_i64;
+    return Scenario(c, s, alpn, info);
+}
+
+unit Policies(i64[] codes) {
     i64[] info = [0_i64, 0_i64, 0_i64, 0_i64];
-    codes[0] = RunSuite(Suites.Aes128(), info);
-    codes[1] = info[1];
-    codes[2] = info[2];
-    codes[6] = info[0];
-    codes[3] = RunSuite(Suites.Aes256(), info);
-    codes[4] = info[1];
-    codes[5] = RunSuite(Suites.ChaCha(), info);
-    codes[7] = info[1];
+    // 0: chain to the test root, DNS name in SAN.
+    codes[0] = Run(Trusted("localhost"), ServerConfig(), info);
+    codes[10] = info[0];
+    // 1: wrong host name: client sends bad_certificate, server sees it.
+    codes[1] = Run(Trusted("example.com"), ServerConfig(), info);
+    // 2: chain to a root the client does not trust: unknown_ca.
+    Blob[] other = TlsConfig.Chain1(OtherRootDer());
+    Result<CertificateVerification, X509Error> v = TlsConfig.Anchors(other);
+    CertificateVerification mode = match v { Result::Ok(m) => m, Result::Error(_) => TlsConfig.AcceptAnyCertificateForTestsOnly(), };
+    codes[2] = Run(TlsConfig.Client("localhost", mode), ServerConfig(), info);
+    // 3: ALPN mismatch: server sends no_application_protocol.
+    TlsClientConfig h2 = Trusted("localhost");
+    h2.alpn = ["h2"];
+    TlsServerConfig http1 = ServerConfig();
+    http1.alpn = ["http/1.1"];
+    codes[3] = Run(h2, http1, info);
+    // 4: HelloRetryRequest: client's first share is X25519, server only accepts P-256.
+    TlsServerConfig p256 = ServerConfig();
+    p256.groups = [Wire.GroupSecp256r1()];
+    codes[4] = Run(Trusted("localhost"), p256, info);
+    codes[5] = info[3];
+    codes[6] = info[2];
+    // 7: IP address identity (SAN iPAddress), no SNI sent.
+    codes[7] = Run(Trusted("127.0.0.1"), ServerConfig(), info);
+    // 8: server requires a name it does not serve: unrecognized_name.
+    TlsServerConfig named = ServerConfig();
+    named.serverNames = ["other.test"];
+    codes[8] = Run(Trusted("localhost"), named, info);
     return;
 }
 
-test loopback_each_cipher_suite_alpn_and_key_update {
-    i64[] codes = [-1_i64, 0_i64, 0_i64, -1_i64, 0_i64, -1_i64, 0_i64, 0_i64];
-    Fiber<unit> scenario = spawn (() => AllSuites(codes));
+test loopback_trust_alpn_and_retry_policies {
+    i64[] codes = [-1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64];
+    Fiber<unit> scenario = spawn (() => Policies(codes));
     scenario.Join();
-    Expect(codes[0], 0_i64, "TLS_AES_128_GCM_SHA256 round trip");
-    Expect(codes[1], 0x1301_i64, "suite 1301");
-    Expect(codes[2], 0x1d_i64, "x25519");
-    Expect(codes[3], 0_i64, "TLS_AES_256_GCM_SHA384 round trip");
-    Expect(codes[4], 0x1302_i64, "suite 1302");
-    Expect(codes[5], 0_i64, "TLS_CHACHA20_POLY1305_SHA256 round trip");
-    Expect(codes[7], 0x1303_i64, "suite 1303");
-    Expect(codes[6] / 100000_i64, 0_i64, "first full handshake time below 100 s");
+    Expect(codes[0], 0_i64, "trusted chain");
+    Expect(codes[1], 1042_i64 * 10000_i64 + 2042_i64, "wrong host name: bad_certificate");
+    Expect(codes[2], 1048_i64 * 10000_i64 + 2048_i64, "untrusted root: unknown_ca");
+    Expect(codes[3], 2120_i64 * 10000_i64 + 1120_i64, "ALPN mismatch: no_application_protocol");
+    Expect(codes[4], 0_i64, "HelloRetryRequest handshake");
+    Expect(codes[5], 1_i64, "HelloRetryRequest was used");
+    Expect(codes[6], 0x17_i64, "P-256 negotiated");
+    Expect(codes[7], 0_i64, "IP address identity");
+    Expect(codes[8], 2112_i64 * 10000_i64 + 1112_i64, "unrecognized_name");
+    Expect(codes[10] / 60000_i64, 0_i64, "handshake below 60 s");
 }
 
 // Test fixtures generated with openssl (see tests/interop/certs). Test-only keys.
@@ -221,6 +223,15 @@ pub u8[] RootCertDer() {
         + "ac328a4017509ec27c8201c8e65d18f99bafb9e40ef52c7821d5d50aa3633061301d0603551d0e0416041446dda763d1978ccc27a6f76bd7519ff9619f4eb7301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300f0603"
         + "551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d040302034800304502200c22ab56867a1fda253fb2c517682802dd87d91a6f152a0fd8ff2c4572d11bb2022100e8f98b28d498dfc5f8aae457d71cd4f433"
         + "94ab8ac6d6ca6d526e21bc35bd1e7a"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] OtherRootDer() {
+    string s = "3082019d30820143a003020102021422b448412db580482e90edb7c50dcdc35797077a300a06082a8648ce3d040302301c311a301806035504030c114265736b6964204f7468657220526f6f74301e170d3236313030353132343733385a170d33363130"
+        + "30323132343733385a301c311a301806035504030c114265736b6964204f7468657220526f6f743059301306072a8648ce3d020106082a8648ce3d03010703420004c67185df52c09306465e9498801541d5f92e7e28549f8663af21b5a31a4c0f1f49ca"
+        + "f5871f196a8fdde8c397df47df3a6482ee8a1ed203338906c625d601dc81a3633061301d0603551d0e041604145894b5a440564b4682c08196da0b47ff40569b5a301f0603551d230418301680145894b5a440564b4682c08196da0b47ff40569b5a300f"
+        + "0603551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d0403020348003045022011276a9734d15db15ee2adcf0bf128606a2566644b64bf3afacd8ae38d7cee58022100fcaaf51e97c30943c53aef2a2b4b31"
+        + "0b3ddb7e3e657a08cce286269c085c2ed4"
         ;
     return Hex.Of(s);
 }

@@ -92,6 +92,19 @@ target do not run).
 - Struct fields cannot be `mut`; keep mutable state in array fields or pass `mut`
   values. A `return` inside a block match arm is not treated as diverging.
 - Extern parameters must be primitives (`i32 i64 ...`, no `u32`, no arrays).
+- Runtime concurrency limits (0.5.2): at most 64 channels per process and closed
+  channels are never freed, so never create a channel per connection, stream or
+  request. Coordinate with preallocated flag arrays + `Fiber.Join` + short polls
+  (see `protocols/connect/src/Connect/Engine.bd`). A cancelled fiber stops at
+  its next wait without cleanup and its children are not cancelled: always give
+  network operations deadlines. The socket table has 256 slots.
+- Identifiers `host`, `launch` and names starting with `spawn` are reserved by
+  the parser. `use` binds the last path segment: avoid submodule names that
+  collide with corelib ones (`Errors`, `Types`, `Codec`, ...); prefix them.
+- See `protocols/COMPILER-GAPS.md` before writing closures, nested generic
+  matches, or matches on struct fields of `Option` type.
+- Available connect: `Connect.ConnectHost(host, port, policy)` and
+  `Connect.ConnectAddresses(addresses, policy)` return `TcpStream`.
 - Available crypto (`protocols/crypto`): SHA-256/384/512, HMAC, HKDF with
   `ExpandLabel`/`DeriveSecret`, ChaCha20-Poly1305, AES-128/256-GCM, AES block,
   ChaCha20 block (QUIC header protection), ConstantTime, `Entropy.Fill`.

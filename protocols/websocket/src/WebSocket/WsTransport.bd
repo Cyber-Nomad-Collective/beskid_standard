@@ -1,0 +1,110 @@
+use Core.Bytes.Slice;
+use Core.IO;
+use Core.IO.IoError;
+use Core.IO.TransferFailure;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Time;
+use Core.Time.Deadline;
+use Network.Types;
+use Network.Tcp.TcpStream;
+use Codec.Buffered;
+use Codec.Errors;
+use WebSocket.WsErrors;
+
+// Concrete byte transports under a WebSocket connection. 0.5.2 cannot keep a
+// contract value (Core.IO.Stream) in a struct field, so the connection holds this
+// enum and every operation dispatches per variant. wss adds a `Tls(TlsStream)`
+// variant and one arm per function below once the TLS package lands.
+
+/// The stream a connection runs over.
+pub enum WsTransport {
+    Tcp(TcpStream stream),
+}
+
+pub WsError FromTransfer(TransferFailure cause) {
+    return match cause {
+        TransferFailure::TimedOut => WsError::TimedOut(),
+        _ => WsError::Io(),
+    };
+}
+
+pub WsError FromIo(IoError error) {
+    return match error {
+        IoError::ReadFailed(cause) => FromTransfer(cause),
+        IoError::WriteFailed(cause) => FromTransfer(cause),
+        _ => WsError::Io(),
+    };
+}
+
+/// Codec failures while reading frames: a clean or early EOF is Io (the peer
+/// went away without a close frame, 1006).
+pub WsError FromCodec(CodecError error) {
+    return match error {
+        CodecError::Io(cause) => FromIo(cause),
+        CodecError::LimitExceeded => WsError::MessageTooBig(),
+        _ => WsError::Io(),
+    };
+}
+
+pub Result<u8[], CodecError> ReadLine(BufferedReader reader, WsTransport transport, i64 maxLength) {
+    return match transport {
+        WsTransport::Tcp(stream) => Buffered.ReadLine(reader, stream, maxLength),
+    };
+}
+
+pub Result<u8[], CodecError> Peek(BufferedReader reader, WsTransport transport, i64 count) {
+    return match transport {
+        WsTransport::Tcp(stream) => Buffered.Peek(reader, stream, count),
+    };
+}
+
+pub Result<unit, CodecError> Skip(BufferedReader reader, WsTransport transport, i64 count) {
+    return match transport {
+        WsTransport::Tcp(stream) => Buffered.Skip(reader, stream, count),
+    };
+}
+
+pub Result<u8[], CodecError> ReadExact(BufferedReader reader, WsTransport transport, i64 count, i64 maxLength) {
+    return match transport {
+        WsTransport::Tcp(stream) => Buffered.ReadExact(reader, stream, count, maxLength),
+    };
+}
+
+pub Result<unit, WsError> WriteAll(WsTransport transport, u8[] data) {
+    return WriteRange(transport, data, 0_i64, Slice.Len(data));
+}
+
+pub Result<unit, WsError> WriteRange(WsTransport transport, u8[] data, i64 offset, i64 count) {
+    Result<unit, IoError> written = match transport {
+        WsTransport::Tcp(stream) => IO.WriteAll(stream, data, offset, count),
+    };
+    return match written {
+        Result::Ok(_) => Result::Ok(()),
+        Result::Error(error) => Result::Error(FromIo(error)),
+    };
+}
+
+Option<Deadline> Within(i64 millis) {
+    if millis <= 0_i64 { return Option.Empty<Deadline>(); }
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+/// Replaces the read and write deadlines, relative to now; 0 or less means none.
+pub bool SetDeadlines(WsTransport transport, i64 readMillis, i64 writeMillis) {
+    TransferDeadlines policy = TransferDeadlines { read: Within(readMillis), write: Within(writeMillis) };
+    return match transport {
+        WsTransport::Tcp(stream) => match stream.SetDeadlines(policy) { Result::Ok(_) => true, Result::Error(_) => false, },
+    };
+}
+
+/// Closes the transport; errors are ignored because the connection is over either way.
+pub unit Close(WsTransport transport) {
+    match transport {
+        WsTransport::Tcp(stream) => { stream.Close(); },
+    };
+    return;
+}

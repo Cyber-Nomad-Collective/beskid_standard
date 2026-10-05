@@ -1,0 +1,85 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http.Types;
+use Http2.Hpack;
+use Http3.H3Connection;
+use Http3.H3Errors;
+use Http3.H3Mapping;
+use Http3.H3Quic;
+
+// HTTP/3 client over one QUIC connection: corelib `Http.Types.Request` in,
+// `Http.Types.Response` out (the same API as corelib Http and Http2).
+// Requests run concurrently on separate request streams; the caller drives
+// progress with Poll (non-blocking) or Send (polls up to a budget).
+
+/// Opens the client side: control stream with SETTINGS and QPACK streams.
+pub H3Conn Connect(QuicLink link, H3Config config) { return H3Connection.Open(link, false, config); }
+
+/// Starts `request` on a new request stream and returns the stream id.
+/// Fails with GoingAway after the server's GOAWAY (retry elsewhere).
+pub Result<i64,H3Error> Start(mut H3Conn conn, Request request) {
+    i64 failed = H3Connection.ErrorCode(conn);
+    if failed >= 0_i64 { return Result::Error(H3Error::Connection(failed)); }
+    if H3Connection.GoawayReceived(conn) >= 0_i64 { return Result::Error(H3Error::GoingAway()); }
+    H3Config config = conn.config;
+    Result<HeaderField[],H3Error> mapped = H3Mapping.RequestFields(request, config.scheme);
+    return match mapped {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(fields) => StartFields(conn, fields, request.body),
+    };
+}
+
+Result<i64,H3Error> StartFields(mut H3Conn conn, HeaderField[] fields, u8[] body) {
+    i64 id = H3Quic.OpenBidi(conn.link);
+    if id < 0_i64 { return Result::Error(H3Error::Transport()); }
+    H3Req added = H3Connection.AddRequest(conn, id, true);
+    if !H3Connection.WriteMessage(conn, id, fields, body, Array.Empty<HeaderField>()) { return Result::Error(H3Error::Transport()); }
+    return Result::Ok(id);
+}
+
+/// Progress of one request: Pending(), Ready() with `response`, or Failed()
+/// with `error`.
+pub type H3Outcome { pub i64 state, pub Response response, pub H3Error error, }
+
+pub i64 Pending() { return 0_i64; }
+pub i64 Ready() { return 1_i64; }
+pub i64 Failed() { return 2_i64; }
+
+H3Outcome Outcome(i64 state, H3Error error) { return H3Outcome { state: state, response: Types.EmptyResponse(0_i64, ""), error: error }; }
+
+/// Pumps the connection and reports the state of request stream `id`.
+pub H3Outcome Poll(mut H3Conn conn, i64 id) {
+    i64 code = H3Connection.Pump(conn);
+    if code != 0_i64 { return Outcome(Failed(), H3Error::Connection(code)); }
+    i64 at = H3Connection.FindRequest(conn, id);
+    if at < 0_i64 { return Outcome(Failed(), H3Error::InvalidMessage()); }
+    H3Req req = Array.Get<H3Req>(conn.requests, at);
+    if req.st[0] == 4_i64 {
+        if req.st[1] == H3Errors.RequestRejected() { return Outcome(Failed(), H3Error::GoingAway()); }
+        return Outcome(Failed(), H3Error::Stream(req.st[1]));
+    }
+    if req.st[0] < 3_i64 { return Outcome(Pending(), H3Error::Timeout()); }
+    req.st[5] = 1_i64;
+    Result<Response,H3Error> mapped = H3Mapping.ResponseFromFields(req.headers, req.body);
+    return match mapped {
+        Result::Ok(response) => H3Outcome { state: Ready(), response: response, error: H3Error::Timeout() },
+        Result::Error(error) => Outcome(Failed(), error),
+    };
+}
+
+/// Trailers received with the response on stream `id` (empty when none).
+pub HeaderField[] Trailers(H3Conn conn, i64 id) {
+    i64 at = H3Connection.FindRequest(conn, id);
+    if at < 0_i64 { return Array.Empty<HeaderField>(); }
+    H3Req req = Array.Get<H3Req>(conn.requests, at);
+    return req.trailers;
+}
+
+/// Sends GOAWAY (push id 0, push is never enabled) and closes the
+/// connection with H3_NO_ERROR (section 5.2).
+pub unit Close(mut H3Conn conn) {
+    bool sent = H3Connection.SendGoaway(conn, 0_i64);
+    H3Quic.Close(conn.link, H3Errors.NoError());
+    return;
+}

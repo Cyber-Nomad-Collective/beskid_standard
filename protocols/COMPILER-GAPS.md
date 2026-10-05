@@ -83,3 +83,15 @@ instead of `this`. Workaround: operations that take a contract are module functi
 
 `u8(0x100000041_i64)` and `u32(0x100000041_i64)` are not equal to 0x41 (no wraparound
 on narrowing from i64). Workaround: mask with `& 255_i64` / `& 0xFFFFFFFF_i64` first.
+
+## 2026-10-05, tooling: per-test overhead and the 120 s target budget
+
+Each `test` costs 1 to 2 s fixed in `beskid test` (compile/JIT per test), and a target has a
+120 s execution budget ("120-second target budget expired", remaining tests reported as
+`timed_out`). 50+ tiny tests in one target time out; the same assertions grouped into
+~8 tests per target run in about 20 s. Group assertions per test and keep targets under
+~40 tests.
+
+Also: test and function names beginning with `host_` fail to parse ("expected Identifier",
+the lexer appears to treat `host` as a keyword prefix); test names must be snake_case
+without double or trailing underscores, and must be unique per target.

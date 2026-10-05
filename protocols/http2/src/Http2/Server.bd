@@ -1,0 +1,167 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO.Stream;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Time.Deadline;
+use Http.Types;
+use Http2.Connection;
+use Http2.Frame;
+use Http2.FrameErrors;
+use Http2.Hpack;
+use Http2.Mapping;
+use Http2.Streams;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+
+// HTTP/2 server over any `Core.IO.Stream`. One fiber serves one connection:
+// it reads frames, calls the handler when a request is complete, and writes
+// the response with flow control. Requests on one connection are handled in
+// arrival order.
+
+// Application callback: one request in, one response out.
+pub contract RequestHandler {
+    Response Handle(Request request);
+}
+
+// Serves one connection until the client closes it, a GOAWAY exchange ends
+// it, or an error occurs. Returns the number of requests handled. The caller
+// closes the transport.
+pub Result<i64,Http2Error> ServeConnection(Stream transport, RequestHandler handler, Config config) {
+    Result<Connection,Http2Error> created = Connection.New(false, config);
+    match created {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(conn) => { return Run(conn, transport, handler); },
+    };
+}
+
+Result<i64,Http2Error> Run(Connection conn, Stream transport, RequestHandler handler) {
+    Result<unit,Http2Error> preface = Connection.ReadPreface(conn, transport);
+    match preface {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    Result<unit,Http2Error> settings = Connection.WriteSettings(conn, transport);
+    match settings {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    // The first frame after the preface must be SETTINGS (section 3.4).
+    Result<Frame,Http2Error> first = Connection.ReadFrame(conn, transport);
+    match first {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(frame) => {
+            bool isSettings = match frame { Frame::Settings(ack, _, _) => !ack, _ => false, };
+            if !isSettings { return Result::Error(Connection.Fail(conn, transport, FrameErrors.ProtocolError())); }
+            Result<unit,Http2Error> applied = Connection.Process(conn, transport, frame);
+            match applied {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(_) => (),
+            };
+        },
+    };
+    while true {
+        Result<unit,Http2Error> dispatched = Dispatch(conn, transport, handler);
+        match dispatched {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+        Result<bool,Http2Error> flushed = Connection.FlushData(conn, transport);
+        match flushed {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+        Cleanup(conn);
+        i64 maxRequests = Connection.MaxRequests(conn);
+        if maxRequests > 0_i64 && conn.handledRequests >= maxRequests && !conn.goAwaySent {
+            Connection.GoAway(conn, transport);
+        }
+        bool idle = Array.Len<StreamState>(conn.streams) == 0_i64;
+        if idle && (conn.goAwaySent || conn.goAwayLastId >= 0_i64) { return Result::Ok(conn.handledRequests); }
+        Result<unit,Http2Error> pumped = Connection.PumpOnce(conn, transport);
+        match pumped {
+            Result::Error(error) => {
+                if conn.peerClosed { return Result::Ok(conn.handledRequests); }
+                return Result::Error(error);
+            },
+            Result::Ok(_) => (),
+        };
+    }
+    return Result::Ok(conn.handledRequests);
+}
+
+// Calls the handler for every stream whose request is complete.
+Result<unit,Http2Error> Dispatch(Connection conn, Stream transport, RequestHandler handler) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<StreamState>(conn.streams) {
+        StreamState s = Array.Get<StreamState>(conn.streams, i);
+        if !s.handled && s.hasHeaders && s.resetCode < 0_i64 && s.state == Streams.HalfClosedRemote() {
+            s.handled = true;
+            conn.handledRequests = conn.handledRequests + 1_i64;
+            Result<Request,Http2Error> request = Mapping.RequestFromFields(s.headers, s.body);
+            match request {
+                Result::Error(_) => { Connection.ResetStream(conn, transport, s, FrameErrors.ProtocolError()); },
+                Result::Ok(value) => {
+                    Response response = handler.Handle(value);
+                    Result<unit,Http2Error> sent = Respond(conn, transport, s, response);
+                    match sent {
+                        Result::Error(error) => { return Result::Error(error); },
+                        Result::Ok(_) => (),
+                    };
+                },
+            };
+        }
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+// Writes the response HEADERS and queues its body; a HEAD response has no body.
+Result<unit,Http2Error> Respond(Connection conn, Stream transport, StreamState s, Response response) {
+    Result<HeaderField[],Http2Error> mapped = Mapping.ResponseFields(response);
+    match mapped {
+        Result::Error(_) => {
+            Connection.ResetStream(conn, transport, s, FrameErrors.InternalError());
+            return Result::Ok(());
+        },
+        Result::Ok(fields) => {
+            bool hasBody = Slice.Len(response.body) > 0_i64 && !s.headRequest;
+            Result<unit,Http2Error> sent = Connection.SendHeaders(conn, transport, s, fields, !hasBody);
+            match sent {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(_) => (),
+            };
+            if hasBody { Connection.QueueBody(s, response.body); }
+            return Result::Ok(());
+        },
+    };
+}
+
+// Drops finished streams from the table.
+unit Cleanup(Connection conn) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<StreamState>(conn.streams) {
+        StreamState s = Array.Get<StreamState>(conn.streams, i);
+        if Streams.IsClosed(s) && !s.outPending {
+            Connection.Remove(conn, s);
+        } else {
+            i = i + 1_i64;
+        }
+    }
+    return;
+}
+
+// Accepts one TCP connection and serves it with prior-knowledge h2c, then
+// closes it. `deadline` bounds the accept only.
+pub Result<i64,Http2Error> AcceptAndServe(TcpListener listener, RequestHandler handler, Config config, Option<Deadline> deadline) {
+    Result<TcpStream,NetworkError> accepted = listener.Accept(deadline);
+    match accepted {
+        Result::Error(_) => { return Result::Error(Http2Error::Closed); },
+        Result::Ok(stream) => {
+            Result<i64,Http2Error> served = ServeConnection(stream, handler, config);
+            stream.Close();
+            return served;
+        },
+    };
+}

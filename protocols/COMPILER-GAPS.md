@@ -286,3 +286,37 @@ Each `test` costs 1 to 2 s fixed in `beskid test` (compile/JIT per test), and a 
 Also: test and function names beginning with `host_` fail to parse ("expected Identifier",
 the lexer appears to treat `host` as a keyword prefix); test names must be snake_case
 without double or trailing underscores, and must be unique per target.
+
+## 2026-10-05, http2 (framing and connection slice)
+
+1. **Nested field path inside an arithmetic comparison is an ICE.**
+   `bool M(Connection c) { return c.config.max + K() > 5_i64; }` fails at CLIF
+   time with "no ISLE lowering rule or fact for `BinaryExpression`".
+   `return c.config.max + K();`, `K() > c.config.max` and
+   `c.recv > c.config.max` all lower. Workaround: read nested settings through
+   accessor functions (`Config c = conn.config; return c.max;`) and bind them to
+   locals before comparing (`Http2/Connection.bd`, "accessors").
+2. **`return match` with a block arm that ends in `return` is an ICE when the
+   function returns a plain enum** (not `Result`): `Http2Error F(IoError e) {
+   return match e { IoError::UnexpectedEof(_) => { x = 1; return A; }, _ => {
+   return B(e); }, }; }` fails with "no ISLE lowering rule or fact for
+   `MatchExpression`". Workaround: compute a `bool` with an expression match,
+   then use `if`, or use a statement `match` with a trailing `return`.
+3. **Contract conformance is nominal and is checked only at specialization.**
+   A type declared `: Stream` passed as `Core.IO.Stream` to `IO.ReadExact`
+   (which takes `Reader`) type-checks, but every test that reaches the call
+   fails at JIT time with "missing contract conformance for MemoryTransport".
+   Workaround: transports declare `Stream, Reader, Writer, Closer` (as
+   `Network.Tcp.TcpStream` does). A future `TlsStream` must do the same to be
+   accepted by `Http2.Client`/`Http2.Server`.
+4. **`mut T[]` parameter growth must be published.** A `unit F(mut u8[] out)`
+   that calls `Array.Append(out, ..)` is rejected ("grown handle ... discarded").
+   Workaround: return the array and rebind (`out = F(out);`), or keep growable
+   arrays in struct fields and assign the grown local back (`conn.block = block`).
+5. Tooling note: a target with loopback networking plus the full HTTP/2 stack
+   takes 5-10 minutes to JIT on a loaded host (load ~12); JIT compiles lazily
+   and reports only the first ICE per test, so each compiler gap costs one full
+   cycle. Editing package sources while `beskid test` runs fails the run with
+   "prepared workspace content mutated during phase `prepare_targets`".
+6. No string escapes (`\r\n`) in string literals: the preface is built from
+   bytes (`Connection.Preface()`).

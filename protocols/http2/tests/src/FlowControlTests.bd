@@ -1,0 +1,187 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Connection;
+use Http2.Frame;
+use Http2.FrameErrors;
+use Http2.Hpack;
+use Http2.MemoryTransport;
+use Http2.Streams;
+
+// Flow-control accounting (RFC 9113 sections 5.2 and 6.9) and settings
+// handling on a Connection driven directly with decoded frames.
+
+Connection Make(bool isClient) {
+    Config c = Connection.DefaultConfig();
+    c.initialWindowSize = 16384_i64;
+    return match Connection.New(isClient, c) { Result::Ok(conn) => conn, Result::Error(_) => Make(isClient), };
+}
+
+Frame F(u8[] bytes) {
+    return match Frame.Decode(bytes, 16384_i64) { Result::Ok(f) => f, Result::Error(_) => Frame::Unknown(255_i64, 0_i64), };
+}
+
+bool Ok(Result<unit,Http2Error> r) { return match r { Result::Ok(_) => true, Result::Error(_) => false, }; }
+i64 Code(Result<unit,Http2Error> r) { return match r { Result::Ok(_) => -1_i64, Result::Error(e) => FrameErrors.CodeOf(e), }; }
+
+i64 Field32(u8[] out, i64 kind, i64 id, i64 at) {
+    mut i64 pos = 0_i64;
+    while pos + 9_i64 <= Slice.Len(out) {
+        FrameHeader h = Frame.ParseHeader(out, pos);
+        if h.kind == kind && (id < 0_i64 || h.streamId == id) { return Frame.GetU32(out, pos + 9_i64 + at); }
+        pos = pos + 9_i64 + h.length;
+    }
+    return -1_i64;
+}
+
+bool HasFrame(u8[] out, i64 kind, i64 flags) {
+    mut i64 pos = 0_i64;
+    while pos + 9_i64 <= Slice.Len(out) {
+        FrameHeader h = Frame.ParseHeader(out, pos);
+        if h.kind == kind && h.flags == flags { return true; }
+        pos = pos + 9_i64 + h.length;
+    }
+    return false;
+}
+
+// A client stream 1 opened locally with HEADERS (no body yet).
+StreamState OpenOne(Connection conn, MemoryTransport t, bool endStream) {
+    mut HeaderField[] f = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(f, Hpack.Field(":method", "POST"));
+    Array.Append<HeaderField>(f, Hpack.Field(":scheme", "http"));
+    Array.Append<HeaderField>(f, Hpack.Field(":path", "/"));
+    return match Connection.OpenStream(conn, t, f, endStream) {
+        Result::Ok(s) => s,
+        Result::Error(_) => Streams.New(-1_i64, 0_i64, 0_i64),
+    };
+}
+
+test connection_window_update_increases_send_window {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    Assert.True(Ok(Connection.Process(conn, t, F(Frame.WindowUpdateFrame(0_i64, 1000_i64)))), "accepted");
+    Assert.Equal<i64>(conn.sendWindow, 66535_i64, "65535 + 1000");
+}
+
+test connection_window_overflow_is_flow_control_error {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    Assert.Equal<i64>(Code(Connection.Process(conn, t, F(Frame.WindowUpdateFrame(0_i64, 2147483647_i64)))), FrameErrors.FlowControlError(), "overflow");
+    Assert.Equal<i64>(Field32(t.output, Frame.TypeGoAway(), 0_i64, 4_i64), FrameErrors.FlowControlError(), "GOAWAY sent");
+}
+
+test stream_window_overflow_resets_stream {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, false);
+    Assert.True(Ok(Connection.Process(conn, t, F(Frame.WindowUpdateFrame(1_i64, 2147483647_i64)))), "stream error only");
+    Assert.Equal<i64>(Field32(t.output, Frame.TypeRstStream(), 1_i64, 0_i64), FrameErrors.FlowControlError(), "RST_STREAM");
+    Assert.True(Streams.IsClosed(s), "closed");
+}
+
+test data_respects_send_windows {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, false);
+    Connection.QueueBody(s, Slice.New(70000_i64));
+    Assert.True(match Connection.FlushData(conn, t) { Result::Ok(any) => any, Result::Error(_) => false, }, "some DATA sent");
+    Assert.Equal<i64>(s.outOffset, 65535_i64, "stopped at the 65535 initial window");
+    Assert.Equal<i64>(s.sendWindow, 0_i64, "stream window spent");
+    Assert.Equal<i64>(conn.sendWindow, 0_i64, "connection window spent");
+    Connection.Process(conn, t, F(Frame.WindowUpdateFrame(0_i64, 10000_i64)));
+    Connection.Process(conn, t, F(Frame.WindowUpdateFrame(1_i64, 3000_i64)));
+    Connection.FlushData(conn, t);
+    Assert.Equal<i64>(s.outOffset, 68535_i64, "limited by the smaller stream window");
+    Assert.True(s.outPending, "rest still pending");
+}
+
+test initial_window_change_adjusts_open_streams {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, false);
+    i64[] ids = [4_i64];
+    i64[] values = [1000_i64];
+    Assert.True(Ok(Connection.Process(conn, t, F(Frame.SettingsFrame(ids, values)))), "settings");
+    Assert.Equal<i64>(s.sendWindow, 1000_i64, "65535 - 64535");
+    Assert.Equal<i64>(conn.sendWindow, 65535_i64, "connection window unchanged");
+    Assert.True(HasFrame(t.output, Frame.TypeSettings(), 1_i64), "SETTINGS ACK sent");
+}
+
+test initial_window_change_can_go_negative {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, false);
+    Connection.QueueBody(s, Slice.New(30000_i64));
+    Connection.FlushData(conn, t);
+    i64[] ids = [4_i64];
+    i64[] values = [10000_i64];
+    Connection.Process(conn, t, F(Frame.SettingsFrame(ids, values)));
+    Assert.Equal<i64>(s.sendWindow, -20000_i64, "35535 - 55535");
+}
+
+test received_data_counts_against_windows_and_replenishes {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, true);
+    Connection.Process(conn, t, F(Frame.SettingsAckFrame()));
+    Assert.Equal<i64>(s.recvWindow, 16384_i64, "acked local window applies");
+    s.hasHeaders = true;
+    Assert.True(Ok(Connection.Process(conn, t, F(Frame.PaddedDataFrame(1_i64, Slice.New(9000_i64), 10_i64, false)))), "data");
+    Assert.Equal<i64>(s.received, 9000_i64, "padding not stored");
+    Assert.Equal<i64>(Field32(t.output, Frame.TypeWindowUpdate(), 1_i64, 0_i64), 9011_i64, "stream credit returned with padding");
+    Assert.Equal<i64>(s.recvWindow, 16384_i64, "window restored");
+}
+
+test data_beyond_stream_window_resets {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, true);
+    Connection.Process(conn, t, F(Frame.SettingsAckFrame()));
+    s.recvWindow = 100_i64;
+    Assert.True(Ok(Connection.Process(conn, t, F(Frame.DataFrame(1_i64, Slice.New(200_i64), false)))), "stream error");
+    Assert.Equal<i64>(Field32(t.output, Frame.TypeRstStream(), 1_i64, 0_i64), FrameErrors.FlowControlError(), "FLOW_CONTROL_ERROR");
+}
+
+test data_beyond_connection_window_fails {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    OpenOne(conn, t, true);
+    conn.recvWindow = 10_i64;
+    Assert.Equal<i64>(Code(Connection.Process(conn, t, F(Frame.DataFrame(1_i64, Slice.New(20_i64), false)))), FrameErrors.FlowControlError(), "connection");
+}
+
+test client_rejects_push_promise {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    OpenOne(conn, t, true);
+    Assert.Equal<i64>(Code(Connection.Process(conn, t, F(Frame.PushPromiseFrame(1_i64, 2_i64, Slice.New(0_i64), true)))), FrameErrors.ProtocolError(), "push disabled");
+}
+
+test client_rejects_enable_push_from_server {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    i64[] ids = [2_i64];
+    i64[] values = [1_i64];
+    Assert.Equal<i64>(Code(Connection.Process(conn, t, F(Frame.SettingsFrame(ids, values)))), FrameErrors.ProtocolError(), "server ENABLE_PUSH=1");
+}
+
+test goaway_marks_unprocessed_streams {
+    Connection conn = Make(true);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    StreamState s = OpenOne(conn, t, true);
+    Assert.True(Ok(Connection.Process(conn, t, F(Frame.GoAwayFrame(0_i64, FrameErrors.NoError(), Slice.New(0_i64))))), "goaway");
+    Assert.True(s.refusedByGoAway, "stream 1 > last 0");
+    Assert.Equal<i64>(conn.goAwayLastId, 0_i64, "last id");
+}
+
+test ping_ack_counted_and_ping_answered {
+    Connection conn = Make(false);
+    MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
+    Connection.Process(conn, t, F(Frame.PingFrame(Slice.New(8_i64), true)));
+    Assert.Equal<i64>(conn.pingAcks, 1_i64, "ack counted");
+    Connection.Process(conn, t, F(Frame.PingFrame(Slice.New(8_i64), false)));
+    FrameHeader h = Frame.ParseHeader(t.output, 0_i64);
+    Assert.Equal<i64>(h.kind, Frame.TypePing(), "PING");
+    Assert.Equal<i64>(h.flags, 1_i64, "ACK");
+}

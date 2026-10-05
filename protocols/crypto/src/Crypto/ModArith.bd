@@ -48,21 +48,38 @@ pub Result<Mont, PkError> New(u32[] modulus) {
         inv = inv * (2_u32 - m0 * inv);
         k = k + 1_i64;
     }
-    // R^2 mod m by 64n modular doublings of 1 (public modulus: variable time is fine).
+    u32[] one = BigNat.Zeros(n);
+    one[0] = 1_u32;
+    Mont c = Mont {
+        m: m, n: n, m0inv: 0_u32 - inv, rr: BigNat.Zeros(n), one: one,
+        t: BigNat.Zeros(n + 2_i64), s: BigNat.Zeros(n),
+    };
+    // R^2 mod m (public modulus: variable time is fine). Write 32n = odd * 2^s. Start from
+    // 2^(bits-1) < m and double up to R * 2^odd mod m; each Montgomery squaring then maps
+    // R * 2^t to R * 2^2t, so s squarings reach R * 2^(32n) = R^2.
+    mut i64 odd = 32_i64 * n;
+    mut i64 squarings = 0_i64;
+    while (odd & 1_i64) == 0_i64 {
+        odd = odd / 2_i64;
+        squarings = squarings + 1_i64;
+    }
     u32[] x = BigNat.Zeros(n + 1_i64);
-    x[0] = 1_u32;
-    mut i64 d = 0_i64;
-    while d < 64_i64 * n {
+    i64 top = BigNat.BitLength(m) - 1_i64;
+    x[top / 32_i64] = 1_u32 << u32(top % 32_i64);
+    mut i64 d = top;
+    while d < 32_i64 * n + odd {
         BigNat.ShiftLeft1(x, 0_u32);
         if BigNat.Compare(x, m) >= 0_i64 { BigNat.SubInPlace(x, m); }
         d = d + 1_i64;
     }
-    u32[] one = BigNat.Zeros(n);
-    one[0] = 1_u32;
-    return Result::Ok(Mont {
-        m: m, n: n, m0inv: 0_u32 - inv, rr: BigNat.Resize(x, n), one: one,
-        t: BigNat.Zeros(n + 2_i64), s: BigNat.Zeros(n),
-    });
+    u32[] rr = c.rr;
+    BigNat.Assign(rr, x);
+    mut i64 k2 = 0_i64;
+    while k2 < squarings {
+        Mul(c, rr, rr, rr);
+        k2 = k2 + 1_i64;
+    }
+    return Result::Ok(c);
 }
 
 /// `out = a * b * R^-1 mod m`.

@@ -163,111 +163,63 @@ unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string be
     return;
 }
 
-use Http2.HpackInteger;
+// RFC 7541 Appendix C.2 header field representations, each on a fresh context.
 
-// A `mut` parameter needs a place argument; a literal `[]` is an ICE (COMPILER-GAPS.md).
-u8[] EncodeInt(u8 flags, i64 prefix, i64 value) {
-    mut u8[] out = [];
-    out = HpackInteger.EncodeInteger(out, flags, prefix, value);
-    return out;
+test c2_1_literal_with_indexing_decode {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] fields = DecodeOk(decoder, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", "C.2.1");
+    ExpectFields(fields, ["custom-key", "custom-header"], "C.2.1");
+    ExpectTable(decoder, ["custom-key", "custom-header"], 55_i64, "C.2.1");
 }
 
-Decoded DecodeInt(string hex, i64 prefix, string because) {
-    Result<Decoded,HpackError> r = HpackInteger.DecodeInteger(Hex(hex), 0_i64, prefix);
-    match r {
-        Result::Ok(d) => { return d; },
-        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
-    };
-    return Decoded { value: -1_i64, next: -1_i64 };
+test c2_1_literal_with_indexing_encode {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header"])), "400a637573746f6d2d6b65790d637573746f6d2d686561646572", "C.2.1");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 55_i64, "C.2.1 encoder table");
 }
 
-i64 DecodedValue(Decoded d) { return d.value; }
-
-bool IntOverflows(string hex, i64 prefix) {
-    Result<Decoded,HpackError> r = HpackInteger.DecodeInteger(Hex(hex), 0_i64, prefix);
-    match r {
-        Result::Ok(_) => { return false; },
-        Result::Error(e) => { return match e { HpackError::IntegerOverflow => true, _ => false, }; },
-    };
-    return false;
+test c2_2_literal_without_indexing_decode {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] fields = DecodeOk(decoder, "040c2f73616d706c652f70617468", "C.2.2");
+    ExpectFields(fields, [":path", "/sample/path"], "C.2.2");
+    ExpectTable(decoder, Array.Empty<string>(), 0_i64, "C.2.2");
+    HeaderField first = Array.Get<HeaderField>(fields, 0_i64);
+    Assert.False(first.sensitive, "not sensitive");
 }
 
-bool IntTruncated(string hex, i64 prefix) {
-    Result<Decoded,HpackError> r = HpackInteger.DecodeInteger(Hex(hex), 0_i64, prefix);
-    match r {
-        Result::Ok(_) => { return false; },
-        Result::Error(e) => { return match e { HpackError::Truncated => true, _ => false, }; },
-    };
-    return false;
+test c2_2_literal_without_indexing_encode {
+    mut EncoderPolicy policy = RfcPolicy(4096_i64, false);
+    policy.indexing = false;
+    mut Encoder encoder = NewTestEncoder(policy);
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":path", "/sample/path"])), "040c2f73616d706c652f70617468", "C.2.2");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "C.2.2 encoder table");
 }
 
-test c1_1_encode_10_with_5_bit_prefix {
-    ExpectBytes(EncodeInt(0_u8, 5_i64, 10_i64), "0a", "10/5");
-    Decoded d = DecodeInt("0a", 5_i64, "10/5");
-    Assert.Equal<i64>(d.value, 10_i64, "value");
-    Assert.Equal<i64>(d.next, 1_i64, "next");
+test c2_3_literal_never_indexed_decode {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] fields = DecodeOk(decoder, "100870617373776f726406736563726574", "C.2.3");
+    ExpectFields(fields, ["password", "secret"], "C.2.3");
+    ExpectTable(decoder, Array.Empty<string>(), 0_i64, "C.2.3");
+    HeaderField first = Array.Get<HeaderField>(fields, 0_i64);
+    Assert.True(first.sensitive, "never-indexed is sensitive");
 }
 
-test c1_2_encode_1337_with_5_bit_prefix {
-    ExpectBytes(EncodeInt(0_u8, 5_i64, 1337_i64), "1f9a0a", "1337/5");
-    Decoded d = DecodeInt("1f9a0a", 5_i64, "1337/5");
-    Assert.Equal<i64>(d.value, 1337_i64, "value");
-    Assert.Equal<i64>(d.next, 3_i64, "next");
+test c2_3_literal_never_indexed_encode {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    mut HeaderField[] fields = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(fields, Hpack.SensitiveField("password", "secret"));
+    ExpectBytes(HpackEncoder.Encode(encoder, fields), "100870617373776f726406736563726574", "C.2.3");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "C.2.3 encoder table");
 }
 
-test c1_3_encode_42_at_octet_boundary {
-    ExpectBytes(EncodeInt(0_u8, 8_i64, 42_i64), "2a", "42/8");
-    Assert.Equal<i64>(DecodedValue(DecodeInt("2a", 8_i64, "42/8")), 42_i64, "value");
+test c2_4_indexed_field_decode {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] fields = DecodeOk(decoder, "82", "C.2.4");
+    ExpectFields(fields, [":method", "GET"], "C.2.4");
+    ExpectTable(decoder, Array.Empty<string>(), 0_i64, "C.2.4");
 }
 
-test prefix_flags_are_kept_and_ignored {
-    ExpectBytes(EncodeInt(224_u8, 5_i64, 10_i64), "ea", "flags kept");
-    Assert.Equal<i64>(DecodedValue(DecodeInt("ea", 5_i64, "flags ignored")), 10_i64, "value");
-    ExpectBytes(EncodeInt(128_u8, 7_i64, 127_i64), "ff00", "exact mask needs a zero continuation");
-    Assert.Equal<i64>(DecodedValue(DecodeInt("ff00", 7_i64, "mask")), 127_i64, "mask value");
-}
-
-test prefix_integer_boundaries_round_trip {
-    i64[] values = [0_i64, 1_i64, 30_i64, 31_i64, 32_i64, 127_i64, 128_i64, 158_i64, 16383_i64, 16384_i64, 2097151_i64, 268435455_i64, 2147483647_i64];
-    mut i64 prefix = 1_i64;
-    while prefix <= 8_i64 {
-        mut i64 i = 0_i64;
-        while i < Array.Len<i64>(values) {
-            i64 v = Array.Get<i64>(values, i);
-            u8[] wire = EncodeInt(0_u8, prefix, v);
-            Decoded d = DecodeInt(HexText(wire), prefix, "round trip");
-            Assert.Equal<i64>(d.value, v, "round trip value");
-            Assert.Equal<i64>(d.next, Slice.Len(wire), "round trip length");
-            i = i + 1_i64;
-        }
-        prefix = prefix + 1_i64;
-    }
-}
-
-test max_integer_is_accepted_and_one_more_overflows {
-    u8[] wire = EncodeInt(0_u8, 5_i64, 2147483647_i64);
-    Assert.Equal<i64>(DecodedValue(DecodeInt(HexText(wire), 5_i64, "max")), 2147483647_i64, "max value");
-    // 2^31 with a 5-bit prefix: 31 + 2147483617.
-    Assert.True(IntOverflows("1fe1ffffff07", 5_i64), "2^31 overflows");
-}
-
-test overlong_zero_continuations_overflow {
-    Assert.True(IntOverflows("1f8080808080808001", 5_i64), "too many continuation octets");
-}
-
-test huge_integer_overflows {
-    Assert.True(IntOverflows("1fffffffffffffffff7f", 5_i64), "huge value");
-}
-
-
-test truncated_integers_are_rejected {
-    Assert.True(IntTruncated("", 5_i64), "empty");
-    Assert.True(IntTruncated("1f", 5_i64), "missing continuation");
-    Assert.True(IntTruncated("1f9a", 5_i64), "continuation bit set at end");
-}
-
-
-
-test zero_padded_8_bit_integer_overflows {
-    Assert.True(IntOverflows("ff808080808000", 8_i64), "zero padding past 28 bits");
+test c2_4_indexed_field_encode {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "82", "C.2.4");
 }

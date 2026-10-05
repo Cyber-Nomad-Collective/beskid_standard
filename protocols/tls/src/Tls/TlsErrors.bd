@@ -1,0 +1,58 @@
+use Core.IO.IoError;
+use Tls.Alert;
+
+/// Typed TLS failures. Every handshake or record failure maps to exactly one variant.
+pub enum TlsError {
+    // This side detected a protocol violation and sent (or would send) this fatal alert.
+    LocalAlert(i64 description),
+    // The peer sent this fatal alert (or an unexpected warning alert).
+    PeerAlert(i64 description),
+    // The transport failed; the cause is kept unchanged.
+    Io(IoError cause),
+    // The connection is closed (close_notify sent or received, or a previous fatal error).
+    Closed,
+    // A configuration is invalid; the code is one of the `Config*` reasons below.
+    InvalidConfig(i64 reason),
+}
+
+pub i64 ConfigMissingServerName() { return 1_i64; }
+pub i64 ConfigNoCipherSuites() { return 2_i64; }
+pub i64 ConfigNoGroups() { return 3_i64; }
+pub i64 ConfigMissingCertificate() { return 4_i64; }
+pub i64 ConfigInvalidPrivateKey() { return 5_i64; }
+pub i64 ConfigInvalidAlpn() { return 6_i64; }
+pub i64 ConfigUnsupportedGroup() { return 7_i64; }
+pub i64 ConfigMissingTrust() { return 8_i64; }
+pub i64 ConfigQuicTransportParameters() { return 9_i64; }
+
+pub TlsError Fatal(i64 description) { return TlsError::LocalAlert(description); }
+
+/// The alert to send for a local failure, or -1 when no alert applies.
+pub i64 AlertToSend(TlsError error) {
+    return match error {
+        TlsError::LocalAlert(d) => d,
+        TlsError::InvalidConfig(_) => Alert.InternalError(),
+        _ => -1_i64,
+    };
+}
+
+/// Stable code for tests: LocalAlert 1000 + d, PeerAlert 2000 + d, Io 3000, Closed 4000, InvalidConfig 5000 + reason.
+pub i64 Code(TlsError error) {
+    return match error {
+        TlsError::LocalAlert(d) => 1000_i64 + d,
+        TlsError::PeerAlert(d) => 2000_i64 + d,
+        TlsError::Io(_) => 3000_i64,
+        TlsError::Closed => 4000_i64,
+        TlsError::InvalidConfig(r) => 5000_i64 + r,
+    };
+}
+
+pub string Describe(TlsError error) {
+    return match error {
+        TlsError::LocalAlert(d) => "local alert " + Alert.Name(d),
+        TlsError::PeerAlert(d) => "peer alert " + Alert.Name(d),
+        TlsError::Io(_) => "transport failure",
+        TlsError::Closed => "connection closed",
+        TlsError::InvalidConfig(_) => "invalid configuration",
+    };
+}

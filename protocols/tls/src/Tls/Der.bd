@@ -1,0 +1,53 @@
+use Core.Bytes.Slice;
+
+// Minimal strict DER walker used to locate SubjectPublicKeyInfo in a certificate and the
+// key inside a private key container. Full certificate validation lives in the X509 package.
+
+/// One TLV: tag byte, content offset, content length and end offset. `ok` false on any error.
+pub type Tlv { pub bool ok, pub i64 tag, pub i64 start, pub i64 length, pub i64 end, }
+
+pub Tlv Bad() { return Tlv { ok: false, tag: 0_i64, start: 0_i64, length: 0_i64, end: 0_i64 }; }
+
+/// Reads the TLV at `offset`, which must end at or before `limit`. Only single-byte tags.
+pub Tlv Read(u8[] buf, i64 offset, i64 limit) {
+    if offset < 0_i64 || limit > Slice.Len(buf) || offset + 2_i64 > limit { return Bad(); }
+    i64 tag = i64(buf[offset]);
+    if (tag & 31_i64) == 31_i64 { return Bad(); }
+    i64 first = i64(buf[offset + 1_i64]);
+    mut i64 at = offset + 2_i64;
+    mut i64 length = first;
+    if first >= 128_i64 {
+        i64 n = first - 128_i64;
+        if n < 1_i64 || n > 3_i64 || at + n > limit { return Bad(); }
+        length = 0_i64;
+        mut i64 i = 0_i64;
+        while i < n { length = (length << 8_i64) | i64(buf[at + i]); i = i + 1_i64; }
+        if i64(buf[at]) == 0_i64 || length < 128_i64 { return Bad(); }
+        at = at + n;
+    }
+    if length > limit - at { return Bad(); }
+    return Tlv { ok: true, tag: tag, start: at, length: length, end: at + length };
+}
+
+/// Reads a TLV that must carry `tag`.
+pub Tlv Expect(u8[] buf, i64 offset, i64 limit, i64 tag) {
+    Tlv t = Read(buf, offset, limit);
+    if !t.ok || t.tag != tag { return Bad(); }
+    return t;
+}
+
+pub u8[] Content(u8[] buf, Tlv t) { return Slice.SubSlice(buf, t.start, t.length); }
+
+pub u8[] Whole(u8[] buf, i64 offset, Tlv t) { return Slice.SubSlice(buf, offset, t.end - offset); }
+
+pub bool ContentEquals(u8[] buf, Tlv t, u8[] expected) {
+    if t.length != Slice.Len(expected) { return false; }
+    mut i64 i = 0_i64;
+    while i < t.length { if buf[t.start + i] != expected[i] { return false; } i = i + 1_i64; }
+    return true;
+}
+
+// OIDs (content bytes).
+pub u8[] OidEcPublicKey() { return [0x2A_u8, 0x86_u8, 0x48_u8, 0xCE_u8, 0x3D_u8, 0x02_u8, 0x01_u8]; }
+pub u8[] OidPrime256v1() { return [0x2A_u8, 0x86_u8, 0x48_u8, 0xCE_u8, 0x3D_u8, 0x03_u8, 0x01_u8, 0x07_u8]; }
+pub u8[] OidRsaEncryption() { return [0x2A_u8, 0x86_u8, 0x48_u8, 0x86_u8, 0xF7_u8, 0x0D_u8, 0x01_u8, 0x01_u8, 0x01_u8]; }

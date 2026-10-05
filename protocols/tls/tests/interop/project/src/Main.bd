@@ -1,0 +1,73 @@
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Output;
+use Core.Results;
+use Core.Time;
+use Core.Time.Deadline;
+use Http.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Types as NetworkTypes;
+use Http2.Connection;
+use Http2.FrameErrors;
+use Http2.Server;
+
+// h2c interop server for scripts/curl-interop.sh: listens on 127.0.0.1:18089,
+// serves three connections with prior-knowledge HTTP/2, then exits.
+// GET answers "hello <target>"; POST echoes the body length.
+
+type Hello: RequestHandler {
+    i64 tag,
+    pub Response Handle(Request request) { return Answer(request); }
+}
+
+string Decimal(i64 value) {
+    if value == 0_i64 { return "0"; }
+    mut string out = "";
+    mut i64 rest = value;
+    while rest > 0_i64 { out = Core.String.DigitChar(rest % 10_i64) + out; rest = rest / 10_i64; }
+    return out;
+}
+
+Response Answer(Request request) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "content-type", value: "text/plain" });
+    if request.method == "POST" {
+        return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("received " + Decimal(Core.Bytes.Slice.Len(request.body))) };
+    }
+    return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("hello " + request.target) };
+}
+
+Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+pub i32 Main() {
+    Port port = match NetworkTypes.PortNumber(18089_i64) { Result::Ok(p) => p, Result::Error(_) => NetworkTypes.PortBytes(0_u8, 0_u8), };
+    SocketAddress address = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: port };
+    Result<TcpListener, NetworkError> bound = TcpListener.Bind(address, 8_i64);
+    match bound {
+        Result::Error(_) => { Output.WriteLine("bind failed"); return 2; },
+        Result::Ok(listener) => {
+            Output.WriteLine("ready");
+            Hello handler = Hello { tag: 0_i64 };
+            Config config = Connection.DefaultConfig();
+            config.timeoutMillis = 10000_i64;
+            mut i64 served = 0_i64;
+            while served < 3_i64 {
+                Result<i64, Http2Error> result = Server.AcceptAndServe(listener, handler, config, Within(60000_i64));
+                match result {
+                    Result::Ok(count) => { Output.WriteLine("connection served " + Decimal(count)); },
+                    Result::Error(error) => { Output.WriteLine("connection failed " + FrameErrors.KindOf(error)); },
+                };
+                served = served + 1_i64;
+            }
+            listener.Close();
+        },
+    };
+    return 0;
+}

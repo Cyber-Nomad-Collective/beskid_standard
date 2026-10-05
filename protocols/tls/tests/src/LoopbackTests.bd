@@ -1,4 +1,3 @@
-use Concurrency;
 use Concurrency.Fiber;
 use Core.Collections.Array;
 use Core.Bytes.Slice;
@@ -6,9 +5,9 @@ use Core.IO;
 use Core.IO.IoError;
 use Core.Optional.Option;
 use Core.Results;
+use Core.String;
 use Core.Time;
 use Core.Time.Deadline;
-use Core.Time.Duration;
 use Core.Time.Instant;
 use Core.Time.TimerError;
 use Codec.Hex;
@@ -23,7 +22,18 @@ use Tls.Suites;
 use Tls.TlsConfig;
 use Tls.TlsErrors;
 use Tls.TlsStream;
-use Tls.Wire;
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+// Fails with the actual value in the message (Assert.Equal does not print values).
+unit Expect(i64 actual, i64 expected, string what) {
+    if actual != expected { Assert.Fail(what + ": got " + Dec(actual) + ", want " + Dec(expected)); }
+    return;
+}
 
 // Loopback Beskid client <-> Beskid server over TcpStream. Each scenario runs the server in
 // a fiber; `result[0]` receives the server outcome (0 ok, else TlsErrors.Code).
@@ -145,16 +155,33 @@ i64 RunSuite(CipherSuite suite, i64[] info) {
     return code;
 }
 
-test loopback_each_cipher_suite_with_alpn {
+unit AllSuites(i64[] codes) {
     i64[] info = [0_i64, 0_i64, 0_i64, 0_i64];
-    Assert.Equal<i64>(RunSuite(Suites.Aes128(), info), 0_i64, "TLS_AES_128_GCM_SHA256 round trip");
-    Assert.Equal<i64>(info[1], 0x1301_i64, "suite 1301");
-    Assert.Equal<i64>(info[2], 0x1d_i64, "x25519");
-    Assert.Equal<i64>(RunSuite(Suites.Aes256(), info), 0_i64, "TLS_AES_256_GCM_SHA384 round trip");
-    Assert.Equal<i64>(info[1], 0x1302_i64, "suite 1302");
-    Assert.Equal<i64>(RunSuite(Suites.ChaCha(), info), 0_i64, "TLS_CHACHA20_POLY1305_SHA256 round trip");
-    Assert.Equal<i64>(info[1], 0x1303_i64, "suite 1303");
+    codes[0] = RunSuite(Suites.Aes128(), info);
+    codes[1] = info[1];
+    codes[2] = info[2];
+    codes[6] = info[0];
+    codes[3] = RunSuite(Suites.Aes256(), info);
+    codes[4] = info[1];
+    codes[5] = RunSuite(Suites.ChaCha(), info);
+    codes[7] = info[1];
+    return;
 }
+
+test loopback_each_cipher_suite_with_alpn {
+    i64[] codes = [-1_i64, 0_i64, 0_i64, -1_i64, 0_i64, -1_i64, 0_i64, 0_i64];
+    Fiber<unit> scenario = spawn (() => AllSuites(codes));
+    scenario.Join();
+    Expect(codes[0], 0_i64, "TLS_AES_128_GCM_SHA256 round trip");
+    Expect(codes[1], 0x1301_i64, "suite 1301");
+    Expect(codes[2], 0x1d_i64, "x25519");
+    Expect(codes[3], 0_i64, "TLS_AES_256_GCM_SHA384 round trip");
+    Expect(codes[4], 0x1302_i64, "suite 1302");
+    Expect(codes[5], 0_i64, "TLS_CHACHA20_POLY1305_SHA256 round trip");
+    Expect(codes[7], 0x1303_i64, "suite 1303");
+    Expect(codes[6] / 100000_i64, 0_i64, "first full handshake time below 100 s");
+}
+
 // Test fixtures generated with openssl (see tests/interop/certs). Test-only keys.
 pub u8[] ServerCertDer() {
     string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"

@@ -80,10 +80,12 @@ Result<unit, TlsError> WriteRecords(TlsConnection c, Stream transport, i64 conte
         Slice.Copy(c.wbuf, 5_i64, src, offset + done, n);
         if c.st[PWriteProtected()] == 1_i64 {
             i64 total = Record.Seal(c.writeKeys, c.wbuf, contentType, n, 0_i64)?;
-            WriteRaw(transport, c.wbuf, total)?;
+            Result<unit, TlsError> r1 = WriteRaw(transport, c.wbuf, total);
+            match r1 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
         } else {
             Record.WriteHeader(c.wbuf, 0_i64, contentType, n);
-            WriteRaw(transport, c.wbuf, 5_i64 + n)?;
+            Result<unit, TlsError> r2 = WriteRaw(transport, c.wbuf, 5_i64 + n);
+            match r2 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
         }
         done = done + n;
     }
@@ -127,7 +129,10 @@ Result<unit, TlsError> Pump(TlsConnection c, Stream transport) {
     while Handshake.HasEvent(e) {
         TlsEvent ev = Handshake.TakeEvent(e);
         match ev {
-            TlsEvent::Send(_, data) => { WriteRecords(c, transport, Wire.ContentHandshake(), data, 0_i64, Slice.Len(data))?; },
+            TlsEvent::Send(_, data) => {
+                Result<unit, TlsError> sent = WriteRecords(c, transport, Wire.ContentHandshake(), data, 0_i64, Slice.Len(data));
+                match sent { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+            },
             TlsEvent::ReadSecret(_, secret) => {
                 c.readKeys = Record.FromSecret(suite, secret)?;
                 c.st[PReadProtected()] = 1_i64;
@@ -183,12 +188,15 @@ pub Result<unit, TlsError> Handshake(TlsConnection c, Stream transport) {
 Result<unit, TlsError> DoHandshake(TlsConnection c, Stream transport) {
     HandshakeEngine e = c.engine;
     Handshake.Start(e)?;
-    Pump(c, transport)?;
+    Result<unit, TlsError> r3 = Pump(c, transport);
+    match r3 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
     while c.st[PDone()] == 0_i64 {
-        i64 contentType = ReadRecord(c, transport)?;
+        Result<i64, TlsError> rr1 = ReadRecord(c, transport);
+        i64 contentType = match rr1 { Result::Ok(x) => x, Result::Error(err) => { return Result::Error(err); }, };
         if contentType == Wire.ContentHandshake() {
             Handshake.Feed(e, Handshake.ReadLevel(e), c.rbuf, 5_i64, c.st[PLength()])?;
-            Pump(c, transport)?;
+            Result<unit, TlsError> r4 = Pump(c, transport);
+            match r4 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
         } else {
             if contentType == Wire.ContentAlert() {
                 bool closed = OnAlert(c)?;
@@ -215,7 +223,8 @@ pub Result<i64, TlsError> Read(TlsConnection c, Stream transport, u8[] destinati
 Result<i64, TlsError> DoRead(TlsConnection c, Stream transport, u8[] destination, i64 offset, i64 count) {
     while c.st[PStart()] >= c.st[PEnd()] {
         if c.st[PReadClosed()] == 1_i64 { return Result::Ok(0_i64); }
-        i64 contentType = ReadRecord(c, transport)?;
+        Result<i64, TlsError> rr2 = ReadRecord(c, transport);
+        i64 contentType = match rr2 { Result::Ok(x) => x, Result::Error(err) => { return Result::Error(err); }, };
         i64 length = c.st[PLength()];
         if contentType == Wire.ContentApplicationData() {
             c.st[PStart()] = 5_i64;
@@ -224,7 +233,8 @@ Result<i64, TlsError> DoRead(TlsConnection c, Stream transport, u8[] destination
             if contentType == Wire.ContentHandshake() {
                 HandshakeEngine e = c.engine;
                 Handshake.Feed(e, Handshake.ReadLevel(e), c.rbuf, 5_i64, length)?;
-                Pump(c, transport)?;
+                Result<unit, TlsError> r5 = Pump(c, transport);
+                match r5 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
             } else {
                 if contentType == Wire.ContentAlert() {
                     bool closed = OnAlert(c)?;
@@ -255,7 +265,8 @@ pub Result<i64, TlsError> Write(TlsConnection c, Stream transport, u8[] source, 
 Result<unit, TlsError> DoWrite(TlsConnection c, Stream transport, u8[] source, i64 offset, i64 count) {
     if Record.Sequence(c.writeKeys) >= Record.KeyUpdateThreshold() {
         Handshake.RequestKeyUpdate(c.engine, false)?;
-        Pump(c, transport)?;
+        Result<unit, TlsError> r6 = Pump(c, transport);
+        match r6 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
     }
     return WriteRecords(c, transport, Wire.ContentApplicationData(), source, offset, count);
 }

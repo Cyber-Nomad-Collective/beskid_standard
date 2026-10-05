@@ -130,16 +130,22 @@ pub i64 EncodedHeaderLength(i64 count, bool masked) {
     return n;
 }
 
-/// Encodes one frame: header (minimal length encoding) followed by the payload,
-/// masked with `maskKey` when it holds 4 bytes, unmasked when it is empty.
-pub Result<u8[], WsError> EncodeFrame(bool fin, i64 opcode, u8[] payload, i64 offset, i64 count, u8[] maskKey) {
-    if !IsKnownOpcode(opcode) || !Slice.IsValidRange(Slice.Len(payload), offset, count) { return Result::Error(WsError::InvalidArgument()); }
+/// Encodes the header of a frame carrying `count` payload bytes (minimal length
+/// encoding), with the masking key when `maskKey` holds 4 bytes.
+pub Result<u8[], WsError> EncodeHeader(bool fin, i64 opcode, i64 count, u8[] maskKey) {
+    if !IsKnownOpcode(opcode) || count < 0_i64 { return Result::Error(WsError::InvalidArgument()); }
     i64 keyLength = Slice.Len(maskKey);
     if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
     if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
     bool masked = keyLength == 4_i64;
-    i64 headerLength = EncodedHeaderLength(count, masked);
-    u8[] out = Slice.New(headerLength + count);
+    u8[] out = Slice.New(EncodedHeaderLength(count, masked));
+    WriteHeader(out, fin, opcode, count, maskKey);
+    return Result::Ok(out);
+}
+
+// Writes the header at the start of `out` and returns its length.
+i64 WriteHeader(u8[] out, bool fin, i64 opcode, i64 count, u8[] maskKey) {
+    bool masked = Slice.Len(maskKey) == 4_i64;
     mut i64 b0 = opcode;
     if fin { b0 = b0 | 128_i64; }
     out[0] = u8(b0);
@@ -166,6 +172,19 @@ pub Result<u8[], WsError> EncodeFrame(bool fin, i64 opcode, u8[] payload, i64 of
         Slice.Copy(out, pos, maskKey, 0_i64, 4_i64);
         pos = pos + 4_i64;
     }
+    return pos;
+}
+
+/// Encodes one frame: header (minimal length encoding) followed by the payload,
+/// masked with `maskKey` when it holds 4 bytes, unmasked when it is empty.
+pub Result<u8[], WsError> EncodeFrame(bool fin, i64 opcode, u8[] payload, i64 offset, i64 count, u8[] maskKey) {
+    if !IsKnownOpcode(opcode) || !Slice.IsValidRange(Slice.Len(payload), offset, count) { return Result::Error(WsError::InvalidArgument()); }
+    i64 keyLength = Slice.Len(maskKey);
+    if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
+    if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
+    bool masked = keyLength == 4_i64;
+    u8[] out = Slice.New(EncodedHeaderLength(count, masked) + count);
+    i64 pos = WriteHeader(out, fin, opcode, count, maskKey);
     Slice.Copy(out, pos, payload, offset, count);
     if masked { ApplyMask(out, pos, count, maskKey, 0_i64); }
     return Result::Ok(out);

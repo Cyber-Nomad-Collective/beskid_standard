@@ -395,6 +395,11 @@ Result<WsFrameIn, WsError> ReadFrame(WsConnection self) {
     return Result::Ok(WsFrameIn { fin: header.fin, opcode: header.opcode, payload: payload });
 }
 
+// Payloads up to this size go out as one buffer; larger ones are written after the
+// header without a whole-frame copy (masked through a small scratch buffer), so a
+// 64 KiB message does not hold two 64 KiB arrays (see protocols/PLAN.md buffers).
+i64 SingleWriteLimit() { return 4096_i64; }
+
 Result<unit, WsError> WriteFrame(WsConnection self, bool fin, i64 opcode, u8[] payload) {
     mut u8[] key = Slice.New(0_i64);
     if !self.isServer {
@@ -403,13 +408,43 @@ Result<unit, WsError> WriteFrame(WsConnection self, bool fin, i64 opcode, u8[] p
             Result::Ok(bytes) => { key = bytes; },
         };
     }
-    Result<u8[], WsError> encoded = WsFrame.EncodeFrame(fin, opcode, payload, 0_i64, Slice.Len(payload), key);
-    mut u8[] wire = Slice.New(0_i64);
-    match encoded {
+    i64 count = Slice.Len(payload);
+    if count <= SingleWriteLimit() {
+        Result<u8[], WsError> encoded = WsFrame.EncodeFrame(fin, opcode, payload, 0_i64, count, key);
+        mut u8[] wire = Slice.New(0_i64);
+        match encoded {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(bytes) => { wire = bytes; },
+        };
+        return WsTransport.WriteAll(self.transport, wire);
+    }
+    Result<u8[], WsError> header = WsFrame.EncodeHeader(fin, opcode, count, key);
+    mut u8[] head = Slice.New(0_i64);
+    match header {
         Result::Error(error) => { return Result::Error(error); },
-        Result::Ok(bytes) => { wire = bytes; },
+        Result::Ok(bytes) => { head = bytes; },
     };
-    return WsTransport.WriteAll(self.transport, wire);
+    Result<unit, WsError> wroteHead = WsTransport.WriteAll(self.transport, head);
+    match wroteHead {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => {},
+    };
+    if self.isServer { return WsTransport.WriteRange(self.transport, payload, 0_i64, count); }
+    u8[] scratch = Slice.New(SingleWriteLimit());
+    mut i64 done = 0_i64;
+    while done < count {
+        mut i64 n = count - done;
+        if n > SingleWriteLimit() { n = SingleWriteLimit(); }
+        Slice.Copy(scratch, 0_i64, payload, done, n);
+        WsFrame.ApplyMask(scratch, 0_i64, n, key, done);
+        Result<unit, WsError> wrote = WsTransport.WriteRange(self.transport, scratch, 0_i64, n);
+        match wrote {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        done = done + n;
+    }
+    return Result::Ok(());
 }
 
 /// Ends the connection after a failure: sends the matching close code when the

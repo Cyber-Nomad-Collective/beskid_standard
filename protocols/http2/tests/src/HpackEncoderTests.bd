@@ -190,11 +190,20 @@ test authorization_is_never_indexed {
     Assert.True(first.sensitive, "decoded as sensitive");
 }
 
-test short_cookies_are_never_indexed_long_ones_are {
+test short_cookie_bytes {
     mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
     ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"])), "1f1103613d62", "short cookie");
+}
+
+test short_cookie_not_inserted {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    u8[] wire = HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"]));
     Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "short cookie not inserted");
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "601461616161616161616161616161616161616161", "long cookie indexed");
+}
+
+test long_cookie_is_indexed {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "60146161616161616161616161616161616161616161", "long cookie indexed");
     Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "long cookie inserted");
     ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "be", "then indexed");
 }
@@ -234,7 +243,7 @@ test size_updates_start_the_next_block {
     Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 0_i64, "decoder evicted");
     Assert.Equal<i64>(HpackDecoder.TableMaxSize(decoder), 256_i64, "decoder max 256");
     SetSize(encoder, 1000_i64);
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "3f490782", "single update");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "3fc90782", "single update");
     ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "82", "no update afterwards");
 }
 
@@ -279,7 +288,14 @@ test long_round_trip_with_eviction {
     mut i64 i = 0_i64;
     while i < 60_i64 {
         string n = String.SubSlice(digits, i % 10_i64, 1_i64) + String.SubSlice(digits, (i / 10_i64) % 10_i64, 1_i64);
-        string[] pairs = [":status", "200", "x-request-id", "req-" + n, "cache-control", "private", "authorization", "Bearer " + n, "x-n" + String.SubSlice(digits, i % 7_i64, 1_i64), n];
+        // Computed elements in an array literal are an ICE in 0.5.2 (COMPILER-GAPS.md).
+        mut string[] pairs = [":status", "200", "cache-control", "private"];
+        Array.Append<string>(pairs, "x-request-id");
+        Array.Append<string>(pairs, "req-" + n);
+        Array.Append<string>(pairs, "authorization");
+        Array.Append<string>(pairs, "Bearer " + n);
+        Array.Append<string>(pairs, "x-n" + String.SubSlice(digits, i % 7_i64, 1_i64));
+        Array.Append<string>(pairs, n);
         u8[] wire = HpackEncoder.Encode(encoder, Fields(pairs));
         Result<HeaderField[],HpackError> decoded = HpackDecoder.Decode(decoder, wire);
         match decoded {

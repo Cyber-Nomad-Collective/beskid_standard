@@ -1,0 +1,165 @@
+/// X25519 Diffie-Hellman (RFC 7748 section 5) over GF(2^255 - 19).
+///
+/// Field arithmetic is the constant-time Montgomery engine of `Crypto.ModArith` with
+/// eight 32-bit limbs. The ladder runs a fixed 255 steps with branch-free conditional
+/// swaps, so its time does not depend on the scalar or the peer's u-coordinate.
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.BigNat;
+use Crypto.ModArith;
+use Crypto.PkErrors;
+
+/// Length of scalars, u-coordinates and shared secrets.
+pub i64 KeyLength() { return 32_i64; }
+
+/// p = 2^255 - 19, little-endian limbs.
+u32[] FieldPrime() {
+    return [0xFFFFFFED_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0x7FFFFFFF_u32];
+}
+
+/// p - 2 big-endian, the Fermat inversion exponent.
+u8[] InverseExponent() {
+    u8[] e = Slice.Fill(Slice.New(32_i64), 0_i64, 32_i64, u8(255));
+    e[0] = u8(127);
+    e[31] = u8(235);
+    return e;
+}
+
+/// Little-endian 32 bytes to eight limbs, bit 255 masked (RFC 7748 decodeUCoordinate).
+u32[] DecodeLittleEndian(u8[] bytes) {
+    u32[] limbs = BigNat.Zeros(8_i64);
+    mut i64 i = 0_i64;
+    while i < 32_i64 {
+        mut u32 b = u32(bytes[i]);
+        if i == 31_i64 { b = b & 127_u32; }
+        limbs[i / 4_i64] = limbs[i / 4_i64] | (b << u32((i % 4_i64) * 8_i64));
+        i = i + 1_i64;
+    }
+    return limbs;
+}
+
+u8[] EncodeLittleEndian(u32[] limbs) {
+    u8[] out = Slice.New(32_i64);
+    mut i64 i = 0_i64;
+    while i < 32_i64 {
+        out[i] = u8((limbs[i / 4_i64] >> u32((i % 4_i64) * 8_i64)) & 255_u32);
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+/// RFC 7748 decodeScalar25519: clear bits 0, 1, 2 and 255, set bit 254.
+u8[] Clamp(u8[] scalar) {
+    u8[] k = Slice.New(32_i64);
+    Slice.Copy(k, 0_i64, scalar, 0_i64, 32_i64);
+    k[0] = k[0] & u8(248);
+    k[31] = (k[31] & u8(127)) | u8(64);
+    return k;
+}
+
+/// The raw X25519 function of RFC 7748 section 5: `scalar` and `u` are 32 bytes each.
+/// Non-canonical u-coordinates (at or above p) are accepted and reduced, as the RFC requires.
+/// The all-zero output is returned as is; key agreement uses `SharedSecret`, which rejects it.
+pub Result<u8[], PkError> ScalarMult(u8[] scalar, u8[] u) {
+    if Slice.Len(scalar) != 32_i64 || Slice.Len(u) != 32_i64 { return Result::Error(PkError::InvalidLength()); }
+    Result<Mont, PkError> created = ModArith.New(FieldPrime());
+    return match created {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(c) => Result::Ok(Ladder(c, Clamp(scalar), u)),
+    };
+}
+
+u8[] Ladder(Mont c, u8[] k, u8[] u) {
+    u32[] p = FieldPrime();
+    u32[] raw = DecodeLittleEndian(u);
+    // raw < 2^255 < 2p: one branch-free conditional subtraction makes it canonical.
+    u32[] reduced = BigNat.Copy(raw);
+    i64 borrow = BigNat.SubInPlace(reduced, p);
+    ModArith.CondAssign(raw, reduced, 1_u32 - u32(borrow));
+
+    u32[] x1 = BigNat.Zeros(8_i64);
+    ModArith.ToMont(c, x1, raw);
+    u32[] x2 = BigNat.Zeros(8_i64);
+    ModArith.ToMont(c, x2, c.one);
+    u32[] z2 = BigNat.Zeros(8_i64);
+    u32[] x3 = BigNat.Copy(x1);
+    u32[] z3 = BigNat.Copy(x2);
+    u32[] a24 = BigNat.Zeros(8_i64);
+    u32[] a24raw = BigNat.Zeros(8_i64);
+    a24raw[0] = 121665_u32;
+    ModArith.ToMont(c, a24, a24raw);
+
+    u32[] a = BigNat.Zeros(8_i64);
+    u32[] aa = BigNat.Zeros(8_i64);
+    u32[] b = BigNat.Zeros(8_i64);
+    u32[] bb = BigNat.Zeros(8_i64);
+    u32[] e = BigNat.Zeros(8_i64);
+    u32[] cc = BigNat.Zeros(8_i64);
+    u32[] d = BigNat.Zeros(8_i64);
+    u32[] da = BigNat.Zeros(8_i64);
+    u32[] cb = BigNat.Zeros(8_i64);
+
+    mut u32 swap = 0_u32;
+    mut i64 t = 254_i64;
+    while t >= 0_i64 {
+        u32 kt = u32((k[t / 8_i64] >> u8(t % 8_i64)) & u8(1));
+        swap = ModArith.Xor(swap, kt);
+        ModArith.CondSwap(x2, x3, swap);
+        ModArith.CondSwap(z2, z3, swap);
+        swap = kt;
+
+        ModArith.Add(c, a, x2, z2);
+        ModArith.Mul(c, aa, a, a);
+        ModArith.Sub(c, b, x2, z2);
+        ModArith.Mul(c, bb, b, b);
+        ModArith.Sub(c, e, aa, bb);
+        ModArith.Add(c, cc, x3, z3);
+        ModArith.Sub(c, d, x3, z3);
+        ModArith.Mul(c, da, d, a);
+        ModArith.Mul(c, cb, cc, b);
+        ModArith.Add(c, x3, da, cb);
+        ModArith.Mul(c, x3, x3, x3);
+        ModArith.Sub(c, z3, da, cb);
+        ModArith.Mul(c, z3, z3, z3);
+        ModArith.Mul(c, z3, z3, x1);
+        ModArith.Mul(c, x2, aa, bb);
+        ModArith.Mul(c, z2, a24, e);
+        ModArith.Add(c, z2, z2, aa);
+        ModArith.Mul(c, z2, z2, e);
+        t = t - 1_i64;
+    }
+    ModArith.CondSwap(x2, x3, swap);
+    ModArith.CondSwap(z2, z3, swap);
+
+    u32[] inv = BigNat.Zeros(8_i64);
+    ModArith.PowPublic(c, inv, z2, InverseExponent());
+    ModArith.Mul(c, x2, x2, inv);
+    ModArith.FromMont(c, x2, x2);
+    return EncodeLittleEndian(x2);
+}
+
+/// The X25519 public key for a 32-byte private key: `ScalarMult(privateKey, 9)`.
+pub Result<u8[], PkError> PublicKey(u8[] privateKey) {
+    u8[] basePoint = Slice.New(32_i64);
+    basePoint[0] = u8(9);
+    return ScalarMult(privateKey, basePoint);
+}
+
+/// The X25519 shared secret. Fails with ZeroSharedSecret when the peer key is a
+/// small-order point (all-zero output), as TLS 1.3 (RFC 8446 section 7.4.2) requires.
+pub Result<u8[], PkError> SharedSecret(u8[] privateKey, u8[] peerPublicKey) {
+    Result<u8[], PkError> raw = ScalarMult(privateKey, peerPublicKey);
+    return match raw {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(secret) => {
+            mut u8 acc = u8(0);
+            mut i64 i = 0_i64;
+            while i < 32_i64 {
+                acc = acc | secret[i];
+                i = i + 1_i64;
+            }
+            if acc == u8(0) { return Result::Error(PkError::ZeroSharedSecret()); }
+            return Result::Ok(secret);
+        },
+    };
+}

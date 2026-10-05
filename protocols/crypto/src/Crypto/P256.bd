@@ -1,0 +1,422 @@
+/// NIST P-256 (secp256r1, SEC 2 section 2.4.2): field and scalar arithmetic, points, ECDH.
+///
+/// Points are projective (X:Y:Z) with coordinates in Montgomery form; the identity is
+/// (0:1:0). Addition and doubling are the complete a = -3 formulas of Renes, Costello and
+/// Batina, "Complete addition formulas for prime order elliptic curves" (ePrint 2015/1060,
+/// algorithms 4 and 6), so no input needs a special case. Scalar multiplication is a fixed
+/// 4-bit window with a branch-free table scan: its time depends on neither the scalar nor
+/// the point. Public keys are uncompressed SEC 1 encodings (0x04 || X || Y, 65 bytes).
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.BigNat;
+use Crypto.ModArith;
+use Crypto.PkErrors;
+
+/// A projective point; all three coordinates are eight limbs in Montgomery form mod p.
+pub type Point { pub u32[] x, pub u32[] y, pub u32[] z, }
+
+/// Curve contexts plus scratch. One `Curve` must not be shared between threads.
+pub type Curve {
+    /// Field arithmetic modulo p.
+    pub Mont fp,
+    /// Scalar arithmetic modulo the group order n.
+    pub Mont fn,
+    /// The curve coefficient b in Montgomery form.
+    pub u32[] b,
+    u32[] t0, u32[] t1, u32[] t2, u32[] t3, u32[] t4,
+    u32[] x3, u32[] y3, u32[] z3,
+}
+
+/// Length of private keys, scalars and shared secrets.
+pub i64 ScalarLength() { return 32_i64; }
+/// Length of an uncompressed SEC 1 public key.
+pub i64 PublicKeyLength() { return 65_i64; }
+
+/// p = 2^256 - 2^224 + 2^192 + 2^96 - 1, little-endian limbs.
+pub u32[] FieldPrime() { return [0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0_u32, 0_u32, 0_u32, 1_u32, 0xFFFFFFFF_u32]; }
+/// The group order n.
+pub u32[] Order() { return [0xFC632551_u32, 0xF3B9CAC2_u32, 0xA7179E84_u32, 0xBCE6FAAD_u32, 0xFFFFFFFF_u32, 0xFFFFFFFF_u32, 0_u32, 0xFFFFFFFF_u32]; }
+u32[] CoefficientB() { return [0x27D2604B_u32, 0x3BCE3C3E_u32, 0xCC53B0F6_u32, 0x651D06B0_u32, 0x769886BC_u32, 0xB3EBBD55_u32, 0xAA3A93E7_u32, 0x5AC635D8_u32]; }
+u32[] GeneratorX() { return [0xD898C296_u32, 0xF4A13945_u32, 0x2DEB33A0_u32, 0x77037D81_u32, 0x63A440F2_u32, 0xF8BCE6E5_u32, 0xE12C4247_u32, 0x6B17D1F2_u32]; }
+u32[] GeneratorY() { return [0x37BF51F5_u32, 0xCBB64068_u32, 0x6B315ECE_u32, 0x2BCE3357_u32, 0x7C0F9E16_u32, 0x8EE7EB4A_u32, 0xFE1A7F9B_u32, 0x4FE342E2_u32]; }
+
+/// `m - 2` as 32 big-endian bytes: the Fermat inversion exponent for a prime `m`.
+pub u8[] InverseExponent(u32[] m) {
+    u32[] e = BigNat.Copy(m);
+    BigNat.SubInPlace(e, [2_u32]);
+    u8[] out = Slice.New(32_i64);
+    BigNat.WriteBytes(e, out, 0_i64, 32_i64);
+    return out;
+}
+
+pub Result<Curve, PkError> NewCurve() {
+    Result<Mont, PkError> fieldCtx = ModArith.New(FieldPrime());
+    Result<Mont, PkError> orderCtx = ModArith.New(Order());
+    return match fieldCtx {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(fp) => match orderCtx {
+            Result::Error(error) => Result::Error(error),
+            Result::Ok(fn) => {
+                u32[] b = BigNat.Zeros(8_i64);
+                ModArith.ToMont(fp, b, CoefficientB());
+                return Result::Ok(Curve {
+                    fp: fp, fn: fn, b: b,
+                    t0: BigNat.Zeros(8_i64), t1: BigNat.Zeros(8_i64), t2: BigNat.Zeros(8_i64), t3: BigNat.Zeros(8_i64), t4: BigNat.Zeros(8_i64),
+                    x3: BigNat.Zeros(8_i64), y3: BigNat.Zeros(8_i64), z3: BigNat.Zeros(8_i64),
+                });
+            },
+        },
+    };
+}
+
+pub Point Identity(Curve c) {
+    Mont fp = c.fp;
+    u32[] y = BigNat.Zeros(8_i64);
+    ModArith.ToMont(fp, y, fp.one);
+    return Point { x: BigNat.Zeros(8_i64), y: y, z: BigNat.Zeros(8_i64) };
+}
+
+pub Point Generator(Curve c) {
+    Mont fp = c.fp;
+    Point g = Identity(c);
+    ModArith.ToMont(fp, g.x, GeneratorX());
+    ModArith.ToMont(fp, g.y, GeneratorY());
+    ModArith.ToMont(fp, g.z, fp.one);
+    return g;
+}
+
+pub Point CopyPoint(Point p) { return Point { x: BigNat.Copy(p.x), y: BigNat.Copy(p.y), z: BigNat.Copy(p.z) }; }
+
+pub unit AssignPoint(Point dst, Point src) {
+    BigNat.Assign(dst.x, src.x);
+    BigNat.Assign(dst.y, src.y);
+    BigNat.Assign(dst.z, src.z);
+    return;
+}
+
+/// 1 for the identity (Z = 0), else 0.
+pub u32 IsIdentityBit(Point p) { return ModArith.IsZeroBit(p.z); }
+
+/// `out = p + q`; complete, any inputs, `out` may alias either.
+pub unit Add(Curve c, Point out, Point p, Point q) {
+    Mont f = c.fp;
+    u32[] b = c.b;
+    u32[] t0 = c.t0; u32[] t1 = c.t1; u32[] t2 = c.t2; u32[] t3 = c.t3; u32[] t4 = c.t4;
+    u32[] x3 = c.x3; u32[] y3 = c.y3; u32[] z3 = c.z3;
+    u32[] px = p.x; u32[] py = p.y; u32[] pz = p.z;
+    u32[] qx = q.x; u32[] qy = q.y; u32[] qz = q.z;
+    ModArith.Mul(f, t0, px, qx);
+    ModArith.Mul(f, t1, py, qy);
+    ModArith.Mul(f, t2, pz, qz);
+    ModArith.Add(f, t3, px, py);
+    ModArith.Add(f, t4, qx, qy);
+    ModArith.Mul(f, t3, t3, t4);
+    ModArith.Add(f, t4, t0, t1);
+    ModArith.Sub(f, t3, t3, t4);
+    ModArith.Add(f, t4, py, pz);
+    ModArith.Add(f, x3, qy, qz);
+    ModArith.Mul(f, t4, t4, x3);
+    ModArith.Add(f, x3, t1, t2);
+    ModArith.Sub(f, t4, t4, x3);
+    ModArith.Add(f, x3, px, pz);
+    ModArith.Add(f, y3, qx, qz);
+    ModArith.Mul(f, x3, x3, y3);
+    ModArith.Add(f, y3, t0, t2);
+    ModArith.Sub(f, y3, x3, y3);
+    ModArith.Mul(f, z3, b, t2);
+    ModArith.Sub(f, x3, y3, z3);
+    ModArith.Add(f, z3, x3, x3);
+    ModArith.Add(f, x3, x3, z3);
+    ModArith.Sub(f, z3, t1, x3);
+    ModArith.Add(f, x3, t1, x3);
+    ModArith.Mul(f, y3, b, y3);
+    ModArith.Add(f, t1, t2, t2);
+    ModArith.Add(f, t2, t1, t2);
+    ModArith.Sub(f, y3, y3, t2);
+    ModArith.Sub(f, y3, y3, t0);
+    ModArith.Add(f, t1, y3, y3);
+    ModArith.Add(f, y3, t1, y3);
+    ModArith.Add(f, t1, t0, t0);
+    ModArith.Add(f, t0, t1, t0);
+    ModArith.Sub(f, t0, t0, t2);
+    ModArith.Mul(f, t1, t4, y3);
+    ModArith.Mul(f, t2, t0, y3);
+    ModArith.Mul(f, y3, x3, z3);
+    ModArith.Add(f, y3, y3, t2);
+    ModArith.Mul(f, x3, t3, x3);
+    ModArith.Sub(f, x3, x3, t1);
+    ModArith.Mul(f, z3, t4, z3);
+    ModArith.Mul(f, t1, t3, t0);
+    ModArith.Add(f, z3, z3, t1);
+    BigNat.Assign(out.x, x3);
+    BigNat.Assign(out.y, y3);
+    BigNat.Assign(out.z, z3);
+    return;
+}
+
+/// `out = 2p`; complete, `out` may alias `p`.
+pub unit Double(Curve c, Point out, Point p) {
+    Mont f = c.fp;
+    u32[] b = c.b;
+    u32[] t0 = c.t0; u32[] t1 = c.t1; u32[] t2 = c.t2; u32[] t3 = c.t3;
+    u32[] x3 = c.x3; u32[] y3 = c.y3; u32[] z3 = c.z3;
+    u32[] px = p.x; u32[] py = p.y; u32[] pz = p.z;
+    ModArith.Mul(f, t0, px, px);
+    ModArith.Mul(f, t1, py, py);
+    ModArith.Mul(f, t2, pz, pz);
+    ModArith.Mul(f, t3, px, py);
+    ModArith.Add(f, t3, t3, t3);
+    ModArith.Mul(f, z3, px, pz);
+    ModArith.Add(f, z3, z3, z3);
+    ModArith.Mul(f, y3, b, t2);
+    ModArith.Sub(f, y3, y3, z3);
+    ModArith.Add(f, x3, y3, y3);
+    ModArith.Add(f, y3, x3, y3);
+    ModArith.Sub(f, x3, t1, y3);
+    ModArith.Add(f, y3, t1, y3);
+    ModArith.Mul(f, y3, x3, y3);
+    ModArith.Mul(f, x3, x3, t3);
+    ModArith.Add(f, t3, t2, t2);
+    ModArith.Add(f, t2, t2, t3);
+    ModArith.Mul(f, z3, b, z3);
+    ModArith.Sub(f, z3, z3, t2);
+    ModArith.Sub(f, z3, z3, t0);
+    ModArith.Add(f, t3, z3, z3);
+    ModArith.Add(f, z3, z3, t3);
+    ModArith.Add(f, t3, t0, t0);
+    ModArith.Add(f, t0, t3, t0);
+    ModArith.Sub(f, t0, t0, t2);
+    ModArith.Mul(f, t0, t0, z3);
+    ModArith.Add(f, y3, y3, t0);
+    ModArith.Mul(f, t0, py, pz);
+    ModArith.Add(f, t0, t0, t0);
+    ModArith.Mul(f, z3, t0, z3);
+    ModArith.Sub(f, x3, x3, z3);
+    ModArith.Mul(f, z3, t0, t1);
+    ModArith.Add(f, z3, z3, z3);
+    ModArith.Add(f, z3, z3, z3);
+    BigNat.Assign(out.x, x3);
+    BigNat.Assign(out.y, y3);
+    BigNat.Assign(out.z, z3);
+    return;
+}
+
+/// The multiples 0P .. 15P for the 4-bit window.
+Point[] Table(Curve c, Point p) {
+    mut Point[] table = [Identity(c)];
+    Core.Collections.Array.Append<Point>(table, CopyPoint(p));
+    mut i64 i = 2_i64;
+    while i < 16_i64 {
+        Point next = Identity(c);
+        if (i & 1_i64) == 0_i64 {
+            Double(c, next, table[i / 2_i64]);
+        } else {
+            Add(c, next, table[i - 1_i64], p);
+        }
+        Core.Collections.Array.Append<Point>(table, next);
+        i = i + 1_i64;
+    }
+    return table;
+}
+
+/// `out = table[index]` by scanning every entry with a mask.
+unit Select(Point out, Point[] table, u32 index) {
+    mut u32 j = 0_u32;
+    while j < 16_u32 {
+        u32 diff = ModArith.Xor(j, index);
+        u32 hit = 1_u32 - ((diff | (0_u32 - diff)) >> 31_u32);
+        Point entry = table[i64(j)];
+        ModArith.CondAssign(out.x, entry.x, hit);
+        ModArith.CondAssign(out.y, entry.y, hit);
+        ModArith.CondAssign(out.z, entry.z, hit);
+        j = j + 1_u32;
+    }
+    return;
+}
+
+u32 Nibble(u32[] scalar, i64 index) {
+    return (scalar[index / 8_i64] >> u32((index % 8_i64) * 4_i64)) & 15_u32;
+}
+
+/// `k * p` for a plain (not Montgomery) eight-limb scalar `k`. Constant-time.
+pub Point ScalarMult(Curve c, u32[] k, Point p) {
+    Point[] table = Table(c, p);
+    Point acc = Identity(c);
+    Point pick = Identity(c);
+    mut i64 i = 63_i64;
+    while i >= 0_i64 {
+        Double(c, acc, acc);
+        Double(c, acc, acc);
+        Double(c, acc, acc);
+        Double(c, acc, acc);
+        Select(pick, table, Nibble(k, i));
+        Add(c, acc, acc, pick);
+        i = i - 1_i64;
+    }
+    return acc;
+}
+
+/// `k1 * p + k2 * q` with one shared doubling chain. Constant-time.
+pub Point DoubleScalarMult(Curve c, u32[] k1, Point p, u32[] k2, Point q) {
+    Point[] tableP = Table(c, p);
+    Point[] tableQ = Table(c, q);
+    Point acc = Identity(c);
+    Point pick = Identity(c);
+    mut i64 i = 63_i64;
+    while i >= 0_i64 {
+        Double(c, acc, acc);
+        Double(c, acc, acc);
+        Double(c, acc, acc);
+        Double(c, acc, acc);
+        Select(pick, tableP, Nibble(k1, i));
+        Add(c, acc, acc, pick);
+        Select(pick, tableQ, Nibble(k2, i));
+        Add(c, acc, acc, pick);
+        i = i - 1_i64;
+    }
+    return acc;
+}
+
+/// Affine coordinates as plain (not Montgomery) limbs; fails for the identity.
+pub Result<Point, PkError> ToAffine(Curve c, Point p) {
+    if IsIdentityBit(p) == 1_u32 { return Result::Error(PkError::InvalidPoint()); }
+    Mont f = c.fp;
+    u32[] inv = BigNat.Zeros(8_i64);
+    ModArith.PowPublic(f, inv, p.z, InverseExponent(FieldPrime()));
+    u32[] x = BigNat.Zeros(8_i64);
+    u32[] y = BigNat.Zeros(8_i64);
+    ModArith.Mul(f, x, p.x, inv);
+    ModArith.Mul(f, y, p.y, inv);
+    ModArith.FromMont(f, x, x);
+    ModArith.FromMont(f, y, y);
+    u32[] one = BigNat.Zeros(8_i64);
+    one[0] = 1_u32;
+    return Result::Ok(Point { x: x, y: y, z: one });
+}
+
+/// Uncompressed SEC 1 encoding; fails for the identity.
+pub Result<u8[], PkError> Encode(Curve c, Point p) {
+    Result<Point, PkError> affine = ToAffine(c, p);
+    return match affine {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(a) => {
+            u8[] out = Slice.New(65_i64);
+            out[0] = u8(4);
+            BigNat.WriteBytes(a.x, out, 1_i64, 32_i64);
+            BigNat.WriteBytes(a.y, out, 33_i64, 32_i64);
+            return Result::Ok(out);
+        },
+    };
+}
+
+/// Decodes an uncompressed SEC 1 point and checks it: 65 bytes, prefix 0x04, both
+/// coordinates below p, and y^2 = x^3 - 3x + b. The identity has no such encoding.
+pub Result<Point, PkError> Decode(Curve c, u8[] encoded) {
+    if Slice.Len(encoded) != 65_i64 { return Result::Error(PkError::InvalidPoint()); }
+    if encoded[0] != u8(4) { return Result::Error(PkError::InvalidPoint()); }
+    Result<u32[], PkError> xr = BigNat.FromBytes(Slice.SubSlice(encoded, 1_i64, 32_i64));
+    Result<u32[], PkError> yr = BigNat.FromBytes(Slice.SubSlice(encoded, 33_i64, 32_i64));
+    return match xr {
+        Result::Error(_) => Result::Error(PkError::InvalidPoint()),
+        Result::Ok(x) => match yr {
+            Result::Error(_) => Result::Error(PkError::InvalidPoint()),
+            Result::Ok(y) => FromAffine(c, x, y),
+        },
+    };
+}
+
+Result<Point, PkError> FromAffine(Curve c, u32[] x, u32[] y) {
+    u32[] p = FieldPrime();
+    if ModArith.LessBit(x, p) == 0_u32 || ModArith.LessBit(y, p) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
+    Mont f = c.fp;
+    Point pt = Identity(c);
+    ModArith.ToMont(f, pt.x, x);
+    ModArith.ToMont(f, pt.y, y);
+    ModArith.ToMont(f, pt.z, f.one);
+    if OnCurveBit(c, pt.x, pt.y) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
+    return Result::Ok(pt);
+}
+
+/// 1 when Montgomery-form affine (x, y) satisfies y^2 = x^3 - 3x + b.
+u32 OnCurveBit(Curve c, u32[] x, u32[] y) {
+    Mont f = c.fp;
+    u32[] lhs = BigNat.Zeros(8_i64);
+    u32[] rhs = BigNat.Zeros(8_i64);
+    u32[] three = BigNat.Zeros(8_i64);
+    ModArith.Mul(f, lhs, y, y);
+    ModArith.Mul(f, rhs, x, x);
+    ModArith.Mul(f, rhs, rhs, x);
+    ModArith.Add(f, three, x, x);
+    ModArith.Add(f, three, three, x);
+    ModArith.Sub(f, rhs, rhs, three);
+    ModArith.Add(f, rhs, rhs, c.b);
+    return ModArith.EqualBit(lhs, rhs);
+}
+
+/// A private scalar as eight plain limbs; fails unless it is 32 bytes in [1, n-1].
+pub Result<u32[], PkError> DecodeScalar(u8[] bytes) {
+    if Slice.Len(bytes) != 32_i64 { return Result::Error(PkError::InvalidLength()); }
+    Result<u32[], PkError> decoded = BigNat.FromBytesFixed(bytes, 8_i64);
+    return match decoded {
+        Result::Error(_) => Result::Error(PkError::InvalidScalar()),
+        Result::Ok(k) => {
+            if (ModArith.IsZeroBit(k) | (1_u32 - ModArith.LessBit(k, Order()))) == 1_u32 { return Result::Error(PkError::InvalidScalar()); }
+            return Result::Ok(k);
+        },
+    };
+}
+
+/// The uncompressed public key `d * G` for a 32-byte private key `d` in [1, n-1].
+pub Result<u8[], PkError> PublicKey(u8[] privateKey) {
+    Result<u32[], PkError> scalar = DecodeScalar(privateKey);
+    Result<Curve, PkError> curve = NewCurve();
+    return match scalar {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(d) => match curve {
+            Result::Error(error) => Result::Error(error),
+            Result::Ok(c) => Encode(c, ScalarMult(c, d, Generator(c))),
+        },
+    };
+}
+
+/// Checks that `publicKey` is a valid uncompressed P-256 point.
+pub Result<unit, PkError> ValidatePublicKey(u8[] publicKey) {
+    Result<Curve, PkError> curve = NewCurve();
+    return match curve {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(c) => {
+            Result<Point, PkError> decoded = Decode(c, publicKey);
+            return match decoded { Result::Error(error) => Result::Error(error), Result::Ok(_) => Result::Ok(()), };
+        },
+    };
+}
+
+/// ECDH (SEC 1 section 3.3.1): the 32-byte x-coordinate of `d * Q`. The peer key is fully
+/// validated; P-256 has cofactor 1, so a valid point never yields the identity for d in [1, n-1].
+pub Result<u8[], PkError> SharedSecret(u8[] privateKey, u8[] peerPublicKey) {
+    Result<u32[], PkError> scalar = DecodeScalar(privateKey);
+    Result<Curve, PkError> curve = NewCurve();
+    return match scalar {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(d) => match curve {
+            Result::Error(error) => Result::Error(error),
+            Result::Ok(c) => {
+                Result<Point, PkError> peer = Decode(c, peerPublicKey);
+                return match peer {
+                    Result::Error(error) => Result::Error(error),
+                    Result::Ok(q) => {
+                        Result<Point, PkError> affine = ToAffine(c, ScalarMult(c, d, q));
+                        return match affine {
+                            Result::Error(_) => Result::Error(PkError::ZeroSharedSecret()),
+                            Result::Ok(a) => {
+                                u8[] out = Slice.New(32_i64);
+                                BigNat.WriteBytes(a.x, out, 0_i64, 32_i64);
+                                return Result::Ok(out);
+                            },
+                        };
+                    },
+                };
+            },
+        },
+    };
+}

@@ -320,3 +320,16 @@ without double or trailing underscores, and must be unique per target.
    "prepared workspace content mutated during phase `prepare_targets`".
 6. No string escapes (`\r\n`) in string literals: the preface is built from
    bytes (`Connection.Preface()`).
+7. **Runtime: byte-wise `Array.Append` growth of a body exhausted the AOT heap.**
+   The interop server appended each received DATA octet to an array kept in a
+   struct field (`mut u8[] b = s.body; Array.Append<u8>(b, x); s.body = b;`).
+   After two connections with a 100 KB POST it trapped
+   `out_of_memory (5): R1 req=104 live=64160 committed=1073741824` (live data
+   small, committed heap at the 1 GiB cap). Workaround: grow buffers by
+   doubling with `Slice.New` + `Slice.Copy` (`Connection.Place`); with that the
+   same run passes.
+8. **AOT entry: `TcpListener.Accept` from `Main` fails at once** (the server
+   reported three immediate accept failures). Workaround: run the network code
+   in a spawned fiber (`spawn Run()` from `Main`, then `Join`). Also `beskid
+   run` needs a debug runtime kit; the local kit has only `release`, so the
+   interop script uses `beskid build --release` and runs the binary.

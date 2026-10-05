@@ -13,6 +13,7 @@ use Http2.Hpack;
 use Http2.HpackDecoder;
 use Http2.HpackEncoder;
 use Http2.Mapping;
+use Http2.MemoryTransport;
 use Http2.Settings;
 use Http2.Streams;
 
@@ -652,10 +653,7 @@ Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool e
         ResetStream(conn, transport, s, FrameErrors.Cancel());
         return ReplenishConnection(conn, transport);
     }
-    mut u8[] body = s.body;
-    mut i64 i = 0_i64;
-    while i < count { Array.Append<u8>(body, data[i]); i = i + 1_i64; }
-    s.body = body;
+    s.body = Place(s.body, s.received, data, s.contentLength);
     s.received = s.received + count;
     Result<unit,Http2Error> conWindow = ReplenishConnection(conn, transport);
     match conWindow {
@@ -670,6 +668,33 @@ Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool e
         return WriteFrame(conn, transport, Frame.WindowUpdateFrame(id, increment));
     }
     return Result::Ok(());
+}
+
+// Copies `data` into `buf` at `used`, growing by doubling (or straight to
+// `expected` when a content-length is known). Byte-wise Array.Append on an
+// array held in a struct field reallocates every call in 0.5.2, which
+// exhausted the heap in the curl interop run.
+u8[] Place(u8[] buf, i64 used, u8[] data, i64 expected) {
+    i64 count = Slice.Len(data);
+    if count == 0_i64 { return buf; }
+    i64 need = used + count;
+    mut u8[] target = buf;
+    if need > Slice.Len(buf) {
+        mut i64 size = Slice.Len(buf) * 2_i64;
+        if size < 4096_i64 { size = 4096_i64; }
+        if expected >= need && expected > size { size = expected; }
+        if size < need { size = need; }
+        target = Slice.New(size);
+        if used > 0_i64 { Slice.Copy(target, 0_i64, buf, 0_i64, used); }
+    }
+    Slice.Copy(target, used, data, 0_i64, count);
+    return target;
+}
+
+// The received body without spare capacity.
+pub u8[] BodyOf(StreamState s) {
+    if Slice.Len(s.body) == s.received { return s.body; }
+    return Slice.SubSlice(s.body, 0_i64, s.received);
 }
 
 // END_STREAM received: checks content-length (section 8.1.1) and updates the state.
@@ -699,10 +724,7 @@ Result<unit,Http2Error> OnContinuation(Connection conn, Stream transport, i64 id
     i64 blockLimit = MaxHeaderList(conn) + LocalMaxFrameSize();
     i64 have = Slice.Len(conn.block);
     if have + count > blockLimit { return Result::Error(Fail(conn, transport, FrameErrors.EnhanceYourCalm())); }
-    mut u8[] block = conn.block;
-    mut i64 i = 0_i64;
-    while i < count { Array.Append<u8>(block, fragment[i]); i = i + 1_i64; }
-    conn.block = block;
+    conn.block = MemoryTransport.Join(conn.block, fragment);
     if !endHeaders { return Result::Ok(()); }
     conn.continuationStream = 0_i64;
     return HeaderBlock(conn, transport, id, conn.continuationEndStream);

@@ -373,3 +373,8 @@ without double or trailing underscores, and must be unique per target.
 ### W6. Library note: `String.CodeUnitChar` covers only ASCII letters and digits
 - Symptom: `String.CodeUnitChar(13_u8)` does not give CR, so a CRLF built from it is wrong.
 - Workaround: `String.FromUtf8CodeUnits([13_u8, 10_u8])`.
+
+### W7. Network waits in a test body fail at once outside a spawned fiber
+- Symptom: `TcpListener.Accept(deadline)` called directly in a `test` body returns an error
+  immediately instead of waiting; the same call inside `spawn` waits as expected.
+- Workaround: run network scenarios as `Fiber<unit> f = spawn Scenario(); f.Join();`.

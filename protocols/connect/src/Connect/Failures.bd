@@ -1,0 +1,39 @@
+use Core.Collections.Array;
+use Network.Types;
+use Network.Errors;
+
+/// One failed connection attempt: the address that was tried and its typed cause.
+pub type AttemptFailure {
+    pub SocketAddress address,
+    pub NetworkError error,
+}
+
+/// Closed Happy Eyeballs failures. Every variant that follows connection
+/// attempts keeps all of them, in the order their outcomes were observed.
+pub enum ConnectError {
+    // The policy is outside its documented domain (for example maxAttempts < 1).
+    InvalidPolicy(),
+    // Every name query failed; carries the preferred family's cause when it failed.
+    ResolutionFailed(NetworkError cause),
+    // Resolution succeeded (or addresses were given) but no usable address remained.
+    NoAddresses(),
+    // Every started attempt failed before the deadline.
+    AllAttemptsFailed(AttemptFailure[] attempts),
+    // The overall deadline passed first. Attempts cut short report TimedOut.
+    DeadlineExceeded(AttemptFailure[] attempts),
+    // The coordinator observed cancellation of the calling fiber. Attempts cut
+    // short report Cancelled. The 0.5.2 runtime ends a cancelled fiber at its
+    // next wait instead (COMPILER-GAPS C11), so today the caller sees
+    // FiberError::Cancelled from Join rather than this variant.
+    Cancelled(AttemptFailure[] attempts),
+}
+
+/// The attempts recorded by an error; empty for errors raised before any attempt.
+pub AttemptFailure[] Attempts(ConnectError error) {
+    return match error {
+        ConnectError::AllAttemptsFailed(attempts) => attempts,
+        ConnectError::DeadlineExceeded(attempts) => attempts,
+        ConnectError::Cancelled(attempts) => attempts,
+        _ => Array.Empty<AttemptFailure>(),
+    };
+}

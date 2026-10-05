@@ -1,2 +1,34 @@
-/// Connect package root.
+/// Connect package root: RFC 8305 Happy Eyeballs v2 TCP connection establishment
+/// built only on the corelib Network layer (Dns, TcpStream) and Concurrency fibers.
+pub mod Connect.Failures;
+pub mod Connect.Policy;
+pub mod Connect.Order;
+pub mod Connect.Engine;
+
+use Core.Collections.Array;
+use Core.Results;
+use Network.Types;
+use Network.Tcp.TcpStream;
+use Connect.Failures;
+use Connect.Policy;
+use Connect.Engine;
+
 pub i64 PackageVersion() { return 1_i64; }
+
+/// Resolves `hostName` for both address families (or the policy family filter),
+/// orders the answers per RFC 8305 section 4 and races staggered TCP attempts.
+/// The first established stream wins; every other attempt is cancelled, closed
+/// and joined before this call returns. At most `Engine.MaxRaceAttempts()` (64)
+/// attempts start per call.
+/// Cancelling the calling fiber in 0.5.2 stops it without cleanup (see
+/// protocols/COMPILER-GAPS.md C11): set `ConnectPolicy.timeout` when the caller
+/// may be cancelled, so orphaned attempts end at the shared deadline.
+pub Result<TcpStream, ConnectError> ConnectHost(string hostName, Port port, ConnectPolicy policy) {
+    return Engine.Run(hostName, port, Array.Empty<SocketAddress>(), true, policy);
+}
+
+/// Races staggered TCP attempts over caller-resolved addresses. The addresses
+/// are filtered, de-duplicated and interleaved by family like resolver answers.
+pub Result<TcpStream, ConnectError> ConnectAddresses(SocketAddress[] addresses, ConnectPolicy policy) {
+    return Engine.Run("", Network.Types.PortBytes(0_u8, 0_u8), addresses, false, policy);
+}

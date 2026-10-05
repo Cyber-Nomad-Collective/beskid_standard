@@ -120,7 +120,7 @@ target do not run).
 - Available http2: HPACK (`Http2.Hpack*`).
 - Available connect: `Connect.ConnectHost(host, port, policy)` and
   `Connect.ConnectAddresses(addresses, policy)` return `TcpStream`.
-- Available crypto (`protocols/crypto`): SHA-256/384/512, HMAC, HKDF with
+- Available crypto (`protocols/crypto`, 18 targets green): `Crypto.PkAdapters` (VerifyRsaPss/Pkcs1Message, SignEcdsaP256*, VerifyEcdsaP256Message), X25519, P256, Ecdsa, Rsa verify, SHA-256/384/512, HMAC, HKDF with
   `ExpandLabel`/`DeriveSecret`, ChaCha20-Poly1305, AES-128/256-GCM, AES block,
   ChaCha20 block (QUIC header protection), ConstantTime, `Entropy.Fill`.
 - Idiom reference: corelib `packages/http/src/Http/*.bd`, `packages/network/src/Network/*.bd`,

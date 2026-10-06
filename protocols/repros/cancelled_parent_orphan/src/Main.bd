@@ -1,0 +1,70 @@
+// GAP: cancelling a parent fiber does not cancel its child fibers; they keep running, unowned (orphaned).
+// Also records whether the parent's code after the park point runs and what Join reports.
+// flags[0] = child finished (set after its 300 ms sleep), flags[1] = parent code after the park ran, flags[2] = parent started,
+// flags[3] = what the parent's Receive returned (1 = Ok, 2 = Error(Closed), 3 = Error(Cancelled)).
+// The parent never joins its child, so a finished child proves it kept running after the parent was cancelled.
+use Concurrency.Channel;
+use Concurrency.ChannelError;
+use Concurrency.Fiber;
+use Concurrency.FiberError;
+use Core.Collections.Array;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Testing.Assert;
+
+unit Child(i64[] flags) {
+    // The flag is set only when the sleep completed normally (not when it was cancelled).
+    match Time.Sleep(Time.FromMilliseconds(300_i64)) {
+        Result::Ok(_) => { Array.Set<i64>(flags, 0_i64, 1_i64); },
+        Result::Error(_) => (),
+    };
+}
+
+unit Parent(i64[] flags, Channel<i64> ch) {
+    Array.Set<i64>(flags, 2_i64, 1_i64);
+    Fiber<unit> child = spawn (() => Child(flags));
+    match Channel<i64>.Receive(ch) {
+        Result::Ok(_) => { Array.Set<i64>(flags, 3_i64, 1_i64); },
+        Result::Error(ChannelError::Closed(_)) => { Array.Set<i64>(flags, 3_i64, 2_i64); },
+        Result::Error(ChannelError::Cancelled(_)) => { Array.Set<i64>(flags, 3_i64, 3_i64); },
+    };
+    Array.Set<i64>(flags, 1_i64, 1_i64);
+}
+
+string Num(i64 n) {
+    if n < 10_i64 { return String.DigitChar(n); }
+    return Num(n / 10_i64) + String.DigitChar(n % 10_i64);
+}
+
+string Flag(i64[] flags, i64 i) {
+    if Array.Get<i64>(flags, i) == 1_i64 { return "yes"; }
+    return "no";
+}
+
+// Network and timer waits fail at once outside a spawned fiber (W7), so the scenario runs inside one.
+i64 Scenario() {
+    i64[] flags = [0_i64, 0_i64, 0_i64, 0_i64];
+    Channel<i64> ch = Channel<i64>.Create();
+    Fiber<unit> parent = spawn (() => Parent(flags, ch));
+    match Time.Sleep(Time.FromMilliseconds(50_i64)) { Result::Ok(_) => (), Result::Error(_) => (), };
+    Output.WriteLine("at 50 ms: parent started=" + Flag(flags, 2_i64) + " child done=" + Flag(flags, 0_i64));
+    parent.Cancel();
+    string joined = match parent.Join() {
+        Result::Ok(_) => "Ok",
+        Result::Error(FiberError::Cancelled(_, _)) => "Error(Cancelled)",
+        Result::Error(_) => "Error(other)",
+    };
+    Output.WriteLine("Join of cancelled parent: " + joined);
+    Output.WriteLine("after Join: parent code after the park ran=" + Flag(flags, 1_i64) + ", Receive result code=" + Num(Array.Get<i64>(flags, 3_i64)) + " (3 = Cancelled)");
+    match Time.Sleep(Time.FromMilliseconds(500_i64)) { Result::Ok(_) => (), Result::Error(_) => (), };
+    Output.WriteLine("at ~550 ms: child done=" + Flag(flags, 0_i64) + " (yes means the child outlived its cancelled parent)");
+    return Array.Get<i64>(flags, 0_i64);
+}
+
+test cancelled_parent_orphans_child {
+    Fiber<i64> scenario = spawn Scenario();
+    i64 childDone = match scenario.Join() { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+    Assert.Equal<i64>(childDone, 0_i64, "child must not keep running after its parent was cancelled");
+}

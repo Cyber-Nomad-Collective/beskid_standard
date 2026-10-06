@@ -818,3 +818,8 @@ limits, and `H3Quic.ForH3` uses it (R25).
   RFC 9002 section 6.2.4). Test `QuicCreditLoss`: 100 KB in memory, where the first
   datagram flight after each receiver read (the credit updates) and every 7th sender
   datagram are lost. The transfer must finish in less than 5 s of simulated time.
+- Evidence after the fix (same host and load): H3QuicLoopback passed in 5 of 5 runs, with
+  POST times of 1.36-1.44 s. Each run had 0 PTOs and 0 lost datagrams (the client sent 41
+  datagrams and the server received 41). One more attempt failed before the test ran, with
+  "prepared workspace content mutated", while another session changed the builder work
+  directories. That attempt is not counted.

@@ -1,0 +1,286 @@
+/// Extended collection tests: List/Map/Set additions, sorting, hashing, hash maps, and the
+/// priority queue.
+
+use Testing.Assert;
+use Core.Collections.Array;
+use Core.Collections.CollectionError;
+use Core.Collections.Hash;
+use Core.Collections.I64Map;
+use Core.Collections.List;
+use Core.Collections.Map;
+use Core.Collections.PriorityQueue;
+use Core.Collections.Set;
+use Core.Collections.Sort;
+use Core.Collections.StringMap;
+use Core.Optional.Option;
+use Core.Results;
+
+i64 I64OrDefault(Option<i64> value, i64 fallback) {
+    return match value {
+        Option::Some(v) => v,
+        Option::None => fallback,
+    };
+}
+
+string StringOrDefault(Option<string> value, string fallback) {
+    return match value {
+        Option::Some(v) => v,
+        Option::None => fallback,
+    };
+}
+
+List<i64> ListOrEmpty(Result<List<i64>, CollectionError> value) {
+    return match value {
+        Result::Ok(list) => list,
+        Result::Error(_) => List.New<i64>(),
+    };
+}
+
+bool IsOutOfRange(Result<List<i64>, CollectionError> value) {
+    return match value {
+        Result::Ok(_) => false,
+        Result::Error(error) => match error {
+            CollectionError::IndexOutOfRange(_, _) => true,
+            _ => false,
+        },
+    };
+}
+
+string JoinI64(i64[] values) {
+    mut string text = "";
+    mut i64 i = 0;
+    while i < Array.Len<i64>(values) {
+        if i > 0 {
+            text = text + ",";
+        }
+        text = text + "${Array.Get<i64>(values, i)}";
+        i = i + 1;
+    }
+    return text;
+}
+
+string JoinStrings(string[] values) {
+    mut string text = "|";
+    mut i64 i = 0;
+    while i < Array.Len<string>(values) {
+        text = text + Array.Get<string>(values, i) + "|";
+        i = i + 1;
+    }
+    return text;
+}
+
+test list_try_get_first_last {
+    List<i64> values = List.FromArray<i64>([10_i64, 20_i64, 30_i64]);
+    Assert.Equal(I64OrDefault(values.TryGet(1), -1), 20, "TryGet in range");
+    Assert.Equal(I64OrDefault(values.TryGet(3), -1), -1, "TryGet out of range");
+    Assert.Equal(I64OrDefault(values.First(), -1), 10, "First");
+    Assert.Equal(I64OrDefault(values.Last(), -1), 30, "Last");
+    Assert.Equal(I64OrDefault(List.New<i64>().First(), -1), -1, "First of empty");
+}
+
+test list_search {
+    List<string> names = List.FromArray<string>(["a", "b", "c"]);
+    Assert.Equal(names.IndexOf("c"), 2, "IndexOf");
+    Assert.Equal(names.IndexOf("z"), -1, "IndexOf missing");
+    Assert.True(names.Contains("b"), "Contains");
+}
+
+test list_insert_set_remove_at {
+    List<i64> values = List.FromArray<i64>([1_i64, 3_i64]);
+    List<i64> inserted = ListOrEmpty(values.Insert(1, 2));
+    Assert.Equal(JoinI64(inserted.ToArray()), "1,2,3", "insert middle");
+    List<i64> appended = ListOrEmpty(inserted.Insert(3, 4));
+    Assert.Equal(JoinI64(appended.ToArray()), "1,2,3,4", "insert at end");
+    List<i64> replaced = ListOrEmpty(appended.Set(0, 9));
+    Assert.Equal(JoinI64(replaced.ToArray()), "9,2,3,4", "set");
+    List<i64> removed = ListOrEmpty(replaced.RemoveAt(1));
+    Assert.Equal(JoinI64(removed.ToArray()), "9,3,4", "remove at");
+    Assert.Equal(removed.Count(), 3, "count after remove");
+    Assert.True(IsOutOfRange(values.Insert(5, 0)), "insert out of range");
+    Assert.True(IsOutOfRange(values.RemoveAt(-1)), "remove negative");
+    Assert.True(IsOutOfRange(values.Set(2, 0)), "set past end");
+}
+
+test list_remove_reverse_slice_concat {
+    List<i64> values = List.FromArray<i64>([1_i64, 2_i64, 3_i64, 2_i64]);
+    Assert.Equal(JoinI64(values.Remove(2).ToArray()), "1,3,2", "remove first match");
+    Assert.Equal(JoinI64(values.Reverse().ToArray()), "2,3,2,1", "reverse");
+    Assert.Equal(JoinI64(values.Slice(1, 2).ToArray()), "2,3", "slice");
+    Assert.Equal(JoinI64(values.Slice(3, 10).ToArray()), "2", "slice clamps");
+    Assert.Equal(values.Slice(9, 1).Count(), 0, "slice past end is empty");
+    List<i64> more = List.FromArray<i64>([7_i64, 8_i64]);
+    Assert.Equal(JoinI64(values.Concat(more).ToArray()), "1,2,3,2,7,8", "concat");
+    Assert.True(values.Clear().IsEmpty(), "clear");
+}
+
+test list_from_array {
+    i64[] source = [4_i64, 5_i64];
+    List<i64> values = List.FromArray<i64>(source);
+    Assert.Equal(values.Count(), 2, "count");
+    Assert.Equal(JoinI64(values.ToArray()), "4,5", "elements");
+}
+
+test map_views_and_try_get {
+    mut Map<string, i64> ages = Map.New<string, i64>();
+    ages = ages.Insert("ann", 31);
+    ages = ages.Insert("bob", 42);
+    Assert.Equal(I64OrDefault(ages.TryGet("bob"), -1), 42, "TryGet hit");
+    Assert.Equal(I64OrDefault(ages.TryGet("cy"), -1), -1, "TryGet miss");
+    Assert.Equal(ages.GetOr("cy", 7), 7, "GetOr fallback");
+    Assert.Equal(JoinStrings(ages.Keys()), "|ann|bob|", "keys");
+    Assert.Equal(JoinI64(ages.Values()), "31,42", "values");
+    Assert.Equal(Array.Len<Core.Collections.Map.MapEntry.MapEntry<string, i64>>(ages.Entries()), 2, "entries");
+    Assert.True(ages.Clear().IsEmpty(), "clear");
+}
+
+test set_algebra {
+    Set<i64> a = Set.FromArray<i64>([1_i64, 2_i64, 3_i64]);
+    Set<i64> b = Set.FromArray<i64>([2_i64, 3_i64, 4_i64]);
+    Assert.Equal(JoinI64(a.Union(b).ToArray()), "1,2,3,4", "union");
+    Assert.Equal(JoinI64(a.Intersect(b).ToArray()), "2,3", "intersect");
+    Assert.Equal(JoinI64(a.Difference(b).ToArray()), "1", "difference");
+    Assert.True(Set.FromArray<i64>([2_i64, 3_i64]).IsSubsetOf(a), "subset");
+    Assert.False(b.IsSubsetOf(a), "not subset");
+}
+
+test sort_i64_and_search {
+    i64[] values = [5_i64, -1_i64, 3_i64, 3_i64, 0_i64];
+    i64[] sorted = Sort.I64(values);
+    Assert.Equal(JoinI64(sorted), "-1,0,3,3,5", "sorted");
+    Assert.Equal(JoinI64(values), "5,-1,3,3,0", "input unchanged");
+    Assert.True(Sort.IsSortedI64(sorted), "is sorted");
+    Assert.False(Sort.IsSortedI64(values), "unsorted detected");
+    Assert.Equal(Sort.BinarySearchI64(sorted, 5), 4, "found");
+    Assert.Equal(Sort.BinarySearchI64(sorted, 1), -3, "insertion point 2 encoded");
+    Assert.Equal(Sort.BinarySearchI64(Array.Empty<i64>(), 1), -1, "empty array");
+}
+
+test sort_strings_ordinal {
+    string[] words = ["pear", "Apple", "apple", "fig"];
+    string[] sorted = Sort.Strings(words);
+    Assert.Equal(JoinStrings(sorted), "|Apple|apple|fig|pear|", "ordinal order");
+    Assert.True(Sort.IsSortedStrings(sorted), "is sorted");
+    Assert.Equal(Sort.BinarySearchString(sorted, "fig"), 2, "found");
+    Assert.Equal(Sort.BinarySearchString(sorted, "zzz"), -5, "insert at end");
+}
+
+test sort_f64_nan_last {
+    f64 zero = 0.0;
+    f64[] values = [2.5, zero / zero, -1.0, 0.5];
+    f64[] sorted = Sort.F64(values);
+    Assert.True(Array.Get<f64>(sorted, 0) == -1.0, "smallest first");
+    Assert.True(Array.Get<f64>(sorted, 2) == 2.5, "largest finite third");
+    f64 last = Array.Get<f64>(sorted, 3);
+    Assert.True(last != last, "NaN last");
+}
+
+test sort_by_key_is_stable {
+    string[] names = ["c1", "a", "c2", "b"];
+    i64[] ranks = [3_i64, 1_i64, 3_i64, 2_i64];
+    Assert.Equal(JoinStrings(Sort.ByI64Key<string>(names, ranks)), "|a|b|c1|c2|", "stable by rank");
+    string[] keys = ["z", "y", "x", "w"];
+    Assert.Equal(JoinStrings(Sort.ByStringKey<string>(names, keys)), "|b|c2|a|c1|", "by string key");
+    Assert.Equal(JoinStrings(Sort.Reverse<string>(names)), "|b|c2|a|c1|", "reverse");
+}
+
+test hash_known_values {
+    Assert.Equal(Hash.String(""), -3750763034362895579_i64, "FNV-1a offset basis");
+    Assert.Equal(Hash.String("a"), -5808556873153909620_i64, "FNV-1a of a");
+    Assert.Equal(Hash.Xor(12, 10), 6, "xor");
+    Assert.Equal(Hash.Xor(-1, 0), -1, "xor negative");
+    Assert.Equal(Hash.ShiftRightLogical(-1, 60), 15, "logical shift");
+    Assert.NotEqual(Hash.I64(1), Hash.I64(2), "mix separates neighbours");
+}
+
+test string_map_basic {
+    mut StringMap<i64> counts = StringMap.New<i64>();
+    counts = counts.Insert("a", 1);
+    counts = counts.Insert("b", 2);
+    counts = counts.Insert("a", 3);
+    Assert.Equal(counts.Count(), 2, "replace keeps count");
+    Assert.Equal(I64OrDefault(counts.Get("a"), -1), 3, "replaced value");
+    Assert.Equal(counts.GetOr("zz", 9), 9, "fallback");
+    Assert.True(counts.ContainsKey("b"), "contains");
+    counts = counts.Remove("a");
+    Assert.False(counts.ContainsKey("a"), "removed");
+    Assert.Equal(I64OrDefault(counts.Get("b"), -1), 2, "other key survives removal");
+    Assert.Equal(counts.Count(), 1, "count after removal");
+}
+
+test string_map_grows_and_removes {
+    mut StringMap<i64> map = StringMap.New<i64>();
+    mut i64 i = 0;
+    while i < 200 {
+        map = map.Insert("key${i}", i * 10);
+        i = i + 1;
+    }
+    Assert.Equal(map.Count(), 200, "all inserted");
+    Assert.Equal(I64OrDefault(map.Get("key137"), -1), 1370, "lookup after growth");
+    i = 0;
+    while i < 200 {
+        if i % 2 == 0 {
+            map = map.Remove("key${i}");
+        }
+        i = i + 1;
+    }
+    Assert.Equal(map.Count(), 100, "half removed");
+    Assert.False(map.ContainsKey("key136"), "even key removed");
+    Assert.Equal(I64OrDefault(map.Get("key199"), -1), 1990, "odd key kept");
+    i = 0;
+    while i < 50 {
+        map = map.Insert("again${i}", i);
+        i = i + 1;
+    }
+    Assert.Equal(map.Count(), 150, "reinsert reuses deleted slots");
+    Assert.Equal(I64OrDefault(map.Get("again49"), -1), 49, "reinserted lookup");
+    Assert.Equal(Array.Len<string>(map.Keys()), 150, "keys view");
+    Assert.Equal(Array.Len<i64>(map.Values()), 150, "values view");
+}
+
+test i64_map_basic {
+    mut I64Map<string> names = I64Map.New<string>();
+    names = names.Insert(-5, "minus five");
+    names = names.Insert(1000000007, "big");
+    Assert.Equal(StringOrDefault(names.Get(-5), "?"), "minus five", "negative key");
+    Assert.Equal(StringOrDefault(names.Get(1000000007), "?"), "big", "large key");
+    Assert.Equal(names.GetOr(3, "none"), "none", "missing key");
+    names = names.Remove(-5);
+    Assert.Equal(names.Count(), 1, "removed");
+    Assert.Equal(JoinI64(names.Keys()), "1000000007", "keys");
+}
+
+test priority_queue_order_and_ties {
+    mut PriorityQueue<string> queue = PriorityQueue.New<string>();
+    queue = queue.Push("low", 5);
+    queue = queue.Push("first-urgent", 1);
+    queue = queue.Push("mid", 3);
+    queue = queue.Push("second-urgent", 1);
+    Assert.Equal(queue.Count(), 4, "count");
+    Assert.Equal(I64OrDefault(queue.PeekPriority(), -1), 1, "min priority");
+    Assert.Equal(StringOrDefault(queue.Peek(), "?"), "first-urgent", "tie keeps insertion order");
+    queue = queue.Pop();
+    Assert.Equal(StringOrDefault(queue.Peek(), "?"), "second-urgent", "second tie");
+    queue = queue.Pop();
+    Assert.Equal(StringOrDefault(queue.Peek(), "?"), "mid", "then mid");
+    queue = queue.Pop();
+    Assert.Equal(StringOrDefault(queue.Peek(), "?"), "low", "then low");
+    queue = queue.Pop();
+    Assert.True(queue.IsEmpty(), "drained");
+    Assert.Equal(StringOrDefault(queue.Pop().Peek(), "empty"), "empty", "pop on empty is a no-op");
+}
+
+test priority_queue_heap_sorts {
+    mut PriorityQueue<i64> queue = PriorityQueue.New<i64>();
+    i64[] input = [9_i64, 4_i64, 7_i64, 1_i64, 8_i64, 2_i64, 6_i64, 3_i64, 5_i64, 0_i64];
+    mut i64 i = 0;
+    while i < Array.Len<i64>(input) {
+        queue = queue.Push(Array.Get<i64>(input, i), Array.Get<i64>(input, i));
+        i = i + 1;
+    }
+    mut i64[] drained = Array.Empty<i64>();
+    while !queue.IsEmpty() {
+        drained = Array.Append<i64>(drained, I64OrDefault(queue.Peek(), -1));
+        queue = queue.Pop();
+    }
+    Assert.Equal(JoinI64(drained), "0,1,2,3,4,5,6,7,8,9", "heap order");
+}

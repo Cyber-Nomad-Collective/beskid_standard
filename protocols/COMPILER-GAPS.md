@@ -609,3 +609,32 @@ callers.
    local copy. Every target passes when run alone with `--target <Name>`.
    Workaround: run the HTTP/2 connection targets one by one; open item: a
    runtime that reuses freed segments, or a per-target process in the matrix.
+
+## 2026-10-06, web facade slice
+
+### WEB1. `Types.X(...)` through `use Http.Types;` ICEs when dependencies also have a `Types` leaf
+- Symptom: in `protocols/web` (which depends on uri, connect, tls, http2: all of them
+  or their dependencies declare a `*.Types` module) the call `Types.LowerAscii(h.name)`
+  with only `use Http.Types;` in the file type-checks but fails at CLIF time with
+  `no ISLE lowering rule or fact for CallExpression` (first seen as a
+  `BinaryExpression` ICE on `Types.LowerAscii(a) == "x" && F(Types.LowerAscii(b))`).
+  Same family as W2: the leaf `Types` resolves to a module other than the one imported.
+- Workaround: never call through a `Types` leaf; use `Uri.Chars.LowerAscii` (or a local
+  helper) and build `Request`/`Response` with struct literals instead of
+  `Types.EmptyRequest`.
+
+### WEB2. A spawn lambda cannot capture a `mut` local
+- Symptom: `mut string[] alpn = Array.Empty<string>(); Array.Append<string>(alpn, "x");
+  Fiber<unit> f = spawn (() => Scenario(alpn, codes));` fails at CLIF time with
+  `spawn legality rejected ... StackReferenceEscapesSpawn` on the captured `alpn`.
+  Immutable locals (`i64[] codes = [...]`, `TcpListener l = listener;`) capture fine.
+- Workaround: build the value in a helper and bind it to an immutable local
+  (`string[] alpn = H1Only();`) before the spawn.
+
+### WEB3. Codegen cost of the full Web stack
+- Every Web test reaches TLS 1.3, X.509, crypto, HTTP/2 and HTTP/1.1 through
+  `Web.Exchange` (the plain-HTTP test too, because the https branch is reachable):
+  "Generate CLIF" takes 9.5-10.5 minutes per test on a loaded host (load ~7), and a
+  target 14-15 minutes. Same family as W8/H3.
+- Workaround: one test per target, `--target-timeout 2400`, scenarios that cover several
+  exchanges per test (WebPlain: HTTP/1.1 and h2c; WebHttpsH2/H1: GET and POST).

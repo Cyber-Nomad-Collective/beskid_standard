@@ -8,6 +8,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add the networking protocol packages to the corelib aggregate:
+  `corelib_uri`, `corelib_codec`, `corelib_connect`, `corelib_crypto`,
+  `corelib_x509`, `corelib_tls`, `corelib_http2`, `corelib_websocket`,
+  `corelib_quic`, `corelib_http3`, and `corelib_web` (moved from `protocols/`
+  to `packages/`, each with a README). Each package depends on Foundation and
+  on the exact sibling packages it imports; tests depend on the aggregate.
+  Requires compiler 0.5.3, which grants corelib authority per service file.
+  Program notes, compiler gap log, rulings, and repros are in
+  `docs/networking/`.
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent
@@ -60,6 +69,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `Crypto.Entropy` AOT link on macOS: compiler 0.5.3 links `libc.so.6` as
+  `-lc`, so the libc link shim in the web interop script is removed (WEB4).
 - Validate a request's `Host` field as soon as its header completes, before
   waiting for or interpreting the body framing.
 - Reject HTTP header control and non-ASCII octets during parsing and serialization, including HTAB before OWS trimming.

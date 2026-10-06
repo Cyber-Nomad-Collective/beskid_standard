@@ -7,12 +7,24 @@ use Tls.TlsConfig;
 // Client and server policy of the Web facade. Fields are plain values: build a
 // default and assign the fields that differ (`config.alpn = ...`).
 
-// HTTP/3 use for https:// requests. `Prefer` tries QUIC first and falls back to
-// TCP when QUIC fails. Until the Http3 QUIC path is linked into this package
-// (branch claude/net-h3quic), `Prefer` behaves like `Off`.
+// HTTP/3 use for https:// requests (RFC 9114 over QUIC, ALPN "h3", same trust
+// policy as TCP). `Prefer` tries QUIC first, within `http3HandshakeMillis`, and
+// falls back to TLS over TCP (ALPN `alpn`) when name resolution, the QUIC
+// handshake or the "h3" negotiation fails. Once the QUIC handshake succeeded the
+// request is not retried over TCP (it may have reached the server). `Only` never
+// uses TCP and fails with WebError::Http3Failed. http:// URLs ignore the mode.
 pub enum Http3Mode {
     Off(),
     Prefer(),
+    Only(),
+}
+
+pub bool UsesHttp3(Http3Mode mode) {
+    return match mode { Http3Mode::Off => false, _ => true, };
+}
+
+pub bool Http3Only(Http3Mode mode) {
+    return match mode { Http3Mode::Only => true, _ => false, };
 }
 
 pub type WebClientConfig {
@@ -32,6 +44,9 @@ pub type WebClientConfig {
     // HTTP/2 settings and limits (scheme is set per request).
     pub Config h2,
     pub Http3Mode http3,
+    // Budget for the QUIC handshakes of one request (all resolved addresses
+    // together); after it `Prefer` falls back to TCP.
+    pub i64 http3HandshakeMillis,
 }
 
 pub type WebServerConfig {
@@ -68,6 +83,9 @@ pub string[] DefaultAlpn() {
     return out;
 }
 
+// Short enough that an origin without HTTP/3 costs at most about a second.
+pub i64 DefaultHttp3HandshakeMillis() { return 1000_i64; }
+
 pub WebClientConfig DefaultClient() {
     Config h2 = Connection.DefaultConfig();
     h2.maxBodyBytes = DefaultMaxBodyBytes();
@@ -80,6 +98,7 @@ pub WebClientConfig DefaultClient() {
         limits: DefaultLimits(),
         h2: h2,
         http3: Http3Mode::Off(),
+        http3HandshakeMillis: DefaultHttp3HandshakeMillis(),
     };
 }
 

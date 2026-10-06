@@ -766,3 +766,38 @@ callers.
 - Symptom: `%o = icmp_imm eq %r, 1` fails with `opcode icmp_imm is not allowed in a clif
   block` (E1232 at lowering).
 - Workaround: `%one = iconst.i32 1` and then `%o = icmp eq %r, %one`.
+## 2026-10-06, web http3 slice
+
+### WEB5. Codegen cost of the Web stack with HTTP/3
+- With `Http3Mode` reachable from `Web.Exchange`, each Web test that does a network exchange
+  generates TLS, X.509, crypto, HTTP/1.1, HTTP/2, QUIC and HTTP/3. Measured at load 4: type
+  check is 1m42s per target. "Generate CLIF" takes 16m42s for WebHttp3 (2333 functions)
+  and 17m13s for WebHttp3Fallback. The scenarios themselves run in seconds: the h3 GET takes
+  9.5 s including the first QUIC+TLS handshake against a server fiber that is still starting,
+  and the h3 POST takes 4.2 s. For the fallback, the baseline h2 takes 1.2 s and Prefer then
+  h2 takes 2.4 s. The Http3 path adds about 1-2 minutes of codegen to the existing Web
+  targets (WebPlain, WebHttpsH1/H2), because the client always reaches it. Same family as
+  WEB3/HQ4/Q1.
+- Workaround: one test per target, `--target-timeout 3000`. Splitting the client into
+  per-transport entry points needs generics over a transport or contract fields.
+
+### WEB6. Lint: `[Extern]` contract members with libc names warn "should use PascalCase"
+- Symptom: `contract Diag { i32 putchar(i32 c); i32 fflush(i64 s); }` produces two
+  warnings per file ("callable `putchar` should use PascalCase"), although the C symbol
+  name is fixed. This is a warning only.
+- Workaround: none needed. An `[Extern]` member needs the exact C name.
+
+Note (HQ5 resolved): `QuicConnection.StreamResetCode` now returns -1 for a stream that was
+not reset. `QuicConnection.StreamPeerStopCode` and `QuicEndpoint.PeerResetCode` /
+`PeerStopCode` expose the peer codes. `QuicConfig.WithStreamLimits` sets the peer stream
+limits, and `H3Quic.ForH3` uses it (R25).
+
+### WEB7. H3QuicLoopback 20 KB POST can stall into the 10 s write timeout on a loaded host
+- Symptom: in one of two runs on the same code, the client's 20000-byte POST failed after
+  about 10.7 s with Transport (step 606000). The server never got the full request
+  (`server result=53`). The rerun passed, with the POST taking 3.1 s. No stream reset or
+  STOP_SENDING was involved, and the HQ5 change does not touch the read or credit path.
+- Suspected cause: a scheduling/flow-control stall under load. The server grants stream
+  credit only while its pump reads (8 KiB windows), and the client's blocking write waits
+  with a fixed 10 s I/O timeout (`H3Quic.DefaultIoTimeoutMillis`). Open item: investigate
+  MAX_STREAM_DATA timing under load before calling the transport stable.

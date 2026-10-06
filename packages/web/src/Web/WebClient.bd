@@ -29,16 +29,19 @@ use X509.X509Errors;
 use Web.H1Wire;
 use Web.WebConfig;
 use Web.WebErrors;
+use Web.WebH3;
 
 // One request per connection: parse the absolute URL, Happy Eyeballs TCP, then
 // - http://  HTTP/1.1, or HTTP/2 with prior knowledge when configured;
 // - https:// TLS 1.3 offering `config.alpn`, then HTTP/2 when the server chose
 //   "h2" and HTTP/1.1 when it chose "http/1.1" (or no ALPN at all while
 //   "http/1.1" was offered).
+// - https:// with `config.http3` Prefer or Only: HTTP/3 over QUIC first (see
+//   Web.WebH3 and WebConfig.Http3Mode), TCP as above only as Prefer's fallback.
 // The connection is closed after the response; there is no pooling yet.
 
-/// A response and the protocol that carried it: "h2", "http/1.1" (over TLS),
-/// "h2c" or "http/1.1-plain".
+/// A response and the protocol that carried it: "h3", "h2", "http/1.1" (over
+/// TLS), "h2c" or "http/1.1-plain".
 pub type WebResponse {
     pub Response response,
     pub string protocol,
@@ -97,13 +100,38 @@ Result<WebResponse,WebError> SendAuthority(Authority authority, string scheme, s
     string hostName = authority.hostName;
     Request wire = WireRequest(request, origin, Scheme.HostHeader(authority));
     bool secure = scheme == "https";
-    // HTTP/3 hook: with `config.http3 == Http3Mode::Prefer()` and a secure URL,
-    // try Http3.H3Client.ConnectQuic here and fall back to TCP when QUIC fails.
-    // The Http3 QUIC path is not merged yet (branch claude/net-h3quic).
     return match NetTypes.PortNumber(authority.port) {
         Result::Error(_) => Result::Error(WebError::InvalidUrl()),
-        Result::Ok(port) => ConnectAndSend(hostName, port, secure, wire, config),
+        Result::Ok(port) => ChooseTransport(hostName, port, secure, wire, config),
     };
+}
+
+Result<WebResponse,WebError> ChooseTransport(string hostName, Port port, bool secure, Request request, WebClientConfig config) {
+    if secure && WebConfig.UsesHttp3(config.http3) { return ViaHttp3(hostName, port, request, config); }
+    return ConnectAndSend(hostName, port, secure, request, config);
+}
+
+// HTTP/3 first; Prefer falls back to TCP only when no QUIC connection with
+// "h3" was established (R21).
+Result<WebResponse,WebError> ViaHttp3(string hostName, Port port, Request request, WebClientConfig config) {
+    Result<CertificateVerification,WebError> trust = ClientTrust(config);
+    match trust {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(verification) => { return Http3First(hostName, port, verification, request, config); },
+    };
+    return Result::Error(WebError::InvalidConfig());
+}
+
+Result<WebResponse,WebError> Http3First(string hostName, Port port, CertificateVerification verification, Request request, WebClientConfig config) {
+    i64[] reached = [0_i64];
+    Result<Response,WebError> h3 = WebH3.Exchange(hostName, port, verification, request, config, reached);
+    match h3 {
+        Result::Ok(response) => { return Result::Ok(WebResponse { response: response, protocol: "h3" }); },
+        Result::Error(error) => {
+            if reached[0] == 1_i64 || WebConfig.Http3Only(config.http3) { return Result::Error(error); }
+        },
+    };
+    return ConnectAndSend(hostName, port, true, request, config);
 }
 
 Option<Deadline> Within(i64 millis) {

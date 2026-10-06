@@ -1,0 +1,195 @@
+use Core.Bytes.Slice;
+
+// Bounded byte reader and writer with a sticky error code. Every read checks bounds;
+// the first failure records a transport error code and later reads return zero.
+
+/// Reader over buf[pos..end). st = [pos, end, error].
+pub type Reader { pub u8[] buf, i64[] st, }
+
+/// Writer into buf[pos..limit). st = [pos, limit, error]; error 1 means the buffer is full.
+pub type Writer { pub u8[] buf, i64[] st, }
+
+pub Reader NewReader(u8[] buf, i64 offset, i64 end) {
+    return Reader { buf: buf, st: [offset, end, 0_i64] };
+}
+
+pub i64 Pos(Reader r) { return r.st[0]; }
+pub i64 End(Reader r) { return r.st[1]; }
+pub i64 Left(Reader r) { return r.st[1] - r.st[0]; }
+pub i64 Error(Reader r) { return r.st[2]; }
+pub bool Ok(Reader r) { return r.st[2] == 0_i64; }
+pub bool AtEnd(Reader r) { return r.st[0] >= r.st[1]; }
+
+/// Records `code` unless an earlier error is already recorded.
+pub unit Fail(Reader r, i64 code) {
+    if r.st[2] == 0_i64 { r.st[2] = code; }
+    return;
+}
+
+/// True and advances when `count` bytes are available; otherwise records FRAME_ENCODING_ERROR.
+pub bool Need(Reader r, i64 count) {
+    if r.st[2] != 0_i64 { return false; }
+    if count < 0_i64 || count > r.st[1] - r.st[0] { r.st[2] = 7_i64; return false; }
+    return true;
+}
+
+pub i64 Byte(Reader r) {
+    if !Need(r, 1_i64) { return 0_i64; }
+    i64 v = i64(r.buf[r.st[0]]);
+    r.st[0] = r.st[0] + 1_i64;
+    return v;
+}
+
+/// Big-endian unsigned integer of `width` bytes (1..8).
+pub i64 Uint(Reader r, i64 width) {
+    if !Need(r, width) { return 0_i64; }
+    mut i64 v = 0_i64;
+    mut i64 i = 0_i64;
+    i64 p = r.st[0];
+    while i < width { v = (v << 8_i64) | i64(r.buf[p + i]); i = i + 1_i64; }
+    r.st[0] = p + width;
+    return v;
+}
+
+/// QUIC variable-length integer (RFC 9000 section 16).
+pub i64 Var(Reader r) {
+    if !Need(r, 1_i64) { return 0_i64; }
+    i64 p = r.st[0];
+    i64 first = i64(r.buf[p]);
+    i64 width = 1_i64 << (first >> 6_i64);
+    if !Need(r, width) { return 0_i64; }
+    mut i64 v = first & 63_i64;
+    mut i64 i = 1_i64;
+    while i < width { v = (v << 8_i64) | i64(r.buf[p + i]); i = i + 1_i64; }
+    r.st[0] = p + width;
+    return v;
+}
+
+/// Copies `count` bytes out.
+pub u8[] Take(Reader r, i64 count) {
+    if !Need(r, count) { return Slice.New(0_i64); }
+    u8[] out = Slice.New(count);
+    Slice.Copy(out, 0_i64, r.buf, r.st[0], count);
+    r.st[0] = r.st[0] + count;
+    return out;
+}
+
+/// Skips `count` bytes; returns the offset where they start.
+pub i64 Skip(Reader r, i64 count) {
+    i64 at = r.st[0];
+    if !Need(r, count) { return at; }
+    r.st[0] = at + count;
+    return at;
+}
+
+pub Writer NewWriter(u8[] buf, i64 offset, i64 limit) {
+    return Writer { buf: buf, st: [offset, limit, 0_i64] };
+}
+
+pub i64 WPos(Writer w) { return w.st[0]; }
+pub i64 WLimit(Writer w) { return w.st[1]; }
+pub i64 WRoom(Writer w) { return w.st[1] - w.st[0]; }
+pub bool WOk(Writer w) { return w.st[2] == 0_i64; }
+pub unit WSetPos(Writer w, i64 pos) { w.st[0] = pos; return; }
+pub unit WSetLimit(Writer w, i64 limit) { w.st[1] = limit; return; }
+
+bool Room(Writer w, i64 count) {
+    if w.st[2] != 0_i64 { return false; }
+    if count > w.st[1] - w.st[0] { w.st[2] = 1_i64; return false; }
+    return true;
+}
+
+pub unit PutByte(Writer w, i64 v) {
+    if !Room(w, 1_i64) { return; }
+    w.buf[w.st[0]] = u8(v & 255_i64);
+    w.st[0] = w.st[0] + 1_i64;
+    return;
+}
+
+pub unit PutUint(Writer w, i64 width, i64 v) {
+    if !Room(w, width) { return; }
+    i64 p = w.st[0];
+    mut i64 i = 0_i64;
+    while i < width {
+        w.buf[p + i] = u8((v >> ((width - 1_i64 - i) * 8_i64)) & 255_i64);
+        i = i + 1_i64;
+    }
+    w.st[0] = p + width;
+    return;
+}
+
+/// Minimal varint length of v (1, 2, 4 or 8); values outside 0..2^62-1 report 8.
+pub i64 VarLen(i64 v) {
+    if v < 64_i64 { return 1_i64; }
+    if v < 16384_i64 { return 2_i64; }
+    if v < 1073741824_i64 { return 4_i64; }
+    return 8_i64;
+}
+
+/// Writes v with an explicit encoded width (1, 2, 4 or 8).
+pub unit PutVarWidth(Writer w, i64 v, i64 width) {
+    if !Room(w, width) { return; }
+    i64 p = w.st[0];
+    PutUint(w, width, v);
+    mut i64 tag = 0_i64;
+    if width == 2_i64 { tag = 64_i64; }
+    if width == 4_i64 { tag = 128_i64; }
+    if width == 8_i64 { tag = 192_i64; }
+    w.buf[p] = u8(i64(w.buf[p]) | tag);
+    return;
+}
+
+pub unit PutVar(Writer w, i64 v) {
+    if v < 0_i64 || v > 4611686018427387903_i64 { w.st[2] = 2_i64; return; }
+    PutVarWidth(w, v, VarLen(v));
+    return;
+}
+
+pub unit PutBytes(Writer w, u8[] src, i64 offset, i64 count) {
+    if !Room(w, count) { return; }
+    Slice.Copy(w.buf, w.st[0], src, offset, count);
+    w.st[0] = w.st[0] + count;
+    return;
+}
+
+pub unit PutAll(Writer w, u8[] src) { PutBytes(w, src, 0_i64, Slice.Len(src)); return; }
+
+/// Writes `count` zero bytes (PADDING).
+pub unit PutZeros(Writer w, i64 count) {
+    if !Room(w, count) { return; }
+    mut i64 i = 0_i64;
+    i64 p = w.st[0];
+    while i < count { w.buf[p + i] = 0_u8; i = i + 1_i64; }
+    w.st[0] = p + count;
+    return;
+}
+
+/// Equality of two byte ranges.
+pub bool SameBytes(u8[] a, i64 aOffset, u8[] b, i64 bOffset, i64 count) {
+    mut i64 i = 0_i64;
+    while i < count {
+        if a[aOffset + i] != b[bOffset + i] { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+pub bool Equal(u8[] a, u8[] b) {
+    i64 n = Slice.Len(a);
+    if n != Slice.Len(b) { return false; }
+    return SameBytes(a, 0_i64, b, 0_i64, n);
+}
+
+/// Copy of src[offset..offset+count).
+pub u8[] CopyOf(u8[] src, i64 offset, i64 count) {
+    u8[] out = Slice.New(count);
+    Slice.Copy(out, 0_i64, src, offset, count);
+    return out;
+}
+
+/// Moves the write position back to `pos` and clears a recorded overflow (frame rollback).
+pub unit WRewind(Writer w, i64 pos) {
+    w.st[0] = pos;
+    w.st[2] = 0_i64;
+    return;
+}

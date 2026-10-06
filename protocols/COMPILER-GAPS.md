@@ -506,3 +506,47 @@ without double or trailing underscores, and must be unique per target.
   `--target-timeout 900` the 2 tests finish but the budget expires (exit non-zero).
 - Workaround: run with `--target-timeout 2400` (done), keep wss tests to the minimum,
   split further targets per scenario. Same family as H3.
+## 2026-10-05, quic slice
+
+### Q1. Codegen cost grows with the field count of parameter types
+- Symptom: 60 trivial functions taking a 25-field struct (`QuicConnection.Connection`) add ~14 s
+  of "Generate CLIF" per test (~0.23 s each); the same functions taking `i64[]` add ~1 s, and a
+  6-field struct ~5 s. A test reaching the whole QUIC connection (~590 functions) spends
+  3.5-4 min in "Generate CLIF"; the UDP loopback test ~7 min per target run.
+- Workaround: one heavy scenario per test and per target; keep hot helpers on primitive arrays.
+  `--all-targets` also runs the front end (~25 s) per target before codegen and has a
+  1800 s matrix budget (`--matrix-timeout`, `BESKID_MATRIX_TIMEOUT_SECS`).
+
+### Q2. The test root is not a fiber: spawned fibers do not run while it sleeps or waits
+- Symptom: a fiber spawned from a `test` body never runs during the root's `Time.Sleep` or a
+  `UdpSocket.ReceiveFrom` wait (a counter written by the child stays 0 for 50 ms); it only
+  runs inside `Join`.
+- Repro: `Fiber<unit> f = spawn (() => Loop(b)); Time.Sleep(50 ms); // b.n[2] still 0`.
+- Workaround: run the scenario in a fiber (`Fiber<i64> s = spawn Scenario(); s.Join();`) and
+  return a step code (assertions inside fibers are not reported, W4).
+
+### Q3. `match` as the right-hand side of an assignment is a parse error
+- Symptom: `sealed = match f() { ... };` (assignment, not declaration) fails with
+  "expected MultiplicationExpression".
+- Workaround: a helper function returning the value, or a declaration `T x = match ...`.
+
+### Q4. `when` is a keyword; enum variant names collide with free functions
+- Symptom: `i64 when = ...` fails to parse. A test function `SocketAddress Loopback()` is
+  rejected with "unqualified enum constructor `Loopback`; use `Handshake::Loopback`" because a
+  dependency declares the variant `Handshake::Loopback`.
+- Workaround: rename locals (`due`) and functions (`LocalHost`).
+
+### Q5. Array literal with computed elements in a match arm is an ICE
+- Symptom: `IpAddress::V4(x, y, z, w) => [4_u8, x, y, z, w, u8(p >> 8_i64), u8(p & 255_i64)]`
+  gives "no ISLE lowering rule or fact for MatchExpression" (variant of the http2 note 8).
+- Workaround: a helper that fills `Slice.New(n)`.
+
+### Q6. `Deadline` exposes no accessor
+- Symptom: `deadline.monotonicNanos` is an "inaccessible struct field"; code that loops over
+  short waits cannot tell when a caller's `Option<Deadline>` expires.
+- Workaround: the QUIC endpoint API takes `i64 timeoutMillis` (-1 = none) and computes an
+  absolute monotonic deadline from `Time.MonotonicNow()`.
+
+Note: struct fields cannot be declared `mut`, but assigning a field (`c.dcid = x`) and
+`Array.Append` through a field (`Array.Append<T>(c.list, v)`) both work and are visible to
+callers.

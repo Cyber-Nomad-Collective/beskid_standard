@@ -1,0 +1,179 @@
+// RFC 9000 appendix A samples, frame round trips and malformed-frame rejection, and
+// transport parameter validation.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Codec.Hex;
+use Quic.QuicErrors;
+use Quic.QuicFrame;
+use Quic.QuicPacket;
+use Quic.QuicTransportParams;
+use Quic.QuicWire;
+
+i64 VarOf(string hex) {
+    u8[] b = Hex.Of(hex);
+    Reader r = QuicWire.NewReader(b, 0_i64, Slice.Len(b));
+    i64 v = QuicWire.Var(r);
+    if !QuicWire.AtEnd(r) { return -1_i64; }
+    return v;
+}
+
+u8[] Enc(Frame f, u8[] data) {
+    u8[] buf = Slice.New(256_i64);
+    Writer w = QuicWire.NewWriter(buf, 0_i64, 256_i64);
+    QuicFrame.Encode(w, f, data);
+    return QuicWire.CopyOf(buf, 0_i64, QuicWire.WPos(w));
+}
+
+// Decodes the encoding of f, re-encodes the result and compares. Returns the decoded type or -1.
+i64 RoundTrip(Frame f, u8[] data) {
+    u8[] wire = Enc(f, data);
+    Reader r = QuicWire.NewReader(wire, 0_i64, Slice.Len(wire));
+    Frame back = QuicFrame.Decode(r);
+    if !QuicWire.Ok(r) || !QuicWire.AtEnd(r) { return -1_i64; }
+    if !QuicWire.Equal(Enc(back, wire), wire) { return -2_i64; }
+    return QuicFrame.TypeOf(back);
+}
+
+// Error code recorded when decoding `hex` as one frame (0 when it decodes cleanly).
+i64 DecodeError(string hex) {
+    u8[] b = Hex.Of(hex);
+    Reader r = QuicWire.NewReader(b, 0_i64, Slice.Len(b));
+    QuicFrame.Decode(r);
+    return QuicWire.Error(r);
+}
+
+test rfc9000_appendix_a_samples {
+    Assert.Equal<i64>(VarOf("c2197c5eff14e88c"), 151288809941952652_i64, "8-byte varint");
+    Assert.Equal<i64>(VarOf("9d7f3e7d"), 494878333_i64, "4-byte varint");
+    Assert.Equal<i64>(VarOf("7bbd"), 15293_i64, "2-byte varint");
+    Assert.Equal<i64>(VarOf("25"), 37_i64, "1-byte varint");
+    Assert.Equal<i64>(VarOf("4025"), 37_i64, "non-minimal 2-byte varint");
+    Assert.Equal<i64>(QuicPacket.PnLength(0xac5c02_i64, 0xabe8b3_i64), 2_i64, "A.2 16 bits");
+    Assert.Equal<i64>(QuicPacket.PnLength(0xace8fe_i64, 0xabe8b3_i64), 3_i64, "A.2 24 bits");
+    Assert.Equal<i64>(QuicPacket.PnLength(0_i64, -1_i64), 1_i64, "first packet");
+    Assert.Equal<i64>(QuicPacket.DecodePn(0xa82f30ea_i64, 0x9b32_i64, 16_i64), 0xa82f9b32_i64, "A.3");
+    Assert.Equal<i64>(QuicPacket.DecodePn(0xff_i64, 0x00_i64, 8_i64), 0x100_i64, "wraps forward");
+    Assert.Equal<i64>(QuicPacket.DecodePn(0x100_i64, 0xff_i64, 8_i64), 0xff_i64, "stays below");
+    u8[] buf = Slice.New(16_i64);
+    Writer w = QuicWire.NewWriter(buf, 0_i64, 16_i64);
+    QuicWire.PutVar(w, 151288809941952652_i64);
+    QuicWire.PutVar(w, 15293_i64);
+    Assert.Equal<string>(Hex.Encode(QuicWire.CopyOf(buf, 0_i64, QuicWire.WPos(w))), "c2197c5eff14e88c7bbd", "varint encoding");
+    QuicWire.PutVar(w, 494878333_i64);
+    QuicWire.PutVar(w, 494878333_i64);
+    Assert.False(QuicWire.WOk(w), "writer overflow is sticky");
+}
+
+test frames_round_trip {
+    u8[] data = Hex.Of("00112233445566778899");
+    i64[] ranges = [100_i64, 90_i64, 80_i64, 80_i64, 10_i64, 0_i64];
+    Assert.Equal<i64>(RoundTrip(Frame::Ack(AckFrame { delay: 7_i64, ranges: ranges, ecn: false, ect0: 0_i64, ect1: 0_i64, ce: 0_i64 }), data), 2_i64, "ACK");
+    Assert.Equal<i64>(RoundTrip(Frame::Ack(AckFrame { delay: 0_i64, ranges: ranges, ecn: true, ect0: 5_i64, ect1: 6_i64, ce: 7_i64 }), data), 3_i64, "ACK_ECN");
+    Assert.Equal<i64>(RoundTrip(Frame::Ping(), data), 1_i64, "PING");
+    Assert.Equal<i64>(RoundTrip(Frame::Padding(5_i64), data), 0_i64, "PADDING");
+    Assert.Equal<i64>(RoundTrip(Frame::ResetStream(4_i64, 99_i64, 70000_i64), data), 4_i64, "RESET_STREAM");
+    Assert.Equal<i64>(RoundTrip(Frame::StopSending(8_i64, 3_i64), data), 5_i64, "STOP_SENDING");
+    Assert.Equal<i64>(RoundTrip(Frame::Crypto(1000_i64, 2_i64, 5_i64), data), 6_i64, "CRYPTO");
+    Assert.Equal<i64>(RoundTrip(Frame::NewToken(Hex.Of("abcd")), data), 7_i64, "NEW_TOKEN");
+    Assert.Equal<i64>(RoundTrip(Frame::Stream(0_i64, 0_i64, 0_i64, 10_i64, false), data), 10_i64, "STREAM len");
+    Assert.Equal<i64>(RoundTrip(Frame::Stream(5_i64, 77_i64, 3_i64, 4_i64, true), data), 15_i64, "STREAM off len fin");
+    Assert.Equal<i64>(RoundTrip(Frame::MaxData(1048576_i64), data), 16_i64, "MAX_DATA");
+    Assert.Equal<i64>(RoundTrip(Frame::MaxStreamData(4_i64, 65536_i64), data), 17_i64, "MAX_STREAM_DATA");
+    Assert.Equal<i64>(RoundTrip(Frame::MaxStreams(true, 100_i64), data), 18_i64, "MAX_STREAMS bidi");
+    Assert.Equal<i64>(RoundTrip(Frame::MaxStreams(false, 3_i64), data), 19_i64, "MAX_STREAMS uni");
+    Assert.Equal<i64>(RoundTrip(Frame::DataBlocked(9_i64), data), 20_i64, "DATA_BLOCKED");
+    Assert.Equal<i64>(RoundTrip(Frame::StreamDataBlocked(4_i64, 9_i64), data), 21_i64, "STREAM_DATA_BLOCKED");
+    Assert.Equal<i64>(RoundTrip(Frame::StreamsBlocked(true, 9_i64), data), 22_i64, "STREAMS_BLOCKED bidi");
+    Assert.Equal<i64>(RoundTrip(Frame::StreamsBlocked(false, 9_i64), data), 23_i64, "STREAMS_BLOCKED uni");
+    Assert.Equal<i64>(RoundTrip(Frame::NewConnectionId(3_i64, 1_i64, Hex.Of("0102030405060708"), Hex.Of("000102030405060708090a0b0c0d0e0f")), data), 24_i64, "NEW_CONNECTION_ID");
+    Assert.Equal<i64>(RoundTrip(Frame::RetireConnectionId(2_i64), data), 25_i64, "RETIRE_CONNECTION_ID");
+    Assert.Equal<i64>(RoundTrip(Frame::PathChallenge(Hex.Of("0102030405060708")), data), 26_i64, "PATH_CHALLENGE");
+    Assert.Equal<i64>(RoundTrip(Frame::PathResponse(Hex.Of("0102030405060708")), data), 27_i64, "PATH_RESPONSE");
+    Assert.Equal<i64>(RoundTrip(Frame::ConnectionClose(false, 10_i64, 8_i64, Hex.Of("6f6f7073")), data), 28_i64, "CONNECTION_CLOSE");
+    Assert.Equal<i64>(RoundTrip(Frame::ConnectionClose(true, 77_i64, 0_i64, Slice.New(0_i64)), data), 29_i64, "APPLICATION_CLOSE");
+    Assert.Equal<i64>(RoundTrip(Frame::HandshakeDone(), data), 30_i64, "HANDSHAKE_DONE");
+}
+
+test frames_decode_fields_and_reject_malformed {
+    // STREAM without length runs to the end of the packet.
+    u8[] s = Hex.Of("0c0405aabbcc");
+    Reader r = QuicWire.NewReader(s, 0_i64, 6_i64);
+    match QuicFrame.Decode(r) {
+        Frame::Stream(id, offset, start, length, fin) => {
+            Assert.Equal<i64>(id, 4_i64, "stream id");
+            Assert.Equal<i64>(offset, 5_i64, "offset");
+            Assert.Equal<i64>(start, 3_i64, "data start");
+            Assert.Equal<i64>(length, 3_i64, "implicit length");
+            Assert.False(fin, "no fin");
+        },
+        _ => { Assert.Fail("STREAM expected"); },
+    };
+    Assert.Equal<i64>(DecodeError("0d"), 7_i64, "truncated STREAM");
+    Assert.Equal<i64>(DecodeError("020a0000 0b"), 7_i64, "ACK first range below zero");
+    Assert.Equal<i64>(DecodeError("020a00010a0000"), 7_i64, "ACK gap below zero");
+    Assert.Equal<i64>(DecodeError("0700"), 7_i64, "empty NEW_TOKEN");
+    Assert.Equal<i64>(DecodeError("18010200"), 7_i64, "NEW_CONNECTION_ID length 0");
+    Assert.Equal<i64>(DecodeError("1801021501"), 7_i64, "retire_prior_to above sequence");
+    Assert.Equal<i64>(DecodeError("12d000000000000001"), 7_i64, "MAX_STREAMS above 2^60");
+    Assert.Equal<i64>(DecodeError("1f"), 7_i64, "unknown frame type");
+    Assert.Equal<i64>(DecodeError("4001"), 7_i64, "non-minimal frame type");
+    Assert.Equal<i64>(DecodeError("1a0102"), 7_i64, "short PATH_CHALLENGE");
+    Assert.Equal<i64>(DecodeError("060005aa"), 7_i64, "CRYPTO longer than packet");
+    Assert.Equal<i64>(DecodeError("1c0a0003616263"), 0_i64, "CONNECTION_CLOSE ok");
+    // Packet-type permissions (RFC 9000 table 3).
+    Assert.True(QuicFrame.AllowedIn(6_i64, QuicPacket.KindInitial()), "CRYPTO in Initial");
+    Assert.True(QuicFrame.AllowedIn(28_i64, QuicPacket.KindHandshake()), "CONNECTION_CLOSE in Handshake");
+    Assert.False(QuicFrame.AllowedIn(29_i64, QuicPacket.KindInitial()), "application close not in Initial");
+    Assert.False(QuicFrame.AllowedIn(8_i64, QuicPacket.KindHandshake()), "STREAM not in Handshake");
+    Assert.False(QuicFrame.AllowedIn(2_i64, QuicPacket.KindZeroRtt()), "ACK not in 0-RTT");
+    Assert.True(QuicFrame.AllowedIn(8_i64, QuicPacket.KindZeroRtt()), "STREAM in 0-RTT");
+    Assert.False(QuicFrame.AllowedIn(30_i64, QuicPacket.KindZeroRtt()), "HANDSHAKE_DONE not in 0-RTT");
+    Assert.True(QuicFrame.AllowedIn(30_i64, QuicPacket.KindOneRtt()), "HANDSHAKE_DONE in 1-RTT");
+    Assert.False(QuicFrame.IsAckEliciting(2_i64), "ACK not ack-eliciting");
+    Assert.True(QuicFrame.IsAckEliciting(1_i64), "PING ack-eliciting");
+}
+
+bool Rejected(string hex, bool fromServer) {
+    return match QuicTransportParams.Decode(Hex.Of(hex), fromServer) {
+        Result::Ok(_) => false,
+        Result::Error(e) => QuicErrors.WireCode(e) == 8_i64,
+    };
+}
+
+test transport_params_round_trip_and_validation {
+    TransportParams p = QuicTransportParams.Empty();
+    QuicTransportParams.Set(p, QuicTransportParams.MaxIdleTimeout(), 30000_i64);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxData(), 65536_i64);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxStreamsBidi(), 8_i64);
+    QuicTransportParams.Set(p, QuicTransportParams.DisableActiveMigration(), 1_i64);
+    QuicTransportParams.SetBytes(p, QuicTransportParams.InitialScid(), Hex.Of("0102030405060708"));
+    QuicTransportParams.SetBytes(p, QuicTransportParams.OriginalDcid(), Hex.Of("8394c8f03e515708"));
+    QuicTransportParams.SetBytes(p, QuicTransportParams.StatelessResetToken(), Hex.Of("000102030405060708090a0b0c0d0e0f"));
+    u8[] wire = QuicTransportParams.Encode(p);
+    match QuicTransportParams.Decode(wire, true) {
+        Result::Ok(q) => {
+            Assert.Equal<i64>(QuicTransportParams.Get(q, 1_i64), 30000_i64, "idle timeout");
+            Assert.Equal<i64>(QuicTransportParams.Get(q, 4_i64), 65536_i64, "max data");
+            Assert.Equal<i64>(QuicTransportParams.Get(q, 8_i64), 8_i64, "streams");
+            Assert.True(QuicTransportParams.Has(q, 12_i64), "disable migration");
+            Assert.Equal<i64>(QuicTransportParams.Get(q, 3_i64), 65527_i64, "default payload size");
+            Assert.Equal<i64>(QuicTransportParams.Get(q, 11_i64), 25_i64, "default max ack delay");
+            Assert.True(QuicWire.Equal(QuicTransportParams.Encode(q), wire), "re-encodes identically");
+            Assert.Equal<i64>(QuicTransportParams.CheckConnectionIds(q, true, Hex.Of("0102030405060708"), Hex.Of("8394c8f03e515708"), Slice.New(0_i64), false), 0_i64, "cids authenticate");
+            Assert.Equal<i64>(QuicTransportParams.CheckConnectionIds(q, true, Hex.Of("0102030405060709"), Hex.Of("8394c8f03e515708"), Slice.New(0_i64), false), 8_i64, "wrong initial scid");
+            Assert.Equal<i64>(QuicTransportParams.CheckConnectionIds(q, true, Hex.Of("0102030405060708"), Hex.Of("8394c8f03e515708"), Hex.Of("01"), true), 8_i64, "missing retry scid");
+        },
+        Result::Error(_) => { Assert.Fail("decodes"); },
+    };
+    Assert.True(Rejected("0000", false), "original_dcid from a client");
+    Assert.True(Rejected("020401020304", true), "short stateless reset token");
+    Assert.True(Rejected("03024000", false), "max_udp_payload_size below 1200");
+    Assert.True(Rejected("0a0115", false), "ack_delay_exponent above 20");
+    Assert.True(Rejected("0b028000", false), "max_ack_delay 2^14");
+    Assert.True(Rejected("0e0101", false), "active_connection_id_limit 1");
+    Assert.True(Rejected("01010a01010a", false), "duplicate parameter");
+    Assert.True(Rejected("0c0100", false), "disable_active_migration with a value");
+    Assert.True(Rejected("010240", false), "truncated value");
+    Assert.False(Rejected("1b00 01010a", false), "reserved parameter ignored");
+}

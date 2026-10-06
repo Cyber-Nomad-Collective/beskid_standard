@@ -1,0 +1,88 @@
+/// Core.String.Builder — incremental string construction over a growable UTF-8 byte buffer.
+/// @tier(supported)
+/// Builders are linear values: every `Append*` returns the updated builder, and callers keep
+/// using the returned value (`b = b.Append("x");`). Earlier copies may share storage with the
+/// returned builder and must not be appended to again.
+use Core.Collections.Array;
+use Core.String.Core;
+use Core.String.Utf8;
+
+pub type StringBuilder {
+    u8[] bytes,
+    i64 length,
+
+    /// Number of UTF-8 bytes appended so far.
+    pub i64 Length() {
+        return this.length;
+    }
+
+    /// Returns true when nothing has been appended.
+    pub bool IsEmpty() {
+        return this.length == 0;
+    }
+
+    /// Appends every byte of `text`.
+    pub StringBuilder Append(string text) {
+        return AppendText(this, text);
+    }
+
+    /// Appends `text` followed by a line feed.
+    pub StringBuilder AppendLine(string text) {
+        StringBuilder next = AppendText(this, text);
+        return AppendCode(next, 10);
+    }
+
+    /// Appends one ASCII code unit (`0..=127`). Larger values are ignored because a lone byte
+    /// above 127 is not valid UTF-8.
+    pub StringBuilder AppendAscii(u8 code) {
+        return AppendCode(this, code);
+    }
+
+    /// Appends the decimal form of `value`.
+    pub StringBuilder AppendI64(i64 value) {
+        return AppendText(this, "${value}");
+    }
+
+    /// Appends `true` or `false`.
+    pub StringBuilder AppendBool(bool value) {
+        if value {
+            return AppendText(this, "true");
+        }
+        return AppendText(this, "false");
+    }
+
+    /// Materializes the appended bytes as a string.
+    pub string ToString() {
+        return Utf8.FromUtf8CodeUnits(this.bytes);
+    }
+}
+
+StringBuilder AppendText(StringBuilder builder, string text) {
+    i64 len = Core.Len(text);
+    mut u8[] data = builder.bytes;
+    mut i64 i = 0;
+    while i < len {
+        data = Array.Append<u8>(data, Core.ByteAt(text, i));
+        i = i + 1;
+    }
+    return StringBuilder { bytes: data, length: builder.length + len };
+}
+
+StringBuilder AppendCode(StringBuilder builder, u8 code) {
+    if code > 127 {
+        return builder;
+    }
+    mut u8[] data = builder.bytes;
+    data = Array.Append<u8>(data, code);
+    return StringBuilder { bytes: data, length: builder.length + 1 };
+}
+
+/// Creates an empty builder.
+pub StringBuilder New() {
+    return StringBuilder { bytes: Array.Empty<u8>(), length: 0 };
+}
+
+/// Creates a builder that starts with `text`.
+pub StringBuilder From(string text) {
+    return AppendText(New(), text);
+}

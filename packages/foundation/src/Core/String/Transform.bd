@@ -1,0 +1,242 @@
+/// Core.String.Transform — splitting, joining, replacement, padding, and ASCII case mapping.
+/// @tier(supported)
+/// Offsets and lengths are UTF-8 byte counts. Case mapping touches ASCII letters only and
+/// leaves every other byte (including multi-byte UTF-8 sequences) unchanged.
+use Core.Collections.Array;
+use Core.String.Core;
+use Core.String.Utf8;
+
+/// Returns a one-byte string for an ASCII code unit (`0..=127`), such as a newline (`10`).
+/// Bytes above 127 are not valid one-byte UTF-8 and yield the empty string.
+pub string FromAscii(u8 code) {
+    if code > 127 {
+        return "";
+    }
+    mut u8[] data = Array.Empty<u8>();
+    data = Array.Append<u8>(data, code);
+    return Utf8.FromUtf8CodeUnits(data);
+}
+
+/// Concatenates `a` and `b`. Returns the non-empty side unchanged when the other is empty, so
+/// two empty operands never reach the runtime concatenation (0.5.2 produces an invalid string
+/// for an empty-plus-empty `+`).
+pub string Concat(string a, string b) {
+    if Core.Len(a) == 0 {
+        return b;
+    }
+    if Core.Len(b) == 0 {
+        return a;
+    }
+    return a + b;
+}
+
+/// The line-feed string (`U+000A`).
+pub string Newline() {
+    return FromAscii(10);
+}
+
+/// The horizontal-tab string (`U+0009`).
+pub string Tab() {
+    return FromAscii(9);
+}
+
+/// Splits `text` on every occurrence of `separator`.
+/// Empty fields are kept, so `n` separators always yield `n + 1` parts. An empty separator
+/// returns `text` as the only part.
+pub string[] Split(string text, string separator) {
+    mut string[] parts = Array.Empty<string>();
+    i64 slen = Core.Len(separator);
+    if slen == 0 {
+        parts = Array.Append<string>(parts, text);
+        return parts;
+    }
+    mut i64 start = 0;
+    mut i64 at = Core.IndexOfFrom(text, 0, separator);
+    while at >= 0 {
+        parts = Array.Append<string>(parts, Core.SubSlice(text, start, at - start));
+        start = at + slen;
+        at = Core.IndexOfFrom(text, start, separator);
+    }
+    parts = Array.Append<string>(parts, Core.SubSlice(text, start, Core.Len(text) - start));
+    return parts;
+}
+
+/// Splits `text` into lines on LF, removing one trailing CR from each line.
+/// A trailing newline does not produce an extra empty line; the empty string has no lines.
+pub string[] Lines(string text) {
+    mut string[] lines = Array.Empty<string>();
+    i64 len = Core.Len(text);
+    mut i64 start = 0;
+    mut i64 i = 0;
+    while i < len {
+        if Core.ByteAt(text, i) == 10 {
+            lines = Array.Append<string>(lines, StripCarriageReturn(Core.SubSlice(text, start, i - start)));
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if start < len {
+        lines = Array.Append<string>(lines, StripCarriageReturn(Core.SubSlice(text, start, len - start)));
+    }
+    return lines;
+}
+
+string StripCarriageReturn(string line) {
+    i64 len = Core.Len(line);
+    if len > 0 && Core.ByteAt(line, len - 1) == 13 {
+        return Core.SubSlice(line, 0, len - 1);
+    }
+    return line;
+}
+
+/// Concatenates `parts` with `separator` between consecutive elements.
+pub string Join(string[] parts, string separator) {
+    i64 count = Array.Len<string>(parts);
+    mut string result = "";
+    mut i64 i = 0;
+    while i < count {
+        if i > 0 {
+            result = Concat(result, separator);
+        }
+        result = Concat(result, Array.Get<string>(parts, i));
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Replaces every non-overlapping occurrence of `old` with `replacement`, scanning left to right.
+/// An empty `old` returns `text` unchanged.
+pub string Replace(string text, string old, string replacement) {
+    i64 olen = Core.Len(old);
+    if olen == 0 {
+        return text;
+    }
+    mut string result = "";
+    mut i64 start = 0;
+    mut i64 at = Core.IndexOfFrom(text, 0, old);
+    while at >= 0 {
+        result = Concat(Concat(result, Core.SubSlice(text, start, at - start)), replacement);
+        start = at + olen;
+        at = Core.IndexOfFrom(text, start, old);
+    }
+    return Concat(result, Core.SubSlice(text, start, Core.Len(text) - start));
+}
+
+/// Repeats `text` `count` times. A non-positive count yields the empty string.
+pub string Repeat(string text, i64 count) {
+    mut string result = "";
+    mut i64 i = 0;
+    while i < count {
+        result = Concat(result, text);
+        i = i + 1;
+    }
+    return result;
+}
+
+/// Left-pads `text` with `fill` until it is at least `width` bytes long.
+/// An empty `fill` returns `text` unchanged; a multi-byte fill may overshoot `width`.
+pub string PadLeft(string text, i64 width, string fill) {
+    if Core.Len(fill) == 0 {
+        return text;
+    }
+    mut string result = text;
+    while Core.Len(result) < width {
+        result = Concat(fill, result);
+    }
+    return result;
+}
+
+/// Right-pads `text` with `fill` until it is at least `width` bytes long.
+/// An empty `fill` returns `text` unchanged; a multi-byte fill may overshoot `width`.
+pub string PadRight(string text, i64 width, string fill) {
+    if Core.Len(fill) == 0 {
+        return text;
+    }
+    mut string result = text;
+    while Core.Len(result) < width {
+        result = Concat(result, fill);
+    }
+    return result;
+}
+
+/// Maps ASCII `a..z` to `A..Z`; all other bytes are preserved.
+pub string ToUpperAscii(string text) {
+    i64 len = Core.Len(text);
+    mut u8[] data = Array.Empty<u8>();
+    mut i64 i = 0;
+    while i < len {
+        u8 b = Core.ByteAt(text, i);
+        if b >= 97 && b <= 122 {
+            data = Array.Append<u8>(data, u8(i64(b) - 32));
+        } else {
+            data = Array.Append<u8>(data, b);
+        }
+        i = i + 1;
+    }
+    return Utf8.FromUtf8CodeUnits(data);
+}
+
+/// Maps ASCII `A..Z` to `a..z`; all other bytes are preserved.
+pub string ToLowerAscii(string text) {
+    i64 len = Core.Len(text);
+    mut u8[] data = Array.Empty<u8>();
+    mut i64 i = 0;
+    while i < len {
+        u8 b = Core.ByteAt(text, i);
+        if b >= 65 && b <= 90 {
+            data = Array.Append<u8>(data, u8(i64(b) + 32));
+        } else {
+            data = Array.Append<u8>(data, b);
+        }
+        i = i + 1;
+    }
+    return Utf8.FromUtf8CodeUnits(data);
+}
+
+bool IsTrimByte(u8 b) {
+    return b == 32 || b == 9 || b == 13 || b == 10;
+}
+
+/// Removes leading ASCII whitespace (space, tab, CR, LF).
+pub string TrimStart(string text) {
+    i64 len = Core.Len(text);
+    mut i64 start = 0;
+    while start < len && IsTrimByte(Core.ByteAt(text, start)) {
+        start = start + 1;
+    }
+    return Core.SubSlice(text, start, len - start);
+}
+
+/// Removes trailing ASCII whitespace (space, tab, CR, LF).
+pub string TrimEnd(string text) {
+    mut i64 end = Core.Len(text);
+    while end > 0 && IsTrimByte(Core.ByteAt(text, end - 1)) {
+        end = end - 1;
+    }
+    return Core.SubSlice(text, 0, end);
+}
+
+/// Removes `prefix` once from the start of `text` when present.
+pub string RemovePrefix(string text, string prefix) {
+    i64 plen = Core.Len(prefix);
+    if plen == 0 || plen > Core.Len(text) {
+        return text;
+    }
+    if Core.SubSlice(text, 0, plen) == prefix {
+        return Core.SubSlice(text, plen, Core.Len(text) - plen);
+    }
+    return text;
+}
+
+/// Removes `suffix` once from the end of `text` when present.
+pub string RemoveSuffix(string text, string suffix) {
+    i64 tlen = Core.Len(text);
+    i64 slen = Core.Len(suffix);
+    if slen == 0 || slen > tlen {
+        return text;
+    }
+    if Core.SubSlice(text, tlen - slen, slen) == suffix {
+        return Core.SubSlice(text, 0, tlen - slen);
+    }
+    return text;
+}

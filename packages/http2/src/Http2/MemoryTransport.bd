@@ -1,0 +1,70 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO.Closer;
+use Core.IO.IoError;
+use Core.IO.Reader;
+use Core.IO.Stream;
+use Core.IO.Writer;
+use Core.Results;
+
+// An in-memory `Core.IO.Stream` for tests and frame-level tools: reads
+// return the preloaded `input` (then EOF) and writes collect into `output`.
+// Like `TcpStream` it also declares Reader/Writer/Closer: Core.IO.ReadExact and
+// WriteAll take those contracts, and 0.5.2 conformance is nominal.
+
+pub type MemoryTransport: Stream, Reader, Writer, Closer {
+    pub u8[] input,
+    // [read position, written length]; `output` has spare capacity.
+    pub i64[] position,
+    pub u8[] output,
+    pub bool closed,
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) { return DoRead(this, destination, offset, count); }
+    pub Result<i64, IoError> Write(u8[] source, i64 offset, i64 count) { return DoWrite(this, source, offset, count); }
+    pub Result<unit, IoError> Close() { return DoClose(this); }
+}
+
+pub MemoryTransport New(u8[] input) {
+    return MemoryTransport { input: input, position: [0_i64, 0_i64], output: Slice.New(0_i64), closed: false };
+}
+
+Result<i64, IoError> DoRead(MemoryTransport self, u8[] destination, i64 offset, i64 count) {
+    if !Slice.IsValidRange(Slice.Len(destination), offset, count) { return Result::Error(IoError::InvalidRange); }
+    i64 at = self.position[0];
+    i64 available = Slice.Len(self.input) - at;
+    mut i64 take = count;
+    if take > available { take = available; }
+    if take <= 0_i64 { return Result::Ok(0_i64); }
+    Slice.Copy(destination, offset, self.input, at, take);
+    self.position[0] = at + take;
+    return Result::Ok(take);
+}
+
+Result<i64, IoError> DoWrite(MemoryTransport self, u8[] source, i64 offset, i64 count) {
+    if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange); }
+    // Byte-wise append on a local copy is what passes in 0.5.2; Slice.New
+    // based growth exhausted the heap (docs/networking/COMPILER-GAPS.md).
+    mut u8[] out = self.output;
+    mut i64 i = 0_i64;
+    while i < count { Array.Append<u8>(out, source[offset + i]); i = i + 1_i64; }
+    self.output = out;
+    self.position[1] = self.position[1] + count;
+    return Result::Ok(count);
+}
+
+// The bytes written so far.
+pub u8[] Written(MemoryTransport t) { return Slice.SubSlice(t.output, 0_i64, t.position[1]); }
+
+Result<unit, IoError> DoClose(MemoryTransport self) {
+    self.closed = true;
+    return Result::Ok(());
+}
+
+// `a` followed by `b`.
+pub u8[] Join(u8[] a, u8[] b) {
+    i64 na = Slice.Len(a);
+    i64 nb = Slice.Len(b);
+    u8[] out = Slice.New(na + nb);
+    if na > 0_i64 { Slice.Copy(out, 0_i64, a, 0_i64, na); }
+    if nb > 0_i64 { Slice.Copy(out, na, b, 0_i64, nb); }
+    return out;
+}

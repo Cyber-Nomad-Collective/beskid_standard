@@ -1,0 +1,215 @@
+/// Throughput benchmarks (not assertions of speed). Each test times one primitive with
+/// Core.Time monotonic nanoseconds and prints one "BENCH" line; see packages/crypto/BENCHMARKS.md.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Crypto.AesGcm;
+use Crypto.ChaCha20Poly1305;
+use Crypto.Ecdsa;
+use Crypto.Hmac;
+use Crypto.P256;
+use Crypto.PkAdapters;
+use Crypto.PkErrors;
+use Crypto.Rsa;
+use Crypto.Sha256;
+use Crypto.Sha512;
+use Crypto.X25519;
+
+i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+/// Prints MB/s (10^6 bytes per second) for `bytes` processed in `nanos`.
+unit Throughput(string name, i64 bytes, i64 nanos) {
+    i64 safe = nanos + 1_i64;
+    Output.WriteLine("BENCH " + name + ": " + Dec(bytes * 1000_i64 / safe) + " MB/s (" + Dec(safe / 1000_i64) + " us total)");
+    return;
+}
+
+/// Prints microseconds and operations per second for `ops` operations in `nanos`.
+unit PerOp(string name, i64 ops, i64 nanos) {
+    i64 safe = nanos + 1_i64;
+    Output.WriteLine("BENCH " + name + ": " + Dec(safe / ops / 1000_i64) + " us/op (" + Dec(ops * 1000000000_i64 / safe) + " op/s)");
+    return;
+}
+
+u8 Nibble(u8 c) {
+    if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
+    if c >= 97_u8 && c <= 102_u8 { return c - 87_u8; }
+    return c - 55_u8;
+}
+
+u8[] Hex(string text) {
+    i64 n = String.Len(text) / 2_i64;
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = Nibble(String.ByteAt(text, 2_i64 * i)) * 16_u8 + Nibble(String.ByteAt(text, 2_i64 * i + 1_i64)); i = i + 1_i64; }
+    return out;
+}
+
+i64 Chunk() { return 16384_i64; }
+
+u8[] Buffer() {
+    u8[] d = Slice.New(Chunk() + 16_i64);
+    mut i64 i = 0_i64;
+    while i < Chunk() { d[i] = u8(i & 255_i64); i = i + 1_i64; }
+    return d;
+}
+
+/// Megabytes hashed per SHA test (in 16 KiB chunks).
+i64 HashChunks() { return 64_i64; }
+/// 16 KiB records sealed per AEAD test.
+i64 Records() { return 32_i64; }
+
+test bench_sha256_1mib {
+    u8[] data = Buffer();
+    Sha256State s = Sha256.New();
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < HashChunks() { Sha256.UpdateRange(s, data, 0_i64, Chunk()); i = i + 1_i64; }
+    u8[] digest = Sha256.Finish(s);
+    Throughput("sha256", HashChunks() * Chunk(), NowNanos() - start);
+    Assert.Equal<i64>(Slice.Len(digest), 32_i64, "digest");
+}
+
+test bench_sha512_1mib {
+    u8[] data = Buffer();
+    Sha512State s = Sha512.New512();
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < HashChunks() { Sha512.UpdateRange(s, data, 0_i64, Chunk()); i = i + 1_i64; }
+    u8[] digest = Sha512.Finish(s);
+    Throughput("sha512", HashChunks() * Chunk(), NowNanos() - start);
+    Assert.Equal<i64>(Slice.Len(digest), 64_i64, "digest");
+}
+
+test bench_hmac_sha256_64b {
+    u8[] key = Slice.New(32_i64);
+    u8[] message = Slice.New(64_i64);
+    i64 ops = 2000_i64;
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < ops { u8[] tag = Hmac.Compute(HashAlgorithm::Sha256(), key, message); message[0] = tag[0]; i = i + 1_i64; }
+    PerOp("hmac-sha256 64B", ops, NowNanos() - start);
+    Assert.True(true, "printed");
+}
+
+test bench_hmac_sha256_16k {
+    u8[] key = Slice.New(32_i64);
+    u8[] data = Buffer();
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < Records() {
+        HmacState h = Hmac.New(HashAlgorithm::Sha256(), key);
+        Hmac.UpdateRange(h, data, 0_i64, Chunk());
+        u8[] tag = Hmac.Finish(h);
+        i = i + 1_i64;
+    }
+    Throughput("hmac-sha256 16KiB", Records() * Chunk(), NowNanos() - start);
+    Assert.True(true, "printed");
+}
+
+test bench_chacha20poly1305_seal_16k {
+    u8[] key = Slice.New(32_i64);
+    u8[] nonce = Slice.New(12_i64);
+    u8[] aad = Slice.New(13_i64);
+    u8[] record = Buffer();
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < Records() {
+        nonce[11] = u8(i & 255_i64);
+        ChaCha20Poly1305.SealInto(key, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
+        i = i + 1_i64;
+    }
+    Throughput("chacha20-poly1305 seal 16KiB", Records() * Chunk(), NowNanos() - start);
+    Assert.True(true, "printed");
+}
+
+test bench_aes128gcm_seal_16k {
+    match AesGcm.New(Slice.New(16_i64)) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] nonce = Slice.New(12_i64);
+            u8[] aad = Slice.New(13_i64);
+            u8[] record = Buffer();
+            i64 start = NowNanos();
+            mut i64 i = 0_i64;
+            while i < Records() {
+                nonce[11] = u8(i & 255_i64);
+                AesGcm.SealInto(key, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
+                i = i + 1_i64;
+            }
+            Throughput("aes-128-gcm seal 16KiB", Records() * Chunk(), NowNanos() - start);
+        },
+    };
+}
+
+test bench_x25519 {
+    u8[] scalar = Hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    u8[] point = Hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c");
+    i64 ops = 20_i64;
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < ops { Result<u8[], PkError> r = X25519.ScalarMult(scalar, point); i = i + 1_i64; }
+    PerOp("x25519", ops, NowNanos() - start);
+    Assert.True(true, "printed");
+}
+
+string P256Key() { return "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721"; }
+string P256Pub() { return "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299"; }
+string P256Digest() { return "af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf"; }
+string P256Sig() { return "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8"; }
+
+test bench_p256 {
+    u8[] d = Hex(P256Key());
+    u8[] q = Hex(P256Pub());
+    u8[] digest = Hex(P256Digest());
+    u8[] sig = Hex(P256Sig());
+    i64 ops = 10_i64;
+    mut i64 i = 0_i64;
+    i64 t0 = NowNanos();
+    while i < ops { Result<u8[], PkError> r = P256.SharedSecret(d, q); i = i + 1_i64; }
+    i64 t1 = NowNanos();
+    i = 0_i64;
+    while i < ops { Result<u8[], PkError> r = PkAdapters.SignEcdsaP256(d, digest); i = i + 1_i64; }
+    i64 t2 = NowNanos();
+    mut bool ok = true;
+    i = 0_i64;
+    while i < ops {
+        bool v = match Ecdsa.Verify(q, digest, sig) { Result::Ok(_) => true, Result::Error(_) => false, };
+        ok = ok && v;
+        i = i + 1_i64;
+    }
+    i64 t3 = NowNanos();
+    PerOp("p256 ecdh", ops, t1 - t0);
+    PerOp("p256 ecdsa sign", ops, t2 - t1);
+    PerOp("p256 ecdsa verify", ops, t3 - t2);
+    Assert.True(ok, "verified");
+}
+
+test bench_rsa2048_verify {
+    match Rsa.NewPublicKey(Hex("b5c59fd85f674978e986b5e8dd175fd0835dab5319ce90a9f39723215e34a1308f5b63d72cc1c08fc6e48e4b7f71be2b0898d5c36d43f7bb0897135afb4d84f5b0754f399f2d77c093e9e5c83b56ff6e06bf43287780af0b675e38e982d987a446c2ccb270a059a83ad856d03f12e9d59da3148cdde668268c682b0c137d32410684a2769de41bcf4d270f329cf453d08c61b27b27f55d11ec0e64617a136fe837ecdc91f56c51fa05ecdd7ba65bdfc3cb5792f2dae4fec772903cafa353de9976d6e8a7b07cebe813551183d0ec2466a74818fae8215b3a0ffa21f18decb0f953d0a548b286adb9df7ce8a8c9ccd6add6fd5640c4f5a3a11699bb998bf50053"), Hex("010001")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] digest = Hex("2ebc68be5635f90da288679cb6fe7d4767cfd4184e760df9c2f50078412461db");
+            u8[] sig = Hex("a691250a6c53e8ddf489762abe3fc74e74df3734b38423c1849c837581b5031db117d9f6a52620c432a3fdd78e0f98d19045e296d2e00508c6bbe1bfc7833f86f10e6e19fd0b163e233577947f40953db9a69c83a3bee4cc8f33d58c41348b35fe6a1c426b116cba33810cf0772a8bba3e108984814a4ef8cf870d83f7a79db7d10048e36e6d530993226b8514a01f9ca7274141a8429ec38840128d4739d84515fd3a49a222ad34a53904198ca1afa80a5f427b766bec5244b32b5d329ab9300362f5e28ce416ea608469c99f204aebeb14050f7f10cb5f5428dc13e44bc4eaf1537cc17cac46f9f8f04ef633f546345fce7501550f21ed3785a1d188421d29");
+            i64 ops = 20_i64;
+            mut bool ok = true;
+            i64 start = NowNanos();
+            mut i64 i = 0_i64;
+            while i < ops {
+                bool v = match Rsa.VerifyPkcs1v15(key, RsaHash::Sha256(), digest, sig) { Result::Ok(_) => true, Result::Error(_) => false, };
+                ok = ok && v;
+                i = i + 1_i64;
+            }
+            PerOp("rsa2048 verify", ops, NowNanos() - start);
+            Assert.True(ok, "verified");
+        },
+    };
+}

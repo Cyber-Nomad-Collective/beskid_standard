@@ -1,0 +1,120 @@
+use Core.Bytes.Slice;
+use Crypto.Sha256;
+use Crypto.Sha512;
+use Crypto.Scratch;
+
+/// Hash functions available to HMAC, HKDF, and the TLS 1.3 key schedule.
+pub enum HashAlgorithm { Sha256(), Sha384(), Sha512(), }
+
+/// A running hash of any `HashAlgorithm`.
+pub enum HashState { Small(Sha256State state), Large(Sha512State state), }
+
+/// Output length in bytes.
+pub i64 HashLength(HashAlgorithm algorithm) {
+    return match algorithm {
+        HashAlgorithm::Sha256 => 32_i64,
+        HashAlgorithm::Sha384 => 48_i64,
+        HashAlgorithm::Sha512 => 64_i64,
+    };
+}
+
+/// Input block length in bytes.
+pub i64 HashBlockLength(HashAlgorithm algorithm) {
+    return match algorithm {
+        HashAlgorithm::Sha256 => 64_i64,
+        HashAlgorithm::Sha384 => 128_i64,
+        HashAlgorithm::Sha512 => 128_i64,
+    };
+}
+
+pub HashState HashNew(HashAlgorithm algorithm) {
+    return match algorithm {
+        HashAlgorithm::Sha256 => HashState::Small(Sha256.New()),
+        HashAlgorithm::Sha384 => HashState::Large(Sha512.New384()),
+        HashAlgorithm::Sha512 => HashState::Large(Sha512.New512()),
+    };
+}
+
+pub bool HashUpdateRange(HashState state, u8[] data, i64 offset, i64 count) {
+    return match state {
+        HashState::Small(s) => Sha256.UpdateRange(s, data, offset, count),
+        HashState::Large(s) => Sha512.UpdateRange(s, data, offset, count),
+    };
+}
+
+pub bool HashUpdate(HashState state, u8[] data) {
+    return HashUpdateRange(state, data, 0_i64, Slice.Len(data));
+}
+
+pub u8[] HashFinish(HashState state) {
+    return match state {
+        HashState::Small(s) => Sha256.Finish(s),
+        HashState::Large(s) => Sha512.Finish(s),
+    };
+}
+
+/// Independent copy, for reading a transcript hash while the transcript continues.
+pub HashState HashClone(HashState state) {
+    return match state {
+        HashState::Small(s) => HashState::Small(Sha256.Clone(s)),
+        HashState::Large(s) => HashState::Large(Sha512.Clone(s)),
+    };
+}
+
+/// One-shot digest.
+pub u8[] Digest(HashAlgorithm algorithm, u8[] data) {
+    HashState state = HashNew(algorithm);
+    HashUpdate(state, data);
+    return HashFinish(state);
+}
+
+/// Keyed HMAC state (RFC 2104): the inner hash has absorbed K ^ ipad, the outer K ^ opad.
+pub type HmacState {
+    HashState inner,
+    HashState outer,
+}
+
+/// Starts HMAC with `key` of any length. Keys longer than the block are hashed first.
+pub HmacState New(HashAlgorithm algorithm, u8[] key) {
+    i64 blockLength = HashBlockLength(algorithm);
+    mut u8[] k = key;
+    if Slice.Len(key) > blockLength { k = Digest(algorithm, key); }
+    u8[] ipad = Scratch.Bytes(blockLength);
+    u8[] opad = Scratch.Bytes(blockLength);
+    i64 keyLength = Slice.Len(k);
+    mut i64 i = 0_i64;
+    while i < blockLength {
+        mut u8 b = 0_u8;
+        if i < keyLength { b = k[i]; }
+        ipad[i] = (b | 0x36_u8) - (b & 0x36_u8);
+        opad[i] = (b | 0x5c_u8) - (b & 0x5c_u8);
+        i = i + 1_i64;
+    }
+    HashState inner = HashNew(algorithm);
+    HashUpdate(inner, ipad);
+    HashState outer = HashNew(algorithm);
+    HashUpdate(outer, opad);
+    return HmacState { inner: inner, outer: outer };
+}
+
+pub bool UpdateRange(HmacState state, u8[] data, i64 offset, i64 count) {
+    return HashUpdateRange(state.inner, data, offset, count);
+}
+
+pub bool Update(HmacState state, u8[] data) {
+    return HashUpdateRange(state.inner, data, 0_i64, Slice.Len(data));
+}
+
+/// Returns the full-length tag.
+pub u8[] Finish(HmacState state) {
+    u8[] innerDigest = HashFinish(state.inner);
+    HashUpdate(state.outer, innerDigest);
+    return HashFinish(state.outer);
+}
+
+/// One-shot HMAC.
+pub u8[] Compute(HashAlgorithm algorithm, u8[] key, u8[] data) {
+    HmacState state = New(algorithm, key);
+    Update(state, data);
+    return Finish(state);
+}

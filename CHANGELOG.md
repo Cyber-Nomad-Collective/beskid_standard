@@ -8,6 +8,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`
+  through the `Core.String` hub: ordinal `Compare`/`Less`, affix and
+  occurrence search, `Split`/`Lines`/`Join`, `Replace`, `Repeat`, padding,
+  ASCII case mapping, trimming, `Concat`, and a linear UTF-8 `StringBuilder`.
+- Add `Core.Text.Number` with full-range `ParseI64`, `ParseHex`, `ParseF64`,
+  typed `NumberError`, `FormatFixed`, `FormatGeneral`, `FormatHex`, and pure
+  `TruncateToI64`/`RoundToI64` conversion.
+- Add `Core.Collections.Sort` (stable merge sort, keyed sorting of any element
+  type, binary search), `Hash`, a caller-hashed open-addressing `HashTable`,
+  hashed `StringMap` and `I64Map`, an `i64`-priority `PriorityQueue`, and
+  typed `CollectionError`.
+- Extend `List` (`TryGet`, `First`, `Last`, `IndexOf`, `Contains`, `Set`,
+  `Insert`, `RemoveAt`, `Remove`, `Reverse`, `Slice`, `Concat`, `ToArray`,
+  `Clear`, `FromArray`), `Map` (`TryGet`, `GetOr`, `Keys`, `Values`,
+  `Entries`, `Clear`), and `Set` (`Union`, `Intersect`, `Difference`,
+  `IsSubsetOf`, `ToArray`, `FromArray`).
+- Add `Core.Json`: RFC 8259 parsing with typed `JsonError` offsets, escape and
+  surrogate-pair decoding, a nesting limit, compact and indented output, and
+  value construction and access helpers.
+- Add `Core.Path.Lexical` normalization, joining, relative paths, stems, and
+  parents; `Core.Time.Calendar` constant-time date arithmetic, ISO weekdays,
+  and RFC 3339 parsing and formatting; and `Testing.Expect` expectations that
+  report expected and actual values.
+- Document the 0.5.2 compiler and runtime limits that shape these APIs, and
+  how to test a modified Corelib with a released binary.
+
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent
@@ -27,6 +53,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Correct the `Core.String` reference: `Contains` scans substrings, and the
+  page now covers the full search, transform, and builder surface.
 - Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.
 - Box every Channel payload through one descriptor-backed generic value shape.
   Document sender/queue/receiver ownership at commit, cancellation and close;

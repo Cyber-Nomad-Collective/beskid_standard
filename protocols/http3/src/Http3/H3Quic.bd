@@ -11,6 +11,7 @@ use Quic.QuicConnection;
 use Quic.QuicEndpoint;
 use Quic.QuicErrors;
 use Tls.TlsConfig;
+use Uri.Host;
 
 // The QUIC services HTTP/3 needs (RFC 9114 sections 3 and 6), as module
 // functions over one concrete type. HTTP/3 code only calls these functions,
@@ -373,11 +374,46 @@ unit Shutdown(Endpoint endpoint, Fiber<unit>[] drivers) {
     return;
 }
 
-/// Opens a client QUIC connection to `address`:`port` with ALPN "h3" and
-/// waits for the handshake. The returned link owns its endpoint and driver
-/// fiber (released by `Release`). Fails closed when "h3" was not negotiated.
-/// Must run inside a fiber.
-pub Result<QuicLink, H3Error> ConnectClient(IpAddress address, i64 port, TlsClientConfig tls, i64 timeoutMillis) {
+/// Parses an IP literal: dotted IPv4 ("127.0.0.1") or IPv6 ("::1", "[::1]").
+/// Host names are not resolved here (Transport error).
+pub Result<IpAddress, H3Error> ParseAddress(string text) {
+    string bare = Host.BareHost(text);
+    if Host.IsIpv4(bare) {
+        return match Host.ParseIpv4(bare) {
+            Result::Ok(v) => Result::Ok(V4Of(v)),
+            Result::Error(_) => Result::Error(H3Error::Transport()),
+        };
+    }
+    return match Host.ParseIpv6(bare) {
+        Result::Ok(b) => Result::Ok(V6Of(b)),
+        Result::Error(_) => Result::Error(H3Error::Transport()),
+    };
+}
+
+IpAddress V4Of(i64 v) {
+    return IpAddress::V4(u8((v >> 24_i64) & 255_i64), u8((v >> 16_i64) & 255_i64), u8((v >> 8_i64) & 255_i64), u8(v & 255_i64));
+}
+
+u32 WordAt(u8[] b, i64 at) {
+    return (u32(b[at]) << 24_u32) | (u32(b[at + 1_i64]) << 16_u32) | (u32(b[at + 2_i64]) << 8_u32) | u32(b[at + 3_i64]);
+}
+
+IpAddress V6Of(u8[] b) { return IpAddress::V6(WordAt(b, 0_i64), WordAt(b, 4_i64), WordAt(b, 8_i64), WordAt(b, 12_i64)); }
+
+/// Opens a client QUIC connection to `address` (an IP literal, see
+/// ParseAddress) and `port` with ALPN "h3" and waits for the handshake. The
+/// returned link owns its endpoint and driver fiber (released by
+/// `Release`). Fails closed when "h3" was not negotiated. Must run inside a
+/// fiber.
+pub Result<QuicLink, H3Error> ConnectClient(string address, i64 port, TlsClientConfig tls, i64 timeoutMillis) {
+    Result<IpAddress, H3Error> parsed = ParseAddress(address);
+    return match parsed {
+        Result::Ok(address) => ConnectAddress(address, port, tls, timeoutMillis),
+        Result::Error(e) => Result::Error(e),
+    };
+}
+
+Result<QuicLink, H3Error> ConnectAddress(IpAddress address, i64 port, TlsClientConfig tls, i64 timeoutMillis) {
     if !ValidPort(port) { return Result::Error(H3Error::Transport()); }
     QuicConfig cfg = ClientConfig(tls);
     Result<Endpoint, QuicError> bound = QuicEndpoint.Bind(AddressOf(AnyLike(address), 0_i64), cfg, false);
@@ -413,9 +449,18 @@ Result<QuicLink, H3Error> Established(Endpoint endpoint, i64 handle, bool isServ
     return Result::Ok(QuicLink::Quic(NewSession(endpoint, handle, isServer, drivers, buffer)));
 }
 
-/// Binds a server QUIC endpoint for HTTP/3 (ALPN "h3") and starts its
-/// driver fiber. Port 0 picks a free port (see `ListenerPort`).
-pub Result<H3QuicListener, H3Error> Listen(IpAddress address, i64 port, TlsServerConfig tls) {
+/// Binds a server QUIC endpoint for HTTP/3 (ALPN "h3") on `address` (an IP
+/// literal) and starts its driver fiber. Port 0 picks a free port (see
+/// `ListenerPort`).
+pub Result<H3QuicListener, H3Error> Listen(string address, i64 port, TlsServerConfig tls) {
+    Result<IpAddress, H3Error> parsed = ParseAddress(address);
+    return match parsed {
+        Result::Ok(address) => ListenAddress(address, port, tls),
+        Result::Error(e) => Result::Error(e),
+    };
+}
+
+Result<H3QuicListener, H3Error> ListenAddress(IpAddress address, i64 port, TlsServerConfig tls) {
     if !ValidPort(port) { return Result::Error(H3Error::Transport()); }
     Result<Endpoint, QuicError> bound = QuicEndpoint.Bind(AddressOf(address, port), ServerConfig(tls), true);
     return match bound {

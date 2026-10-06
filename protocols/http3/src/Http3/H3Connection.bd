@@ -178,7 +178,12 @@ pub u8[] HeadersFrame(mut H3Conn conn, i64 streamId, HeaderField[] fields, mut u
     return H3Frame.AppendFrame(out, H3Frame.TypeHeaders(), section);
 }
 
-/// Writes a whole message (HEADERS, DATA in 16 KiB frames, optional
+/// Largest DATA frame payload written. Kept at 4 KiB so neither side ever
+/// builds an array near the 0.5.2 runtime's large-array limit (COMPILER-GAPS
+/// HQ3): receive buffers then stay below ~12 KiB.
+pub i64 DataChunk() { return 4096_i64; }
+
+/// Writes a whole message (HEADERS, DATA in 4 KiB frames, optional
 /// trailers) to `streamId` and finishes the stream.
 pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] body, HeaderField[] trailers) {
     mut u8[] out = HeadersFrame(conn, streamId, fields, Slice.New(0_i64));
@@ -187,7 +192,7 @@ pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] 
     mut i64 at = 0_i64;
     while at < total {
         mut i64 chunk = total - at;
-        if chunk > 16384_i64 { chunk = 16384_i64; }
+        if chunk > DataChunk() { chunk = DataChunk(); }
         mut u8[] frame = H3Frame.AppendVarint(Slice.New(0_i64), H3Frame.TypeData());
         frame = H3Frame.AppendVarint(frame, chunk);
         i64 head = Slice.Len(frame);
@@ -414,11 +419,20 @@ i64 OnData(H3Conn conn, H3Req req, u8[] buf, FrameHead head) {
     H3Config config = conn.config;
     if Slice.Len(req.body) + head.length > config.maxBodyBytes { return 0_i64 - H3Errors.ExcessiveLoad(); }
     if req.st[2] >= 0_i64 && Slice.Len(req.body) + head.length > req.st[2] { return 0_i64 - H3Errors.MessageError(); }
-    req.body = Concat(req.body, 0_i64, Payload(buf, head));
+    req.body = AppendRange(req.body, buf, head.start, head.length);
     return 0_i64;
 }
 
 u8[] Payload(u8[] buf, FrameHead head) { return H3Frame.Payload(buf, head); }
+
+// a followed by b[from .. from+count), in one allocation.
+u8[] AppendRange(u8[] a, u8[] b, i64 from, i64 count) {
+    i64 na = Slice.Len(a);
+    u8[] out = Slice.New(na + count);
+    if na > 0_i64 { Slice.Copy(out, 0_i64, a, 0_i64, na); }
+    if count > 0_i64 { Slice.Copy(out, na, b, from, count); }
+    return out;
+}
 
 // Advances one request stream. Returns 0 or a connection error code.
 i64 PumpRequest(mut H3Conn conn, H3Req req) {

@@ -18,10 +18,25 @@ use Http3.H3Connection;
 use Http3.H3Errors;
 use Http3.H3Quic;
 use Http3.H3Server;
-use Network.Types;
 use Tls.PeerKeys;
 use Tls.TlsConfig;
 use X509.X509Errors;
+
+// Progress marks on stdout (assertions inside fibers are not reported, W4).
+[Extern(Abi:"C", Library:"libc")]
+contract Diag { i32 putchar(i32 c); i32 fflush(i64 s); }
+
+i64[] Started() { return [0_i64]; }
+
+unit Mark(i64[] t0, string tag) {
+    if t0[0] == 0_i64 { t0[0] = H3Quic.NowNanos(); }
+    u8[] text = Convert.StringToBytes("[h3q " + tag + " t=" + Dec((H3Quic.NowNanos() - t0[0]) / 1000000_i64) + "ms]");
+    mut i64 i = 0_i64;
+    while i < Slice.Len(text) { i32 r = Diag.putchar(i32(text[i])); i = i + 1_i64; }
+    i32 nl = Diag.putchar(10_i32);
+    i32 f = Diag.fflush(0_i64);
+    return;
+}
 
 string Dec(i64 v) {
     if v < 0_i64 { return "-" + Dec(0_i64 - v); }
@@ -29,7 +44,7 @@ string Dec(i64 v) {
     return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
 }
 
-IpAddress LocalIp() { return IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8); }
+string LocalIp() { return "127.0.0.1"; }
 
 i64 PostSize() { return 20000_i64; }
 
@@ -89,34 +104,41 @@ TlsClientConfig NoClientTls() {
 
 // ------------------------------------------------------------ server
 
-i64 Serve(H3Listener listener) {
-    Result<H3Conn,H3Error> accepted = H3Server.AcceptQuic(listener, 30000_i64);
+i64 Serve(H3Listener listener, i64[] t0) {
+    Mark(t0, "server accepting");
+    Result<H3Conn,H3Error> accepted = H3Server.AcceptQuic(listener, 15000_i64);
     return match accepted {
-        Result::Ok(conn) => ServeConn(conn),
+        Result::Ok(conn) => ServeConn(conn, t0),
         Result::Error(e) => Failure(50_i64, e),
     };
 }
 
-i64 ServeConn(H3Conn start) {
+i64 ServeConn(H3Conn start, i64[] t0) {
     mut H3Conn conn = start;
+    Mark(t0, "server accepted alpn=" + H3Quic.Alpn(conn.link));
     if H3Quic.Alpn(conn.link) != "h3" { return 51_i64; }
     mut i64 served = 0_i64;
     while served < 2_i64 {
-        H3Incoming incoming = H3Server.NextRequest(conn, 30000_i64);
-        if incoming.streamId < 0_i64 { return 52_i64 + served; }
+        H3Incoming incoming = H3Server.NextRequest(conn, 15000_i64);
+        if incoming.streamId < 0_i64 { Mark(t0, "server no request err=" + Dec(H3Connection.ErrorCode(conn))); return 52_i64 + served; }
+        Mark(t0, "server request stream=" + Dec(incoming.streamId));
         Request request = incoming.request;
         Response response = Answer(request);
         Result<unit,H3Error> sent = H3Server.Respond(conn, incoming.streamId, response);
         i64 failed = match sent { Result::Ok(_) => 0_i64, Result::Error(e) => Failure(55_i64, e), };
         if failed != 0_i64 { return failed; }
+        Mark(t0, "server responded");
         served = served + 1_i64;
     }
     // Graceful shutdown: GOAWAY naming the first unprocessed request stream (8).
     if !H3Server.Shutdown(conn) { return 56_i64; }
-    H3Incoming none = H3Server.NextRequest(conn, 30000_i64);
+    Mark(t0, "server sent GOAWAY");
+    H3Incoming none = H3Server.NextRequest(conn, 15000_i64);
+    Mark(t0, "server sees close code=" + Dec(H3Connection.ErrorCode(conn)));
     if none.streamId >= 0_i64 { return 57_i64; }
     i64 code = H3Connection.ErrorCode(conn);
     H3Server.Release(conn, 2000_i64);
+    Mark(t0, "server released");
     if code != H3Errors.NoError() { return 58000_i64 + code; }
     return 0_i64;
 }
@@ -144,10 +166,11 @@ Response Answer(Request request) {
 
 // ------------------------------------------------------------ client
 
-i64 Client(i64 port) {
-    Result<H3Conn,H3Error> connected = H3Client.ConnectQuic(LocalIp(), port, ClientTls(), Config(), 30000_i64);
+i64 Client(i64 port, i64[] t0) {
+    Mark(t0, "client connecting port=" + Dec(port));
+    Result<H3Conn,H3Error> connected = H3Client.ConnectQuic(LocalIp(), port, ClientTls(), Config(), 15000_i64);
     return match connected {
-        Result::Ok(conn) => Talk(conn),
+        Result::Ok(conn) => Talk(conn, t0),
         Result::Error(e) => Failure(1_i64, e),
     };
 }
@@ -189,24 +212,29 @@ bool IsGoingAway(Result<i64,H3Error> r) {
     };
 }
 
-i64 Talk(H3Conn start) {
+i64 Talk(H3Conn start, i64[] t0) {
     mut H3Conn conn = start;
+    Mark(t0, "client connected alpn=" + H3Quic.Alpn(conn.link));
     if H3Quic.Alpn(conn.link) != "h3" { return 2_i64; }
-    i64 a = CheckGet(H3Client.Send(conn, Get("/hello"), 30000_i64));
+    i64 a = CheckGet(H3Client.Send(conn, Get("/hello"), 15000_i64));
+    Mark(t0, "client GET=" + Dec(a));
     if a != 0_i64 { return a; }
-    i64 b = CheckPost(H3Client.Send(conn, Post("/upload", Payload()), 60000_i64));
+    i64 b = CheckPost(H3Client.Send(conn, Post("/upload", Payload()), 20000_i64));
+    Mark(t0, "client POST=" + Dec(b));
     if b != 0_i64 { return b; }
     // The server's GOAWAY names stream 8: requests 0 and 4 were processed.
-    i64 deadline = H3Quic.DeadlineIn(30000_i64);
+    i64 deadline = H3Quic.DeadlineIn(15000_i64);
     while H3Connection.GoawayReceived(conn) < 0_i64 && !H3Quic.Expired(deadline) {
         i64 pumped = H3Connection.Pump(conn);
         H3Quic.Nap();
     }
     i64 goaway = H3Connection.GoawayReceived(conn);
+    Mark(t0, "client GOAWAY id=" + Dec(goaway));
     if goaway != 8_i64 { return 11000_i64 + goaway; }
     if !IsGoingAway(H3Client.Start(conn, Get("/late"))) { return 12_i64; }
     if H3Connection.ErrorCode(conn) != -1_i64 { return 13_i64; }
     H3Client.Close(conn);
+    Mark(t0, "client closed code=" + Dec(H3Quic.CloseCode(conn.link)));
     if H3Quic.CloseCode(conn.link) != H3Errors.NoError() { return 14_i64; }
     return 0_i64;
 }
@@ -223,14 +251,18 @@ i64 Scenario() {
 }
 
 i64 WithListener(H3Listener listener) {
+    i64[] t0 = Started();
+    Mark(t0, "listening");
     i64 port = H3Server.ListenPort(listener);
     if port <= 0_i64 {
         H3Server.StopListening(listener);
         return 91_i64;
     }
-    Fiber<i64> server = spawn (() => Serve(listener));
-    i64 step = Client(port);
+    Fiber<i64> server = spawn (() => Serve(listener, t0));
+    i64 step = Client(port, t0);
+    Mark(t0, "client step=" + Dec(step));
     i64 served = match server.Join() { Result::Ok(v) => v, Result::Error(_) => -9_i64, };
+    Mark(t0, "server result=" + Dec(served));
     H3Server.StopListening(listener);
     if step != 0_i64 { return step; }
     if served != 0_i64 { return 9000000_i64 + served; }

@@ -648,3 +648,54 @@ callers.
 - Workaround (`protocols/web/interop/curl-interop.sh`): a link shim directory with
   `libc.so.6.tbd -> $(xcrun --show-sdk-path)/usr/lib/libSystem.tbd` on `LIBRARY_PATH`.
   Open item: per-platform library names for extern contracts.
+## 2026-10-06, http3 over quic slice
+
+### HQ1. Duplicate import leaf is an error in the root project, silent in a dependency
+- Symptom: a test file with `use Http.Types;` and `use Network.Types;` fails with
+  "duplicate item name `Types`" / "ambiguous import" and then "unknown type `IpAddress`".
+  The same two imports inside a dependency package (H3Client) type-check without a
+  diagnostic (compare W2).
+- Workaround: keep `Network.Types` out of every module that uses `Http.Types`. The HTTP/3
+  QUIC entry points take the address as an IP-literal string (`"127.0.0.1"`, `"::1"`),
+  parsed in `H3Quic` with `Uri.Host`.
+
+### HQ2. `host` as a parameter name is a parse error
+- Symptom: `ConnectQuic(string host, ...)` gives "expected Identifier or GenericArguments"
+  (same family as C8). Workaround: `address`.
+
+### HQ3. Runtime: building an array above ~17 KiB exhausts the 1 GiB heap within a few dozen allocations
+- Symptom: `out_of_memory (5): R1 req=48 live=0 committed=1073741824 cap=1073741824`.
+  Measured in the root (no fibers), loop of `Slice.New(n)`: n = 8192 x 300, 16384 x 200,
+  16385 x 200 and 17000 x 100 pass; 18432 x 100, 20000 x 100 and even 20000 x 40 trap
+  (20000 x 5 passes). `live=0` shows the memory is garbage that is never reclaimed or
+  reused. Parked fibers do not change it (8192 x 300 with a napping fiber passes).
+  The HTTP/3 POST of 20 KB over QUIC hit this through 16 KiB DATA frames: receive
+  buffers of 16 KiB + one 8 KiB read, the payload copy and the body concatenation.
+- Workaround: `H3Connection.DataChunk()` = 4 KiB DATA frames, the body grows by one
+  copy per frame (`AppendRange`, no payload copy), QUIC reads go through one 8 KiB
+  scratch buffer per connection. Only the final body array (20000 bytes) crosses the
+  limit, once per side. A peer that sends 16 KiB DATA frames still makes the receiver
+  build 16-24 KiB buffers; bodies near `maxBodyBytes` (64 KiB) will trap until the
+  runtime is fixed. Same root cause as W5 and the "No sized array allocation" entry.
+
+### HQ4. Codegen cost: the QuicLink enum pulls QUIC + TLS into every HTTP/3 test
+- Symptom: with `QuicLink` dispatching to `Memory` or `Quic`, every test that reaches
+  `H3Connection.Pump` also generates the QUIC endpoint, TLS 1.3, X.509 and crypto code:
+  "Generate CLIF" per test in H3ExchangeTests went from 40-57 s (H3) to about 2m05s.
+  H3QuicLoopback (one test): type check 1m09s-1m27s, Generate CLIF 11m15s-11m39s (1729
+  functions); the scenario itself runs in about 8 s (handshake 1.6 s, GET 0.5 s, 20 KB POST
+  4.8 s: dominated by `Slice.New` cost for the 20000-byte bodies and 8 KiB stream windows).
+- Workaround: one heavy test per target, `--target-timeout 2400` for the QUIC target.
+  A per-transport build (no enum) needs generics over a transport or contract fields.
+
+### HQ5. QUIC API notes for HTTP/3 (library, not compiler)
+- `QuicConnection.StreamResetCode` returns 0 (not -1) for a stream that was not reset, so
+  callers must detect a reset from `StreamRead` returning -2 (H3Quic does a zero-length
+  read). There is no accessor for the peer's STOP_SENDING code (`QuicStream.PeerStopCodeOf`
+  is not reachable through `QuicConnection`/`QuicEndpoint`), so `H3Quic.PeerStopCode`
+  reports -1 on a QUIC link; the stop shows up as a failed Write.
+- `QuicConfig.Defaults` allows only 2 peer unidirectional streams; HTTP/3 needs 3
+  (control, QPACK encoder, QPACK decoder). `H3Quic.ForH3` sets 3 uni / 8 bidi.
+- A closing QUIC connection sends no more stream data, so `H3Quic.Close` waits (bounded,
+  1 s) until written stream data is acknowledged, then sends CONNECTION_CLOSE; otherwise
+  a GOAWAY written just before the close is lost.

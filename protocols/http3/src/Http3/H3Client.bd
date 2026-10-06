@@ -7,20 +7,65 @@ use Http3.H3Connection;
 use Http3.H3Errors;
 use Http3.H3Mapping;
 use Http3.H3Quic;
+use Tls.TlsConfig;
 
 // HTTP/3 client over one QUIC connection: corelib `Http.Types.Request` in,
 // `Http.Types.Response` out (the same API as corelib Http and Http2).
 // Requests run concurrently on separate request streams; the caller drives
-// progress with Poll (non-blocking) or Send (polls up to a budget).
+// progress with Poll (non-blocking) or Send (blocks until a deadline).
 
 /// Opens the client side: control stream with SETTINGS and QPACK streams.
 pub H3Conn Connect(QuicLink link, H3Config config) { return H3Connection.Open(link, false, config); }
+
+/// Connects over QUIC + TLS 1.3 with ALPN "h3" (RFC 9114 section 3.1) to
+/// `address` (an IP literal such as "127.0.0.1" or "::1") and `port`, and
+/// opens the HTTP/3 client side. `tls` supplies the
+/// server name and certificate verification; its ALPN list is replaced by
+/// "h3". Fails closed (Transport) when "h3" is not negotiated, Timeout when
+/// the handshake does not finish within `timeoutMillis`. Must run inside a
+/// fiber; `Close` releases the connection and its endpoint.
+pub Result<H3Conn,H3Error> ConnectQuic(string address, i64 port, TlsClientConfig tls, H3Config config, i64 timeoutMillis) {
+    Result<QuicLink,H3Error> linked = H3Quic.ConnectClient(address, port, tls, timeoutMillis);
+    return match linked {
+        Result::Ok(link) => Result::Ok(Connect(link, config)),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+/// Sends `request` and waits for the complete response, polling the
+/// connection until `timeoutMillis` (-1: no limit). On timeout the request
+/// stream is cancelled (H3_REQUEST_CANCELLED) and Timeout is returned.
+/// With a QUIC link this must run inside a fiber.
+pub Result<Response,H3Error> Send(mut H3Conn conn, Request request, i64 timeoutMillis) {
+    i64 deadline = H3Quic.DeadlineIn(timeoutMillis);
+    Result<i64,H3Error> started = Start(conn, request);
+    return match started {
+        Result::Ok(id) => Await(conn, id, deadline),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+Result<Response,H3Error> Await(H3Conn start, i64 id, i64 deadline) {
+    mut H3Conn conn = start;
+    while true {
+        H3Outcome outcome = Poll(conn, id);
+        if outcome.state == Ready() { return Result::Ok(outcome.response); }
+        if outcome.state == Failed() { return Result::Error(outcome.error); }
+        if H3Quic.Expired(deadline) {
+            H3Quic.Reset(conn.link, id, H3Errors.RequestCancelled());
+            H3Quic.StopSending(conn.link, id, H3Errors.RequestCancelled());
+            return Result::Error(H3Error::Timeout());
+        }
+        H3Quic.Nap();
+    }
+    return Result::Error(H3Error::Timeout());
+}
 
 /// Starts `request` on a new request stream and returns the stream id.
 /// Fails with GoingAway after the server's GOAWAY (retry elsewhere).
 pub Result<i64,H3Error> Start(mut H3Conn conn, Request request) {
     i64 failed = H3Connection.ErrorCode(conn);
-    if failed >= 0_i64 { return Result::Error(H3Error::Connection(failed)); }
+    if failed >= 0_i64 { return Result::Error(ConnectionFailure(conn, failed)); }
     if H3Connection.GoawayReceived(conn) >= 0_i64 { return Result::Error(H3Error::GoingAway()); }
     H3Config config = conn.config;
     Result<HeaderField[],H3Error> mapped = H3Mapping.RequestFields(request, config.scheme);
@@ -46,12 +91,21 @@ pub i64 Pending() { return 0_i64; }
 pub i64 Ready() { return 1_i64; }
 pub i64 Failed() { return 2_i64; }
 
-H3Outcome Outcome(i64 state, H3Error error) { return H3Outcome { state: state, response: Types.EmptyResponse(0_i64, ""), error: error }; }
+H3Outcome Outcome(i64 state, H3Error error) { return H3Outcome { state: state, response: NoResponse(), error: error }; }
+
+Response NoResponse() { return Response { status: 0_i64, reason: "", headers: Array.Empty<Header>(), body: Slice.New(0_i64) }; }
+
+// A connection-level failure: Transport when QUIC itself ended the
+// connection, otherwise the HTTP/3 application error code.
+H3Error ConnectionFailure(H3Conn conn, i64 code) {
+    if H3Quic.TransportFailed(conn.link) { return H3Error::Transport(); }
+    return H3Error::Connection(code);
+}
 
 /// Pumps the connection and reports the state of request stream `id`.
 pub H3Outcome Poll(mut H3Conn conn, i64 id) {
     i64 code = H3Connection.Pump(conn);
-    if code != 0_i64 { return Outcome(Failed(), H3Error::Connection(code)); }
+    if code != 0_i64 { return Outcome(Failed(), ConnectionFailure(conn, code)); }
     i64 at = H3Connection.FindRequest(conn, id);
     if at < 0_i64 { return Outcome(Failed(), H3Error::InvalidMessage()); }
     H3Req req = Array.Get<H3Req>(conn.requests, at);
@@ -77,9 +131,11 @@ pub HeaderField[] Trailers(H3Conn conn, i64 id) {
 }
 
 /// Sends GOAWAY (push id 0, push is never enabled) and closes the
-/// connection with H3_NO_ERROR (section 5.2).
+/// connection with H3_NO_ERROR (section 5.2). A QUIC link is then released
+/// (closing period, endpoint driver stopped).
 pub unit Close(mut H3Conn conn) {
     bool sent = H3Connection.SendGoaway(conn, 0_i64);
     H3Quic.Close(conn.link, H3Errors.NoError());
+    H3Quic.Release(conn.link, 2000_i64);
     return;
 }

@@ -466,6 +466,42 @@ without double or trailing underscores, and must be unique per target.
   immediately instead of waiting; the same call inside `spawn` waits as expected.
 - Workaround: run network scenarios as `Fiber<unit> f = spawn Scenario(); f.Join();`.
 
+## 2026-10-06, crypto CLIF optimization (0.5.3 CLI)
+
+### C53-1. A `clif` block inside a loop has no typed context
+- Symptom: `InvalidClifBlock(clif block has no typed context)` for
+  `while c { i64 next = clif { ... return %r }; m[0] = next; }` or `F(clif {...})` in a
+  `unit` function. The lowering only consults `scalar_type(key)` and the function return
+  type; a typed `let` at the top level of the body works.
+- Repro: `unit L(i64[] m) { while m[0] < m[1] { i64 next = clif { %p = payload %0 %v = load.i64 %p return %v }; m[0] = next; } return; }`
+- Workaround: make the enclosing function return `i64` (the block then takes the return type)
+  and assign `last = clif { ... }` to a `mut i64`.
+
+### C53-2. Array parameters cost about 70 ns per call; `i64[]` element stores call a barrier
+- Symptom: every array parameter is spilled and `gc_register_root`/`gc_unregister_root` are
+  called around the body (`beskid clif` shows them); a 1-array call costs ~70 ns, 2 arrays
+  ~146 ns, a scalar call ~1 ns. A Beskid `m[i] = v` on `i64[]` calls
+  `beskid_rt_v5_array_write_barrier`.
+- Workaround: loop inside the kernel function; advance cursors with `store` in the block.
+
+### C53-3. `uadd_overflow_cin` has no x86-64 lowering
+- Symptom: JIT `Unsupported feature: should be implemented in ISLE: inst = v97, v98 = uadd_overflow_cin.i64`.
+  The opcode is on the allowlist and verifies, then fails in Cranelift 0.136 isel.
+- Workaround: two `uadd_overflow` and `bor` of the carries. (`usub_overflow_bin` presumably
+  the same; avoided.)
+
+### C53-4. Array literal with a field-access element is an ICE
+- Symptom: `no ISLE lowering rule or fact for ArrayLiteralExpression` on
+  `[a, b, 0_i64, key.rounds]` and on `[0_i64, t[2], ...]`.
+- Workaround: bind the field or element to a local, or fill by index.
+
+### C53-5. `Slice.New(n)` is ~250 ns per byte
+- Symptom: 16 us for `Slice.New(64)`, 0.2 us for a 64-byte literal.
+- Workaround: `Crypto.Scratch.Bytes(n)` returns literals for common sizes.
+
+### C53-6. JIT runs at `opt_level=none`; no AES-NI/PCLMUL/SHA-NI opcodes
+- `production_isa_settings_builder` never sets `opt_level`; Cranelift 0.136 has no x86 AES,
+  CLMUL or SHA opcodes, so the clif surface cannot reach them.
 ## 2026-10-05, http3 slice
 
 ### H1. Identifiers that start with `never` are split by the lexer

@@ -56,6 +56,20 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
         k = k + 1_i64;
     }
     w[n] = 0_u32 - inv;
+    if n % 8_i64 == 0_i64 {
+        // Widths 8k run on 64-bit limbs (Mul8, MulWide) with -m^-1 mod 2^64 at limbs n+1..n+3;
+        // the 32-bit CIOS accumulator that would live there is not used at these widths.
+        i64 m64 = i64(m[0]) | (i64(m[1]) << 32_i64);
+        mut i64 inv64 = m64;
+        k = 0_i64;
+        while k < 6_i64 {
+            inv64 = inv64 * (2_i64 - m64 * inv64);
+            k = k + 1_i64;
+        }
+        i64 mprime = 0_i64 - inv64;
+        w[n + 1_i64] = u32(mprime & 4294967295_i64);
+        w[n + 2_i64] = u32((mprime >> 32_i64) & 4294967295_i64);
+    }
     w[WOne(n)] = 1_u32;
     // R^2 mod m (public modulus: variable time is fine). Write 32n = odd * 2^s. Start from
     // 2^(bits-1) < m and double up to R * 2^odd mod m; each Montgomery squaring then maps
@@ -132,6 +146,13 @@ pub unit WSetSmall(u32[] w, i64 n, i64 dst, u32 v) {
 
 /// `w[out] = w[a] * w[b] * R^-1 mod m` (CIOS, branch-free final subtraction).
 pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
+    if n == 8_i64 { Mul8(w, out, a, b); return; }
+    if n % 8_i64 == 0_i64 {
+        i64[] t = WideScratch();
+        i64[] meta = [out, a, b, n / 2_i64, 0_i64, 0_i64, 0_i64, 0_i64, WideLength(n)];
+        MulWide(w, t, meta);
+        return;
+    }
     i64 t = n + 1_i64;
     i64 m0inv = i64(w[n]);
     i64 mask = 4294967295_i64;
@@ -189,6 +210,7 @@ pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
 
 /// `w[out] = w[a] + w[b] mod m`.
 pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
+    if n == 8_i64 { Add8(w, out, a, b); return; }
     i64 s = 2_i64 * n + 3_i64;
     i64 mask = 4294967295_i64;
     mut i64 carry = 0_i64;
@@ -219,6 +241,7 @@ pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
 
 /// `w[out] = w[a] - w[b] mod m`.
 pub unit WSub(u32[] w, i64 n, i64 out, i64 a, i64 b) {
+    if n == 8_i64 { Sub8(w, out, a, b); return; }
     i64 mask = 4294967295_i64;
     mut i64 borrow = 0_i64;
     mut i64 j = 0_i64;
@@ -314,6 +337,17 @@ pub u32 WEqualBit(u32[] w, i64 n, i64 a, i64 b) {
 /// scratch slot distinct from `base`. The time depends on `exp`, never on `w[base]`.
 pub unit WPowPublic(u32[] w, i64 n, i64 out, i64 base, i64 acc, u8[] exp) {
     WToMont(w, n, acc, WOne(n));
+    if n == 8_i64 {
+        i64[] meta = [0_i64, 0_i64, acc, base];
+        Pow8(w, exp, meta);
+        WCopy(w, n, out, acc);
+        return;
+    }
+    if n % 8_i64 == 0_i64 {
+        PowWide(w, n, acc, base, exp);
+        WCopy(w, n, out, acc);
+        return;
+    }
     i64 len = Slice.Len(exp);
     mut i64 i = 0_i64;
     while i < len {
@@ -394,3 +428,1408 @@ pub u32 LessBit(u32[] a, u32[] b) {
     return u32(borrow);
 }
 
+/// MulWide scratch: t[-1], t[0..n/2+2), rounded up to whole 4-word chunks.
+i64 WideLength(i64 n) { return ((n / 2_i64 + 3_i64 + 3_i64) / 4_i64) * 4_i64; }
+
+/// A zeroed i64 scratch for MulWide, large enough for `BigNat.MaxLimbs()` (n = 256).
+i64[] WideScratch() {
+    return [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+}
+
+/// `w[acc] = w[acc]^exp` (Montgomery form) for widths 8k, one scratch for every step.
+unit PowWide(u32[] w, i64 n, i64 acc, i64 base, u8[] exp) {
+    i64[] t = WideScratch();
+    i64 len = Slice.Len(exp);
+    i64 half = n / 2_i64;
+    i64 tlen = WideLength(n);
+    mut i64 i = 0_i64;
+    while i < len {
+        u8 byte = exp[i];
+        mut i64 bit = 7_i64;
+        while bit >= 0_i64 {
+            MulWide(w, t, [acc, acc, acc, half, 0_i64, 0_i64, 0_i64, 0_i64, tlen]);
+            if ((byte >> u8(bit)) & u8(1)) == u8(1) {
+                MulWide(w, t, [acc, acc, base, half, 0_i64, 0_i64, 0_i64, 0_i64, tlen]);
+            }
+            bit = bit - 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    return;
+}
+
+// BEGIN GENERATED ModArithKernels (tools/clifgen.py)
+/// `w[out] = w[a] * R^-1 * w[b]` for width 8 (four 64-bit limbs).
+i64 Mul8(u32[] w, i64 out, i64 a, i64 b) {
+    return clif {
+        %wp1 = payload %0
+        %f2 = load.i64 %wp1+0
+        %f3 = load.i64 %wp1+8
+        %f4 = load.i64 %wp1+16
+        %f5 = load.i64 %wp1+24
+        %mprime6 = load.i64 %wp1+36
+        %c7 = iconst.i64 0
+        %c8 = iconst.i64 2
+        %v9 = ishl %2, %c8
+        %at10 = iadd %wp1, %v9
+        %f11 = load.i64 %at10+0
+        %f12 = load.i64 %at10+8
+        %f13 = load.i64 %at10+16
+        %f14 = load.i64 %at10+24
+        %v15 = ishl %3, %c8
+        %at16 = iadd %wp1, %v15
+        %f17 = load.i64 %at16+0
+        %f18 = load.i64 %at16+8
+        %f19 = load.i64 %at16+16
+        %f20 = load.i64 %at16+24
+        %v21 = imul %f11, %f17
+        %v22 = umulhi %f11, %f17
+        %v23 = imul %f12, %f17
+        %v24 = umulhi %f12, %f17
+        %s25, %c26 = uadd_overflow %v23, %v22
+        %v27 = uextend.i64 %c26
+        %v28 = iadd %v24, %v27
+        %v29 = imul %f13, %f17
+        %v30 = umulhi %f13, %f17
+        %s31, %c32 = uadd_overflow %v29, %v28
+        %v33 = uextend.i64 %c32
+        %v34 = iadd %v30, %v33
+        %v35 = imul %f14, %f17
+        %v36 = umulhi %f14, %f17
+        %s37, %c38 = uadd_overflow %v35, %v34
+        %v39 = uextend.i64 %c38
+        %v40 = iadd %v36, %v39
+        %v41 = imul %v21, %mprime6
+        %v42 = imul %v41, %f2
+        %v43 = umulhi %v41, %f2
+        %s44, %c45 = uadd_overflow %v42, %v21
+        %v46 = uextend.i64 %c45
+        %v47 = iadd %v43, %v46
+        %v48 = imul %v41, %f3
+        %v49 = umulhi %v41, %f3
+        %s50, %c51 = uadd_overflow %v48, %s25
+        %v52 = uextend.i64 %c51
+        %v53 = iadd %v49, %v52
+        %s54, %c55 = uadd_overflow %s50, %v47
+        %v56 = uextend.i64 %c55
+        %v57 = iadd %v53, %v56
+        %v58 = imul %v41, %f4
+        %v59 = umulhi %v41, %f4
+        %s60, %c61 = uadd_overflow %v58, %s31
+        %v62 = uextend.i64 %c61
+        %v63 = iadd %v59, %v62
+        %s64, %c65 = uadd_overflow %s60, %v57
+        %v66 = uextend.i64 %c65
+        %v67 = iadd %v63, %v66
+        %v68 = imul %v41, %f5
+        %v69 = umulhi %v41, %f5
+        %s70, %c71 = uadd_overflow %v68, %s37
+        %v72 = uextend.i64 %c71
+        %v73 = iadd %v69, %v72
+        %s74, %c75 = uadd_overflow %s70, %v67
+        %v76 = uextend.i64 %c75
+        %v77 = iadd %v73, %v76
+        %s78, %c79 = uadd_overflow %v40, %v77
+        %v80 = uextend.i64 %c79
+        %v81 = iadd %c7, %v80
+        %v82 = imul %f11, %f18
+        %v83 = umulhi %f11, %f18
+        %s84, %c85 = uadd_overflow %v82, %s54
+        %v86 = uextend.i64 %c85
+        %v87 = iadd %v83, %v86
+        %v88 = imul %f12, %f18
+        %v89 = umulhi %f12, %f18
+        %s90, %c91 = uadd_overflow %v88, %s64
+        %v92 = uextend.i64 %c91
+        %v93 = iadd %v89, %v92
+        %s94, %c95 = uadd_overflow %s90, %v87
+        %v96 = uextend.i64 %c95
+        %v97 = iadd %v93, %v96
+        %v98 = imul %f13, %f18
+        %v99 = umulhi %f13, %f18
+        %s100, %c101 = uadd_overflow %v98, %s74
+        %v102 = uextend.i64 %c101
+        %v103 = iadd %v99, %v102
+        %s104, %c105 = uadd_overflow %s100, %v97
+        %v106 = uextend.i64 %c105
+        %v107 = iadd %v103, %v106
+        %v108 = imul %f14, %f18
+        %v109 = umulhi %f14, %f18
+        %s110, %c111 = uadd_overflow %v108, %s78
+        %v112 = uextend.i64 %c111
+        %v113 = iadd %v109, %v112
+        %s114, %c115 = uadd_overflow %s110, %v107
+        %v116 = uextend.i64 %c115
+        %v117 = iadd %v113, %v116
+        %s118, %c119 = uadd_overflow %v81, %v117
+        %v120 = uextend.i64 %c119
+        %v121 = imul %s84, %mprime6
+        %v122 = imul %v121, %f2
+        %v123 = umulhi %v121, %f2
+        %s124, %c125 = uadd_overflow %v122, %s84
+        %v126 = uextend.i64 %c125
+        %v127 = iadd %v123, %v126
+        %v128 = imul %v121, %f3
+        %v129 = umulhi %v121, %f3
+        %s130, %c131 = uadd_overflow %v128, %s94
+        %v132 = uextend.i64 %c131
+        %v133 = iadd %v129, %v132
+        %s134, %c135 = uadd_overflow %s130, %v127
+        %v136 = uextend.i64 %c135
+        %v137 = iadd %v133, %v136
+        %v138 = imul %v121, %f4
+        %v139 = umulhi %v121, %f4
+        %s140, %c141 = uadd_overflow %v138, %s104
+        %v142 = uextend.i64 %c141
+        %v143 = iadd %v139, %v142
+        %s144, %c145 = uadd_overflow %s140, %v137
+        %v146 = uextend.i64 %c145
+        %v147 = iadd %v143, %v146
+        %v148 = imul %v121, %f5
+        %v149 = umulhi %v121, %f5
+        %s150, %c151 = uadd_overflow %v148, %s114
+        %v152 = uextend.i64 %c151
+        %v153 = iadd %v149, %v152
+        %s154, %c155 = uadd_overflow %s150, %v147
+        %v156 = uextend.i64 %c155
+        %v157 = iadd %v153, %v156
+        %s158, %c159 = uadd_overflow %s118, %v157
+        %v160 = uextend.i64 %c159
+        %v161 = iadd %v120, %v160
+        %v162 = imul %f11, %f19
+        %v163 = umulhi %f11, %f19
+        %s164, %c165 = uadd_overflow %v162, %s134
+        %v166 = uextend.i64 %c165
+        %v167 = iadd %v163, %v166
+        %v168 = imul %f12, %f19
+        %v169 = umulhi %f12, %f19
+        %s170, %c171 = uadd_overflow %v168, %s144
+        %v172 = uextend.i64 %c171
+        %v173 = iadd %v169, %v172
+        %s174, %c175 = uadd_overflow %s170, %v167
+        %v176 = uextend.i64 %c175
+        %v177 = iadd %v173, %v176
+        %v178 = imul %f13, %f19
+        %v179 = umulhi %f13, %f19
+        %s180, %c181 = uadd_overflow %v178, %s154
+        %v182 = uextend.i64 %c181
+        %v183 = iadd %v179, %v182
+        %s184, %c185 = uadd_overflow %s180, %v177
+        %v186 = uextend.i64 %c185
+        %v187 = iadd %v183, %v186
+        %v188 = imul %f14, %f19
+        %v189 = umulhi %f14, %f19
+        %s190, %c191 = uadd_overflow %v188, %s158
+        %v192 = uextend.i64 %c191
+        %v193 = iadd %v189, %v192
+        %s194, %c195 = uadd_overflow %s190, %v187
+        %v196 = uextend.i64 %c195
+        %v197 = iadd %v193, %v196
+        %s198, %c199 = uadd_overflow %v161, %v197
+        %v200 = uextend.i64 %c199
+        %v201 = imul %s164, %mprime6
+        %v202 = imul %v201, %f2
+        %v203 = umulhi %v201, %f2
+        %s204, %c205 = uadd_overflow %v202, %s164
+        %v206 = uextend.i64 %c205
+        %v207 = iadd %v203, %v206
+        %v208 = imul %v201, %f3
+        %v209 = umulhi %v201, %f3
+        %s210, %c211 = uadd_overflow %v208, %s174
+        %v212 = uextend.i64 %c211
+        %v213 = iadd %v209, %v212
+        %s214, %c215 = uadd_overflow %s210, %v207
+        %v216 = uextend.i64 %c215
+        %v217 = iadd %v213, %v216
+        %v218 = imul %v201, %f4
+        %v219 = umulhi %v201, %f4
+        %s220, %c221 = uadd_overflow %v218, %s184
+        %v222 = uextend.i64 %c221
+        %v223 = iadd %v219, %v222
+        %s224, %c225 = uadd_overflow %s220, %v217
+        %v226 = uextend.i64 %c225
+        %v227 = iadd %v223, %v226
+        %v228 = imul %v201, %f5
+        %v229 = umulhi %v201, %f5
+        %s230, %c231 = uadd_overflow %v228, %s194
+        %v232 = uextend.i64 %c231
+        %v233 = iadd %v229, %v232
+        %s234, %c235 = uadd_overflow %s230, %v227
+        %v236 = uextend.i64 %c235
+        %v237 = iadd %v233, %v236
+        %s238, %c239 = uadd_overflow %s198, %v237
+        %v240 = uextend.i64 %c239
+        %v241 = iadd %v200, %v240
+        %v242 = imul %f11, %f20
+        %v243 = umulhi %f11, %f20
+        %s244, %c245 = uadd_overflow %v242, %s214
+        %v246 = uextend.i64 %c245
+        %v247 = iadd %v243, %v246
+        %v248 = imul %f12, %f20
+        %v249 = umulhi %f12, %f20
+        %s250, %c251 = uadd_overflow %v248, %s224
+        %v252 = uextend.i64 %c251
+        %v253 = iadd %v249, %v252
+        %s254, %c255 = uadd_overflow %s250, %v247
+        %v256 = uextend.i64 %c255
+        %v257 = iadd %v253, %v256
+        %v258 = imul %f13, %f20
+        %v259 = umulhi %f13, %f20
+        %s260, %c261 = uadd_overflow %v258, %s234
+        %v262 = uextend.i64 %c261
+        %v263 = iadd %v259, %v262
+        %s264, %c265 = uadd_overflow %s260, %v257
+        %v266 = uextend.i64 %c265
+        %v267 = iadd %v263, %v266
+        %v268 = imul %f14, %f20
+        %v269 = umulhi %f14, %f20
+        %s270, %c271 = uadd_overflow %v268, %s238
+        %v272 = uextend.i64 %c271
+        %v273 = iadd %v269, %v272
+        %s274, %c275 = uadd_overflow %s270, %v267
+        %v276 = uextend.i64 %c275
+        %v277 = iadd %v273, %v276
+        %s278, %c279 = uadd_overflow %v241, %v277
+        %v280 = uextend.i64 %c279
+        %v281 = imul %s244, %mprime6
+        %v282 = imul %v281, %f2
+        %v283 = umulhi %v281, %f2
+        %s284, %c285 = uadd_overflow %v282, %s244
+        %v286 = uextend.i64 %c285
+        %v287 = iadd %v283, %v286
+        %v288 = imul %v281, %f3
+        %v289 = umulhi %v281, %f3
+        %s290, %c291 = uadd_overflow %v288, %s254
+        %v292 = uextend.i64 %c291
+        %v293 = iadd %v289, %v292
+        %s294, %c295 = uadd_overflow %s290, %v287
+        %v296 = uextend.i64 %c295
+        %v297 = iadd %v293, %v296
+        %v298 = imul %v281, %f4
+        %v299 = umulhi %v281, %f4
+        %s300, %c301 = uadd_overflow %v298, %s264
+        %v302 = uextend.i64 %c301
+        %v303 = iadd %v299, %v302
+        %s304, %c305 = uadd_overflow %s300, %v297
+        %v306 = uextend.i64 %c305
+        %v307 = iadd %v303, %v306
+        %v308 = imul %v281, %f5
+        %v309 = umulhi %v281, %f5
+        %s310, %c311 = uadd_overflow %v308, %s274
+        %v312 = uextend.i64 %c311
+        %v313 = iadd %v309, %v312
+        %s314, %c315 = uadd_overflow %s310, %v307
+        %v316 = uextend.i64 %c315
+        %v317 = iadd %v313, %v316
+        %s318, %c319 = uadd_overflow %s278, %v317
+        %v320 = uextend.i64 %c319
+        %v321 = iadd %v280, %v320
+        %d322, %w323 = usub_overflow %s294, %f2
+        %d324, %w325 = usub_overflow %s304, %f3
+        %v326 = uextend.i64 %w323
+        %d327, %w328 = usub_overflow %d324, %v326
+        %v329 = bor %w325, %w328
+        %d330, %w331 = usub_overflow %s314, %f4
+        %v332 = uextend.i64 %v329
+        %d333, %w334 = usub_overflow %d330, %v332
+        %v335 = bor %w331, %w334
+        %d336, %w337 = usub_overflow %s318, %f5
+        %v338 = uextend.i64 %v335
+        %d339, %w340 = usub_overflow %d336, %v338
+        %v341 = bor %w337, %w340
+        %v342 = uextend.i64 %v341
+        %v343 = isub %v321, %v342
+        %c344 = iconst.i64 63
+        %v345 = sshr %v343, %c344
+        %v346 = bitselect %v345, %s294, %d322
+        %v347 = bitselect %v345, %s304, %d327
+        %v348 = bitselect %v345, %s314, %d333
+        %v349 = bitselect %v345, %s318, %d339
+        %v350 = ishl %1, %c8
+        %at351 = iadd %wp1, %v350
+        store %v346, %at351+0
+        store %v347, %at351+8
+        store %v348, %at351+16
+        store %v349, %at351+24
+        return %c7
+    };
+}
+
+/// `w[out] = w[a] + w[b]` for width 8 (four 64-bit limbs).
+i64 Add8(u32[] w, i64 out, i64 a, i64 b) {
+    return clif {
+        %wp1 = payload %0
+        %f2 = load.i64 %wp1+0
+        %f3 = load.i64 %wp1+8
+        %f4 = load.i64 %wp1+16
+        %f5 = load.i64 %wp1+24
+        %mprime6 = load.i64 %wp1+36
+        %c7 = iconst.i64 0
+        %c8 = iconst.i64 2
+        %v9 = ishl %2, %c8
+        %at10 = iadd %wp1, %v9
+        %f11 = load.i64 %at10+0
+        %f12 = load.i64 %at10+8
+        %f13 = load.i64 %at10+16
+        %f14 = load.i64 %at10+24
+        %v15 = ishl %3, %c8
+        %at16 = iadd %wp1, %v15
+        %f17 = load.i64 %at16+0
+        %f18 = load.i64 %at16+8
+        %f19 = load.i64 %at16+16
+        %f20 = load.i64 %at16+24
+        %s21, %c22 = uadd_overflow %f11, %f17
+        %s23, %c24 = uadd_overflow %f12, %f18
+        %v25 = uextend.i64 %c22
+        %s26, %c27 = uadd_overflow %s23, %v25
+        %v28 = bor %c24, %c27
+        %s29, %c30 = uadd_overflow %f13, %f19
+        %v31 = uextend.i64 %v28
+        %s32, %c33 = uadd_overflow %s29, %v31
+        %v34 = bor %c30, %c33
+        %s35, %c36 = uadd_overflow %f14, %f20
+        %v37 = uextend.i64 %v34
+        %s38, %c39 = uadd_overflow %s35, %v37
+        %v40 = bor %c36, %c39
+        %v41 = uextend.i64 %v40
+        %d42, %w43 = usub_overflow %s21, %f2
+        %d44, %w45 = usub_overflow %s26, %f3
+        %v46 = uextend.i64 %w43
+        %d47, %w48 = usub_overflow %d44, %v46
+        %v49 = bor %w45, %w48
+        %d50, %w51 = usub_overflow %s32, %f4
+        %v52 = uextend.i64 %v49
+        %d53, %w54 = usub_overflow %d50, %v52
+        %v55 = bor %w51, %w54
+        %d56, %w57 = usub_overflow %s38, %f5
+        %v58 = uextend.i64 %v55
+        %d59, %w60 = usub_overflow %d56, %v58
+        %v61 = bor %w57, %w60
+        %v62 = uextend.i64 %v61
+        %v63 = isub %v41, %v62
+        %c64 = iconst.i64 63
+        %v65 = sshr %v63, %c64
+        %v66 = bitselect %v65, %s21, %d42
+        %v67 = bitselect %v65, %s26, %d47
+        %v68 = bitselect %v65, %s32, %d53
+        %v69 = bitselect %v65, %s38, %d59
+        %v70 = ishl %1, %c8
+        %at71 = iadd %wp1, %v70
+        store %v66, %at71+0
+        store %v67, %at71+8
+        store %v68, %at71+16
+        store %v69, %at71+24
+        return %c7
+    };
+}
+
+/// `w[out] = w[a] - w[b]` for width 8 (four 64-bit limbs).
+i64 Sub8(u32[] w, i64 out, i64 a, i64 b) {
+    return clif {
+        %wp1 = payload %0
+        %f2 = load.i64 %wp1+0
+        %f3 = load.i64 %wp1+8
+        %f4 = load.i64 %wp1+16
+        %f5 = load.i64 %wp1+24
+        %mprime6 = load.i64 %wp1+36
+        %c7 = iconst.i64 0
+        %c8 = iconst.i64 2
+        %v9 = ishl %2, %c8
+        %at10 = iadd %wp1, %v9
+        %f11 = load.i64 %at10+0
+        %f12 = load.i64 %at10+8
+        %f13 = load.i64 %at10+16
+        %f14 = load.i64 %at10+24
+        %v15 = ishl %3, %c8
+        %at16 = iadd %wp1, %v15
+        %f17 = load.i64 %at16+0
+        %f18 = load.i64 %at16+8
+        %f19 = load.i64 %at16+16
+        %f20 = load.i64 %at16+24
+        %d21, %w22 = usub_overflow %f11, %f17
+        %d23, %w24 = usub_overflow %f12, %f18
+        %v25 = uextend.i64 %w22
+        %d26, %w27 = usub_overflow %d23, %v25
+        %v28 = bor %w24, %w27
+        %d29, %w30 = usub_overflow %f13, %f19
+        %v31 = uextend.i64 %v28
+        %d32, %w33 = usub_overflow %d29, %v31
+        %v34 = bor %w30, %w33
+        %d35, %w36 = usub_overflow %f14, %f20
+        %v37 = uextend.i64 %v34
+        %d38, %w39 = usub_overflow %d35, %v37
+        %v40 = bor %w36, %w39
+        %v41 = uextend.i64 %v40
+        %v42 = isub %c7, %v41
+        %v43 = band %f2, %v42
+        %s44, %c45 = uadd_overflow %d21, %v43
+        %v46 = band %f3, %v42
+        %s47, %c48 = uadd_overflow %d26, %v46
+        %v49 = uextend.i64 %c45
+        %s50, %c51 = uadd_overflow %s47, %v49
+        %v52 = bor %c48, %c51
+        %v53 = band %f4, %v42
+        %s54, %c55 = uadd_overflow %d32, %v53
+        %v56 = uextend.i64 %v52
+        %s57, %c58 = uadd_overflow %s54, %v56
+        %v59 = bor %c55, %c58
+        %v60 = band %f5, %v42
+        %s61, %c62 = uadd_overflow %d38, %v60
+        %v63 = uextend.i64 %v59
+        %s64, %c65 = uadd_overflow %s61, %v63
+        %v66 = bor %c62, %c65
+        %v67 = ishl %1, %c8
+        %at68 = iadd %wp1, %v67
+        store %s44, %at68+0
+        store %s50, %at68+8
+        store %s57, %at68+16
+        store %s64, %at68+24
+        return %c7
+    };
+}
+
+/// `w[meta[2]] = w[meta[2]] ^ e` (Montgomery form) for the big-endian public exponent `e`,
+/// width 8: square, then multiply by `w[meta[3]]` when the bit is set. `meta[0]` is the
+/// byte index and `meta[1]` the bit index (7 down to 0). The time depends only on `e`.
+i64 Pow8(u32[] w, u8[] e, i64[] meta) {
+    mut i64 last = 0_i64;
+    i64 len = Slice.Len(e);
+    while meta[0] < len {
+        u8 byte = e[meta[0]];
+        mut i64 bit = 7_i64;
+        while bit >= 0_i64 {
+            last = clif {
+                %wp1 = payload %0
+                %mp2 = payload %2
+                %f3 = load.i64 %wp1+0
+                %f4 = load.i64 %wp1+8
+                %f5 = load.i64 %wp1+16
+                %f6 = load.i64 %wp1+24
+                %mprime7 = load.i64 %wp1+36
+                %c8 = iconst.i64 0
+                %acc9 = load.i64 %mp2+16
+                %c10 = iconst.i64 2
+                %v11 = ishl %acc9, %c10
+                %at12 = iadd %wp1, %v11
+                %f13 = load.i64 %at12+0
+                %f14 = load.i64 %at12+8
+                %f15 = load.i64 %at12+16
+                %f16 = load.i64 %at12+24
+                %v17 = imul %f13, %f13
+                %v18 = umulhi %f13, %f13
+                %v19 = imul %f14, %f13
+                %v20 = umulhi %f14, %f13
+                %s21, %c22 = uadd_overflow %v19, %v18
+                %v23 = uextend.i64 %c22
+                %v24 = iadd %v20, %v23
+                %v25 = imul %f15, %f13
+                %v26 = umulhi %f15, %f13
+                %s27, %c28 = uadd_overflow %v25, %v24
+                %v29 = uextend.i64 %c28
+                %v30 = iadd %v26, %v29
+                %v31 = imul %f16, %f13
+                %v32 = umulhi %f16, %f13
+                %s33, %c34 = uadd_overflow %v31, %v30
+                %v35 = uextend.i64 %c34
+                %v36 = iadd %v32, %v35
+                %v37 = imul %v17, %mprime7
+                %v38 = imul %v37, %f3
+                %v39 = umulhi %v37, %f3
+                %s40, %c41 = uadd_overflow %v38, %v17
+                %v42 = uextend.i64 %c41
+                %v43 = iadd %v39, %v42
+                %v44 = imul %v37, %f4
+                %v45 = umulhi %v37, %f4
+                %s46, %c47 = uadd_overflow %v44, %s21
+                %v48 = uextend.i64 %c47
+                %v49 = iadd %v45, %v48
+                %s50, %c51 = uadd_overflow %s46, %v43
+                %v52 = uextend.i64 %c51
+                %v53 = iadd %v49, %v52
+                %v54 = imul %v37, %f5
+                %v55 = umulhi %v37, %f5
+                %s56, %c57 = uadd_overflow %v54, %s27
+                %v58 = uextend.i64 %c57
+                %v59 = iadd %v55, %v58
+                %s60, %c61 = uadd_overflow %s56, %v53
+                %v62 = uextend.i64 %c61
+                %v63 = iadd %v59, %v62
+                %v64 = imul %v37, %f6
+                %v65 = umulhi %v37, %f6
+                %s66, %c67 = uadd_overflow %v64, %s33
+                %v68 = uextend.i64 %c67
+                %v69 = iadd %v65, %v68
+                %s70, %c71 = uadd_overflow %s66, %v63
+                %v72 = uextend.i64 %c71
+                %v73 = iadd %v69, %v72
+                %s74, %c75 = uadd_overflow %v36, %v73
+                %v76 = uextend.i64 %c75
+                %v77 = iadd %c8, %v76
+                %v78 = imul %f13, %f14
+                %v79 = umulhi %f13, %f14
+                %s80, %c81 = uadd_overflow %v78, %s50
+                %v82 = uextend.i64 %c81
+                %v83 = iadd %v79, %v82
+                %v84 = imul %f14, %f14
+                %v85 = umulhi %f14, %f14
+                %s86, %c87 = uadd_overflow %v84, %s60
+                %v88 = uextend.i64 %c87
+                %v89 = iadd %v85, %v88
+                %s90, %c91 = uadd_overflow %s86, %v83
+                %v92 = uextend.i64 %c91
+                %v93 = iadd %v89, %v92
+                %v94 = imul %f15, %f14
+                %v95 = umulhi %f15, %f14
+                %s96, %c97 = uadd_overflow %v94, %s70
+                %v98 = uextend.i64 %c97
+                %v99 = iadd %v95, %v98
+                %s100, %c101 = uadd_overflow %s96, %v93
+                %v102 = uextend.i64 %c101
+                %v103 = iadd %v99, %v102
+                %v104 = imul %f16, %f14
+                %v105 = umulhi %f16, %f14
+                %s106, %c107 = uadd_overflow %v104, %s74
+                %v108 = uextend.i64 %c107
+                %v109 = iadd %v105, %v108
+                %s110, %c111 = uadd_overflow %s106, %v103
+                %v112 = uextend.i64 %c111
+                %v113 = iadd %v109, %v112
+                %s114, %c115 = uadd_overflow %v77, %v113
+                %v116 = uextend.i64 %c115
+                %v117 = imul %s80, %mprime7
+                %v118 = imul %v117, %f3
+                %v119 = umulhi %v117, %f3
+                %s120, %c121 = uadd_overflow %v118, %s80
+                %v122 = uextend.i64 %c121
+                %v123 = iadd %v119, %v122
+                %v124 = imul %v117, %f4
+                %v125 = umulhi %v117, %f4
+                %s126, %c127 = uadd_overflow %v124, %s90
+                %v128 = uextend.i64 %c127
+                %v129 = iadd %v125, %v128
+                %s130, %c131 = uadd_overflow %s126, %v123
+                %v132 = uextend.i64 %c131
+                %v133 = iadd %v129, %v132
+                %v134 = imul %v117, %f5
+                %v135 = umulhi %v117, %f5
+                %s136, %c137 = uadd_overflow %v134, %s100
+                %v138 = uextend.i64 %c137
+                %v139 = iadd %v135, %v138
+                %s140, %c141 = uadd_overflow %s136, %v133
+                %v142 = uextend.i64 %c141
+                %v143 = iadd %v139, %v142
+                %v144 = imul %v117, %f6
+                %v145 = umulhi %v117, %f6
+                %s146, %c147 = uadd_overflow %v144, %s110
+                %v148 = uextend.i64 %c147
+                %v149 = iadd %v145, %v148
+                %s150, %c151 = uadd_overflow %s146, %v143
+                %v152 = uextend.i64 %c151
+                %v153 = iadd %v149, %v152
+                %s154, %c155 = uadd_overflow %s114, %v153
+                %v156 = uextend.i64 %c155
+                %v157 = iadd %v116, %v156
+                %v158 = imul %f13, %f15
+                %v159 = umulhi %f13, %f15
+                %s160, %c161 = uadd_overflow %v158, %s130
+                %v162 = uextend.i64 %c161
+                %v163 = iadd %v159, %v162
+                %v164 = imul %f14, %f15
+                %v165 = umulhi %f14, %f15
+                %s166, %c167 = uadd_overflow %v164, %s140
+                %v168 = uextend.i64 %c167
+                %v169 = iadd %v165, %v168
+                %s170, %c171 = uadd_overflow %s166, %v163
+                %v172 = uextend.i64 %c171
+                %v173 = iadd %v169, %v172
+                %v174 = imul %f15, %f15
+                %v175 = umulhi %f15, %f15
+                %s176, %c177 = uadd_overflow %v174, %s150
+                %v178 = uextend.i64 %c177
+                %v179 = iadd %v175, %v178
+                %s180, %c181 = uadd_overflow %s176, %v173
+                %v182 = uextend.i64 %c181
+                %v183 = iadd %v179, %v182
+                %v184 = imul %f16, %f15
+                %v185 = umulhi %f16, %f15
+                %s186, %c187 = uadd_overflow %v184, %s154
+                %v188 = uextend.i64 %c187
+                %v189 = iadd %v185, %v188
+                %s190, %c191 = uadd_overflow %s186, %v183
+                %v192 = uextend.i64 %c191
+                %v193 = iadd %v189, %v192
+                %s194, %c195 = uadd_overflow %v157, %v193
+                %v196 = uextend.i64 %c195
+                %v197 = imul %s160, %mprime7
+                %v198 = imul %v197, %f3
+                %v199 = umulhi %v197, %f3
+                %s200, %c201 = uadd_overflow %v198, %s160
+                %v202 = uextend.i64 %c201
+                %v203 = iadd %v199, %v202
+                %v204 = imul %v197, %f4
+                %v205 = umulhi %v197, %f4
+                %s206, %c207 = uadd_overflow %v204, %s170
+                %v208 = uextend.i64 %c207
+                %v209 = iadd %v205, %v208
+                %s210, %c211 = uadd_overflow %s206, %v203
+                %v212 = uextend.i64 %c211
+                %v213 = iadd %v209, %v212
+                %v214 = imul %v197, %f5
+                %v215 = umulhi %v197, %f5
+                %s216, %c217 = uadd_overflow %v214, %s180
+                %v218 = uextend.i64 %c217
+                %v219 = iadd %v215, %v218
+                %s220, %c221 = uadd_overflow %s216, %v213
+                %v222 = uextend.i64 %c221
+                %v223 = iadd %v219, %v222
+                %v224 = imul %v197, %f6
+                %v225 = umulhi %v197, %f6
+                %s226, %c227 = uadd_overflow %v224, %s190
+                %v228 = uextend.i64 %c227
+                %v229 = iadd %v225, %v228
+                %s230, %c231 = uadd_overflow %s226, %v223
+                %v232 = uextend.i64 %c231
+                %v233 = iadd %v229, %v232
+                %s234, %c235 = uadd_overflow %s194, %v233
+                %v236 = uextend.i64 %c235
+                %v237 = iadd %v196, %v236
+                %v238 = imul %f13, %f16
+                %v239 = umulhi %f13, %f16
+                %s240, %c241 = uadd_overflow %v238, %s210
+                %v242 = uextend.i64 %c241
+                %v243 = iadd %v239, %v242
+                %v244 = imul %f14, %f16
+                %v245 = umulhi %f14, %f16
+                %s246, %c247 = uadd_overflow %v244, %s220
+                %v248 = uextend.i64 %c247
+                %v249 = iadd %v245, %v248
+                %s250, %c251 = uadd_overflow %s246, %v243
+                %v252 = uextend.i64 %c251
+                %v253 = iadd %v249, %v252
+                %v254 = imul %f15, %f16
+                %v255 = umulhi %f15, %f16
+                %s256, %c257 = uadd_overflow %v254, %s230
+                %v258 = uextend.i64 %c257
+                %v259 = iadd %v255, %v258
+                %s260, %c261 = uadd_overflow %s256, %v253
+                %v262 = uextend.i64 %c261
+                %v263 = iadd %v259, %v262
+                %v264 = imul %f16, %f16
+                %v265 = umulhi %f16, %f16
+                %s266, %c267 = uadd_overflow %v264, %s234
+                %v268 = uextend.i64 %c267
+                %v269 = iadd %v265, %v268
+                %s270, %c271 = uadd_overflow %s266, %v263
+                %v272 = uextend.i64 %c271
+                %v273 = iadd %v269, %v272
+                %s274, %c275 = uadd_overflow %v237, %v273
+                %v276 = uextend.i64 %c275
+                %v277 = imul %s240, %mprime7
+                %v278 = imul %v277, %f3
+                %v279 = umulhi %v277, %f3
+                %s280, %c281 = uadd_overflow %v278, %s240
+                %v282 = uextend.i64 %c281
+                %v283 = iadd %v279, %v282
+                %v284 = imul %v277, %f4
+                %v285 = umulhi %v277, %f4
+                %s286, %c287 = uadd_overflow %v284, %s250
+                %v288 = uextend.i64 %c287
+                %v289 = iadd %v285, %v288
+                %s290, %c291 = uadd_overflow %s286, %v283
+                %v292 = uextend.i64 %c291
+                %v293 = iadd %v289, %v292
+                %v294 = imul %v277, %f5
+                %v295 = umulhi %v277, %f5
+                %s296, %c297 = uadd_overflow %v294, %s260
+                %v298 = uextend.i64 %c297
+                %v299 = iadd %v295, %v298
+                %s300, %c301 = uadd_overflow %s296, %v293
+                %v302 = uextend.i64 %c301
+                %v303 = iadd %v299, %v302
+                %v304 = imul %v277, %f6
+                %v305 = umulhi %v277, %f6
+                %s306, %c307 = uadd_overflow %v304, %s270
+                %v308 = uextend.i64 %c307
+                %v309 = iadd %v305, %v308
+                %s310, %c311 = uadd_overflow %s306, %v303
+                %v312 = uextend.i64 %c311
+                %v313 = iadd %v309, %v312
+                %s314, %c315 = uadd_overflow %s274, %v313
+                %v316 = uextend.i64 %c315
+                %v317 = iadd %v276, %v316
+                %d318, %w319 = usub_overflow %s290, %f3
+                %d320, %w321 = usub_overflow %s300, %f4
+                %v322 = uextend.i64 %w319
+                %d323, %w324 = usub_overflow %d320, %v322
+                %v325 = bor %w321, %w324
+                %d326, %w327 = usub_overflow %s310, %f5
+                %v328 = uextend.i64 %v325
+                %d329, %w330 = usub_overflow %d326, %v328
+                %v331 = bor %w327, %w330
+                %d332, %w333 = usub_overflow %s314, %f6
+                %v334 = uextend.i64 %v331
+                %d335, %w336 = usub_overflow %d332, %v334
+                %v337 = bor %w333, %w336
+                %v338 = uextend.i64 %v337
+                %v339 = isub %v317, %v338
+                %c340 = iconst.i64 63
+                %v341 = sshr %v339, %c340
+                %v342 = bitselect %v341, %s290, %d318
+                %v343 = bitselect %v341, %s300, %d323
+                %v344 = bitselect %v341, %s310, %d329
+                %v345 = bitselect %v341, %s314, %d335
+                store %v342, %at12+0
+                store %v343, %at12+8
+                store %v344, %at12+16
+                store %v345, %at12+24
+                return %c8
+            };
+            if ((byte >> u8(bit)) & u8(1)) == u8(1) {
+                last = clif {
+                    %wp1 = payload %0
+                    %mp2 = payload %2
+                    %f3 = load.i64 %wp1+0
+                    %f4 = load.i64 %wp1+8
+                    %f5 = load.i64 %wp1+16
+                    %f6 = load.i64 %wp1+24
+                    %mprime7 = load.i64 %wp1+36
+                    %c8 = iconst.i64 0
+                    %acc9 = load.i64 %mp2+16
+                    %c10 = iconst.i64 2
+                    %v11 = ishl %acc9, %c10
+                    %at12 = iadd %wp1, %v11
+                    %f13 = load.i64 %at12+0
+                    %f14 = load.i64 %at12+8
+                    %f15 = load.i64 %at12+16
+                    %f16 = load.i64 %at12+24
+                    %base17 = load.i64 %mp2+24
+                    %v18 = ishl %base17, %c10
+                    %at19 = iadd %wp1, %v18
+                    %f20 = load.i64 %at19+0
+                    %f21 = load.i64 %at19+8
+                    %f22 = load.i64 %at19+16
+                    %f23 = load.i64 %at19+24
+                    %v24 = imul %f13, %f20
+                    %v25 = umulhi %f13, %f20
+                    %v26 = imul %f14, %f20
+                    %v27 = umulhi %f14, %f20
+                    %s28, %c29 = uadd_overflow %v26, %v25
+                    %v30 = uextend.i64 %c29
+                    %v31 = iadd %v27, %v30
+                    %v32 = imul %f15, %f20
+                    %v33 = umulhi %f15, %f20
+                    %s34, %c35 = uadd_overflow %v32, %v31
+                    %v36 = uextend.i64 %c35
+                    %v37 = iadd %v33, %v36
+                    %v38 = imul %f16, %f20
+                    %v39 = umulhi %f16, %f20
+                    %s40, %c41 = uadd_overflow %v38, %v37
+                    %v42 = uextend.i64 %c41
+                    %v43 = iadd %v39, %v42
+                    %v44 = imul %v24, %mprime7
+                    %v45 = imul %v44, %f3
+                    %v46 = umulhi %v44, %f3
+                    %s47, %c48 = uadd_overflow %v45, %v24
+                    %v49 = uextend.i64 %c48
+                    %v50 = iadd %v46, %v49
+                    %v51 = imul %v44, %f4
+                    %v52 = umulhi %v44, %f4
+                    %s53, %c54 = uadd_overflow %v51, %s28
+                    %v55 = uextend.i64 %c54
+                    %v56 = iadd %v52, %v55
+                    %s57, %c58 = uadd_overflow %s53, %v50
+                    %v59 = uextend.i64 %c58
+                    %v60 = iadd %v56, %v59
+                    %v61 = imul %v44, %f5
+                    %v62 = umulhi %v44, %f5
+                    %s63, %c64 = uadd_overflow %v61, %s34
+                    %v65 = uextend.i64 %c64
+                    %v66 = iadd %v62, %v65
+                    %s67, %c68 = uadd_overflow %s63, %v60
+                    %v69 = uextend.i64 %c68
+                    %v70 = iadd %v66, %v69
+                    %v71 = imul %v44, %f6
+                    %v72 = umulhi %v44, %f6
+                    %s73, %c74 = uadd_overflow %v71, %s40
+                    %v75 = uextend.i64 %c74
+                    %v76 = iadd %v72, %v75
+                    %s77, %c78 = uadd_overflow %s73, %v70
+                    %v79 = uextend.i64 %c78
+                    %v80 = iadd %v76, %v79
+                    %s81, %c82 = uadd_overflow %v43, %v80
+                    %v83 = uextend.i64 %c82
+                    %v84 = iadd %c8, %v83
+                    %v85 = imul %f13, %f21
+                    %v86 = umulhi %f13, %f21
+                    %s87, %c88 = uadd_overflow %v85, %s57
+                    %v89 = uextend.i64 %c88
+                    %v90 = iadd %v86, %v89
+                    %v91 = imul %f14, %f21
+                    %v92 = umulhi %f14, %f21
+                    %s93, %c94 = uadd_overflow %v91, %s67
+                    %v95 = uextend.i64 %c94
+                    %v96 = iadd %v92, %v95
+                    %s97, %c98 = uadd_overflow %s93, %v90
+                    %v99 = uextend.i64 %c98
+                    %v100 = iadd %v96, %v99
+                    %v101 = imul %f15, %f21
+                    %v102 = umulhi %f15, %f21
+                    %s103, %c104 = uadd_overflow %v101, %s77
+                    %v105 = uextend.i64 %c104
+                    %v106 = iadd %v102, %v105
+                    %s107, %c108 = uadd_overflow %s103, %v100
+                    %v109 = uextend.i64 %c108
+                    %v110 = iadd %v106, %v109
+                    %v111 = imul %f16, %f21
+                    %v112 = umulhi %f16, %f21
+                    %s113, %c114 = uadd_overflow %v111, %s81
+                    %v115 = uextend.i64 %c114
+                    %v116 = iadd %v112, %v115
+                    %s117, %c118 = uadd_overflow %s113, %v110
+                    %v119 = uextend.i64 %c118
+                    %v120 = iadd %v116, %v119
+                    %s121, %c122 = uadd_overflow %v84, %v120
+                    %v123 = uextend.i64 %c122
+                    %v124 = imul %s87, %mprime7
+                    %v125 = imul %v124, %f3
+                    %v126 = umulhi %v124, %f3
+                    %s127, %c128 = uadd_overflow %v125, %s87
+                    %v129 = uextend.i64 %c128
+                    %v130 = iadd %v126, %v129
+                    %v131 = imul %v124, %f4
+                    %v132 = umulhi %v124, %f4
+                    %s133, %c134 = uadd_overflow %v131, %s97
+                    %v135 = uextend.i64 %c134
+                    %v136 = iadd %v132, %v135
+                    %s137, %c138 = uadd_overflow %s133, %v130
+                    %v139 = uextend.i64 %c138
+                    %v140 = iadd %v136, %v139
+                    %v141 = imul %v124, %f5
+                    %v142 = umulhi %v124, %f5
+                    %s143, %c144 = uadd_overflow %v141, %s107
+                    %v145 = uextend.i64 %c144
+                    %v146 = iadd %v142, %v145
+                    %s147, %c148 = uadd_overflow %s143, %v140
+                    %v149 = uextend.i64 %c148
+                    %v150 = iadd %v146, %v149
+                    %v151 = imul %v124, %f6
+                    %v152 = umulhi %v124, %f6
+                    %s153, %c154 = uadd_overflow %v151, %s117
+                    %v155 = uextend.i64 %c154
+                    %v156 = iadd %v152, %v155
+                    %s157, %c158 = uadd_overflow %s153, %v150
+                    %v159 = uextend.i64 %c158
+                    %v160 = iadd %v156, %v159
+                    %s161, %c162 = uadd_overflow %s121, %v160
+                    %v163 = uextend.i64 %c162
+                    %v164 = iadd %v123, %v163
+                    %v165 = imul %f13, %f22
+                    %v166 = umulhi %f13, %f22
+                    %s167, %c168 = uadd_overflow %v165, %s137
+                    %v169 = uextend.i64 %c168
+                    %v170 = iadd %v166, %v169
+                    %v171 = imul %f14, %f22
+                    %v172 = umulhi %f14, %f22
+                    %s173, %c174 = uadd_overflow %v171, %s147
+                    %v175 = uextend.i64 %c174
+                    %v176 = iadd %v172, %v175
+                    %s177, %c178 = uadd_overflow %s173, %v170
+                    %v179 = uextend.i64 %c178
+                    %v180 = iadd %v176, %v179
+                    %v181 = imul %f15, %f22
+                    %v182 = umulhi %f15, %f22
+                    %s183, %c184 = uadd_overflow %v181, %s157
+                    %v185 = uextend.i64 %c184
+                    %v186 = iadd %v182, %v185
+                    %s187, %c188 = uadd_overflow %s183, %v180
+                    %v189 = uextend.i64 %c188
+                    %v190 = iadd %v186, %v189
+                    %v191 = imul %f16, %f22
+                    %v192 = umulhi %f16, %f22
+                    %s193, %c194 = uadd_overflow %v191, %s161
+                    %v195 = uextend.i64 %c194
+                    %v196 = iadd %v192, %v195
+                    %s197, %c198 = uadd_overflow %s193, %v190
+                    %v199 = uextend.i64 %c198
+                    %v200 = iadd %v196, %v199
+                    %s201, %c202 = uadd_overflow %v164, %v200
+                    %v203 = uextend.i64 %c202
+                    %v204 = imul %s167, %mprime7
+                    %v205 = imul %v204, %f3
+                    %v206 = umulhi %v204, %f3
+                    %s207, %c208 = uadd_overflow %v205, %s167
+                    %v209 = uextend.i64 %c208
+                    %v210 = iadd %v206, %v209
+                    %v211 = imul %v204, %f4
+                    %v212 = umulhi %v204, %f4
+                    %s213, %c214 = uadd_overflow %v211, %s177
+                    %v215 = uextend.i64 %c214
+                    %v216 = iadd %v212, %v215
+                    %s217, %c218 = uadd_overflow %s213, %v210
+                    %v219 = uextend.i64 %c218
+                    %v220 = iadd %v216, %v219
+                    %v221 = imul %v204, %f5
+                    %v222 = umulhi %v204, %f5
+                    %s223, %c224 = uadd_overflow %v221, %s187
+                    %v225 = uextend.i64 %c224
+                    %v226 = iadd %v222, %v225
+                    %s227, %c228 = uadd_overflow %s223, %v220
+                    %v229 = uextend.i64 %c228
+                    %v230 = iadd %v226, %v229
+                    %v231 = imul %v204, %f6
+                    %v232 = umulhi %v204, %f6
+                    %s233, %c234 = uadd_overflow %v231, %s197
+                    %v235 = uextend.i64 %c234
+                    %v236 = iadd %v232, %v235
+                    %s237, %c238 = uadd_overflow %s233, %v230
+                    %v239 = uextend.i64 %c238
+                    %v240 = iadd %v236, %v239
+                    %s241, %c242 = uadd_overflow %s201, %v240
+                    %v243 = uextend.i64 %c242
+                    %v244 = iadd %v203, %v243
+                    %v245 = imul %f13, %f23
+                    %v246 = umulhi %f13, %f23
+                    %s247, %c248 = uadd_overflow %v245, %s217
+                    %v249 = uextend.i64 %c248
+                    %v250 = iadd %v246, %v249
+                    %v251 = imul %f14, %f23
+                    %v252 = umulhi %f14, %f23
+                    %s253, %c254 = uadd_overflow %v251, %s227
+                    %v255 = uextend.i64 %c254
+                    %v256 = iadd %v252, %v255
+                    %s257, %c258 = uadd_overflow %s253, %v250
+                    %v259 = uextend.i64 %c258
+                    %v260 = iadd %v256, %v259
+                    %v261 = imul %f15, %f23
+                    %v262 = umulhi %f15, %f23
+                    %s263, %c264 = uadd_overflow %v261, %s237
+                    %v265 = uextend.i64 %c264
+                    %v266 = iadd %v262, %v265
+                    %s267, %c268 = uadd_overflow %s263, %v260
+                    %v269 = uextend.i64 %c268
+                    %v270 = iadd %v266, %v269
+                    %v271 = imul %f16, %f23
+                    %v272 = umulhi %f16, %f23
+                    %s273, %c274 = uadd_overflow %v271, %s241
+                    %v275 = uextend.i64 %c274
+                    %v276 = iadd %v272, %v275
+                    %s277, %c278 = uadd_overflow %s273, %v270
+                    %v279 = uextend.i64 %c278
+                    %v280 = iadd %v276, %v279
+                    %s281, %c282 = uadd_overflow %v244, %v280
+                    %v283 = uextend.i64 %c282
+                    %v284 = imul %s247, %mprime7
+                    %v285 = imul %v284, %f3
+                    %v286 = umulhi %v284, %f3
+                    %s287, %c288 = uadd_overflow %v285, %s247
+                    %v289 = uextend.i64 %c288
+                    %v290 = iadd %v286, %v289
+                    %v291 = imul %v284, %f4
+                    %v292 = umulhi %v284, %f4
+                    %s293, %c294 = uadd_overflow %v291, %s257
+                    %v295 = uextend.i64 %c294
+                    %v296 = iadd %v292, %v295
+                    %s297, %c298 = uadd_overflow %s293, %v290
+                    %v299 = uextend.i64 %c298
+                    %v300 = iadd %v296, %v299
+                    %v301 = imul %v284, %f5
+                    %v302 = umulhi %v284, %f5
+                    %s303, %c304 = uadd_overflow %v301, %s267
+                    %v305 = uextend.i64 %c304
+                    %v306 = iadd %v302, %v305
+                    %s307, %c308 = uadd_overflow %s303, %v300
+                    %v309 = uextend.i64 %c308
+                    %v310 = iadd %v306, %v309
+                    %v311 = imul %v284, %f6
+                    %v312 = umulhi %v284, %f6
+                    %s313, %c314 = uadd_overflow %v311, %s277
+                    %v315 = uextend.i64 %c314
+                    %v316 = iadd %v312, %v315
+                    %s317, %c318 = uadd_overflow %s313, %v310
+                    %v319 = uextend.i64 %c318
+                    %v320 = iadd %v316, %v319
+                    %s321, %c322 = uadd_overflow %s281, %v320
+                    %v323 = uextend.i64 %c322
+                    %v324 = iadd %v283, %v323
+                    %d325, %w326 = usub_overflow %s297, %f3
+                    %d327, %w328 = usub_overflow %s307, %f4
+                    %v329 = uextend.i64 %w326
+                    %d330, %w331 = usub_overflow %d327, %v329
+                    %v332 = bor %w328, %w331
+                    %d333, %w334 = usub_overflow %s317, %f5
+                    %v335 = uextend.i64 %v332
+                    %d336, %w337 = usub_overflow %d333, %v335
+                    %v338 = bor %w334, %w337
+                    %d339, %w340 = usub_overflow %s321, %f6
+                    %v341 = uextend.i64 %v338
+                    %d342, %w343 = usub_overflow %d339, %v341
+                    %v344 = bor %w340, %w343
+                    %v345 = uextend.i64 %v344
+                    %v346 = isub %v324, %v345
+                    %c347 = iconst.i64 63
+                    %v348 = sshr %v346, %c347
+                    %v349 = bitselect %v348, %s297, %d325
+                    %v350 = bitselect %v348, %s307, %d330
+                    %v351 = bitselect %v348, %s317, %d336
+                    %v352 = bitselect %v348, %s321, %d342
+                    store %v349, %at12+0
+                    store %v350, %at12+8
+                    store %v351, %at12+16
+                    store %v352, %at12+24
+                    return %c8
+                };
+            }
+            bit = bit - 1_i64;
+        }
+        meta[0] = meta[0] + 1_i64;
+    }
+    return last;
+}
+
+/// `w[meta[0]] = w[meta[1]] * w[meta[2]] * R^-1 mod m` for widths n = 8k (64-bit CIOS,
+/// Koc-Acar-Kaliski 1996, in 4-limb chunks). Branch-free in the operands; `t` holds
+/// meta[8] >= n/2 + 3 words. Outputs may alias inputs.
+i64 MulWide(u32[] w, i64[] t, i64[] meta) {
+    mut i64 last = 0_i64;
+    while meta[5] < meta[8] {
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %j5 = load.i64 %mp4+40
+            %c6 = iconst.i64 3
+            %v7 = ishl %j5, %c6
+            %at8 = iadd %tp3, %v7
+            store %c1, %at8+0
+            store %c1, %at8+8
+            store %c1, %at8+16
+            store %c1, %at8+24
+            %c9 = iconst.i64 4
+            %v10 = iadd %j5, %c9
+            store %v10, %mp4+40
+            return %v10
+        };
+    }
+    last = clif {
+        %c1 = iconst.i64 0
+        %wp2 = payload %0
+        %tp3 = payload %1
+        %mp4 = payload %2
+        store %c1, %mp4+32
+        store %c1, %mp4+40
+        store %c1, %mp4+48
+        return %c1
+    };
+    while meta[4] < meta[3] {
+        while meta[5] < meta[3] {
+            last = clif {
+                %c1 = iconst.i64 0
+                %wp2 = payload %0
+                %tp3 = payload %1
+                %mp4 = payload %2
+                %i5 = load.i64 %mp4+32
+                %j6 = load.i64 %mp4+40
+                %carry7 = load.i64 %mp4+48
+                %b8 = load.i64 %mp4+16
+                %c9 = iconst.i64 2
+                %v10 = ishl %b8, %c9
+                %at11 = iadd %wp2, %v10
+                %c12 = iconst.i64 3
+                %v13 = ishl %i5, %c12
+                %at14 = iadd %at11, %v13
+                %bi15 = load.i64 %at14
+                %a16 = load.i64 %mp4+8
+                %v17 = ishl %a16, %c9
+                %at18 = iadd %wp2, %v17
+                %v19 = ishl %j6, %c12
+                %at20 = iadd %at18, %v19
+                %v21 = ishl %j6, %c12
+                %at22 = iadd %tp3, %v21
+                %v23 = load.i64 %at20+0
+                %v24 = load.i64 %at22+8
+                %v25 = imul %v23, %bi15
+                %v26 = umulhi %v23, %bi15
+                %s27, %c28 = uadd_overflow %v25, %v24
+                %s29, %c30 = uadd_overflow %s27, %carry7
+                %v31 = uextend.i64 %c28
+                %v32 = iadd %v26, %v31
+                %v33 = uextend.i64 %c30
+                %v34 = iadd %v32, %v33
+                store %s29, %at22+8
+                %v35 = load.i64 %at20+8
+                %v36 = load.i64 %at22+16
+                %v37 = imul %v35, %bi15
+                %v38 = umulhi %v35, %bi15
+                %s39, %c40 = uadd_overflow %v37, %v36
+                %s41, %c42 = uadd_overflow %s39, %v34
+                %v43 = uextend.i64 %c40
+                %v44 = iadd %v38, %v43
+                %v45 = uextend.i64 %c42
+                %v46 = iadd %v44, %v45
+                store %s41, %at22+16
+                %v47 = load.i64 %at20+16
+                %v48 = load.i64 %at22+24
+                %v49 = imul %v47, %bi15
+                %v50 = umulhi %v47, %bi15
+                %s51, %c52 = uadd_overflow %v49, %v48
+                %s53, %c54 = uadd_overflow %s51, %v46
+                %v55 = uextend.i64 %c52
+                %v56 = iadd %v50, %v55
+                %v57 = uextend.i64 %c54
+                %v58 = iadd %v56, %v57
+                store %s53, %at22+24
+                %v59 = load.i64 %at20+24
+                %v60 = load.i64 %at22+32
+                %v61 = imul %v59, %bi15
+                %v62 = umulhi %v59, %bi15
+                %s63, %c64 = uadd_overflow %v61, %v60
+                %s65, %c66 = uadd_overflow %s63, %v58
+                %v67 = uextend.i64 %c64
+                %v68 = iadd %v62, %v67
+                %v69 = uextend.i64 %c66
+                %v70 = iadd %v68, %v69
+                store %s65, %at22+32
+                store %v70, %mp4+48
+                %c71 = iconst.i64 4
+                %v72 = iadd %j6, %c71
+                store %v72, %mp4+40
+                return %v72
+            };
+        }
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %n5 = load.i64 %mp4+24
+            %carry6 = load.i64 %mp4+48
+            %c7 = iconst.i64 3
+            %v8 = ishl %n5, %c7
+            %at9 = iadd %tp3, %v8
+            %v10 = load.i64 %at9+8
+            %s11, %c12 = uadd_overflow %v10, %carry6
+            store %s11, %at9+8
+            %v13 = uextend.i64 %c12
+            store %v13, %at9+16
+            %t014 = load.i64 %tp3+8
+            %v15 = ishl %n5, %c7
+            %at16 = iadd %wp2, %v15
+            %c17 = iconst.i64 4
+            %at18 = iadd %at16, %c17
+            %mprime19 = load.i64 %at18
+            %q20 = imul %t014, %mprime19
+            store %q20, %mp4+56
+            store %c1, %mp4+40
+            store %c1, %mp4+48
+            return %q20
+        };
+        while meta[5] < meta[3] {
+            last = clif {
+                %c1 = iconst.i64 0
+                %wp2 = payload %0
+                %tp3 = payload %1
+                %mp4 = payload %2
+                %j5 = load.i64 %mp4+40
+                %carry6 = load.i64 %mp4+48
+                %q7 = load.i64 %mp4+56
+                %c8 = iconst.i64 3
+                %v9 = ishl %j5, %c8
+                %at10 = iadd %wp2, %v9
+                %v11 = ishl %j5, %c8
+                %at12 = iadd %tp3, %v11
+                %v13 = load.i64 %at10+0
+                %v14 = load.i64 %at12+8
+                %v15 = imul %q7, %v13
+                %v16 = umulhi %q7, %v13
+                %s17, %c18 = uadd_overflow %v15, %v14
+                %s19, %c20 = uadd_overflow %s17, %carry6
+                %v21 = uextend.i64 %c18
+                %v22 = iadd %v16, %v21
+                %v23 = uextend.i64 %c20
+                %v24 = iadd %v22, %v23
+                store %s19, %at12+0
+                %v25 = load.i64 %at10+8
+                %v26 = load.i64 %at12+16
+                %v27 = imul %q7, %v25
+                %v28 = umulhi %q7, %v25
+                %s29, %c30 = uadd_overflow %v27, %v26
+                %s31, %c32 = uadd_overflow %s29, %v24
+                %v33 = uextend.i64 %c30
+                %v34 = iadd %v28, %v33
+                %v35 = uextend.i64 %c32
+                %v36 = iadd %v34, %v35
+                store %s31, %at12+8
+                %v37 = load.i64 %at10+16
+                %v38 = load.i64 %at12+24
+                %v39 = imul %q7, %v37
+                %v40 = umulhi %q7, %v37
+                %s41, %c42 = uadd_overflow %v39, %v38
+                %s43, %c44 = uadd_overflow %s41, %v36
+                %v45 = uextend.i64 %c42
+                %v46 = iadd %v40, %v45
+                %v47 = uextend.i64 %c44
+                %v48 = iadd %v46, %v47
+                store %s43, %at12+16
+                %v49 = load.i64 %at10+24
+                %v50 = load.i64 %at12+32
+                %v51 = imul %q7, %v49
+                %v52 = umulhi %q7, %v49
+                %s53, %c54 = uadd_overflow %v51, %v50
+                %s55, %c56 = uadd_overflow %s53, %v48
+                %v57 = uextend.i64 %c54
+                %v58 = iadd %v52, %v57
+                %v59 = uextend.i64 %c56
+                %v60 = iadd %v58, %v59
+                store %s55, %at12+24
+                store %v60, %mp4+48
+                %c61 = iconst.i64 4
+                %v62 = iadd %j5, %c61
+                store %v62, %mp4+40
+                return %v62
+            };
+        }
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %n5 = load.i64 %mp4+24
+            %carry6 = load.i64 %mp4+48
+            %i7 = load.i64 %mp4+32
+            %c8 = iconst.i64 3
+            %v9 = ishl %n5, %c8
+            %at10 = iadd %tp3, %v9
+            %v11 = load.i64 %at10+8
+            %v12 = load.i64 %at10+16
+            %s13, %c14 = uadd_overflow %v11, %carry6
+            store %s13, %at10
+            %v15 = uextend.i64 %c14
+            %v16 = iadd %v12, %v15
+            store %v16, %at10+8
+            store %c1, %mp4+40
+            store %c1, %mp4+48
+            %c17 = iconst.i64 1
+            %v18 = iadd %i7, %c17
+            store %v18, %mp4+32
+            return %v18
+        };
+    }
+    while meta[5] < meta[3] {
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %j5 = load.i64 %mp4+40
+            %borrow6 = load.i64 %mp4+48
+            %c7 = iconst.i64 3
+            %v8 = ishl %j5, %c7
+            %at9 = iadd %wp2, %v8
+            %v10 = ishl %j5, %c7
+            %at11 = iadd %tp3, %v10
+            %out12 = load.i64 %mp4+0
+            %c13 = iconst.i64 2
+            %v14 = ishl %out12, %c13
+            %at15 = iadd %wp2, %v14
+            %v16 = ishl %j5, %c7
+            %at17 = iadd %at15, %v16
+            %v18 = load.i64 %at9+0
+            %v19 = load.i64 %at11+8
+            %d20, %w21 = usub_overflow %v19, %v18
+            %d22, %w23 = usub_overflow %d20, %borrow6
+            store %d22, %at17+0
+            %v24 = uextend.i64 %w21
+            %v25 = uextend.i64 %w23
+            %v26 = iadd %v24, %v25
+            %v27 = load.i64 %at9+8
+            %v28 = load.i64 %at11+16
+            %d29, %w30 = usub_overflow %v28, %v27
+            %d31, %w32 = usub_overflow %d29, %v26
+            store %d31, %at17+8
+            %v33 = uextend.i64 %w30
+            %v34 = uextend.i64 %w32
+            %v35 = iadd %v33, %v34
+            %v36 = load.i64 %at9+16
+            %v37 = load.i64 %at11+24
+            %d38, %w39 = usub_overflow %v37, %v36
+            %d40, %w41 = usub_overflow %d38, %v35
+            store %d40, %at17+16
+            %v42 = uextend.i64 %w39
+            %v43 = uextend.i64 %w41
+            %v44 = iadd %v42, %v43
+            %v45 = load.i64 %at9+24
+            %v46 = load.i64 %at11+32
+            %d47, %w48 = usub_overflow %v46, %v45
+            %d49, %w50 = usub_overflow %d47, %v44
+            store %d49, %at17+24
+            %v51 = uextend.i64 %w48
+            %v52 = uextend.i64 %w50
+            %v53 = iadd %v51, %v52
+            store %v53, %mp4+48
+            %c54 = iconst.i64 4
+            %v55 = iadd %j5, %c54
+            store %v55, %mp4+40
+            return %v55
+        };
+    }
+    last = clif {
+        %c1 = iconst.i64 0
+        %wp2 = payload %0
+        %tp3 = payload %1
+        %mp4 = payload %2
+        %n5 = load.i64 %mp4+24
+        %borrow6 = load.i64 %mp4+48
+        %c7 = iconst.i64 3
+        %v8 = ishl %n5, %c7
+        %at9 = iadd %tp3, %v8
+        %top10 = load.i64 %at9+8
+        %v11 = isub %top10, %borrow6
+        %c12 = iconst.i64 63
+        %keep13 = sshr %v11, %c12
+        store %keep13, %mp4+56
+        store %c1, %mp4+40
+        return %keep13
+    };
+    while meta[5] < meta[3] {
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %j5 = load.i64 %mp4+40
+            %keep6 = load.i64 %mp4+56
+            %c7 = iconst.i64 3
+            %v8 = ishl %j5, %c7
+            %at9 = iadd %tp3, %v8
+            %out10 = load.i64 %mp4+0
+            %c11 = iconst.i64 2
+            %v12 = ishl %out10, %c11
+            %at13 = iadd %wp2, %v12
+            %v14 = ishl %j5, %c7
+            %at15 = iadd %at13, %v14
+            %v16 = load.i64 %at9+8
+            %v17 = load.i64 %at15+0
+            %v18 = bitselect %keep6, %v16, %v17
+            store %v18, %at15+0
+            %v19 = load.i64 %at9+16
+            %v20 = load.i64 %at15+8
+            %v21 = bitselect %keep6, %v19, %v20
+            store %v21, %at15+8
+            %v22 = load.i64 %at9+24
+            %v23 = load.i64 %at15+16
+            %v24 = bitselect %keep6, %v22, %v23
+            store %v24, %at15+16
+            %v25 = load.i64 %at9+32
+            %v26 = load.i64 %at15+24
+            %v27 = bitselect %keep6, %v25, %v26
+            store %v27, %at15+24
+            %c28 = iconst.i64 4
+            %v29 = iadd %j5, %c28
+            store %v29, %mp4+40
+            return %v29
+        };
+    }
+    return last;
+}
+// END GENERATED ModArithKernels

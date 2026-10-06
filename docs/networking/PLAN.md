@@ -60,19 +60,19 @@ targets in `tests/src/*.bd`. Add a test target per area (keep targets small:
 one failed assertion traps the whole target process, so later tests in that
 target do not run).
 
-| Package | Module | Depends on | Scope |
+| Package | Module | Depends on (besides foundation) | Scope |
 | --- | --- | --- | --- |
 | uri | `Uri` | - | RFC 3986 parse/format, normalization, reference resolution, percent-encoding, authority/host/port, IPv4/IPv6 literals |
 | codec | `Codec` | - | Bounded byte primitives: big-endian ints, QUIC varint, length-prefixed vectors, bounded line reader, incremental `BufferedReader`/writer over `Core.IO` |
-| connect | `Connect` | uri | RFC 8305 Happy Eyeballs: resolve, interleave families, staggered attempts (250 ms), cancel losers, typed attempt errors |
-| crypto | `Crypto` | codec | SHA-256/384/512, HMAC, HKDF, ChaCha20-Poly1305, AES-128/256-GCM, X25519, P-256 ECDH/ECDSA, RSA PKCS#1 v1.5/PSS verify, constant-time compare, OS entropy |
-| x509 | `X509` | crypto, codec | DER/ASN.1, PEM, certificate parsing, chain building, signature check, validity, name constraints basics, RFC 6125 hostname verification, trust store |
-| tls | `Tls` | crypto, x509, codec | TLS 1.3 (RFC 8446) client and server, `TlsStream` implementing `Core.IO.Stream`, explicit trust/hostname/ALPN policy, no insecure default |
-| http2 | `Http2` | codec, tls, uri | RFC 9113 frames, HPACK (RFC 7541), stream states, flow control, settings, client and server, mapped to corelib `Http.Types` Request/Response |
-| websocket | `WebSocket` | codec, crypto, tls, uri | RFC 6455 opening handshake over HTTP/1.1, framing, masking, fragmentation, ping/pong, close |
-| quic | `Quic` | crypto, tls, codec | RFC 9000/9001/9002 over `Network.UdpSocket`: packets, protection, TLS handshake, streams, flow control, loss recovery, congestion control |
-| http3 | `Http3` | quic, codec, uri | RFC 9114 and QPACK (RFC 9204) |
-| web | `Web` | all | One client/server facade over HTTP/1.1, HTTP/2, HTTP/3 with ALPN selection |
+| connect | `Connect` | concurrency, network | RFC 8305 Happy Eyeballs: resolve, interleave families, staggered attempts (250 ms), cancel losers, typed attempt errors |
+| crypto | `Crypto` | - | SHA-256/384/512, HMAC, HKDF, ChaCha20-Poly1305, AES-128/256-GCM, X25519, P-256 ECDH/ECDSA, RSA PKCS#1 v1.5/PSS verify, constant-time compare, OS entropy |
+| x509 | `X509` | crypto | DER/ASN.1, PEM, certificate parsing, chain building, signature check, validity, name constraints basics, RFC 6125 hostname verification, trust store |
+| tls | `Tls` | network, codec, crypto, x509 | TLS 1.3 (RFC 8446) client and server, `TlsStream` implementing `Core.IO.Stream`, explicit trust/hostname/ALPN policy, no insecure default |
+| http2 | `Http2` | network, http | RFC 9113 frames, HPACK (RFC 7541), stream states, flow control, settings, client and server, mapped to corelib `Http.Types` Request/Response |
+| websocket | `WebSocket` | network, uri, codec, connect, crypto, x509, tls | RFC 6455 opening handshake over HTTP/1.1, framing, masking, fragmentation, ping/pong, close |
+| quic | `Quic` | concurrency, network, codec, crypto, tls | RFC 9000/9001/9002 over `Network.UdpSocket`: packets, protection, TLS handshake, streams, flow control, loss recovery, congestion control |
+| http3 | `Http3` | concurrency, network, http, uri, codec, tls, http2, quic | RFC 9114 and QPACK (RFC 9204) |
+| web | `Web` | network, http, uri, connect, x509, tls, http2 | One client/server facade over HTTP/1.1, HTTP/2, HTTP/3 with ALPN selection |
 
 ## Beskid 0.5.2 language facts (verified)
 

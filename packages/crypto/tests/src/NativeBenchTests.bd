@@ -1,4 +1,4 @@
-/// Pure vs native (OpenSSL) throughput. Each test prints a "BENCH pure ..." and a
+/// Pure vs native (OpenSSL, ruling R27) throughput; pure runs force BESKID_CRYPTO_PROVIDER=pure. Each test prints a "BENCH pure ..." and a
 /// "BENCH native ..." line; see packages/crypto/BENCHMARKS.md. One-shot APIs over 16 KiB
 /// inputs (the runtime caps live arrays near 160 KiB, ruling R9).
 use Testing.Assert;
@@ -9,14 +9,11 @@ use Core.String;
 use Core.Time;
 use Crypto.AesGcm;
 use Crypto.ChaCha20Poly1305;
+use Crypto.Errors;
 use Crypto.Hmac;
+use Crypto.Provider;
 use Crypto.Sha256;
 use Crypto.Sha512;
-use CryptoOpenSsl.NativeAesGcm;
-use CryptoOpenSsl.NativeChaCha20Poly1305;
-use CryptoOpenSsl.NativeHmac;
-use CryptoOpenSsl.NativeSha256;
-use CryptoOpenSsl.NativeSha512;
 
 i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
 
@@ -54,26 +51,30 @@ i64 NativeRuns() { return 512_i64; }
 
 test bench_sha256_16k_one_shot {
     u8[] data = Slice.SubSlice(Buffer(), 0_i64, Chunk());
+    Provider.ForcePure(true);
     mut i64 start = NowNanos();
     mut i64 i = 0_i64;
     while i < PureRuns() { u8[] d = Sha256.Hash(data); data[0] = d[0]; i = i + 1_i64; }
     Throughput("pure sha256", PureRuns() * Chunk(), NowNanos() - start);
+    Provider.ForcePure(false);
     start = NowNanos();
     i = 0_i64;
-    while i < NativeRuns() { u8[] d = NativeSha256.Hash(data); data[0] = d[0]; i = i + 1_i64; }
+    while i < NativeRuns() { u8[] d = Sha256.Hash(data); data[0] = d[0]; i = i + 1_i64; }
     Throughput("native sha256", NativeRuns() * Chunk(), NowNanos() - start);
     Assert.True(true, "printed");
 }
 
 test bench_sha512_16k_one_shot {
     u8[] data = Slice.SubSlice(Buffer(), 0_i64, Chunk());
+    Provider.ForcePure(true);
     mut i64 start = NowNanos();
     mut i64 i = 0_i64;
     while i < PureRuns() { u8[] d = Sha512.Hash512(data); data[0] = d[0]; i = i + 1_i64; }
     Throughput("pure sha512", PureRuns() * Chunk(), NowNanos() - start);
+    Provider.ForcePure(false);
     start = NowNanos();
     i = 0_i64;
-    while i < NativeRuns() { u8[] d = NativeSha512.Hash512(data); data[0] = d[0]; i = i + 1_i64; }
+    while i < NativeRuns() { u8[] d = Sha512.Hash512(data); data[0] = d[0]; i = i + 1_i64; }
     Throughput("native sha512", NativeRuns() * Chunk(), NowNanos() - start);
     Assert.True(true, "printed");
 }
@@ -82,13 +83,15 @@ test bench_hmac_sha256_64b {
     u8[] key = Slice.New(32_i64);
     u8[] message = Slice.New(64_i64);
     i64 ops = 2000_i64;
+    Provider.ForcePure(true);
     mut i64 start = NowNanos();
     mut i64 i = 0_i64;
     while i < ops { u8[] tag = Hmac.Compute(HashAlgorithm::Sha256(), key, message); message[0] = tag[0]; i = i + 1_i64; }
     PerOp("pure hmac-sha256 64B", ops, NowNanos() - start);
+    Provider.ForcePure(false);
     start = NowNanos();
     i = 0_i64;
-    while i < ops { u8[] tag = NativeHmac.Compute(HashAlgorithm::Sha256(), key, message); message[0] = tag[0]; i = i + 1_i64; }
+    while i < ops { u8[] tag = Hmac.Compute(HashAlgorithm::Sha256(), key, message); message[0] = tag[0]; i = i + 1_i64; }
     PerOp("native hmac-sha256 64B", ops, NowNanos() - start);
     Assert.True(true, "printed");
 }
@@ -96,13 +99,15 @@ test bench_hmac_sha256_64b {
 test bench_hmac_sha256_16k {
     u8[] key = Slice.New(32_i64);
     u8[] data = Slice.SubSlice(Buffer(), 0_i64, Chunk());
+    Provider.ForcePure(true);
     mut i64 start = NowNanos();
     mut i64 i = 0_i64;
     while i < PureRuns() / 2_i64 { u8[] tag = Hmac.Compute(HashAlgorithm::Sha256(), key, data); i = i + 1_i64; }
     Throughput("pure hmac-sha256 16KiB", PureRuns() / 2_i64 * Chunk(), NowNanos() - start);
+    Provider.ForcePure(false);
     start = NowNanos();
     i = 0_i64;
-    while i < NativeRuns() { u8[] tag = NativeHmac.Compute(HashAlgorithm::Sha256(), key, data); i = i + 1_i64; }
+    while i < NativeRuns() { u8[] tag = Hmac.Compute(HashAlgorithm::Sha256(), key, data); i = i + 1_i64; }
     Throughput("native hmac-sha256 16KiB", NativeRuns() * Chunk(), NowNanos() - start);
     Assert.True(true, "printed");
 }
@@ -112,6 +117,7 @@ test bench_chacha20poly1305_seal_16k {
     u8[] nonce = Slice.New(12_i64);
     u8[] aad = Slice.New(13_i64);
     u8[] record = Buffer();
+    Provider.ForcePure(true);
     mut i64 start = NowNanos();
     mut i64 i = 0_i64;
     while i < PureRuns() / 2_i64 {
@@ -120,11 +126,12 @@ test bench_chacha20poly1305_seal_16k {
         i = i + 1_i64;
     }
     Throughput("pure chacha20-poly1305 seal 16KiB", PureRuns() / 2_i64 * Chunk(), NowNanos() - start);
+    Provider.ForcePure(false);
     start = NowNanos();
     i = 0_i64;
     while i < NativeRuns() {
         nonce[11] = u8(i & 255_i64);
-        NativeChaCha20Poly1305.SealInto(key, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
+        ChaCha20Poly1305.SealInto(key, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
         i = i + 1_i64;
     }
     Throughput("native chacha20-poly1305 seal 16KiB", NativeRuns() * Chunk(), NowNanos() - start);
@@ -132,10 +139,13 @@ test bench_chacha20poly1305_seal_16k {
 }
 
 unit BenchAes(i64 keyLength) {
-    match AesGcm.New(Slice.New(keyLength)) {
+    Provider.ForcePure(true);
+    Result<AesGcmKey, CryptoError> pureKey = AesGcm.New(Slice.New(keyLength));
+    Provider.ForcePure(false);
+    match pureKey {
         Result::Error(_) => { Assert.Fail("pure key"); },
         Result::Ok(pure) => {
-            match NativeAesGcm.New(Slice.New(keyLength)) {
+            match AesGcm.New(Slice.New(keyLength)) {
                 Result::Error(_) => { Assert.Fail("native key"); },
                 Result::Ok(native) => {
                     u8[] nonce = Slice.New(12_i64);
@@ -154,15 +164,15 @@ unit BenchAes(i64 keyLength) {
                     i = 0_i64;
                     while i < NativeRuns() {
                         nonce[11] = u8(i & 255_i64);
-                        NativeAesGcm.SealInto(native, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
+                        AesGcm.SealInto(native, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
                         i = i + 1_i64;
                     }
                     Throughput("native " + name, NativeRuns() * Chunk(), NowNanos() - start);
                     i = 0_i64;
                     start = NowNanos();
                     while i < NativeRuns() {
-                        NativeAesGcm.SealInto(native, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
-                        NativeAesGcm.OpenInto(native, nonce, aad, record, 0_i64, Chunk() + 16_i64, record, 0_i64);
+                        AesGcm.SealInto(native, nonce, aad, record, 0_i64, Chunk(), record, 0_i64);
+                        AesGcm.OpenInto(native, nonce, aad, record, 0_i64, Chunk() + 16_i64, record, 0_i64);
                         i = i + 1_i64;
                     }
                     Throughput("native " + name + " + open", NativeRuns() * Chunk() * 2_i64, NowNanos() - start);

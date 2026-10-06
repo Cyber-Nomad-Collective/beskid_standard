@@ -1,14 +1,20 @@
-/// Raw OpenSSL libcrypto 3 calls (Linux `libcrypto.so.3`).
+/// Raw OpenSSL libcrypto 3 calls (`libcrypto.so.3`), the native provider of ruling R27.
+///
+/// `LibCrypto` is an optional contract (compiler 0.5.3): a program that uses it loads on a
+/// host without OpenSSL 3, and `LibCrypto.Available()` is then false. Nothing here may be
+/// called unless `Available()` is true; `Crypto.Provider` decides that once per process.
+/// Calling an absent symbol stops the program with the ABI-v5 `extern_unavailable` trap.
 ///
 /// Every function here passes Beskid array payload addresses to C through a CLIF block
-/// (compiler 0.5.3; ruling R13). The arrays are parameters, so the caller keeps them rooted
-/// for the whole call, and the collector does not move objects. Callers check every range
-/// before they call; these functions do no bounds checks. Cipher contexts are created and
-/// freed inside one function, on every path.
+/// (ruling R13). The arrays are parameters, so the caller keeps them rooted for the whole
+/// call, and the collector does not move objects. Callers check every range before they
+/// call; these functions do no bounds checks. Cipher contexts are created and freed inside
+/// one function, on every path.
 ///
 /// The C names are dictated by OpenSSL and libc, so these contracts trigger naming warning W1633.
-[Extern(Abi:"C", Library:"libcrypto.so.3")]
-contract LibCrypto {
+[Extern(Abi:"C", Library:"libcrypto.so.3", Optional:true)]
+pub contract LibCrypto {
+    bool Available();
     i64 SHA256(i64 data, i64 count, i64 digest);
     i64 SHA384(i64 data, i64 count, i64 digest);
     i64 SHA512(i64 data, i64 count, i64 digest);
@@ -31,13 +37,19 @@ contract LibCrypto {
     i32 EVP_DecryptFinal_ex(i64 context, i64 output, i64 outputLength);
 }
 
+/// libc environment access without allocation (Linux glibc soname; the JIT and an AOT link
+/// reach libSystem on macOS, as for `Crypto.Entropy`).
 [Extern(Abi:"C", Library:"libc.so.6")]
 contract ProviderLibc {
     i64 getenv(i64 name);
     i32 setenv(i64 name, i64 value, i32 overwrite);
     i32 unsetenv(i64 name);
     i32 strcmp(i64 left, i64 right);
+    i64 memset(i64 pointer, i32 value, i64 count);
 }
+
+/// True when `libcrypto.so.3` and every symbol of `LibCrypto` resolved at load time.
+pub bool Available() { return LibCrypto.Available(); }
 
 /// Largest input or AAD length passed to one EVP call (EVP lengths are C `int`).
 /// Larger requests take the pure path.
@@ -228,11 +240,19 @@ pub i64 AeadOpen(i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 se
     i64[] scratch = [0_i64, 0_i64];
     i64 result = OpenSteps(context, cipher, key, nonce, aad, sealed, sealedOffset, count, output, outputOffset, scratch);
     LibCrypto.EVP_CIPHER_CTX_free(context);
-    if result != 1_i64 {
-        mut i64 i = 0_i64;
-        while i < count { output[outputOffset + i] = 0_u8; i = i + 1_i64; }
-    }
+    if result != 1_i64 { Wipe(output, outputOffset, count); }
     return result;
+}
+
+/// Zeroes `buffer[offset, offset + count)` with libc `memset`. Precondition: in bounds.
+pub unit Wipe(u8[] buffer, i64 offset, i64 count) {
+    clif {
+        %b = payload %0
+        %p = iadd %b, %1
+        %z = iconst.i32 0
+        %r = call @memset(%p, %z, %2) -> i64
+    };
+    return;
 }
 
 /// True when the environment variable `name` (NUL-terminated) equals `value` (NUL-terminated).
@@ -255,8 +275,8 @@ i32 CompareCString(i64 left, u8[] right) {
     };
 }
 
-/// Sets (or, for an empty `value` with `remove`, removes) an environment variable.
-/// Both arrays are NUL-terminated. Used by tests to force the pure provider.
+/// Sets (or, with `remove`, removes) an environment variable. Both arrays are
+/// NUL-terminated. Used by `Crypto.Provider` for the switch and the cached selection.
 pub unit SetEnv(u8[] name, u8[] value, bool remove) {
     if remove {
         clif {

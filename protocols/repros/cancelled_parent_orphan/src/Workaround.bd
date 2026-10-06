@@ -1,0 +1,47 @@
+// WORKAROUND: the owner of both fibers cancels the child explicitly; the cancelled parent cannot clean up after itself.
+use Concurrency.Channel;
+use Concurrency.Fiber;
+use Core.Collections.Array;
+use Core.Output;
+use Core.Results;
+use Core.Time;
+use Testing.Assert;
+
+unit Child(i64[] flags) {
+    // The flag is set only when the sleep completed normally (not when it was cancelled).
+    match Time.Sleep(Time.FromMilliseconds(300_i64)) {
+        Result::Ok(_) => { Array.Set<i64>(flags, 0_i64, 1_i64); },
+        Result::Error(_) => (),
+    };
+}
+
+unit Parent(Channel<i64> ch) {
+    match Channel<i64>.Receive(ch) { Result::Ok(_) => (), Result::Error(_) => (), };
+}
+
+string Flag(i64[] flags, i64 i) {
+    if Array.Get<i64>(flags, i) == 1_i64 { return "yes"; }
+    return "no";
+}
+
+// Network and timer waits fail at once outside a spawned fiber (W7), so the scenario runs inside one.
+i64 Scenario() {
+    i64[] flags = [0_i64];
+    Channel<i64> ch = Channel<i64>.Create();
+    Fiber<unit> child = spawn (() => Child(flags));
+    Fiber<unit> parent = spawn (() => Parent(ch));
+    match Time.Sleep(Time.FromMilliseconds(50_i64)) { Result::Ok(_) => (), Result::Error(_) => (), };
+    parent.Cancel();
+    child.Cancel();
+    parent.Join();
+    child.Join();
+    match Time.Sleep(Time.FromMilliseconds(500_i64)) { Result::Ok(_) => (), Result::Error(_) => (), };
+    Output.WriteLine("workaround: child done=" + Flag(flags, 0_i64));
+    return Array.Get<i64>(flags, 0_i64);
+}
+
+test owner_cancels_both {
+    Fiber<i64> scenario = spawn Scenario();
+    i64 childDone = match scenario.Join() { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+    Assert.Equal<i64>(childDone, 0_i64, "child was cancelled with its parent");
+}

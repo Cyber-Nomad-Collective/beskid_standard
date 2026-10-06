@@ -98,8 +98,31 @@ pub Result<TrustStore, X509Error> FromFile(string path) {
     };
 }
 
-/// The macOS system bundle path.
-pub string SystemBundlePath() { return "/etc/ssl/cert.pem"; }
+/// The first system CA bundle that exists, in the search order of Go's crypto/x509
+/// (root_linux.go) plus macOS: Debian/Ubuntu/Gentoo, Fedora/RHEL, openSUSE, OpenELEC,
+/// CentOS/RHEL 7, then Alpine and macOS. Returns the macOS path when none exists, so
+/// `FromFile` fails closed with its typed error.
+pub string SystemBundlePath() {
+    string[] candidates = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/tls/cacert.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    ];
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(candidates) {
+        string path = candidates[i];
+        Result<bool, FsError> exists = FS.Exists(path);
+        match exists {
+            Result::Ok(found) => { if found { return path; } },
+            Result::Error(_) => {},
+        };
+        i = i + 1_i64;
+    }
+    return "/etc/ssl/cert.pem";
+}
 
 /// Index of the first anchor whose subject common name equals `commonName`, or -1.
 pub i64 FindByCommonName(TrustStore store, string commonName) {

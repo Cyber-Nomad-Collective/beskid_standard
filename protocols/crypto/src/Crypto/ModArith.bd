@@ -56,9 +56,9 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
         k = k + 1_i64;
     }
     w[n] = 0_u32 - inv;
-    if n == 8_i64 {
-        // Width 8 runs on four 64-bit limbs (Mul8 and friends) with -m^-1 mod 2^64 at limbs 9..11;
-        // the 32-bit CIOS accumulator that would live there is not used at this width.
+    if n % 8_i64 == 0_i64 {
+        // Widths 8k run on 64-bit limbs (Mul8, MulWide) with -m^-1 mod 2^64 at limbs n+1..n+3;
+        // the 32-bit CIOS accumulator that would live there is not used at these widths.
         i64 m64 = i64(m[0]) | (i64(m[1]) << 32_i64);
         mut i64 inv64 = m64;
         k = 0_i64;
@@ -67,8 +67,8 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
             k = k + 1_i64;
         }
         i64 mprime = 0_i64 - inv64;
-        w[9] = u32(mprime & 4294967295_i64);
-        w[10] = u32((mprime >> 32_i64) & 4294967295_i64);
+        w[n + 1_i64] = u32(mprime & 4294967295_i64);
+        w[n + 2_i64] = u32((mprime >> 32_i64) & 4294967295_i64);
     }
     w[WOne(n)] = 1_u32;
     // R^2 mod m (public modulus: variable time is fine). Write 32n = odd * 2^s. Start from
@@ -147,6 +147,12 @@ pub unit WSetSmall(u32[] w, i64 n, i64 dst, u32 v) {
 /// `w[out] = w[a] * w[b] * R^-1 mod m` (CIOS, branch-free final subtraction).
 pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     if n == 8_i64 { Mul8(w, out, a, b); return; }
+    if n % 8_i64 == 0_i64 {
+        i64[] t = WideScratch();
+        i64[] meta = [out, a, b, n / 2_i64, 0_i64, 0_i64, 0_i64, 0_i64, WideLength(n)];
+        MulWide(w, t, meta);
+        return;
+    }
     i64 t = n + 1_i64;
     i64 m0inv = i64(w[n]);
     i64 mask = 4294967295_i64;
@@ -337,6 +343,11 @@ pub unit WPowPublic(u32[] w, i64 n, i64 out, i64 base, i64 acc, u8[] exp) {
         WCopy(w, n, out, acc);
         return;
     }
+    if n % 8_i64 == 0_i64 {
+        PowWide(w, n, acc, base, exp);
+        WCopy(w, n, out, acc);
+        return;
+    }
     i64 len = Slice.Len(exp);
     mut i64 i = 0_i64;
     while i < len {
@@ -415,6 +426,36 @@ pub u32 LessBit(u32[] a, u32[] b) {
         j = j + 1_i64;
     }
     return u32(borrow);
+}
+
+/// MulWide scratch: t[-1], t[0..n/2+2), rounded up to whole 4-word chunks.
+i64 WideLength(i64 n) { return ((n / 2_i64 + 3_i64 + 3_i64) / 4_i64) * 4_i64; }
+
+/// A zeroed i64 scratch for MulWide, large enough for `BigNat.MaxLimbs()` (n = 256).
+i64[] WideScratch() {
+    return [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+}
+
+/// `w[acc] = w[acc]^exp` (Montgomery form) for widths 8k, one scratch for every step.
+unit PowWide(u32[] w, i64 n, i64 acc, i64 base, u8[] exp) {
+    i64[] t = WideScratch();
+    i64 len = Slice.Len(exp);
+    i64 half = n / 2_i64;
+    i64 tlen = WideLength(n);
+    mut i64 i = 0_i64;
+    while i < len {
+        u8 byte = exp[i];
+        mut i64 bit = 7_i64;
+        while bit >= 0_i64 {
+            MulWide(w, t, [acc, acc, acc, half, 0_i64, 0_i64, 0_i64, 0_i64, tlen]);
+            if ((byte >> u8(bit)) & u8(1)) == u8(1) {
+                MulWide(w, t, [acc, acc, base, half, 0_i64, 0_i64, 0_i64, 0_i64, tlen]);
+            }
+            bit = bit - 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    return;
 }
 
 // BEGIN GENERATED ModArithKernels (tools/clifgen.py)
@@ -1441,6 +1482,353 @@ i64 Pow8(u32[] w, u8[] e, i64[] meta) {
             bit = bit - 1_i64;
         }
         meta[0] = meta[0] + 1_i64;
+    }
+    return last;
+}
+
+/// `w[meta[0]] = w[meta[1]] * w[meta[2]] * R^-1 mod m` for widths n = 8k (64-bit CIOS,
+/// Koc-Acar-Kaliski 1996, in 4-limb chunks). Branch-free in the operands; `t` holds
+/// meta[8] >= n/2 + 3 words. Outputs may alias inputs.
+i64 MulWide(u32[] w, i64[] t, i64[] meta) {
+    mut i64 last = 0_i64;
+    while meta[5] < meta[8] {
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %j5 = load.i64 %mp4+40
+            %c6 = iconst.i64 3
+            %v7 = ishl %j5, %c6
+            %at8 = iadd %tp3, %v7
+            store %c1, %at8+0
+            store %c1, %at8+8
+            store %c1, %at8+16
+            store %c1, %at8+24
+            %c9 = iconst.i64 4
+            %v10 = iadd %j5, %c9
+            store %v10, %mp4+40
+            return %v10
+        };
+    }
+    last = clif {
+        %c1 = iconst.i64 0
+        %wp2 = payload %0
+        %tp3 = payload %1
+        %mp4 = payload %2
+        store %c1, %mp4+32
+        store %c1, %mp4+40
+        store %c1, %mp4+48
+        return %c1
+    };
+    while meta[4] < meta[3] {
+        while meta[5] < meta[3] {
+            last = clif {
+                %c1 = iconst.i64 0
+                %wp2 = payload %0
+                %tp3 = payload %1
+                %mp4 = payload %2
+                %i5 = load.i64 %mp4+32
+                %j6 = load.i64 %mp4+40
+                %carry7 = load.i64 %mp4+48
+                %b8 = load.i64 %mp4+16
+                %c9 = iconst.i64 2
+                %v10 = ishl %b8, %c9
+                %at11 = iadd %wp2, %v10
+                %c12 = iconst.i64 3
+                %v13 = ishl %i5, %c12
+                %at14 = iadd %at11, %v13
+                %bi15 = load.i64 %at14
+                %a16 = load.i64 %mp4+8
+                %v17 = ishl %a16, %c9
+                %at18 = iadd %wp2, %v17
+                %v19 = ishl %j6, %c12
+                %at20 = iadd %at18, %v19
+                %v21 = ishl %j6, %c12
+                %at22 = iadd %tp3, %v21
+                %v23 = load.i64 %at20+0
+                %v24 = load.i64 %at22+8
+                %v25 = imul %v23, %bi15
+                %v26 = umulhi %v23, %bi15
+                %s27, %c28 = uadd_overflow %v25, %v24
+                %s29, %c30 = uadd_overflow %s27, %carry7
+                %v31 = uextend.i64 %c28
+                %v32 = iadd %v26, %v31
+                %v33 = uextend.i64 %c30
+                %v34 = iadd %v32, %v33
+                store %s29, %at22+8
+                %v35 = load.i64 %at20+8
+                %v36 = load.i64 %at22+16
+                %v37 = imul %v35, %bi15
+                %v38 = umulhi %v35, %bi15
+                %s39, %c40 = uadd_overflow %v37, %v36
+                %s41, %c42 = uadd_overflow %s39, %v34
+                %v43 = uextend.i64 %c40
+                %v44 = iadd %v38, %v43
+                %v45 = uextend.i64 %c42
+                %v46 = iadd %v44, %v45
+                store %s41, %at22+16
+                %v47 = load.i64 %at20+16
+                %v48 = load.i64 %at22+24
+                %v49 = imul %v47, %bi15
+                %v50 = umulhi %v47, %bi15
+                %s51, %c52 = uadd_overflow %v49, %v48
+                %s53, %c54 = uadd_overflow %s51, %v46
+                %v55 = uextend.i64 %c52
+                %v56 = iadd %v50, %v55
+                %v57 = uextend.i64 %c54
+                %v58 = iadd %v56, %v57
+                store %s53, %at22+24
+                %v59 = load.i64 %at20+24
+                %v60 = load.i64 %at22+32
+                %v61 = imul %v59, %bi15
+                %v62 = umulhi %v59, %bi15
+                %s63, %c64 = uadd_overflow %v61, %v60
+                %s65, %c66 = uadd_overflow %s63, %v58
+                %v67 = uextend.i64 %c64
+                %v68 = iadd %v62, %v67
+                %v69 = uextend.i64 %c66
+                %v70 = iadd %v68, %v69
+                store %s65, %at22+32
+                store %v70, %mp4+48
+                %c71 = iconst.i64 4
+                %v72 = iadd %j6, %c71
+                store %v72, %mp4+40
+                return %v72
+            };
+        }
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %n5 = load.i64 %mp4+24
+            %carry6 = load.i64 %mp4+48
+            %c7 = iconst.i64 3
+            %v8 = ishl %n5, %c7
+            %at9 = iadd %tp3, %v8
+            %v10 = load.i64 %at9+8
+            %s11, %c12 = uadd_overflow %v10, %carry6
+            store %s11, %at9+8
+            %v13 = uextend.i64 %c12
+            store %v13, %at9+16
+            %t014 = load.i64 %tp3+8
+            %v15 = ishl %n5, %c7
+            %at16 = iadd %wp2, %v15
+            %c17 = iconst.i64 4
+            %at18 = iadd %at16, %c17
+            %mprime19 = load.i64 %at18
+            %q20 = imul %t014, %mprime19
+            store %q20, %mp4+56
+            store %c1, %mp4+40
+            store %c1, %mp4+48
+            return %q20
+        };
+        while meta[5] < meta[3] {
+            last = clif {
+                %c1 = iconst.i64 0
+                %wp2 = payload %0
+                %tp3 = payload %1
+                %mp4 = payload %2
+                %j5 = load.i64 %mp4+40
+                %carry6 = load.i64 %mp4+48
+                %q7 = load.i64 %mp4+56
+                %c8 = iconst.i64 3
+                %v9 = ishl %j5, %c8
+                %at10 = iadd %wp2, %v9
+                %v11 = ishl %j5, %c8
+                %at12 = iadd %tp3, %v11
+                %v13 = load.i64 %at10+0
+                %v14 = load.i64 %at12+8
+                %v15 = imul %q7, %v13
+                %v16 = umulhi %q7, %v13
+                %s17, %c18 = uadd_overflow %v15, %v14
+                %s19, %c20 = uadd_overflow %s17, %carry6
+                %v21 = uextend.i64 %c18
+                %v22 = iadd %v16, %v21
+                %v23 = uextend.i64 %c20
+                %v24 = iadd %v22, %v23
+                store %s19, %at12+0
+                %v25 = load.i64 %at10+8
+                %v26 = load.i64 %at12+16
+                %v27 = imul %q7, %v25
+                %v28 = umulhi %q7, %v25
+                %s29, %c30 = uadd_overflow %v27, %v26
+                %s31, %c32 = uadd_overflow %s29, %v24
+                %v33 = uextend.i64 %c30
+                %v34 = iadd %v28, %v33
+                %v35 = uextend.i64 %c32
+                %v36 = iadd %v34, %v35
+                store %s31, %at12+8
+                %v37 = load.i64 %at10+16
+                %v38 = load.i64 %at12+24
+                %v39 = imul %q7, %v37
+                %v40 = umulhi %q7, %v37
+                %s41, %c42 = uadd_overflow %v39, %v38
+                %s43, %c44 = uadd_overflow %s41, %v36
+                %v45 = uextend.i64 %c42
+                %v46 = iadd %v40, %v45
+                %v47 = uextend.i64 %c44
+                %v48 = iadd %v46, %v47
+                store %s43, %at12+16
+                %v49 = load.i64 %at10+24
+                %v50 = load.i64 %at12+32
+                %v51 = imul %q7, %v49
+                %v52 = umulhi %q7, %v49
+                %s53, %c54 = uadd_overflow %v51, %v50
+                %s55, %c56 = uadd_overflow %s53, %v48
+                %v57 = uextend.i64 %c54
+                %v58 = iadd %v52, %v57
+                %v59 = uextend.i64 %c56
+                %v60 = iadd %v58, %v59
+                store %s55, %at12+24
+                store %v60, %mp4+48
+                %c61 = iconst.i64 4
+                %v62 = iadd %j5, %c61
+                store %v62, %mp4+40
+                return %v62
+            };
+        }
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %n5 = load.i64 %mp4+24
+            %carry6 = load.i64 %mp4+48
+            %i7 = load.i64 %mp4+32
+            %c8 = iconst.i64 3
+            %v9 = ishl %n5, %c8
+            %at10 = iadd %tp3, %v9
+            %v11 = load.i64 %at10+8
+            %v12 = load.i64 %at10+16
+            %s13, %c14 = uadd_overflow %v11, %carry6
+            store %s13, %at10
+            %v15 = uextend.i64 %c14
+            %v16 = iadd %v12, %v15
+            store %v16, %at10+8
+            store %c1, %mp4+40
+            store %c1, %mp4+48
+            %c17 = iconst.i64 1
+            %v18 = iadd %i7, %c17
+            store %v18, %mp4+32
+            return %v18
+        };
+    }
+    while meta[5] < meta[3] {
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %j5 = load.i64 %mp4+40
+            %borrow6 = load.i64 %mp4+48
+            %c7 = iconst.i64 3
+            %v8 = ishl %j5, %c7
+            %at9 = iadd %wp2, %v8
+            %v10 = ishl %j5, %c7
+            %at11 = iadd %tp3, %v10
+            %out12 = load.i64 %mp4+0
+            %c13 = iconst.i64 2
+            %v14 = ishl %out12, %c13
+            %at15 = iadd %wp2, %v14
+            %v16 = ishl %j5, %c7
+            %at17 = iadd %at15, %v16
+            %v18 = load.i64 %at9+0
+            %v19 = load.i64 %at11+8
+            %d20, %w21 = usub_overflow %v19, %v18
+            %d22, %w23 = usub_overflow %d20, %borrow6
+            store %d22, %at17+0
+            %v24 = uextend.i64 %w21
+            %v25 = uextend.i64 %w23
+            %v26 = iadd %v24, %v25
+            %v27 = load.i64 %at9+8
+            %v28 = load.i64 %at11+16
+            %d29, %w30 = usub_overflow %v28, %v27
+            %d31, %w32 = usub_overflow %d29, %v26
+            store %d31, %at17+8
+            %v33 = uextend.i64 %w30
+            %v34 = uextend.i64 %w32
+            %v35 = iadd %v33, %v34
+            %v36 = load.i64 %at9+16
+            %v37 = load.i64 %at11+24
+            %d38, %w39 = usub_overflow %v37, %v36
+            %d40, %w41 = usub_overflow %d38, %v35
+            store %d40, %at17+16
+            %v42 = uextend.i64 %w39
+            %v43 = uextend.i64 %w41
+            %v44 = iadd %v42, %v43
+            %v45 = load.i64 %at9+24
+            %v46 = load.i64 %at11+32
+            %d47, %w48 = usub_overflow %v46, %v45
+            %d49, %w50 = usub_overflow %d47, %v44
+            store %d49, %at17+24
+            %v51 = uextend.i64 %w48
+            %v52 = uextend.i64 %w50
+            %v53 = iadd %v51, %v52
+            store %v53, %mp4+48
+            %c54 = iconst.i64 4
+            %v55 = iadd %j5, %c54
+            store %v55, %mp4+40
+            return %v55
+        };
+    }
+    last = clif {
+        %c1 = iconst.i64 0
+        %wp2 = payload %0
+        %tp3 = payload %1
+        %mp4 = payload %2
+        %n5 = load.i64 %mp4+24
+        %borrow6 = load.i64 %mp4+48
+        %c7 = iconst.i64 3
+        %v8 = ishl %n5, %c7
+        %at9 = iadd %tp3, %v8
+        %top10 = load.i64 %at9+8
+        %v11 = isub %top10, %borrow6
+        %c12 = iconst.i64 63
+        %keep13 = sshr %v11, %c12
+        store %keep13, %mp4+56
+        store %c1, %mp4+40
+        return %keep13
+    };
+    while meta[5] < meta[3] {
+        last = clif {
+            %c1 = iconst.i64 0
+            %wp2 = payload %0
+            %tp3 = payload %1
+            %mp4 = payload %2
+            %j5 = load.i64 %mp4+40
+            %keep6 = load.i64 %mp4+56
+            %c7 = iconst.i64 3
+            %v8 = ishl %j5, %c7
+            %at9 = iadd %tp3, %v8
+            %out10 = load.i64 %mp4+0
+            %c11 = iconst.i64 2
+            %v12 = ishl %out10, %c11
+            %at13 = iadd %wp2, %v12
+            %v14 = ishl %j5, %c7
+            %at15 = iadd %at13, %v14
+            %v16 = load.i64 %at9+8
+            %v17 = load.i64 %at15+0
+            %v18 = bitselect %keep6, %v16, %v17
+            store %v18, %at15+0
+            %v19 = load.i64 %at9+16
+            %v20 = load.i64 %at15+8
+            %v21 = bitselect %keep6, %v19, %v20
+            store %v21, %at15+8
+            %v22 = load.i64 %at9+24
+            %v23 = load.i64 %at15+16
+            %v24 = bitselect %keep6, %v22, %v23
+            store %v24, %at15+16
+            %v25 = load.i64 %at9+32
+            %v26 = load.i64 %at15+24
+            %v27 = bitselect %keep6, %v25, %v26
+            store %v27, %at15+24
+            %c28 = iconst.i64 4
+            %v29 = iadd %j5, %c28
+            store %v29, %mp4+40
+            return %v29
+        };
     }
     return last;
 }

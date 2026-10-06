@@ -1084,8 +1084,171 @@ def x25519_ladder():
                   "meta[0] >= 0_i64", b)
 
 
+def wide_mul():
+    """Montgomery multiplication for widths n = 8k u32 limbs (RSA moduli) on 64-bit limbs:
+    CIOS rows split into 4-limb chunk blocks so one function serves every size. Parameters
+    %0 w (workspace; modulus at limb 0, -m^-1 mod 2^64 at limbs n+1..n+3), %1 t (i64 scratch:
+    t[-1] at index 0, then t[0..n64+1]), %2 meta = [out, a, b, n64, i, j, carry, q/keep, tlen]."""
+    blocks = {}
+
+    def new(name):
+        b = Block()
+        b.f = Field(b, None, None)
+        b.wp = b.op("payload %0", "wp")
+        b.tp = b.op("payload %1", "tp")
+        b.mp = b.op("payload %2", "mp")
+        b.meta = lambda k, stem="m": b.op("load.i64 %s+%d" % (b.mp, 8 * k), stem)
+        b.set = lambda k, v: b.raw("store %s, %s+%d" % (v, b.mp, 8 * k))
+        b.c = lambda v: b.const("i64", v)
+        b.shl = lambda v, k: b.op("ishl %s, %s" % (v, b.c(k)))
+        b.at = lambda base, off: b.op("iadd %s, %s" % (base, off), "at")
+        blocks[name] = b
+        return b
+
+    def finish(b, value):
+        b.raw("return %s" % value)
+
+    # Z: zero four t words.
+    b = new("Z")
+    j = b.meta(5, "j")
+    at = b.at(b.tp, b.shl(j, 3))
+    for k in range(4):
+        b.raw("store %s, %s+%d" % (b.c(0), at, 8 * k))
+    nj = b.op("iadd %s, %s" % (j, b.c(4)))
+    b.set(5, nj)
+    finish(b, nj)
+    # Z-end: i = j = carry = 0.
+    b = new("Zend")
+    for k in (4, 5, 6):
+        b.set(k, b.c(0))
+    finish(b, b.c(0))
+    # A: t[j..j+4] += a[j..j+4] * b[i] + carry.
+    b = new("A")
+    i, j, carry = b.meta(4, "i"), b.meta(5, "j"), b.meta(6, "carry")
+    bi = b.op("load.i64 %s" % b.at(b.at(b.wp, b.shl(b.meta(2, "b"), 2)), b.shl(i, 3)), "bi")
+    a_at = b.at(b.at(b.wp, b.shl(b.meta(1, "a"), 2)), b.shl(j, 3))
+    t_at = b.at(b.tp, b.shl(j, 3))
+    for k in range(4):
+        aj = b.op("load.i64 %s+%d" % (a_at, 8 * k))
+        tj = b.op("load.i64 %s+%d" % (t_at, 8 + 8 * k))
+        lo = b.op("imul %s, %s" % (aj, bi))
+        hi = b.op("umulhi %s, %s" % (aj, bi))
+        lo, c1 = b.f.add2(lo, tj)
+        lo, c2 = b.f.add2(lo, carry)
+        hi = b.op("iadd %s, %s" % (b.op("iadd %s, %s" % (hi, b.f.ext(c1))), b.f.ext(c2)))
+        b.raw("store %s, %s+%d" % (lo, t_at, 8 + 8 * k))
+        carry = hi
+    b.set(6, carry)
+    nj = b.op("iadd %s, %s" % (j, b.c(4)))
+    b.set(5, nj)
+    finish(b, nj)
+    # Q: t[n] += carry (overflow into t[n+1]); q = t[0] * m'; carry = high(t[0] + q m[0]); j = 1.
+    b = new("Q")
+    n64, carry = b.meta(3, "n"), b.meta(6, "carry")
+    top_at = b.at(b.tp, b.shl(n64, 3))
+    tn = b.op("load.i64 %s+8" % top_at)
+    tn, c = b.f.add2(tn, carry)
+    b.raw("store %s, %s+8" % (tn, top_at))
+    b.raw("store %s, %s+16" % (b.f.ext(c), top_at))
+    t0 = b.op("load.i64 %s+8" % b.tp, "t0")
+    mprime = b.op("load.i64 %s" % b.at(b.at(b.wp, b.shl(n64, 3)), b.c(4)), "mprime")
+    q = b.op("imul %s, %s" % (t0, mprime), "q")
+    b.set(7, q)
+    b.set(5, b.c(0))
+    b.set(6, b.c(0))
+    finish(b, q)
+    # B: t[j-1] = t[j] + q m[j] + carry for four j (t[-1] absorbs the zero low word of j = 0).
+    b = new("B")
+    j, carry, q = b.meta(5, "j"), b.meta(6, "carry"), b.meta(7, "q")
+    m_at = b.at(b.wp, b.shl(j, 3))
+    t_at = b.at(b.tp, b.shl(j, 3))
+    for k in range(4):
+        mj = b.op("load.i64 %s+%d" % (m_at, 8 * k))
+        tj = b.op("load.i64 %s+%d" % (t_at, 8 + 8 * k))
+        lo = b.op("imul %s, %s" % (q, mj))
+        hi = b.op("umulhi %s, %s" % (q, mj))
+        lo, c1 = b.f.add2(lo, tj)
+        lo, c2 = b.f.add2(lo, carry)
+        hi = b.op("iadd %s, %s" % (b.op("iadd %s, %s" % (hi, b.f.ext(c1))), b.f.ext(c2)))
+        b.raw("store %s, %s+%d" % (lo, t_at, 8 * k))
+        carry = hi
+    b.set(6, carry)
+    nj = b.op("iadd %s, %s" % (j, b.c(4)))
+    b.set(5, nj)
+    finish(b, nj)
+    # E: t[n-1] = t[n] + carry; t[n] = t[n+1] + overflow; next row.
+    b = new("E")
+    n64, carry, i = b.meta(3, "n"), b.meta(6, "carry"), b.meta(4, "i")
+    top_at = b.at(b.tp, b.shl(n64, 3))
+    tn = b.op("load.i64 %s+8" % top_at)
+    tn1 = b.op("load.i64 %s+16" % top_at)
+    low, c = b.f.add2(tn, carry)
+    b.raw("store %s, %s" % (low, top_at))
+    b.raw("store %s, %s+8" % (b.op("iadd %s, %s" % (tn1, b.f.ext(c))), top_at))
+    b.set(5, b.c(0))
+    b.set(6, b.c(0))
+    ni = b.op("iadd %s, %s" % (i, b.c(1)))
+    b.set(4, ni)
+    finish(b, ni)
+    # S: out[j..j+4] = t - m with borrow (meta[6]).
+    b = new("S")
+    j, borrow = b.meta(5, "j"), b.meta(6, "borrow")
+    m_at = b.at(b.wp, b.shl(j, 3))
+    t_at = b.at(b.tp, b.shl(j, 3))
+    o_at = b.at(b.at(b.wp, b.shl(b.meta(0, "out"), 2)), b.shl(j, 3))
+    for k in range(4):
+        mj = b.op("load.i64 %s+%d" % (m_at, 8 * k))
+        tj = b.op("load.i64 %s+%d" % (t_at, 8 + 8 * k))
+        d1, w1 = b.f.sub2(tj, mj)
+        d2, w2 = b.f.sub2(d1, borrow)
+        b.raw("store %s, %s+%d" % (d2, o_at, 8 * k))
+        borrow = b.op("iadd %s, %s" % (b.f.ext(w1), b.f.ext(w2)))
+    b.set(6, borrow)
+    nj = b.op("iadd %s, %s" % (j, b.c(4)))
+    b.set(5, nj)
+    finish(b, nj)
+    # K: keep t when t[n] - borrow < 0.
+    b = new("K")
+    n64, borrow = b.meta(3, "n"), b.meta(6, "borrow")
+    top = b.op("load.i64 %s+8" % b.at(b.tp, b.shl(n64, 3)), "top")
+    keep = b.op("sshr %s, %s" % (b.op("isub %s, %s" % (top, borrow)), b.c(63)), "keep")
+    b.set(7, keep)
+    b.set(5, b.c(0))
+    finish(b, keep)
+    # Sel: out = keep ? t : out.
+    b = new("Sel")
+    j, keep = b.meta(5, "j"), b.meta(7, "keep")
+    t_at = b.at(b.tp, b.shl(j, 3))
+    o_at = b.at(b.at(b.wp, b.shl(b.meta(0, "out"), 2)), b.shl(j, 3))
+    for k in range(4):
+        tj = b.op("load.i64 %s+%d" % (t_at, 8 + 8 * k))
+        oj = b.op("load.i64 %s+%d" % (o_at, 8 * k))
+        b.raw("store %s, %s+%d" % (b.op("bitselect %s, %s, %s" % (keep, tj, oj)), o_at, 8 * k))
+    nj = b.op("iadd %s, %s" % (j, b.c(4)))
+    b.set(5, nj)
+    finish(b, nj)
+
+    def blk(name, depth):
+        ind = "    " * depth
+        return "%slast = clif {\n%s\n%s};\n" % (ind, blocks[name].render(ind + "    "), ind)
+
+    return ("/// `w[meta[0]] = w[meta[1]] * w[meta[2]] * R^-1 mod m` for widths n = 8k (64-bit CIOS,\n"
+            "/// Koc-Acar-Kaliski 1996, in 4-limb chunks). Branch-free in the operands; `t` holds\n"
+            "/// meta[8] >= n/2 + 3 words. Outputs may alias inputs.\n"
+            "i64 MulWide(u32[] w, i64[] t, i64[] meta) {\n"
+            "    mut i64 last = 0_i64;\n"
+            "    while meta[5] < meta[8] {\n" + blk("Z", 2) + "    }\n" + blk("Zend", 1) +
+            "    while meta[4] < meta[3] {\n"
+            "        while meta[5] < meta[3] {\n" + blk("A", 3) + "        }\n" + blk("Q", 2) +
+            "        while meta[5] < meta[3] {\n" + blk("B", 3) + "        }\n" + blk("E", 2) +
+            "    }\n"
+            "    while meta[5] < meta[3] {\n" + blk("S", 2) + "    }\n" + blk("K", 1) +
+            "    while meta[5] < meta[3] {\n" + blk("Sel", 2) + "    }\n"
+            "    return last;\n}\n")
+
+
 def gen_pk():
-    replace_region("ModArith.bd", "ModArithKernels", modarith_kernels())
+    replace_region("ModArith.bd", "ModArithKernels", modarith_kernels() + "\n" + wide_mul())
     replace_region("P256.bd", "P256Kernels", p256_kernels())
     replace_region("X25519.bd", "X25519Kernels", x25519_ladder())
 

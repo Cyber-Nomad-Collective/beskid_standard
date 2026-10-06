@@ -792,12 +792,29 @@ not reset. `QuicConnection.StreamPeerStopCode` and `QuicEndpoint.PeerResetCode` 
 `PeerStopCode` expose the peer codes. `QuicConfig.WithStreamLimits` sets the peer stream
 limits, and `H3Quic.ForH3` uses it (R25).
 
-### WEB7. H3QuicLoopback 20 KB POST can stall into the 10 s write timeout on a loaded host
+### WEB7. H3QuicLoopback 20 KB POST can stall into the 10 s write timeout on a loaded host (resolved in QUIC; runtime gap open)
 - Symptom: in one of two runs on the same code, the client's 20000-byte POST failed after
   about 10.7 s with Transport (step 606000). The server never got the full request
   (`server result=53`). The rerun passed, with the POST taking 3.1 s. No stream reset or
   STOP_SENDING was involved, and the HQ5 change does not touch the read or credit path.
-- Suspected cause: a scheduling/flow-control stall under load. The server grants stream
-  credit only while its pump reads (8 KiB windows), and the client's blocking write waits
-  with a fixed 10 s I/O timeout (`H3Quic.DefaultIoTimeoutMillis`). Open item: investigate
-  MAX_STREAM_DATA timing under load before calling the transport stable.
+- Cause (2026-10-06, 0.5.3 CLI + kit3, builder load 15-20): loopback datagrams were lost.
+  Five baseline runs all passed, with POST times of 5.2, 14.5, 1.9, 10.2 and 5.2 s. Each
+  4 KiB DATA write has its own 10 s deadline, so only one stalled chunk fails the test.
+  Instrumented runs showed 6-8 of 30-40 datagrams lost in each direction (sender tx
+  minus peer rx), no send errors, and hundreds of timed-out driver receives. QUIC
+  recovered every loss with PTO probes. The first RTT sample includes the TLS handshake
+  computation (0.5 s in one run), which made the PTO about 1.5 s plus backoff, so a few
+  losses cost seconds.
+- Runtime gap (not fixed here): `NetworkFinish` (`Runtime/Network/Operations.bd`)
+  returns `NETWORK_TIMED_OUT` when the deadline wins the one-winner wait. The reactor may
+  already have run `recvmsg` (`network_posix.h`, `BeskidNetworkAttempt`) for that request,
+  and those bytes are freed with it. A UDP receive with a deadline can drop a datagram.
+  A TCP `Read` with a deadline can drop stream bytes in the same way.
+- Fix in `packages/quic`: `QuicEndpoint` runs a receiver fiber that waits with no
+  deadline and queues datagrams. The driver fiber drains the queue, runs timers and sends,
+  and sleeps at most 1 ms. Closing the socket ends the receiver's wait. A PTO also queues
+  the control frames still in flight (MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS,
+  HANDSHAKE_DONE, RESET_STREAM, STOP_SENDING) for the probe again (RFC 9000 section 13.3,
+  RFC 9002 section 6.2.4). Test `QuicCreditLoss`: 100 KB in memory, where the first
+  datagram flight after each receiver read (the credit updates) and every 7th sender
+  datagram are lost. The transfer must finish in less than 5 s of simulated time.

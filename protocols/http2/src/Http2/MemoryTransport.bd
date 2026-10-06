@@ -1,4 +1,5 @@
 use Core.Bytes.Slice;
+use Core.Collections.Array;
 use Core.IO.Closer;
 use Core.IO.IoError;
 use Core.IO.Reader;
@@ -40,19 +41,13 @@ Result<i64, IoError> DoRead(MemoryTransport self, u8[] destination, i64 offset, 
 
 Result<i64, IoError> DoWrite(MemoryTransport self, u8[] source, i64 offset, i64 count) {
     if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange); }
-    // Doubling growth: copying the whole output on every write exhausted the
-    // heap when many targets share one test process.
-    i64 have = self.position[1];
-    if have + count > Slice.Len(self.output) {
-        mut i64 size = Slice.Len(self.output) * 2_i64;
-        if size < 1024_i64 { size = 1024_i64; }
-        if size < have + count { size = have + count; }
-        u8[] grown = Slice.New(size);
-        if have > 0_i64 { Slice.Copy(grown, 0_i64, self.output, 0_i64, have); }
-        self.output = grown;
-    }
-    if count > 0_i64 { Slice.Copy(self.output, have, source, offset, count); }
-    self.position[1] = have + count;
+    // Byte-wise append on a local copy is what passes in 0.5.2; Slice.New
+    // based growth exhausted the heap (protocols/COMPILER-GAPS.md).
+    mut u8[] out = self.output;
+    mut i64 i = 0_i64;
+    while i < count { Array.Append<u8>(out, source[offset + i]); i = i + 1_i64; }
+    self.output = out;
+    self.position[1] = self.position[1] + count;
     return Result::Ok(count);
 }
 

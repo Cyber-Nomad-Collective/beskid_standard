@@ -6,6 +6,7 @@ use Http3.H3Errors;
 use Http3.QpackStatic;
 use Http3.QpackTable;
 use Http3.QpackWire;
+use Codec.Mem;
 
 // RFC 9204 encoder. The default policy uses the static table and literals
 // only. With `dynamic` enabled (and a non-zero peer
@@ -182,9 +183,7 @@ pub u8[] EncodeSection(mut QEncoder e, i64 streamId, HeaderField[] fields) {
     mut i64 sectionBase = base;
     if required == 0_i64 { sectionBase = 0_i64; }
     out = QpackWire.WritePrefix(out, required, sectionBase, QpackTable.MaxEntries(e.table));
-    i64 n = Slice.Len(lines);
-    mut i64 k = 0_i64;
-    while k < n { Array.Append<u8>(out, lines[k]); k = k + 1_i64; }
+    out = Mem.Join(out, lines, 0_i64, Slice.Len(lines));
     if required > 0_i64 {
         mut i64[] ids = e.secStream;
         mut i64[] reqs = e.secRequired;
@@ -238,9 +237,9 @@ pub i64 OnDecoderStream(mut QEncoder e, u8[] data) {
     if e.st[1] != 0_i64 { return e.st[1]; }
     i64 na = Slice.Len(e.pending);
     i64 nb = Slice.Len(data);
-    u8[] buf = Slice.New(na + nb);
-    if na > 0_i64 { Slice.Copy(buf, 0_i64, e.pending, 0_i64, na); }
-    if nb > 0_i64 { Slice.Copy(buf, na, data, 0_i64, nb); }
+    u8[] buf = Mem.Zeroed(na + nb);
+    if na > 0_i64 { Mem.Copy(buf, 0_i64, e.pending, 0_i64, na); }
+    if nb > 0_i64 { Mem.Copy(buf, na, data, 0_i64, nb); }
     i64 count = na + nb;
     mut i64 pos = 0_i64;
     mut bool more = true;
@@ -271,8 +270,8 @@ pub i64 OnDecoderStream(mut QEncoder e, u8[] data) {
         }
     }
     if count - pos > 16_i64 { return Fail(e); }
-    u8[] rest = Slice.New(count - pos);
-    if count > pos { Slice.Copy(rest, 0_i64, buf, pos, count - pos); }
+    u8[] rest = Mem.Zeroed(count - pos);
+    if count > pos { Mem.Copy(rest, 0_i64, buf, pos, count - pos); }
     e.pending = rest;
     return 0_i64;
 }

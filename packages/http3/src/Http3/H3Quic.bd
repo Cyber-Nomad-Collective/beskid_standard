@@ -12,6 +12,7 @@ use Quic.QuicEndpoint;
 use Quic.QuicErrors;
 use Tls.TlsConfig;
 use Uri.Host;
+use Codec.Mem;
 
 // The QUIC services HTTP/3 needs (RFC 9114 sections 3 and 6), as module
 // functions over one concrete type. HTTP/3 code only calls these functions,
@@ -146,9 +147,7 @@ bool MemWrite(MemLink link, i64 id, u8[] data, bool fin) {
     if s.st[finSlot] == 1_i64 || s.st[resetSlot] >= 0_i64 { return false; }
     mut u8[] buf = s.toServer;
     if link.isServer { buf = s.toClient; }
-    i64 n = Slice.Len(data);
-    mut i64 i = 0_i64;
-    while i < n { Array.Append<u8>(buf, data[i]); i = i + 1_i64; }
+    buf = Mem.Join(buf, data, 0_i64, Slice.Len(data));
     if link.isServer { s.toClient = buf; } else { s.toServer = buf; }
     if fin { s.st[finSlot] = 1_i64; }
     return true;
@@ -167,8 +166,8 @@ u8[] MemRead(MemLink link, i64 id, i64 maxCount) {
     mut i64 take = Slice.Len(buf) - pos;
     if take > maxCount { take = maxCount; }
     if take <= 0_i64 { return Slice.New(0_i64); }
-    u8[] out = Slice.New(take);
-    Slice.Copy(out, 0_i64, buf, pos, take);
+    u8[] out = Mem.Zeroed(take);
+    Mem.Copy(out, 0_i64, buf, pos, take);
     if pos + take == Slice.Len(buf) {
         // Everything was consumed: drop the backing buffer.
         if link.isServer { s.toServer = Slice.New(0_i64); } else { s.toClient = Slice.New(0_i64); }
@@ -351,7 +350,7 @@ H3QuicSession NewSession(Endpoint endpoint, i64 handle, bool isServer, Fiber<uni
     mut i64[] n = [0_i64, -1_i64, 0_i64, 0_i64];
     n[0] = DefaultIoTimeoutMillis();
     n[3] = buffer;
-    u8[] scratch = Slice.New(buffer);
+    u8[] scratch = Mem.Zeroed(buffer);
     return H3QuicSession {
         endpoint: endpoint, handle: handle, isServer: isServer, ids: Array.Empty<i64>(), resets: Array.Empty<i64>(),
         scratch: scratch, n: n, drivers: drivers,
@@ -594,8 +593,8 @@ u8[] QRead(H3QuicSession s, i64 id, i64 maxCount) {
         return Slice.New(0_i64);
     }
     if n <= 0_i64 { return Slice.New(0_i64); }
-    u8[] out = Slice.New(n);
-    Slice.Copy(out, 0_i64, s.scratch, 0_i64, n);
+    u8[] out = Mem.Zeroed(n);
+    Mem.Copy(out, 0_i64, s.scratch, 0_i64, n);
     return out;
 }
 

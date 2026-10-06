@@ -15,6 +15,7 @@ use Tls.TlsConfig;
 use Tls.TlsErrors;
 use Tls.TlsPk;
 use Tls.Wire;
+use Codec.Mem;
 
 // Sans-I/O TLS 1.3 handshake engine (RFC 8446 section 4), shared by the TLS record layer
 // and QUIC (RFC 9001). The carrier feeds handshake bytes per encryption level with `Feed`
@@ -170,7 +171,7 @@ pub Result<HandshakeEngine, TlsError> NewServer(TlsServerConfig config) {
 /// (full encoding) with the ephemeral `share`. No Send event is produced for it.
 pub Result<HandshakeEngine, TlsError> NewClientAfterHello(TlsClientConfig config, KeyShare share, u8[] clientHello) {
     HandshakeEngine e = NewClient(config)?;
-    Messages.ClientHello ch = Messages.DecodeClientHello(Slice.SubSlice(clientHello, 4_i64, Slice.Len(clientHello) - 4_i64))?;
+    Messages.ClientHello ch = Messages.DecodeClientHello(Mem.SubSlice(clientHello, 4_i64, Slice.Len(clientHello) - 4_i64))?;
     e.share = share;
     SetB(e, BRandom(), ch.random);
     SetB(e, BSessionId(), ch.sessionId);
@@ -234,9 +235,9 @@ i64[] SuiteCodes(CipherSuite[] list) {
 u8[] Cat(u8[] a, u8[] b) {
     i64 na = Slice.Len(a);
     i64 nb = Slice.Len(b);
-    u8[] out = Slice.New(na + nb);
-    Slice.Copy(out, 0_i64, a, 0_i64, na);
-    Slice.Copy(out, na, b, 0_i64, nb);
+    u8[] out = Mem.Zeroed(na + nb);
+    Mem.Copy(out, 0_i64, a, 0_i64, na);
+    Mem.Copy(out, na, b, 0_i64, nb);
     return out;
 }
 
@@ -338,14 +339,13 @@ Result<unit, TlsError> DoFeed(HandshakeEngine e, i64 level, u8[] data, i64 offse
     if level != e.st[SLevel()] { return Result::Error(F(Alert.UnexpectedMessage())); }
     if count <= 0_i64 { return Result::Ok(()); }
     if Slice.Len(e.inbuf) + count > Wire.MaxHandshakeMessage() + 4_i64 + 16384_i64 { return Result::Error(F(Alert.DecodeError())); }
-    mut i64 i = 0_i64;
-    while i < count { Array.Append<u8>(e.inbuf, data[offset + i]); i = i + 1_i64; }
+    e.inbuf = Mem.Join(e.inbuf, data, offset, count);
     while true {
         i64 have = Slice.Len(e.inbuf);
         i64 n = Messages.MessageLength(e.inbuf, 0_i64, have)?;
         if n == 0_i64 { return Result::Ok(()); }
-        u8[] msg = Slice.SubSlice(e.inbuf, 0_i64, n);
-        e.inbuf = Slice.SubSlice(e.inbuf, n, have - n);
+        u8[] msg = Mem.SubSlice(e.inbuf, 0_i64, n);
+        e.inbuf = Mem.SubSlice(e.inbuf, n, have - n);
         i64 before = e.st[SLevel()];
         Dispatch(e, Messages.Frame(msg))?;
         if e.st[SLevel()] != before && Slice.Len(e.inbuf) > 0_i64 { return Result::Error(F(Alert.UnexpectedMessage())); }

@@ -11,6 +11,7 @@ use Tls.TlsConfig;
 use Tls.TlsErrors;
 use Quic.QuicProtection;
 use Quic.QuicWire;
+use Codec.Mem;
 
 // The handshake interface QUIC drives (RFC 9001 section 4): the carrier feeds CRYPTO bytes per
 // encryption level and drains events in order:
@@ -77,7 +78,7 @@ pub i64 AlertNoApplicationProtocol() { return 120_i64; }
 pub i64 AlertMissingExtension() { return 109_i64; }
 
 u8[] Random32() {
-    return match Entropy.Bytes(32_i64) { Result::Ok(b) => b, Result::Error(_) => Slice.New(32_i64), };
+    return match Entropy.Bytes(32_i64) { Result::Ok(b) => b, Result::Error(_) => Mem.Zeroed(32_i64), };
 }
 
 LoopbackHandshake MakeLoopback(bool isClient, string[] alpn, u8[] transportParams, i64 suite) {
@@ -244,12 +245,12 @@ unit Push(LoopbackHandshake hs, HandshakeEvent ev) { Array.Append<HandshakeEvent
 
 u8[] Message(i64 kind, u8[] body) {
     i64 n = Slice.Len(body);
-    u8[] out = Slice.New(4_i64 + n);
+    u8[] out = Mem.Zeroed(4_i64 + n);
     out[0] = u8(kind);
     out[1] = u8((n >> 16_i64) & 255_i64);
     out[2] = u8((n >> 8_i64) & 255_i64);
     out[3] = u8(n & 255_i64);
-    Slice.Copy(out, 4_i64, body, 0_i64, n);
+    Mem.Copy(out, 4_i64, body, 0_i64, n);
     return out;
 }
 
@@ -273,14 +274,14 @@ string ReadString(Reader r) {
 u8[] Secret(LoopbackHandshake hs, string label) {
     return match Hkdf.ExpandLabel(HashAlgorithm::Sha256, hs.master, label, Slice.New(0_i64), 32_i64) {
         Result::Ok(v) => v,
-        Result::Error(_) => Slice.New(32_i64),
+        Result::Error(_) => Mem.Zeroed(32_i64),
     };
 }
 
 unit DeriveMaster(LoopbackHandshake hs, u8[] clientRandom, u8[] serverRandom) {
-    u8[] ikm = Slice.New(64_i64);
-    Slice.Copy(ikm, 0_i64, clientRandom, 0_i64, 32_i64);
-    Slice.Copy(ikm, 32_i64, serverRandom, 0_i64, 32_i64);
+    u8[] ikm = Mem.Zeroed(64_i64);
+    Mem.Copy(ikm, 0_i64, clientRandom, 0_i64, 32_i64);
+    Mem.Copy(ikm, 32_i64, serverRandom, 0_i64, 32_i64);
     u8[] salt = [98_u8, 101_u8, 115_u8, 107_u8, 105_u8, 100_u8];
     hs.master = Hkdf.Extract(HashAlgorithm::Sha256, salt, ikm);
     return;
@@ -288,7 +289,7 @@ unit DeriveMaster(LoopbackHandshake hs, u8[] clientRandom, u8[] serverRandom) {
 
 i64 LbStart(LoopbackHandshake hs) {
     if !hs.isClient || hs.st[0] != StStart() { return 0_i64; }
-    u8[] body = Slice.New(1024_i64);
+    u8[] body = Mem.Zeroed(1024_i64);
     Writer w = QuicWire.NewWriter(body, 0_i64, 1024_i64);
     QuicWire.PutAll(w, hs.random);
     QuicWire.PutByte(w, Array.Len<string>(hs.alpn));
@@ -310,8 +311,7 @@ i64 Fail(LoopbackHandshake hs, i64 alert) {
 i64 LbFeed(LoopbackHandshake hs, i64 level, u8[] data, i64 offset, i64 count) {
     if hs.st[0] == StFailed() { return hs.st[3]; }
     if Slice.Len(hs.inbuf) + count > 16384_i64 { return Fail(hs, AlertDecodeError()); }
-    mut i64 i = 0_i64;
-    while i < count { Array.Append<u8>(hs.inbuf, data[offset + i]); i = i + 1_i64; }
+    hs.inbuf = Mem.Join(hs.inbuf, data, offset, count);
     while Slice.Len(hs.inbuf) >= 4_i64 {
         i64 n = (i64(hs.inbuf[1]) << 16_i64) | (i64(hs.inbuf[2]) << 8_i64) | i64(hs.inbuf[3]);
         i64 have = Slice.Len(hs.inbuf);
@@ -346,14 +346,14 @@ i64 Handle(LoopbackHandshake hs, i64 level, i64 kind, u8[] body) {
         hs.selected[0] = chosen;
         hs.peerRandom = clientRandom;
         DeriveMaster(hs, clientRandom, hs.random);
-        u8[] sh = Slice.New(300_i64);
+        u8[] sh = Mem.Zeroed(300_i64);
         Writer w = QuicWire.NewWriter(sh, 0_i64, 300_i64);
         QuicWire.PutAll(w, hs.random);
         PutString(w, chosen);
         Push(hs, HandshakeEvent::Send(0_i64, Message(2_i64, QuicWire.CopyOf(sh, 0_i64, QuicWire.WPos(w)))));
         Push(hs, HandshakeEvent::WriteSecret(2_i64, Secret(hs, "s hs")));
         Push(hs, HandshakeEvent::ReadSecret(2_i64, Secret(hs, "c hs")));
-        u8[] ee = Slice.New(Slice.Len(hs.localParams) + 2_i64);
+        u8[] ee = Mem.Zeroed(Slice.Len(hs.localParams) + 2_i64);
         Writer we = QuicWire.NewWriter(ee, 0_i64, Slice.Len(ee));
         QuicWire.PutUint(we, 2_i64, Slice.Len(hs.localParams));
         QuicWire.PutAll(we, hs.localParams);

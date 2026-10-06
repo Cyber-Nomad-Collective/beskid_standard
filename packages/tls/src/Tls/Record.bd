@@ -8,6 +8,7 @@ use Tls.KeySchedule;
 use Tls.Suites;
 use Tls.TlsErrors;
 use Tls.Wire;
+use Codec.Mem;
 
 // TLS 1.3 record protection (RFC 8446 section 5.2-5.3). Records are sealed and opened
 // in place inside one caller-owned buffer laid out as
@@ -78,7 +79,7 @@ pub i64 Sequence(RecordKeys keys) { return keys.seq[0]; }
 
 /// Per-record nonce: the IV XORed with the 64-bit sequence number, left-padded to 12 bytes.
 pub u8[] Nonce(u8[] iv, i64 sequence) {
-    u8[] nonce = Slice.New(12_i64);
+    u8[] nonce = Mem.Zeroed(12_i64);
     mut i64 i = 0_i64;
     while i < 12_i64 {
         mut i64 s = 0_i64;
@@ -128,7 +129,7 @@ pub Result<i64, TlsError> Seal(RecordKeys keys, u8[] buf, i64 contentType, i64 l
     mut i64 i = 0_i64;
     while i < padding { buf[6_i64 + length + i] = 0_u8; i = i + 1_i64; }
     WriteHeader(buf, 0_i64, Wire.ContentApplicationData(), total);
-    u8[] aad = Slice.SubSlice(buf, 0_i64, 5_i64);
+    u8[] aad = Mem.SubSlice(buf, 0_i64, 5_i64);
     i64 sequence = keys.seq[0];
     if sequence < 0_i64 { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
     u8[] nonce = Nonce(keys.iv, sequence);
@@ -150,7 +151,7 @@ pub Result<Opened, TlsError> Open(RecordKeys keys, u8[] buf, i64 recordLength) {
     if total > Wire.MaxCiphertext() { return Result::Error(TlsErrors.Fatal(Alert.RecordOverflow())); }
     if total < 17_i64 { return Result::Error(TlsErrors.Fatal(Alert.BadRecordMac())); }
     if i64(buf[0]) != Wire.ContentApplicationData() { return Result::Error(TlsErrors.Fatal(Alert.UnexpectedMessage())); }
-    u8[] aad = Slice.SubSlice(buf, 0_i64, 5_i64);
+    u8[] aad = Mem.SubSlice(buf, 0_i64, 5_i64);
     i64 sequence = keys.seq[0];
     u8[] nonce = Nonce(keys.iv, sequence);
     Result<i64, CryptoError> opened = OpenRaw(keys.key, nonce, aad, buf, 5_i64, total);

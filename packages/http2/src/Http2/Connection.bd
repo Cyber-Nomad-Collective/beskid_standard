@@ -16,6 +16,7 @@ use Http2.Mapping;
 use Http2.MemoryTransport;
 use Http2.Settings;
 use Http2.Streams;
+use Codec.Mem;
 
 // RFC 9113 connection core shared by the client and the server: preface,
 // SETTINGS exchange, frame dispatch, stream table, header block assembly,
@@ -55,6 +56,22 @@ pub Config DefaultConfig() {
 pub i64 ConnectionWindow() { return 65535_i64; }
 // Largest frame this endpoint accepts and sends (SETTINGS_MAX_FRAME_SIZE stays at its default).
 pub i64 LocalMaxFrameSize() { return 16384_i64; }
+// Frame buffers start at 4 KiB (a literal allocation) and grow once to a full frame: a
+// 16 KiB buffer costs about 120 ms to allocate in 0.5.3 (COMPILER-GAPS PERF1).
+i64 InitialBuffer() { return 4096_i64; }
+i64 FullBuffer() { return Frame.HeaderLength() + LocalMaxFrameSize(); }
+unit GrowIn(Connection conn, i64 need) {
+    if Slice.Len(conn.inBuf) >= need { return; }
+    u8[] grown = Mem.Zeroed(FullBuffer());
+    Mem.Copy(grown, 0_i64, conn.inBuf, 0_i64, Frame.HeaderLength());
+    conn.inBuf = grown;
+    return;
+}
+unit GrowOut(Connection conn, i64 need) {
+    if Slice.Len(conn.outBuf) >= need { return; }
+    conn.outBuf = Mem.Zeroed(FullBuffer());
+    return;
+}
 // Recently closed stream ids kept to tell "closed" from "never opened".
 i64 ClosedRing() { return 64_i64; }
 
@@ -155,8 +172,8 @@ pub Result<Connection,Http2Error> New(bool isClient, Config config) {
                 continuationStream: 0_i64, continuationEndStream: false, block: Slice.New(0_i64),
                 goAwaySent: false, goAwayLastId: -1_i64, goAwayCode: -1_i64,
                 failed: -1_i64, peerClosed: false, writeBusy: false, readBusy: false,
-                inBuf: Slice.New(Frame.HeaderLength() + LocalMaxFrameSize()),
-                outBuf: Slice.New(Frame.HeaderLength() + LocalMaxFrameSize()),
+                inBuf: Mem.Zeroed(InitialBuffer()),
+                outBuf: Mem.Zeroed(InitialBuffer()),
                 closedIds: Ring(), closedNext: 0_i64, pingAcks: 0_i64, settingsAcks: 0_i64, handledRequests: 0_i64, windowUpdates: 0_i64,
             }),
         },
@@ -267,9 +284,9 @@ pub Result<unit,Http2Error> GoAway(Connection conn, Stream transport) {
 pub Result<unit,Http2Error> WriteClientPreface(Connection conn, Stream transport) {
     u8[] preface = Preface();
     u8[] settings = Settings.EncodeFrame(conn.localSent);
-    u8[] both = Slice.New(Slice.Len(preface) + Slice.Len(settings));
-    Slice.Copy(both, 0_i64, preface, 0_i64, Slice.Len(preface));
-    Slice.Copy(both, Slice.Len(preface), settings, 0_i64, Slice.Len(settings));
+    u8[] both = Mem.Zeroed(Slice.Len(preface) + Slice.Len(settings));
+    Mem.Copy(both, 0_i64, preface, 0_i64, Slice.Len(preface));
+    Mem.Copy(both, Slice.Len(preface), settings, 0_i64, Slice.Len(settings));
     return WriteFrame(conn, transport, both);
 }
 
@@ -309,8 +326,9 @@ Result<unit,Http2Error> WriteHeaderBlockLocked(Connection conn, Stream transport
             kind = Frame.TypeHeaders();
             if endStream { flags = flags | Frame.FlagEndStream(); }
         }
+        GrowOut(conn, Frame.HeaderLength() + chunk);
         Frame.PutHeader(conn.outBuf, 0_i64, chunk, kind, flags, id);
-        if chunk > 0_i64 { Slice.Copy(conn.outBuf, Frame.HeaderLength(), block, offset, chunk); }
+        if chunk > 0_i64 { Mem.Copy(conn.outBuf, Frame.HeaderLength(), block, offset, chunk); }
         Result<unit,Http2Error> written = WriteLocked(conn, transport, conn.outBuf, Frame.HeaderLength() + chunk);
         match written {
             Result::Error(error) => { return Result::Error(error); },
@@ -411,8 +429,9 @@ Result<bool,Http2Error> FlushStream(Connection conn, Stream transport, StreamSta
     bool last = chunk == remaining;
     mut i64 flags = 0_i64;
     if last { flags = Frame.FlagEndStream(); }
+    GrowOut(conn, Frame.HeaderLength() + chunk);
     Frame.PutHeader(conn.outBuf, 0_i64, chunk, Frame.TypeData(), flags, s.id);
-    if chunk > 0_i64 { Slice.Copy(conn.outBuf, Frame.HeaderLength(), s.outBody, s.outOffset, chunk); }
+    if chunk > 0_i64 { Mem.Copy(conn.outBuf, Frame.HeaderLength(), s.outBody, s.outOffset, chunk); }
     Result<unit,Http2Error> written = WriteLocked(conn, transport, conn.outBuf, Frame.HeaderLength() + chunk);
     s.outOffset = s.outOffset + chunk;
     s.sendWindow = s.sendWindow - chunk;
@@ -542,6 +561,7 @@ pub Result<Frame,Http2Error> ReadFrame(Connection conn, Stream transport) {
     FrameHeader header = Frame.ParseHeader(conn.inBuf, 0_i64);
     if header.length > LocalMaxFrameSize() { return Result::Error(Fail(conn, transport, FrameErrors.FrameSizeError())); }
     if header.length > 0_i64 {
+        GrowIn(conn, Frame.HeaderLength() + header.length);
         Result<unit,IoError> body = IO.ReadExact(transport, conn.inBuf, Frame.HeaderLength(), header.length);
         match body {
             Result::Error(error) => { return Result::Error(ReadFailure(conn, error)); },
@@ -677,6 +697,9 @@ Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool e
 u8[] Place(u8[] buf, i64 used, u8[] data, i64 expected) {
     i64 count = Slice.Len(data);
     if count == 0_i64 { return buf; }
+    // The first DATA payload is a fresh copy owned by this stream: adopt it as the body
+    // instead of allocating and copying again (most bodies arrive in one frame).
+    if used == 0_i64 && Slice.Len(buf) == 0_i64 { return data; }
     i64 need = used + count;
     mut u8[] target = buf;
     if need > Slice.Len(buf) {
@@ -684,17 +707,17 @@ u8[] Place(u8[] buf, i64 used, u8[] data, i64 expected) {
         if size < 4096_i64 { size = 4096_i64; }
         if expected >= need && expected > size { size = expected; }
         if size < need { size = need; }
-        target = Slice.New(size);
-        if used > 0_i64 { Slice.Copy(target, 0_i64, buf, 0_i64, used); }
+        target = Mem.Zeroed(size);
+        if used > 0_i64 { Mem.Copy(target, 0_i64, buf, 0_i64, used); }
     }
-    Slice.Copy(target, used, data, 0_i64, count);
+    Mem.Copy(target, used, data, 0_i64, count);
     return target;
 }
 
 // The received body without spare capacity.
 pub u8[] BodyOf(StreamState s) {
     if Slice.Len(s.body) == s.received { return s.body; }
-    return Slice.SubSlice(s.body, 0_i64, s.received);
+    return Mem.SubSlice(s.body, 0_i64, s.received);
 }
 
 // END_STREAM received: checks content-length (section 8.1.1) and updates the state.

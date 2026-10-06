@@ -1,0 +1,226 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+
+// The QUIC services HTTP/3 needs (RFC 9114 section 3 and 6), as module
+// functions over one concrete type. HTTP/3 code only calls these functions,
+// so the transport behind `QuicLink` can change without touching the
+// HTTP/3 layer (a contract value cannot be a struct field in 0.5.2).
+//
+// The current implementation is an in-memory loopback: `NewPair` returns
+// the client and server ends of one simulated QUIC connection, with stream
+// ids, directions, FIN, RESET_STREAM, STOP_SENDING and CONNECTION_CLOSE as
+// in RFC 9000. Data written by one end is readable by the other at once.
+
+/// One simulated stream: bytes in each direction plus state.
+pub type MemStream {
+    pub i64 id,
+    pub u8[] toServer,
+    pub u8[] toClient,
+    // [0] server read offset, [1] client read offset, [2] FIN toward the
+    // server, [3] FIN toward the client, [4] reset code of the client send
+    // side (-1), [5] reset code of the server send side (-1), [6] STOP_SENDING
+    // code from the server (-1), [7] STOP_SENDING code from the client (-1).
+    pub i64[] st,
+}
+
+/// The shared state of one simulated connection.
+pub type MemConnection {
+    pub MemStream[] streams,
+    // [0..3] next stream index for client bidi, server bidi, client uni,
+    // server uni; [4] close code (-1 while open); [5] closed by server (0/1).
+    pub i64[] st,
+}
+
+/// One endpoint of a QUIC connection.
+pub type QuicLink { pub MemConnection conn, pub bool isServer, }
+
+/// Two connected endpoints: [client, server] of one in-memory connection.
+pub QuicLink[] NewPair() {
+    MemConnection conn = MemConnection { streams: Array.Empty<MemStream>(), st: [0_i64, 0_i64, 0_i64, 0_i64, -1_i64, 0_i64] };
+    mut QuicLink[] out = Array.Empty<QuicLink>();
+    Array.Append<QuicLink>(out, QuicLink { conn: conn, isServer: false });
+    Array.Append<QuicLink>(out, QuicLink { conn: conn, isServer: true });
+    return out;
+}
+
+/// The stream was opened by the server (RFC 9000 section 2.1).
+pub bool IsServerInitiated(i64 id) { return (id & 1_i64) == 1_i64; }
+/// The stream is unidirectional.
+pub bool IsUnidirectional(i64 id) { return (id & 2_i64) == 2_i64; }
+/// The stream was opened by the peer of `link`.
+pub bool IsPeerInitiated(QuicLink link, i64 id) { return IsServerInitiated(id) != link.isServer; }
+
+i64 Find(MemConnection conn, i64 id) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<MemStream>(conn.streams) {
+        MemStream s = Array.Get<MemStream>(conn.streams, i);
+        if s.id == id { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+i64 Open(QuicLink link, bool uni) {
+    MemConnection conn = link.conn;
+    mut i64 slot = 0_i64;
+    if link.isServer { slot = 1_i64; }
+    if uni { slot = slot + 2_i64; }
+    i64 index = conn.st[slot];
+    conn.st[slot] = index + 1_i64;
+    i64 id = index * 4_i64 + slot;
+    mut MemStream[] streams = conn.streams;
+    Array.Append<MemStream>(streams, MemStream { id: id, toServer: Slice.New(0_i64), toClient: Slice.New(0_i64), st: [0_i64, 0_i64, 0_i64, 0_i64, -1_i64, -1_i64, -1_i64, -1_i64] });
+    conn.streams = streams;
+    return id;
+}
+
+/// Opens a bidirectional stream; returns its id, or -1 when closed.
+pub i64 OpenBidi(QuicLink link) {
+    if IsClosed(link) { return -1_i64; }
+    return Open(link, false);
+}
+
+/// Opens a unidirectional stream; returns its id, or -1 when closed.
+pub i64 OpenUni(QuicLink link) {
+    if IsClosed(link) { return -1_i64; }
+    return Open(link, true);
+}
+
+/// Number of streams known to the connection; with StreamAt this lists them
+/// in creation order, so callers discover new peer streams incrementally.
+pub i64 StreamCount(QuicLink link) {
+    MemConnection conn = link.conn;
+    return Array.Len<MemStream>(conn.streams);
+}
+
+/// Id of the `index`-th stream.
+pub i64 StreamAt(QuicLink link, i64 index) {
+    MemConnection conn = link.conn;
+    MemStream s = Array.Get<MemStream>(conn.streams, index);
+    return s.id;
+}
+
+/// Writes `data` (and FIN when `fin`) to the send side of `id`. False when
+/// the connection is closed, the stream is unknown, not writable by this
+/// endpoint, already finished, or reset.
+pub bool Write(QuicLink link, i64 id, u8[] data, bool fin) {
+    if IsClosed(link) { return false; }
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return false; }
+    if IsUnidirectional(id) && IsPeerInitiated(link, id) { return false; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    mut i64 finSlot = 2_i64;
+    mut i64 resetSlot = 4_i64;
+    if link.isServer { finSlot = 3_i64; resetSlot = 5_i64; }
+    if s.st[finSlot] == 1_i64 || s.st[resetSlot] >= 0_i64 { return false; }
+    mut u8[] buf = s.toServer;
+    if link.isServer { buf = s.toClient; }
+    i64 n = Slice.Len(data);
+    mut i64 i = 0_i64;
+    while i < n { Array.Append<u8>(buf, data[i]); i = i + 1_i64; }
+    if link.isServer { s.toClient = buf; } else { s.toServer = buf; }
+    if fin { s.st[finSlot] = 1_i64; }
+    return true;
+}
+
+/// Reads and consumes up to `maxCount` available bytes of `id`.
+pub u8[] Read(QuicLink link, i64 id, i64 maxCount) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return Slice.New(0_i64); }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    mut u8[] buf = s.toServer;
+    mut i64 posSlot = 0_i64;
+    if !link.isServer { buf = s.toClient; posSlot = 1_i64; }
+    i64 pos = s.st[posSlot];
+    mut i64 take = Slice.Len(buf) - pos;
+    if take > maxCount { take = maxCount; }
+    if take <= 0_i64 { return Slice.New(0_i64); }
+    u8[] out = Slice.New(take);
+    Slice.Copy(out, 0_i64, buf, pos, take);
+    if pos + take == Slice.Len(buf) {
+        // Everything was consumed: drop the backing buffer.
+        if link.isServer { s.toServer = Slice.New(0_i64); } else { s.toClient = Slice.New(0_i64); }
+        s.st[posSlot] = 0_i64;
+    } else {
+        s.st[posSlot] = pos + take;
+    }
+    return out;
+}
+
+/// The peer finished its send side and every byte has been read.
+pub bool IsFinished(QuicLink link, i64 id) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return false; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { return s.st[2] == 1_i64 && Slice.Len(s.toServer) == s.st[0]; }
+    return s.st[3] == 1_i64 && Slice.Len(s.toClient) == s.st[1];
+}
+
+/// RESET_STREAM code the peer sent for its send side of `id`, or -1.
+pub i64 PeerResetCode(QuicLink link, i64 id) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return -1_i64; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { return s.st[4]; }
+    return s.st[5];
+}
+
+/// STOP_SENDING code the peer sent for our send side of `id`, or -1.
+pub i64 PeerStopCode(QuicLink link, i64 id) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return -1_i64; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { return s.st[7]; }
+    return s.st[6];
+}
+
+/// Abruptly ends our send side of `id` with `code` (RESET_STREAM).
+pub unit Reset(QuicLink link, i64 id, i64 code) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer {
+        if s.st[3] == 0_i64 && s.st[5] < 0_i64 { s.st[5] = code; s.toClient = Slice.New(0_i64); s.st[1] = 0_i64; }
+    } else {
+        if s.st[2] == 0_i64 && s.st[4] < 0_i64 { s.st[4] = code; s.toServer = Slice.New(0_i64); s.st[0] = 0_i64; }
+    }
+    return;
+}
+
+/// Asks the peer to stop sending on `id` with `code` (STOP_SENDING).
+pub unit StopSending(QuicLink link, i64 id, i64 code) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { if s.st[6] < 0_i64 { s.st[6] = code; } } else { if s.st[7] < 0_i64 { s.st[7] = code; } }
+    return;
+}
+
+/// Closes the connection with an application error code (CONNECTION_CLOSE).
+pub unit Close(QuicLink link, i64 code) {
+    MemConnection conn = link.conn;
+    if conn.st[4] < 0_i64 {
+        conn.st[4] = code;
+        if link.isServer { conn.st[5] = 1_i64; }
+    }
+    return;
+}
+
+/// The connection is closed (by either end).
+pub bool IsClosed(QuicLink link) {
+    MemConnection conn = link.conn;
+    return conn.st[4] >= 0_i64;
+}
+
+/// The close code, or -1 while open.
+pub i64 CloseCode(QuicLink link) {
+    MemConnection conn = link.conn;
+    return conn.st[4];
+}

@@ -1,0 +1,75 @@
+use Testing.Assert;
+use Codec.Hex;
+use Http3.H3Errors;
+use Http3.QpackDecoder;
+use Http3.QpackEncoder;
+
+// Malformed QPACK input is rejected with the RFC 9204 section 6 codes.
+
+unit ExpectSectionFails(string hex, i64 maxBlocked, string because) {
+    mut QDecoder d = QpackDecoder.New(220_i64, maxBlocked);
+    SectionResult r = QpackDecoder.DecodeSection(d, 0_i64, Hex.Of(hex));
+    Assert.Equal<i64>(r.status, QpackDecoder.Failed(), because);
+    Assert.Equal<i64>(r.code, H3Errors.QpackDecompressionFailed(), because + " code");
+    return;
+}
+
+unit ExpectEncoderStreamFails(string hex, string because) {
+    mut QDecoder d = QpackDecoder.New(220_i64, 1_i64);
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of(hex)), H3Errors.QpackEncoderStreamError(), because);
+    return;
+}
+
+test qpack_rejects_bad_static_references {
+    ExpectSectionFails("0000ff24", 0_i64, "indexed static 99");
+    ExpectSectionFails("00005f5400", 0_i64, "literal static name 99");
+}
+
+test qpack_rejects_bad_section_prefixes {
+    ExpectSectionFails("0d00", 1_i64, "encoded insert count above full range");
+    ExpectSectionFails("0281", 1_i64, "negative base");
+    ExpectSectionFails("020080", 0_i64, "blocked stream over the advertised limit");
+    ExpectSectionFails("00", 0_i64, "missing base");
+    ExpectSectionFails("00002900", 0_i64, "truncated literal");
+    ExpectSectionFails("0000290000", 0_i64, "invalid Huffman padding");
+}
+
+test qpack_rejects_bad_dynamic_references {
+    mut QDecoder d = QpackDecoder.New(220_i64, 1_i64);
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("3fbd01c00f7777772e6578616d706c652e636f6d")), 0_i64, "one insert");
+    SectionResult beyond = QpackDecoder.DecodeSection(d, 0_i64, Hex.Of("020081"));
+    Assert.Equal<i64>(beyond.status, QpackDecoder.Failed(), "relative index before the table");
+    mut QDecoder d2 = QpackDecoder.New(220_i64, 1_i64);
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d2, Hex.Of("3fbd01c00f7777772e6578616d706c652e636f6d")), 0_i64, "one insert");
+    SectionResult unused = QpackDecoder.DecodeSection(d2, 0_i64, Hex.Of("0200d1"));
+    Assert.Equal<i64>(unused.status, QpackDecoder.Failed(), "required insert count larger than needed");
+    SectionResult sticky = QpackDecoder.DecodeSection(d2, 4_i64, Hex.Of("0000d1"));
+    Assert.Equal<i64>(sticky.status, QpackDecoder.Failed(), "failure is sticky");
+    mut QDecoder d3 = QpackDecoder.New(220_i64, 1_i64);
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d3, Hex.Of("3fbd01c00f7777772e6578616d706c652e636f6d")), 0_i64, "one insert");
+    SectionResult post = QpackDecoder.DecodeSection(d3, 0_i64, Hex.Of("028011"));
+    Assert.Equal<i64>(post.status, QpackDecoder.Failed(), "post-base index at or above required insert count");
+}
+
+test qpack_rejects_bad_encoder_streams {
+    ExpectEncoderStreamFails("3fbe01", "capacity above the maximum");
+    ExpectEncoderStreamFails("3f01416101 62", "insert larger than the capacity");
+    ExpectEncoderStreamFails("3fbd0100", "duplicate of a missing entry");
+    ExpectEncoderStreamFails("3fbd0180 00", "dynamic name reference to a missing entry");
+    ExpectEncoderStreamFails("3fbd01ff2400", "static name index 99");
+    mut QDecoder d = QpackDecoder.New(220_i64, 1_i64);
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("3fbd01c00f7777")), 0_i64, "split instruction waits");
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("772e6578616d706c652e636f6d")), 0_i64, "rest of the instruction");
+    Assert.Equal<i64>(d.table.size, 57_i64, "inserted after reassembly");
+}
+
+test qpack_rejects_bad_decoder_streams {
+    mut QEncoder e = QpackEncoder.New(QpackEncoder.DefaultPolicy());
+    Assert.Equal<i64>(QpackEncoder.OnDecoderStream(e, Hex.Of("84")), H3Errors.QpackDecoderStreamError(), "ack without a section");
+    mut QEncoder e2 = QpackEncoder.New(QpackEncoder.DefaultPolicy());
+    Assert.Equal<i64>(QpackEncoder.OnDecoderStream(e2, Hex.Of("00")), H3Errors.QpackDecoderStreamError(), "zero increment");
+    mut QEncoder e3 = QpackEncoder.New(QpackEncoder.DefaultPolicy());
+    Assert.Equal<i64>(QpackEncoder.OnDecoderStream(e3, Hex.Of("01")), H3Errors.QpackDecoderStreamError(), "increment beyond inserts");
+    mut QEncoder e4 = QpackEncoder.New(QpackEncoder.DefaultPolicy());
+    Assert.Equal<i64>(QpackEncoder.OnDecoderStream(e4, Hex.Of("48")), 0_i64, "cancellation of an unknown stream is harmless");
+}

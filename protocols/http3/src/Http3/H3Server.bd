@@ -1,3 +1,4 @@
+use Core.Bytes.Slice;
 use Core.Collections.Array;
 use Core.Results;
 use Http.Types;
@@ -6,6 +7,8 @@ use Http3.H3Connection;
 use Http3.H3Errors;
 use Http3.H3Mapping;
 use Http3.H3Quic;
+use Network.Types;
+use Tls.TlsConfig;
 
 // HTTP/3 server side of one QUIC connection: requests arrive as corelib
 // `Http.Types.Request`, responses are `Http.Types.Response`.
@@ -13,10 +16,66 @@ use Http3.H3Quic;
 /// Opens the server side: control stream with SETTINGS and QPACK streams.
 pub H3Conn Accept(QuicLink link, H3Config config) { return H3Connection.Open(link, true, config); }
 
+/// A listening HTTP/3 server endpoint over QUIC.
+pub type H3Listener { pub H3QuicListener quic, pub H3Config config, }
+
+/// Binds `address`:`port` (0: any free port) for HTTP/3 over QUIC + TLS 1.3
+/// and starts the endpoint driver fiber. Only ALPN "h3" is accepted (the
+/// ALPN list of `tls` is replaced). Stop with `StopListening`.
+pub Result<H3Listener,H3Error> ListenQuic(IpAddress address, i64 port, TlsServerConfig tls, H3Config config) {
+    Result<H3QuicListener,H3Error> bound = H3Quic.Listen(address, port, tls);
+    return match bound {
+        Result::Ok(quic) => Result::Ok(H3Listener { quic: quic, config: config }),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+/// The bound UDP port (-1 when unknown).
+pub i64 ListenPort(H3Listener listener) { return H3Quic.ListenerPort(listener.quic); }
+
+/// The accept loop step: waits up to `timeoutMillis` for the next QUIC
+/// connection that negotiated "h3" and opens its HTTP/3 server side. Serve
+/// it with NextRequest / Respond and finish with Shutdown and Release.
+/// Must run inside a fiber.
+pub Result<H3Conn,H3Error> AcceptQuic(H3Listener listener, i64 timeoutMillis) {
+    Result<QuicLink,H3Error> accepted = H3Quic.AcceptLink(listener.quic, timeoutMillis);
+    return match accepted {
+        Result::Ok(link) => Result::Ok(Accept(link, listener.config)),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+/// Stops the endpoint driver; connections still open are abandoned.
+pub unit StopListening(H3Listener listener) {
+    H3Quic.StopListener(listener.quic);
+    return;
+}
+
+/// Waits up to `timeoutMillis` for the next complete request. Returns
+/// streamId -1 on timeout or when the connection is closed (see
+/// H3Connection.ErrorCode).
+pub H3Incoming NextRequest(mut H3Conn conn, i64 timeoutMillis) {
+    i64 deadline = H3Quic.DeadlineIn(timeoutMillis);
+    while true {
+        H3Incoming incoming = Next(conn);
+        if incoming.streamId >= 0_i64 { return incoming; }
+        if H3Connection.ErrorCode(conn) >= 0_i64 || H3Quic.Expired(deadline) { return None(); }
+        H3Quic.Nap();
+    }
+    return None();
+}
+
+/// Closes the connection with H3_NO_ERROR if it is still open, waits up to
+/// `timeoutMillis` for the closing period and frees the transport.
+pub unit Release(mut H3Conn conn, i64 timeoutMillis) {
+    H3Quic.Release(conn.link, timeoutMillis);
+    return;
+}
+
 /// A complete request and its stream id (-1 when none is ready).
 pub type H3Incoming { pub i64 streamId, pub Request request, }
 
-H3Incoming None() { return H3Incoming { streamId: -1_i64, request: Types.EmptyRequest("", "") }; }
+H3Incoming None() { return H3Incoming { streamId: -1_i64, request: Request { method: "", target: "", headers: Array.Empty<Header>(), body: Slice.New(0_i64) } }; }
 
 /// Pumps the connection and returns the next complete, not yet delivered
 /// request. Malformed requests were already reset with H3_MESSAGE_ERROR.

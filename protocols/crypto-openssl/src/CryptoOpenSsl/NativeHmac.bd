@@ -1,0 +1,33 @@
+use Core.Bytes.Slice;
+use Crypto.Hmac;
+use Crypto.Scratch;
+use CryptoOpenSsl.Native;
+
+i64 Md(HashAlgorithm algorithm) {
+    return match algorithm {
+        HashAlgorithm::Sha256 => Native.Sha256Md(),
+        HashAlgorithm::Sha384 => Native.Sha384Md(),
+        HashAlgorithm::Sha512 => Native.Sha512Md(),
+    };
+}
+
+/// One-shot digest through OpenSSL; drop-in for `Crypto.Hmac.Digest`.
+pub u8[] Digest(HashAlgorithm algorithm, u8[] data) {
+    u8[] out = Scratch.Bytes(Hmac.HashLength(algorithm));
+    match algorithm {
+        HashAlgorithm::Sha256 => { Native.Sha256Into(data, out); },
+        HashAlgorithm::Sha384 => { Native.Sha384Into(data, out); },
+        HashAlgorithm::Sha512 => { Native.Sha512Into(data, out); },
+    };
+    return out;
+}
+
+/// One-shot HMAC through OpenSSL `HMAC`; drop-in for `Crypto.Hmac.Compute`.
+/// A key of 2^30 bytes or more, or an OpenSSL failure, takes the pure path.
+/// Incremental HMAC (`HmacState`) stays on the pure kernels.
+pub u8[] Compute(HashAlgorithm algorithm, u8[] key, u8[] data) {
+    if Slice.Len(key) >= Native.MaxEvpLength() { return Hmac.Compute(algorithm, key, data); }
+    u8[] out = Scratch.Bytes(Hmac.HashLength(algorithm));
+    if Native.HmacInto(Md(algorithm), key, data, out) == 0_i64 { return Hmac.Compute(algorithm, key, data); }
+    return out;
+}

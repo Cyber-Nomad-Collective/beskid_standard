@@ -684,3 +684,28 @@ callers.
 - Workaround (`protocols/web/interop/curl-interop.sh`): a link shim directory with
   `libc.so.6.tbd -> $(xcrun --show-sdk-path)/usr/lib/libSystem.tbd` on `LIBRARY_PATH`.
   Open item: per-platform library names for extern contracts.
+
+## 2026-10-06, crypto native provider slice
+
+### NATIVE1. An extern from a missing library fails the whole program, even when it is never called
+- Symptom: `protocols/crypto-openssl/repros/missing-extern-library` declares
+  `[Extern(Abi:"C", Library:"libbeskid-not-installed.so.1")]` and calls it only behind
+  `if false`. The 0.5.3 JIT fails before any test runs:
+  `JIT compile failed: extern resolve: dlopen(libbeskid-not-installed.so.1) for
+  beskid_missing_symbol: ... cannot open shared object file` (`actual-0.5.3-linux.txt`).
+  The JIT resolves every referenced `[Extern]` symbol at load time
+  (`beskid_engine/src/engine.rs` `resolve_process_extern_symbols`), and an AOT link needs
+  the library too. CLIF blocks admit no `call_indirect`, so `dlopen`/`dlsym` at run time
+  cannot replace it.
+- Consequence: an optional native provider cannot live in `corelib_crypto`. A
+  `libcrypto.so.3` import there would stop every crypto user from loading on macOS and on
+  Linux hosts without OpenSSL 3. The provider ships as the opt-in package
+  `protocols/crypto-openssl` (ruling R20).
+- Open item: runtime-optional externs, for example a lazy or weak import that reports a
+  typed "library unavailable" result, or `call_indirect` to a `dlsym` address in CLIF
+  blocks. Either would let TLS/QUIC select the provider in process.
+
+### NATIVE2. `icmp_imm` is not admitted in CLIF blocks
+- Symptom: `%o = icmp_imm eq %r, 1` fails with `opcode icmp_imm is not allowed in a clif
+  block` (E1232 at lowering).
+- Workaround: `%one = iconst.i32 1` and then `%o = icmp eq %r, %one`.

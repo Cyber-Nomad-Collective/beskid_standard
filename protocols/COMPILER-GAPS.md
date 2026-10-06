@@ -496,3 +496,13 @@ without double or trailing underscores, and must be unique per target.
   content mutated during phase `execute_target`" when a test file of the project
   was edited while it ran.
 - Workaround: do not edit the project while its tests run; stage edits elsewhere.
+
+## 2026-10-06, websocket wss slice
+
+### W8. Codegen cost of the TLS-backed WebSocket path
+- Symptom: `WsTlsTests` (2 tests) takes about 19 minutes on a loaded host (load 6-10),
+  roughly 9 minutes of "Generate CLIF" per test, because every test reaches the whole
+  TLS 1.3 engine, X.509 and crypto through `WsTransport::Tls`. With
+  `--target-timeout 900` the 2 tests finish but the budget expires (exit non-zero).
+- Workaround: run with `--target-timeout 2400` (done), keep wss tests to the minimum,
+  split further targets per scenario. Same family as H3.

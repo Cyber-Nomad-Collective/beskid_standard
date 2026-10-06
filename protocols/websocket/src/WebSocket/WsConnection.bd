@@ -15,6 +15,14 @@ use Uri.Scheme;
 use Uri.Types;
 use Connect;
 use Connect.Policy;
+use Core.Optional.Option;
+use Core.Time.Deadline;
+use Tls;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsStream;
+use X509.TrustStore;
+use X509.X509Errors;
 use WebSocket.WsErrors;
 use WebSocket.WsFrame;
 use WebSocket.WsHandshake;
@@ -39,6 +47,8 @@ pub type WsOptions {
     pub i64 handshakeTimeoutMillis,
     pub i64 closeTimeoutMillis,
     pub i64 readTimeoutMillis,
+    // wss client trust; empty means the system bundle (loaded at Open, fail closed).
+    pub Option<CertificateVerification> tls,
 }
 
 pub WsOptions DefaultOptions() {
@@ -49,23 +59,29 @@ pub WsOptions DefaultOptions() {
         handshakeTimeoutMillis: 10000_i64,
         closeTimeoutMillis: 5000_i64,
         readTimeoutMillis: 0_i64,
+        tls: Option.Empty<CertificateVerification>(),
     };
 }
 
 pub WsOptions WithProtocols(WsOptions o, string[] protocols) {
-    return WsOptions { protocols: protocols, origin: o.origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis };
+    return WsOptions { protocols: protocols, origin: o.origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis, tls: o.tls };
 }
 
 pub WsOptions WithOrigin(WsOptions o, string origin) {
-    return WsOptions { protocols: o.protocols, origin: origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis };
+    return WsOptions { protocols: o.protocols, origin: origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis, tls: o.tls };
 }
 
 pub WsOptions WithMaxMessageBytes(WsOptions o, i64 limit) {
-    return WsOptions { protocols: o.protocols, origin: o.origin, maxMessageBytes: limit, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis };
+    return WsOptions { protocols: o.protocols, origin: o.origin, maxMessageBytes: limit, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis, tls: o.tls };
+}
+
+/// Trust policy for wss client connections (for example `TlsConfig.Anchors(...)`).
+pub WsOptions WithTls(WsOptions o, CertificateVerification verification) {
+    return WsOptions { protocols: o.protocols, origin: o.origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis, tls: Option.FromValue<CertificateVerification>(verification) };
 }
 
 pub WsOptions WithTimeouts(WsOptions o, i64 handshakeMillis, i64 closeMillis, i64 readMillis) {
-    return WsOptions { protocols: o.protocols, origin: o.origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: handshakeMillis, closeTimeoutMillis: closeMillis, readTimeoutMillis: readMillis };
+    return WsOptions { protocols: o.protocols, origin: o.origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: handshakeMillis, closeTimeoutMillis: closeMillis, readTimeoutMillis: readMillis, tls: o.tls };
 }
 
 /// One received message. Close carries the peer's status (1005 when it sent none)
@@ -201,8 +217,9 @@ pub string ResourceName(UriRef u) {
     return path;
 }
 
-/// Opens a ws:// connection: resolve and connect (Happy Eyeballs), then the client
-/// opening handshake. wss:// is UnsupportedScheme until the TLS transport exists.
+/// Opens a ws:// or wss:// connection: resolve and connect (Happy Eyeballs), for wss the
+/// TLS 1.3 handshake (server name = URI host, ALPN http/1.1, trust from `options.tls`,
+/// default the system bundle, fail closed), then the client opening handshake.
 pub Result<WsConnection, WsError> Open(string url, WsOptions options) {
     // `Types.Empty()` placeholders would resolve against Network.Types (both are
     // imported as `Types`), so each step continues in a helper instead.
@@ -214,29 +231,73 @@ pub Result<WsConnection, WsError> Open(string url, WsOptions options) {
 
 Result<WsConnection, WsError> OpenUri(UriRef u, WsOptions options) {
     string scheme = Chars.LowerAscii(u.scheme);
-    if scheme != "ws" { return Result::Error(WsError::UnsupportedScheme()); }
+    if scheme != "ws" && scheme != "wss" { return Result::Error(WsError::UnsupportedScheme()); }
     if u.hasFragment { return Result::Error(WsError::InvalidUrl()); }
     string resource = ResourceName(u);
+    bool secure = scheme == "wss";
     return match Scheme.AuthorityOf(u) {
         Result::Error(_) => Result::Error(WsError::InvalidUrl()),
-        Result::Ok(authority) => OpenAuthority(authority, resource, options),
+        Result::Ok(authority) => OpenAuthority(authority, secure, resource, options),
     };
 }
 
-Result<WsConnection, WsError> OpenAuthority(Authority authority, string resource, WsOptions options) {
+Result<WsConnection, WsError> OpenAuthority(Authority authority, bool secure, string resource, WsOptions options) {
     string hostName = authority.hostName;
     string hostHeader = Scheme.HostHeader(authority);
     return match Network.Types.PortNumber(authority.port) {
         Result::Error(_) => Result::Error(WsError::InvalidUrl()),
-        Result::Ok(port) => OpenTcp(hostName, port, hostHeader, resource, options),
+        Result::Ok(port) => OpenTcp(hostName, port, secure, hostHeader, resource, options),
     };
 }
 
-Result<WsConnection, WsError> OpenTcp(string hostName, Port port, string hostHeader, string resource, WsOptions options) {
+Result<WsConnection, WsError> OpenTcp(string hostName, Port port, bool secure, string hostHeader, string resource, WsOptions options) {
     ConnectPolicy policy = Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(options.handshakeTimeoutMillis));
     return match Connect.ConnectHost(hostName, port, policy) {
         Result::Error(_) => Result::Error(WsError::ConnectFailed()),
-        Result::Ok(stream) => ClientHandshake(WsTransport::Tcp(stream), hostHeader, resource, options),
+        Result::Ok(stream) => OpenStream(stream, hostName, secure, hostHeader, resource, options),
+    };
+}
+
+Result<WsConnection, WsError> OpenStream(TcpStream stream, string hostName, bool secure, string hostHeader, string resource, WsOptions options) {
+    if !secure { return ClientHandshake(WsTransport::Tcp(stream), hostHeader, resource, options); }
+    Result<CertificateVerification, WsError> trust = ClientTrust(options);
+    match trust {
+        Result::Error(error) => { stream.Close(); return Result::Error(error); },
+        Result::Ok(verification) => { return OpenTls(stream, hostName, verification, hostHeader, resource, options); },
+    };
+}
+
+/// The wss trust policy: `options.tls`, else the system bundle. A bundle that cannot be
+/// loaded or holds no anchors fails the connection (no insecure fallback).
+Result<CertificateVerification, WsError> ClientTrust(WsOptions options) {
+    Option<CertificateVerification> chosen = options.tls;
+    match chosen {
+        Option::Some(verification) => { return Result::Ok(verification); },
+        Option::None => {},
+    };
+    Result<TrustStore, X509Error> loaded = TrustStore.FromFile(TrustStore.SystemBundlePath());
+    return match loaded {
+        Result::Error(_) => Result::Error(WsError::Tls(0_i64)),
+        Result::Ok(store) => SystemTrust(store),
+    };
+}
+
+Result<CertificateVerification, WsError> SystemTrust(TrustStore store) {
+    if TrustStore.Count(store) == 0_i64 { return Result::Error(WsError::Tls(0_i64)); }
+    return Result::Ok(TlsConfig.WithTrustStore(store));
+}
+
+Option<Deadline> HandshakeDeadline(WsOptions options) {
+    return WsTransport.Within(options.handshakeTimeoutMillis);
+}
+
+Result<WsConnection, WsError> OpenTls(TcpStream stream, string hostName, CertificateVerification verification, string hostHeader, string resource, WsOptions options) {
+    mut TlsClientConfig config = TlsConfig.Client(hostName, verification);
+    config.alpn = ["http/1.1"];
+    Result<TlsStream, TlsError> secured = Tls.Connect(stream, config, HandshakeDeadline(options));
+    return match secured {
+        Result::Error(error) => Result::Error(WsError::Tls(TlsErrors.Code(error))),
+        Result::Ok(tlsStream) => ClientHandshake(WsTransport::Tls(tlsStream), hostHeader, resource, options),
     };
 }
 
@@ -293,6 +354,16 @@ Result<WsConnection, WsError> ClientHandshakeInner(WsTransport transport, string
 /// Runs the server opening handshake on an accepted TCP stream.
 pub Result<WsConnection, WsError> Accept(TcpStream stream, WsOptions options) {
     return ServerHandshake(WsTransport::Tcp(stream), options);
+}
+
+/// Runs the TLS server handshake on an accepted TCP stream (wss), then the server
+/// opening handshake. The TCP stream is closed when the TLS handshake fails.
+pub Result<WsConnection, WsError> AcceptTls(TcpStream stream, TlsServerConfig config, WsOptions options) {
+    Result<TlsStream, TlsError> secured = Tls.Accept(stream, config, HandshakeDeadline(options));
+    return match secured {
+        Result::Error(error) => Result::Error(WsError::Tls(TlsErrors.Code(error))),
+        Result::Ok(tlsStream) => ServerHandshake(WsTransport::Tls(tlsStream), options),
+    };
 }
 
 /// Runs the server opening handshake: reads and validates the upgrade request,

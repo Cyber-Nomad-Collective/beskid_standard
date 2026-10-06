@@ -638,3 +638,13 @@ callers.
   target 14-15 minutes. Same family as W8/H3.
 - Workaround: one test per target, `--target-timeout 2400`, scenarios that cover several
   exchanges per test (WebPlain: HTTP/1.1 and h2c; WebHttpsH2/H1: GET and POST).
+
+### WEB4. AOT link on macOS fails for `Library:"libc.so.6"` externs
+- Symptom: `beskid build --release` of an App that reaches `Crypto.Entropy` (declared
+  `[Extern(Abi:"C", Library:"libc.so.6")]`) links with `-lc.so.6` and fails on macOS:
+  `ld: library 'c.so.6' not found`. The JIT (`beskid test`) is not affected, because it
+  resolves symbols in the process namespace (see "`Library` does not appear to scope
+  symbol lookup" above).
+- Workaround (`protocols/web/interop/curl-interop.sh`): a link shim directory with
+  `libc.so.6.tbd -> $(xcrun --show-sdk-path)/usr/lib/libSystem.tbd` on `LIBRARY_PATH`.
+  Open item: per-platform library names for extern contracts.

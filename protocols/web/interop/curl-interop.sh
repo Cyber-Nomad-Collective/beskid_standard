@@ -19,6 +19,13 @@ fail=0
 check() { # name expected actual
   if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1: expected [$2] got [$3]"; fail=1; fi
 }
+# Crypto.Entropy declares `Library:"libc.so.6"` (the corelib Linux name), so the AOT
+# link asks for -lc.so.6. On macOS point that name at libSystem (COMPILER-GAPS WEB4).
+if [ "$(uname)" = Darwin ]; then
+  shim="$here/obj/linkshim"; mkdir -p "$shim"
+  ln -sf "$(xcrun --show-sdk-path)/usr/lib/libSystem.tbd" "$shim/libc.so.6.tbd"
+  export LIBRARY_PATH="$shim${LIBRARY_PATH:+:$LIBRARY_PATH}"
+fi
 if [ ! -x "$bin" ] || [ -n "${WEB_INTEROP_REBUILD:-}" ]; then
   beskid build --project "$here/web_interop.bproj" --target WebInterop --release --output "$bin" --plain >"$log/build.log" 2>&1 \
     || { echo "FAIL: build"; grep -v INFO "$log/build.log" | tail -20; exit 1; }

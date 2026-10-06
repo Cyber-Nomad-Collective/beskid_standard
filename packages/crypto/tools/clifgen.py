@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generates the straight-line CLIF kernels of protocols/crypto.
+"""Generates the straight-line CLIF kernels of packages/crypto.
 
 Each kernel is a Beskid function whose body is one `clif { ... }` block. The script
 rewrites the region between `// BEGIN GENERATED <name>` and `// END GENERATED <name>`

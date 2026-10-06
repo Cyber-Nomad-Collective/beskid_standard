@@ -6,11 +6,12 @@
 #     h2 and http/1.1 (18444).
 # OpenSSL s_server -www answers HTTP/1.0 with a close-delimited body, which the
 # corelib HTTP/1.1 codec rejects by design, so Node.js is the client peer.
-# Usage: protocols/web/interop/curl-interop.sh
+# Usage: packages/web/interop/curl-interop.sh
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
 certs="$here/../../tls/tests/interop/certs"
-export BESKID_RUNTIME_PREFIX="${BESKID_RUNTIME_PREFIX:-/Users/mikserek/Projects/beskid/.worktrees/net-kit-0.5.2}"
+export BESKID_RUNTIME_PREFIX="${BESKID_RUNTIME_PREFIX:?set BESKID_RUNTIME_PREFIX to a beskid 0.5.3 runtime kit}"
+BESKID="${BESKID:-beskid}"
 unset BESKID_CORELIB_ROOT
 log="${WEB_INTEROP_LOG:-$(mktemp -d)}"
 bin="$here/obj/web-interop"
@@ -19,15 +20,8 @@ fail=0
 check() { # name expected actual
   if [ "$2" = "$3" ]; then echo "PASS $1"; else echo "FAIL $1: expected [$2] got [$3]"; fail=1; fi
 }
-# Crypto.Entropy declares `Library:"libc.so.6"` (the corelib Linux name), so the AOT
-# link asks for -lc.so.6. On macOS point that name at libSystem (COMPILER-GAPS WEB4).
-if [ "$(uname)" = Darwin ]; then
-  shim="$here/obj/linkshim"; mkdir -p "$shim"
-  ln -sf "$(xcrun --show-sdk-path)/usr/lib/libSystem.tbd" "$shim/libc.so.6.tbd"
-  export LIBRARY_PATH="$shim${LIBRARY_PATH:+:$LIBRARY_PATH}"
-fi
 if [ ! -x "$bin" ] || [ -n "${WEB_INTEROP_REBUILD:-}" ]; then
-  beskid build --project "$here/web_interop.bproj" --target WebInterop --release --output "$bin" --plain >"$log/build.log" 2>&1 \
+  "$BESKID" build --project "$here/web_interop.bproj" --target WebInterop --release --output "$bin" --plain >"$log/build.log" 2>&1 \
     || { echo "FAIL: build"; grep -v INFO "$log/build.log" | tail -20; exit 1; }
 fi
 

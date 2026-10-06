@@ -17,37 +17,44 @@ Sources of the order: `docs/research/2026-09-22-v05-network-protocol-candidates.
 and `docs/superpowers/specs/2026-09-22-future-ready-networking-design.md` in the
 root beskid repository.
 
-## Why these packages live outside corelib
+## Where the packages live
 
-The 0.5.2 CLI authorizes corelib runtime services (`__panic`, network builtins,
-...) only when the corelib tree is byte-identical to its embedded bundle
-(`.beskid-bundle.sha256`). Adding one file to corelib makes every corelib
-service unavailable. So each protocol is its own package under `protocols/` and
-depends on an unmodified copy of the released corelib. Moving them into
-`corelib/packages/` happens later, with a CLI that accepts a changed corelib.
+The 0.5.2 CLI authorized corelib runtime services (`__panic`, network builtins,
+...) only when the corelib tree was byte-identical to its embedded bundle, so
+the packages were first developed under `protocols/` against an unmodified
+0.5.2 corelib copy. Compiler 0.5.3 grants authority per canonical service file,
+so the packages now live in `packages/<pkg>/` of the corelib repository and are
+registered in the `beskid_corelib/corelib.bproj` aggregate (ruling R20).
+The program notes, gap log, and repros are in `docs/networking/`.
 
 ## Environment (mandatory)
 
 ```bash
-export BESKID_RUNTIME_PREFIX=/Users/mikserek/Projects/beskid/.worktrees/net-kit-0.5.2
+export BESKID_RUNTIME_PREFIX=<0.5.3 runtime kit>   # builder: /workspace/v053-kit2
 unset BESKID_CORELIB_ROOT
-beskid test --project protocols/<pkg>/tests --target <Target> --plain
-beskid test --project protocols/<pkg>/tests --all-targets --plain
+beskid test --project packages/<pkg>/tests --target <Target> --plain
 ```
 
-- CLI: `/opt/homebrew/bin/beskid` (0.5.2). Its Homebrew runtime kit fails its
-  own hash check (tracked as v0.6 blocker WEB-KIT01); the prefix above is a
-  kit built by `beskid runtime-kit build-native-host`.
-- Released corelib copy: `/Users/mikserek/Projects/beskid/.worktrees/corelib-0.5.2-pristine`.
-  Read it for API reference. Never edit it.
-- Never edit anything outside `protocols/` in this worktree, never touch the
-  compiler, and never touch other worktrees.
+- CLI: beskid 0.5.3 (builder: `/target/compiler-v053/release/beskid_cli`).
+  The 0.5.2 CLI cannot build the relocated packages: they depend on in-tree
+  corelib packages, which 0.5.2 does not authorize.
+- Prefer one `--target` per run. `--all-targets` shares one heap cap across
+  targets (COMPILER-GAPS 9), so per-target runs are the acceptance evidence.
 - Delete `tests/obj` if a build behaves inconsistently. Do not commit `obj/` or
-  `Project.lock` (ignored).
+  `Project.lock`.
+
+## Dependency scheme
+
+- A package `packages/<pkg>/corelib_<pkg>.bproj` depends on `corelib_foundation`
+  and on the exact sibling packages whose modules its `src` imports
+  (`corelib_concurrency`, `corelib_network`, `corelib_http`, `corelib_<pkg>`).
+  It never depends on the aggregate, because the aggregate depends on it.
+- A test or interop project depends only on the aggregate
+  (`dependency "corelib"`, path to `beskid_corelib`), like `corelib_tests`.
 
 ## Layout
 
-Each package `protocols/<pkg>/` has `corelib_<pkg>.bproj`, `src/<Module>.bd`
+Each package `packages/<pkg>/` has `corelib_<pkg>.bproj`, `src/<Module>.bd`
 plus `src/<Module>/*.bd`, and a test project `tests/<pkg>_tests.bproj` with
 targets in `tests/src/*.bd`. Add a test target per area (keep targets small:
 one failed assertion traps the whole target process, so later tests in that
@@ -95,13 +102,13 @@ target do not run).
 - Runtime concurrency limits (0.5.2): at most 64 channels per process and closed
   channels are never freed, so never create a channel per connection, stream or
   request. Coordinate with preallocated flag arrays + `Fiber.Join` + short polls
-  (see `protocols/connect/src/Connect/Engine.bd`). A cancelled fiber stops at
+  (see `packages/connect/src/Connect/Engine.bd`). A cancelled fiber stops at
   its next wait without cleanup and its children are not cancelled: always give
   network operations deadlines. The socket table has 256 slots.
 - Identifiers `host`, `launch` and names starting with `spawn` are reserved by
   the parser. `use` binds the last path segment: avoid submodule names that
   collide with corelib ones (`Errors`, `Types`, `Codec`, ...); prefix them.
-- See `protocols/COMPILER-GAPS.md` before writing closures, nested generic
+- See `docs/networking/COMPILER-GAPS.md` before writing closures, nested generic
   matches, or matches on struct fields of `Option` type.
 - A contract value (e.g. `Core.IO.Stream`) cannot be a struct field (ICE), and a
   method forwarding `this` plus a contract argument fails. Pass the transport to
@@ -120,7 +127,7 @@ target do not run).
 - Available http2: HPACK (`Http2.Hpack*`).
 - Available connect: `Connect.ConnectHost(host, port, policy)` and
   `Connect.ConnectAddresses(addresses, policy)` return `TcpStream`.
-- Available crypto (`protocols/crypto`, 18 targets green): `Crypto.PkAdapters` (VerifyRsaPss/Pkcs1Message, SignEcdsaP256*, VerifyEcdsaP256Message), X25519, P256, Ecdsa, Rsa verify, SHA-256/384/512, HMAC, HKDF with
+- Available crypto (`packages/crypto`, 18 targets green): `Crypto.PkAdapters` (VerifyRsaPss/Pkcs1Message, SignEcdsaP256*, VerifyEcdsaP256Message), X25519, P256, Ecdsa, Rsa verify, SHA-256/384/512, HMAC, HKDF with
   `ExpandLabel`/`DeriveSecret`, ChaCha20-Poly1305, AES-128/256-GCM, AES block,
   ChaCha20 block (QUIC header protection), ConstantTime, `Entropy.Fill`.
 - Idiom reference: corelib `packages/http/src/Http/*.bd`, `packages/network/src/Network/*.bd`,
@@ -134,6 +141,6 @@ target do not run).
   RFC 7541 appendix C, RFC 8448, RFC 9001 appendix A, NIST/Wycheproof vectors, ...).
 - Fail closed with typed error enums. Bound every buffer and count.
 - When the 0.5.2 compiler rejects valid code, reduce it to a minimal repro,
-  append it to `protocols/COMPILER-GAPS.md` (symptom, repro, workaround), and
+  append it to `docs/networking/COMPILER-GAPS.md` (symptom, repro, workaround), and
   work around it in source. Do not stop the slice for a workaround-able gap.
 - Report: what is implemented, test targets with pass counts, gaps, open items.

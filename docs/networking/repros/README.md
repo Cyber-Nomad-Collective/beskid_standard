@@ -6,8 +6,10 @@ Standalone projects that reproduce the gaps listed in `../COMPILER-GAPS.md`. Eac
 
 Run a case: `BESKID_RUNTIME_PREFIX=<kit> ./<case>/run.sh` (set `BESKID=<path>` to pick a compiler; `run.sh` runs
 `beskid test --project <case> --target <T> --plain | grep -v INFO` for every target). The corelib dependency is
-`../../../../corelib-0.5.2-pristine/beskid_corelib`, so the case directories must sit four levels below the directory that
-holds `corelib-0.5.2-pristine`.
+`../../../../../corelib-0.5.2-pristine/beskid_corelib` (the unmodified 0.5.2 corelib, kept as the baseline so that both
+toolchains compile the same library). The case directories are `docs/networking/repros/<case>` in the corelib repository, so the
+repository must sit next to `corelib-0.5.2-pristine` (locally `.worktrees/`, builder `/workspace/`). The repros do not use the
+in-tree corelib.
 
 ## Toolchains
 

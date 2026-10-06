@@ -8,9 +8,9 @@ All paths are local; nothing is pushed.
 | What | Repository | Branch @ commit | Path |
 | --- | --- | --- | --- |
 | Integrated protocol stack (uri, codec, connect, crypto (pure), x509, tls, http2 HPACK, websocket + wss, quic, http3 + QPACK) | corelib (`compiler/corelib`, `beskid_standard`) | `claude/net-protocols` @ `bde3c41` | worktree `.worktrees/corelib-net-protocols/protocols/` |
-| Main gap report | same | same | `protocols/COMPILER-GAPS.md` (C*, W*, X*, H*, Q*, tls/codec/uri sections) |
-| Runnable repros (8 cases, outputs on both toolchains) | same | same (merged from `claude/net-repros` @ `68a726d`) | `protocols/repros/` (README.md per-case table) |
-| Rulings | same | same | `protocols/RULINGS.md` |
+| Main gap report | same | same | `docs/networking/COMPILER-GAPS.md` (C*, W*, X*, H*, Q*, tls/codec/uri sections) |
+| Runnable repros (8 cases, outputs on both toolchains) | same | same (merged from `claude/net-repros` @ `68a726d`) | `docs/networking/repros/` (README.md per-case table) |
+| Rulings | same | same | `docs/networking/RULINGS.md` |
 | CLIF-optimized crypto + 0.5.3 gaps C53-1..6 + benchmarks | corelib | `claude/net-crypto-opt` @ `3c8dc4b` (not merged: needs 0.5.3) | `.worktrees/net-crypto-opt/protocols/{COMPILER-GAPS.md,crypto/BENCHMARKS.md}` |
 | HTTP/2 connection layer + its gaps | corelib | `claude/net-h2` (in progress, last `51922a7`) | `.worktrees/net-h2/protocols/` |
 | HTTP/3 over real QUIC | corelib | `claude/net-h3quic` (in progress) | `.worktrees/net-h3quic/protocols/` |
@@ -33,12 +33,12 @@ authority — `88522d60`.
 Command shape (both): `BESKID_RUNTIME_PREFIX=<kit> beskid test --project protocols/<pkg>/tests [--target <T> | --all-targets] --plain --target-timeout <s>` with `BESKID_CORELIB_ROOT` unset. Packages depend on an unmodified 0.5.2 corelib copy at `.worktrees/corelib-0.5.2-pristine` (builder: `/workspace/corelib-0.5.2-pristine`).
 
 Rechecked with 0.5.3: the 8 repro cases (identical results to 0.5.2, outputs in
-`protocols/repros/<case>/actual-0.5.3-linux.txt`) and the whole crypto suite (21/21 green, where
+`docs/networking/repros/<case>/actual-0.5.3-linux.txt`) and the whole crypto suite (21/21 green, where
 C53-1..6 were found). The other gap entries were observed on 0.5.2 only.
 
 ## 3. Complete repros
 
-`protocols/repros/<case>/` each with `<case>.bproj`, `src/Main.bd` (+ variant files), `run.sh`
+`docs/networking/repros/<case>/` each with `<case>.bproj`, `src/Main.bd` (+ variant files), `run.sh`
 (one `beskid test --target` per variant; set `BESKID_RUNTIME_PREFIX`, optional `BESKID=<cli>`),
 `actual-0.5.2-macos.txt`, `actual-0.5.3-linux.txt`.
 
@@ -57,22 +57,22 @@ host, load 8–15):
 
 | Package | Target(s) | Observed | Command |
 | --- | --- | --- | --- |
-| x509 | `ChainRsa`, `ChainEc` (1 test each) | 103 s, 94 s; parsing 30–50 s per test | `beskid test --project protocols/x509/tests --target ChainRsa --plain --target-timeout 600` |
-| tls | `Rfc8448Client`, `Engine`, `LoopbackPolicy`, `Loopback` (1 test each) | 170 s, 204 s, 256 s, 275 s; whole matrix 27.5 min; 544 reachable functions → 2m15s, 722 → 4m10–4m35 CLIF generation | `--project protocols/tls/tests --target Loopback --target-timeout 900` |
-| quic | `QuicConnection`, `QuicConnectionStress`, `QuicLoopback`, `QuicTlsLoopback` | 453 s, 517 s, 532 s, 509 s; matrix 53 min | `--project protocols/quic/tests --target QuicTlsLoopback --target-timeout 900` |
-| http3 | `H3ExchangeTests` (3), `H3ProtocolErrorTests` (4), `H3PeerTests` (2) | 141 s, 156 s, 81 s (40–57 s per connection test) | `--project protocols/http3/tests --target H3ExchangeTests --target-timeout 900` |
-| websocket (wss) | `WsTlsTests` (2) | 18 m 56 s (~9 min per TLS-reaching test) | `--project protocols/websocket/tests --target WsTlsTests --target-timeout 2400` |
+| x509 | `ChainRsa`, `ChainEc` (1 test each) | 103 s, 94 s; parsing 30–50 s per test | `beskid test --project packages/x509/tests --target ChainRsa --plain --target-timeout 600` |
+| tls | `Rfc8448Client`, `Engine`, `LoopbackPolicy`, `Loopback` (1 test each) | 170 s, 204 s, 256 s, 275 s; whole matrix 27.5 min; 544 reachable functions → 2m15s, 722 → 4m10–4m35 CLIF generation | `--project packages/tls/tests --target Loopback --target-timeout 900` |
+| quic | `QuicConnection`, `QuicConnectionStress`, `QuicLoopback`, `QuicTlsLoopback` | 453 s, 517 s, 532 s, 509 s; matrix 53 min | `--project packages/quic/tests --target QuicTlsLoopback --target-timeout 900` |
+| http3 | `H3ExchangeTests` (3), `H3ProtocolErrorTests` (4), `H3PeerTests` (2) | 141 s, 156 s, 81 s (40–57 s per connection test) | `--project packages/http3/tests --target H3ExchangeTests --target-timeout 900` |
+| websocket (wss) | `WsTlsTests` (2) | 18 m 56 s (~9 min per TLS-reaching test) | `--project packages/websocket/tests --target WsTlsTests --target-timeout 2400` |
 
 Correctness after removing workarounds: every package's full matrix must stay green, run as
 `beskid test --project protocols/<pkg>/tests --all-targets --plain --target-timeout 900 --matrix-timeout 7200`
 for uri, codec, connect, crypto, x509, tls, http2, websocket, quic, http3 (pass counts are in each
 slice's report; summary: uri 9/9, codec 8/8, connect 8/8, crypto 18/18 (21/21 on the optimized
 branch), x509 9/9, tls 8/8, http2 HPACK 9/9, websocket 9/9 + WsTlsTests, quic 9/9, http3 8/8).
-Interop scripts: `protocols/tls/tests/interop/run.sh` (OpenSSL 6/6), `protocols/websocket/tests/interop/run.sh` (Node 7/7).
+Interop scripts: `packages/tls/tests/interop/run.sh` (OpenSSL 6/6), `packages/websocket/tests/interop/run.sh` (Node 7/7).
 
 ## 5. Runtime regressions
 
-Runnable cases: `protocols/repros/{channel_exhaustion,array_oom,cancelled_parent_orphan}`, run on
+Runnable cases: `docs/networking/repros/{channel_exhaustion,array_oom,cancelled_parent_orphan}`, run on
 0.5.2 (macOS) and 0.5.3 (Linux; the 0.5.3 runtime kit is the newest runtime built from the 0.5.3
 branch). Results identical on both:
 

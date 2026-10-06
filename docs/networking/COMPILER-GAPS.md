@@ -634,7 +634,7 @@ callers.
    run` needs a debug runtime kit; the local kit has only `release`, so the
    interop script uses `beskid build --release` and runs the binary.
 9. **Runtime: `--all-targets` runs every target in one process and the heap
-   cap is shared.** For `protocols/http2/tests` the matrix passes the first 12
+   cap is shared.** For `packages/http2/tests` the matrix passes the first 12
    targets (smoke, 8 HPACK, frame, loopback, server-error) and then traps
    `out_of_memory (5): R1 req=57344 live=262032 committed=1073741824` in the
    13th target (flow control); live data stays near 256 KiB, committed memory
@@ -649,7 +649,7 @@ callers.
 ## 2026-10-06, web facade slice
 
 ### WEB1. `Types.X(...)` through `use Http.Types;` ICEs when dependencies also have a `Types` leaf
-- Symptom: in `protocols/web` (which depends on uri, connect, tls, http2: all of them
+- Symptom: in `packages/web` (which depends on uri, connect, tls, http2: all of them
   or their dependencies declare a `*.Types` module) the call `Types.LowerAscii(h.name)`
   with only `use Http.Types;` in the file type-checks but fails at CLIF time with
   `no ISLE lowering rule or fact for CallExpression` (first seen as a
@@ -681,9 +681,15 @@ callers.
   `ld: library 'c.so.6' not found`. The JIT (`beskid test`) is not affected, because it
   resolves symbols in the process namespace (see "`Library` does not appear to scope
   symbol lookup" above).
-- Workaround (`protocols/web/interop/curl-interop.sh`): a link shim directory with
+- Workaround under 0.5.2: a link shim directory with
   `libc.so.6.tbd -> $(xcrun --show-sdk-path)/usr/lib/libSystem.tbd` on `LIBRARY_PATH`.
-  Open item: per-platform library names for extern contracts.
+- Status (2026-10-06, relocation): fixed by compiler 0.5.3. The AOT linker maps a
+  versioned soname to its base name (`canonical_link_library_name` in
+  `beskid_aot/src/linker/common.rs`: `libc.so.6` -> `-lc`), which resolves to libSystem on
+  macOS. `Crypto.Entropy` keeps the `Core.Threading.Thread` pattern (Linux contract with
+  `libc.so.6`, Darwin contract with `libc`), and the shim is removed from
+  `packages/web/interop/curl-interop.sh`. Not yet confirmed by a macOS 0.5.3 AOT build
+  (no 0.5.3 macOS CLI was available during the relocation).
 ## 2026-10-06, http3 over quic slice
 
 ### HQ1. Duplicate import leaf is an error in the root project, silent in a dependency

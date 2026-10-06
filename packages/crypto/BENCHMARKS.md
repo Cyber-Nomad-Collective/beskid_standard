@@ -1,7 +1,7 @@
 # Crypto benchmarks
 
 Machine: NixOS builder container, AMD Ryzen 7 7700 (aes, pclmulqdq, sha_ni, avx2, avx512f,
-vaes), shared and noisy. Beskid numbers: `beskid test --project protocols/crypto/tests
+vaes), shared and noisy. Beskid numbers: `beskid test --project packages/crypto/tests
 --target CryptoBench` with the 0.5.3 CLI (JIT, Cranelift `opt_level=none`), one run each.
 References are the best of 3 runs: OpenSSL 3.0.20 `openssl speed -seconds 2`
 (SW = `OPENSSL_ia32cap="~0x200000200000000"`, no AES-NI/PCLMULQDQ; for SHA rows the SW

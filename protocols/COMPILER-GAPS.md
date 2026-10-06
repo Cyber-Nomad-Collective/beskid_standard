@@ -338,7 +338,10 @@ without double or trailing underscores, and must be unique per target.
    targets (smoke, 8 HPACK, frame, loopback, server-error) and then traps
    `out_of_memory (5): R1 req=57344 live=262032 committed=1073741824` in the
    13th target (flow control); live data stays near 256 KiB, committed memory
-   reaches the 1 GiB cap. `Assert.CollectGarbage()` before each connection does
-   not help. Every target passes when run alone with `--target <Name>`.
+   reaches the 1 GiB cap. `Assert.CollectGarbage()` before each connection did
+   not help. Replacing byte-wise `Array.Append` growth of the test transport
+   by `Slice.New` + `Slice.Copy` (exact or doubling) made the flow-control
+   target trap even alone, so `MemoryTransport` keeps byte-wise appends on a
+   local copy. Every target passes when run alone with `--target <Name>`.
    Workaround: run the HTTP/2 connection targets one by one; open item: a
    runtime that reuses freed segments, or a per-target process in the matrix.

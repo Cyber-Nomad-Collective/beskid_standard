@@ -761,6 +761,15 @@ callers.
 - Open item: runtime-optional externs, for example a lazy or weak import that reports a
   typed "library unavailable" result, or `call_indirect` to a `dlsym` address in CLIF
   blocks. Either would let TLS/QUIC select the provider in process.
+- Resolved in compiler 0.5.3: `[Extern(Abi:"C", Library:"...", Optional:true)]` binds an
+  absent library or symbol to null, `Available()` reports it, and a call to an absent
+  symbol traps `extern_unavailable` (code 11). `corelib_crypto` now holds the provider
+  (ruling R27) and `packages/crypto-openssl` is removed. A run without the library is the
+  0.5.3 e2e fixture `crates/beskid_cli/tests/fixtures/optional_extern` (missing library:
+  `Available()` false and the pure path runs; calling the symbol traps code 11). On ELF an
+  AOT build links `libcrypto.so.3` as a load-time dependency when the build host has it,
+  so a binary built there needs the library at run time; build on a host without it to get
+  a binary that always runs pure.
 
 ### NATIVE2. `icmp_imm` is not admitted in CLIF blocks
 - Symptom: `%o = icmp_imm eq %r, 1` fails with `opcode icmp_imm is not allowed in a clif
@@ -801,3 +810,36 @@ limits, and `H3Quic.ForH3` uses it (R25).
   credit only while its pump reads (8 KiB windows), and the client's blocking write waits
   with a fixed 10 s I/O timeout (`H3Quic.DefaultIoTimeoutMillis`). Open item: investigate
   MAX_STREAM_DATA timing under load before calling the transport stable.
+
+## 2026-10-06, protocol throughput slice (0.5.3 CLI)
+
+### PERF1. `Array.Append` grows by one element: an n-byte buffer costs O(n^2), and big literals cost superlinear CLIF time
+- Symptom (builder, 0.5.3 JIT): `Slice.New(1024)` 1.3 ms, `Slice.New(4096)` 12 ms,
+  `Slice.New(16384)` 98-155 ms. A `u8[]` literal of 4096 zeros allocates in 35 us and one of
+  16640 zeros in 33-97 us. The quadratic cost is the copy of the whole array on every append;
+  the copies are also the garbage behind HQ3 and W5 (`live=0` at the 1 GiB cap). A TLS
+  connection allocated two 16.6 KiB record buffers, so `Connection.New` cost about 200 ms and
+  dominated the full handshake (228 ms); an HTTP/2 DATA frame decode cost 106 ms.
+- Literals move the cost to the compiler, superlinearly: a function holding a literal of
+  4096 zeros adds about 1.4 s of "Generate CLIF" per test and a few seconds to the build; one
+  of 16896 zeros adds about 2 min 15 s to every build of a program that contains it (before
+  "program.assemble", whatever the line layout) plus 18-25 s of "Generate CLIF" per test. An
+  `i64[]` literal of 2112 zeros allocates in 48 us and compiles cheaply, but it is not a `u8[]`.
+  Appending to a literal does not help: 4096-byte literal + 12800 appends = 138 ms.
+- Workaround: `Codec.Mem.Zeroed(n)` trims literals of 64, 1024, 2048 and 4096 bytes and falls
+  back to `Slice.New` above 4096. TLS and HTTP/2 start their record and frame buffers at
+  4 KiB and grow them once to the full size when a larger record or frame arrives or is
+  written, so a handshake no longer pays for two 16 KiB buffers. `Mem.Copy`/`Zero` call libc
+  `memmove`/`memset` on array payloads (one CLIF block each). Buffers above 4 KiB (HTTP/2
+  bodies, 16 KiB TLS records in bulk transfers, HTTP/3 and WebSocket bodies) still pay the
+  quadratic path once per buffer.
+- Open item: a sized allocation primitive for packages (for example `Array.Filled<T>(n, v)`
+  lowered to one runtime allocation) and geometric growth in `Array.Append`.
+
+### PERF2. A `///` block separated by a blank line from the next `///` block hides the next function
+- Symptom: in `Crypto/ChaCha20Poly1305.bd`, a module comment (`/// ...` lines), a blank line,
+  then `/// True when ...` and `bool NativeServes(...) { ... }` gave "unknown value
+  `NativeServes`" at both call sites and "unknown type `sult`" with a span over the function.
+  Renaming the function did not help; moving it below the first declaration did.
+- Workaround: put a declaration between two doc-comment blocks, or use `//` for a module
+  comment.

@@ -43,16 +43,6 @@ HeaderField[] GetFields(string path) {
     return f;
 }
 
-HeaderField[] PostFields(string length) {
-    mut HeaderField[] f = Array.Empty<HeaderField>();
-    Array.Append<HeaderField>(f, Hpack.Field(":method", "POST"));
-    Array.Append<HeaderField>(f, Hpack.Field(":scheme", "http"));
-    Array.Append<HeaderField>(f, Hpack.Field(":path", "/p"));
-    Array.Append<HeaderField>(f, Hpack.Field(":authority", "a.test"));
-    Array.Append<HeaderField>(f, Hpack.Field("content-length", length));
-    return f;
-}
-
 u8[] Headers(Encoder enc, i64 id, HeaderField[] fields, bool endStream) {
     return Frame.HeadersFrame(id, HpackEncoder.Encode(enc, fields), endStream, true);
 }
@@ -64,10 +54,12 @@ Config Cfg() {
 }
 
 u8[] Serve(u8[] input, Config config) {
+    // Targets share one process under --all-targets; keep the heap small.
+    Assert.CollectGarbage();
     MemoryTransport t = MemoryTransport.New(input);
     Fixed handler = Fixed { tag: 0_i64 };
     Server.ServeConnection(t, handler, config);
-    return t.output;
+    return MemoryTransport.Written(t);
 }
 
 // ---- output inspection ----
@@ -95,7 +87,6 @@ i64 Count(u8[] out, i64 kind, i64 flags) {
 }
 
 i64 GoAwayCode(u8[] out) { return Field32(out, Frame.TypeGoAway(), -1_i64, 4_i64); }
-i64 GoAwayLast(u8[] out) { return Field32(out, Frame.TypeGoAway(), -1_i64, 0_i64); }
 i64 RstCode(u8[] out, i64 id) { return Field32(out, Frame.TypeRstStream(), id, 0_i64); }
 
 // ---- tests ----

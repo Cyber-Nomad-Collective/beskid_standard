@@ -333,3 +333,12 @@ without double or trailing underscores, and must be unique per target.
    in a spawned fiber (`spawn Run()` from `Main`, then `Join`). Also `beskid
    run` needs a debug runtime kit; the local kit has only `release`, so the
    interop script uses `beskid build --release` and runs the binary.
+9. **Runtime: `--all-targets` runs every target in one process and the heap
+   cap is shared.** For `protocols/http2/tests` the matrix passes the first 12
+   targets (smoke, 8 HPACK, frame, loopback, server-error) and then traps
+   `out_of_memory (5): R1 req=57344 live=262032 committed=1073741824` in the
+   13th target (flow control); live data stays near 256 KiB, committed memory
+   reaches the 1 GiB cap. `Assert.CollectGarbage()` before each connection does
+   not help. Every target passes when run alone with `--target <Name>`.
+   Workaround: run the HTTP/2 connection targets one by one; open item: a
+   runtime that reuses freed segments, or a per-target process in the matrix.

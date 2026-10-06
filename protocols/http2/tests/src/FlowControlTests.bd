@@ -13,6 +13,8 @@ use Http2.Streams;
 // handling on a Connection driven directly with decoded frames.
 
 Connection Make(bool isClient) {
+    // Targets share one process under --all-targets; keep the heap small.
+    Assert.CollectGarbage();
     Config c = Connection.DefaultConfig();
     c.initialWindowSize = 16384_i64;
     return match Connection.New(isClient, c) { Result::Ok(conn) => conn, Result::Error(_) => Make(isClient), };
@@ -68,7 +70,7 @@ test connection_window_overflow_is_flow_control_error {
     Connection conn = Make(true);
     MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
     Assert.Equal<i64>(Code(Connection.Process(conn, t, F(Frame.WindowUpdateFrame(0_i64, 2147483647_i64)))), FrameErrors.FlowControlError(), "overflow");
-    Assert.Equal<i64>(Field32(t.output, Frame.TypeGoAway(), 0_i64, 4_i64), FrameErrors.FlowControlError(), "GOAWAY sent");
+    Assert.Equal<i64>(Field32(MemoryTransport.Written(t), Frame.TypeGoAway(), 0_i64, 4_i64), FrameErrors.FlowControlError(), "GOAWAY sent");
 }
 
 test stream_window_overflow_resets_stream {
@@ -76,7 +78,7 @@ test stream_window_overflow_resets_stream {
     MemoryTransport t = MemoryTransport.New(Slice.New(0_i64));
     StreamState s = OpenOne(conn, t, false);
     Assert.True(Ok(Connection.Process(conn, t, F(Frame.WindowUpdateFrame(1_i64, 2147483647_i64)))), "stream error only");
-    Assert.Equal<i64>(Field32(t.output, Frame.TypeRstStream(), 1_i64, 0_i64), FrameErrors.FlowControlError(), "RST_STREAM");
+    Assert.Equal<i64>(Field32(MemoryTransport.Written(t), Frame.TypeRstStream(), 1_i64, 0_i64), FrameErrors.FlowControlError(), "RST_STREAM");
     Assert.True(Streams.IsClosed(s), "closed");
 }
 
@@ -105,7 +107,7 @@ test initial_window_change_adjusts_open_streams {
     Assert.True(Ok(Connection.Process(conn, t, F(Frame.SettingsFrame(ids, values)))), "settings");
     Assert.Equal<i64>(s.sendWindow, 1000_i64, "65535 - 64535");
     Assert.Equal<i64>(conn.sendWindow, 65535_i64, "connection window unchanged");
-    Assert.True(HasFrame(t.output, Frame.TypeSettings(), 1_i64), "SETTINGS ACK sent");
+    Assert.True(HasFrame(MemoryTransport.Written(t), Frame.TypeSettings(), 1_i64), "SETTINGS ACK sent");
 }
 
 test initial_window_change_can_go_negative {
@@ -129,7 +131,7 @@ test received_data_counts_against_windows_and_replenishes {
     s.hasHeaders = true;
     Assert.True(Ok(Connection.Process(conn, t, F(Frame.PaddedDataFrame(1_i64, Slice.New(9000_i64), 10_i64, false)))), "data");
     Assert.Equal<i64>(s.received, 9000_i64, "padding not stored");
-    Assert.Equal<i64>(Field32(t.output, Frame.TypeWindowUpdate(), 1_i64, 0_i64), 9011_i64, "stream credit returned with padding");
+    Assert.Equal<i64>(Field32(MemoryTransport.Written(t), Frame.TypeWindowUpdate(), 1_i64, 0_i64), 9011_i64, "stream credit returned with padding");
     Assert.Equal<i64>(s.recvWindow, 16384_i64, "window restored");
 }
 
@@ -140,7 +142,7 @@ test data_beyond_stream_window_resets {
     Connection.Process(conn, t, F(Frame.SettingsAckFrame()));
     s.recvWindow = 100_i64;
     Assert.True(Ok(Connection.Process(conn, t, F(Frame.DataFrame(1_i64, Slice.New(200_i64), false)))), "stream error");
-    Assert.Equal<i64>(Field32(t.output, Frame.TypeRstStream(), 1_i64, 0_i64), FrameErrors.FlowControlError(), "FLOW_CONTROL_ERROR");
+    Assert.Equal<i64>(Field32(MemoryTransport.Written(t), Frame.TypeRstStream(), 1_i64, 0_i64), FrameErrors.FlowControlError(), "FLOW_CONTROL_ERROR");
 }
 
 test data_beyond_connection_window_fails {
@@ -181,7 +183,7 @@ test ping_ack_counted_and_ping_answered {
     Connection.Process(conn, t, F(Frame.PingFrame(Slice.New(8_i64), true)));
     Assert.Equal<i64>(conn.pingAcks, 1_i64, "ack counted");
     Connection.Process(conn, t, F(Frame.PingFrame(Slice.New(8_i64), false)));
-    FrameHeader h = Frame.ParseHeader(t.output, 0_i64);
+    FrameHeader h = Frame.ParseHeader(MemoryTransport.Written(t), 0_i64);
     Assert.Equal<i64>(h.kind, Frame.TypePing(), "PING");
     Assert.Equal<i64>(h.flags, 1_i64, "ACK");
 }

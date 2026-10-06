@@ -13,6 +13,7 @@ use Core.Results;
 
 pub type MemoryTransport: Stream, Reader, Writer, Closer {
     pub u8[] input,
+    // [read position, written length]; `output` has spare capacity.
     pub i64[] position,
     pub u8[] output,
     pub bool closed,
@@ -22,7 +23,7 @@ pub type MemoryTransport: Stream, Reader, Writer, Closer {
 }
 
 pub MemoryTransport New(u8[] input) {
-    return MemoryTransport { input: input, position: [0_i64], output: Slice.New(0_i64), closed: false };
+    return MemoryTransport { input: input, position: [0_i64, 0_i64], output: Slice.New(0_i64), closed: false };
 }
 
 Result<i64, IoError> DoRead(MemoryTransport self, u8[] destination, i64 offset, i64 count) {
@@ -39,13 +40,24 @@ Result<i64, IoError> DoRead(MemoryTransport self, u8[] destination, i64 offset, 
 
 Result<i64, IoError> DoWrite(MemoryTransport self, u8[] source, i64 offset, i64 count) {
     if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange); }
-    i64 have = Slice.Len(self.output);
-    u8[] out = Slice.New(have + count);
-    if have > 0_i64 { Slice.Copy(out, 0_i64, self.output, 0_i64, have); }
-    Slice.Copy(out, have, source, offset, count);
-    self.output = out;
+    // Doubling growth: copying the whole output on every write exhausted the
+    // heap when many targets share one test process.
+    i64 have = self.position[1];
+    if have + count > Slice.Len(self.output) {
+        mut i64 size = Slice.Len(self.output) * 2_i64;
+        if size < 1024_i64 { size = 1024_i64; }
+        if size < have + count { size = have + count; }
+        u8[] grown = Slice.New(size);
+        if have > 0_i64 { Slice.Copy(grown, 0_i64, self.output, 0_i64, have); }
+        self.output = grown;
+    }
+    if count > 0_i64 { Slice.Copy(self.output, have, source, offset, count); }
+    self.position[1] = have + count;
     return Result::Ok(count);
 }
+
+// The bytes written so far.
+pub u8[] Written(MemoryTransport t) { return Slice.SubSlice(t.output, 0_i64, t.position[1]); }
 
 Result<unit, IoError> DoClose(MemoryTransport self) {
     self.closed = true;

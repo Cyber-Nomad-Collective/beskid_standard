@@ -1,4 +1,27 @@
+use Core.Collections.Array;
 use Testing.Assert;
 use Web;
+use Web.WebConfig;
+use Web.WebErrors;
+use Web.H1Wire;
+use Http.Types;
 
 test web_package_links { Assert.Equal<i64>(Web.PackageVersion(), 1_i64, "package links"); }
+
+test web_defaults {
+    WebClientConfig client = WebConfig.DefaultClient();
+    Assert.Equal<i64>(Array.Len<string>(client.alpn), 2_i64, "two ALPN protocols");
+    Assert.True(Array.Get<string>(client.alpn, 0_i64) == "h2", "h2 preferred");
+    WebServerConfig server = WebConfig.DefaultServer();
+    Assert.True(server.h2cPriorKnowledge, "h2c detection on by default");
+    Assert.Equal<i64>(WebErrors.Code(WebError::InvalidUrl()), 1_i64, "error code");
+}
+
+test web_h1_fields {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Connection", value: "keep-alive, Close" });
+    Array.Append<Header>(headers, Header { name: "X-A", value: "1" });
+    Assert.True(H1Wire.WantsClose(headers), "close token");
+    Assert.Equal<i64>(Array.Len<Header>(H1Wire.EndToEnd(headers)), 1_i64, "hop field dropped");
+    Assert.True(H1Wire.FieldValue(headers, "x-a") == "1", "field lookup");
+}

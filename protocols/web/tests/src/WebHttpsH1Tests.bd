@@ -1,0 +1,221 @@
+use Concurrency;
+use Concurrency.Fiber;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Codec.Hex;
+use Http.Types;
+use Http2.Server;
+use Network.Types as NetTypes;
+use Network.Tcp.TcpListener;
+use Testing.Assert;
+use Tls.PeerKeys;
+use Tls.TlsConfig;
+use X509.X509Errors;
+use Web;
+use Web.WebClient;
+use Web.WebConfig;
+use Web.WebErrors;
+
+// GET answers "hello <target>"; POST answers "received <length>".
+type Hello: RequestHandler {
+    i64 tag,
+    pub Response Handle(Request request) { return Answer(request); }
+}
+
+Response Answer(Request request) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "content-type", value: "text/plain" });
+    if request.method == "POST" {
+        return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("received " + Dec(Slice.Len(request.body))) };
+    }
+    return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("hello " + request.target) };
+}
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+SocketAddress Loopback4() {
+    Port value = match NetTypes.PortNumber(0_i64) { Result::Ok(p) => p, Result::Error(_) => NetTypes.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+string BaseUrl(TcpListener listener, string scheme, string hostName) {
+    return match listener.LocalAddress() {
+        Result::Ok(address) => scheme + "://" + hostName + ":" + Dec(address.port.Value()),
+        Result::Error(_) => "",
+    };
+}
+
+// Records [kind, detail] of a failure, or [0, 0], at codes[at], codes[at + 1].
+unit Record(i64[] codes, i64 at, Result<WebResponse, WebError> r) {
+    match r {
+        Result::Ok(_) => { codes[at] = 0_i64; codes[at + 1_i64] = 0_i64; },
+        Result::Error(e) => { codes[at] = WebErrors.Code(e); codes[at + 1_i64] = WebErrors.Detail(e); },
+    };
+    return;
+}
+
+string TextOf(u8[] body) {
+    return match Convert.BytesToString(body) { Result::Ok(t) => t, Result::Error(_) => "<binary>", };
+}
+
+string BodyOf(WebResponse w) { Response r = w.response; return TextOf(r.body); }
+i64 StatusIn(WebResponse w) { Response r = w.response; return r.status; }
+
+string BodyText(Result<WebResponse, WebError> r) {
+    return match r {
+        Result::Ok(w) => BodyOf(w),
+        Result::Error(e) => "<error " + WebErrors.KindOf(e) + ">",
+    };
+}
+
+string ProtocolOf(Result<WebResponse, WebError> r) {
+    return match r { Result::Ok(w) => w.protocol, Result::Error(_) => "<error>", };
+}
+
+i64 StatusOf(Result<WebResponse, WebError> r) {
+    return match r { Result::Ok(w) => StatusIn(w), Result::Error(_) => -1_i64, };
+}
+
+unit Expect(i64 actual, i64 expected, string what) {
+    if actual != expected { Assert.Fail(what + ": got " + Dec(actual) + ", expected " + Dec(expected)); }
+    return;
+}
+
+unit ExpectText(string actual, string expected, string what) {
+    if actual != expected { Assert.Fail(what + ": got [" + actual + "], expected [" + expected + "]"); }
+    return;
+}
+
+TlsServerConfig ServerConfig() {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    return WebConfig.ServerTls(TlsConfig.Chain1(ServerCertDer()), key);
+}
+
+// Trusts only the test root (explicit trust, no system bundle).
+WebClientConfig ClientConfig(string[] alpn) {
+    mut WebClientConfig c = WebConfig.DefaultClient();
+    Result<CertificateVerification, X509Error> v = TlsConfig.Anchors(TlsConfig.Chain1(RootCertDer()));
+    match v {
+        Result::Ok(verification) => { c.trust = Option.FromValue<CertificateVerification>(verification); },
+        Result::Error(_) => {},
+    };
+    c.alpn = alpn;
+    return c;
+}
+
+unit ServeTlsN(TcpListener l, i64 connections, i64[] served) {
+    Hello handler = Hello { tag: 0_i64 };
+    mut WebServerConfig c = WebConfig.DefaultServer();
+    c.maxConnections = connections;
+    c.acceptTimeoutMillis = 120000_i64;
+    Result<i64, WebError> r = Web.ServeTls(l, ServerConfig(), handler, c);
+    match r {
+        Result::Ok(n) => { served[0] = n; },
+        Result::Error(e) => { served[0] = 100_i64 + WebErrors.Code(e); },
+    };
+    return;
+}
+
+Request Get(string url) {
+    return Request { method: "GET", target: url, headers: Array.Empty<Header>(), body: Slice.New(0_i64) };
+}
+
+Request Post(string url, i64 size) {
+    return Request { method: "POST", target: url, headers: Array.Empty<Header>(), body: Slice.New(size) };
+}
+
+// codes: [0] server result, [1..2] GET error, [3] GET status, [4..5] POST error, [6] POST status.
+// texts: [0] GET body, [1] GET protocol, [2] POST body, [3] POST protocol.
+unit TlsScenario(string[] alpn, i64[] codes, string[] texts) {
+    match TcpListener.Bind(Loopback4(), 4_i64) {
+        Result::Error(_) => { codes[0] = -1_i64; },
+        Result::Ok(listener) => {
+            TcpListener l = listener;
+            i64[] served = [0_i64];
+            Fiber<unit> server = spawn (() => ServeTlsN(l, 2_i64, served));
+            string base = BaseUrl(l, "https", "localhost");
+            WebClientConfig config = ClientConfig(alpn);
+            Result<WebResponse, WebError> got = Web.Exchange(Get(base + "/hello?a=1"), config);
+            Record(codes, 1_i64, got);
+            codes[3] = StatusOf(got);
+            texts[0] = BodyText(got);
+            texts[1] = ProtocolOf(got);
+            Result<WebResponse, WebError> posted = Web.Exchange(Post(base + "/upload", 3000_i64), config);
+            Record(codes, 4_i64, posted);
+            codes[6] = StatusOf(posted);
+            texts[2] = BodyText(posted);
+            texts[3] = ProtocolOf(posted);
+            server.Join();
+            codes[0] = served[0];
+            l.Close();
+        },
+    };
+    return;
+}
+
+unit CheckTls(i64[] codes, string[] texts, string protocol) {
+    Expect(codes[1] * 1000_i64 + codes[2], 0_i64, "GET error kind*1000+detail");
+    Expect(codes[3], 200_i64, "GET status");
+    ExpectText(texts[0], "hello /hello?a=1", "GET body");
+    ExpectText(texts[1], protocol, "GET protocol");
+    Expect(codes[4] * 1000_i64 + codes[5], 0_i64, "POST error kind*1000+detail");
+    Expect(codes[6], 200_i64, "POST status");
+    ExpectText(texts[2], "received 3000", "POST body");
+    ExpectText(texts[3], protocol, "POST protocol");
+    Expect(codes[0], 2_i64, "server connections served");
+    return;
+}
+
+// https:// offering only "http/1.1": HTTP/1.1 over TLS.
+test web_https_h1 {
+    i64[] codes = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+    string[] texts = ["", "", "", ""];
+    mut string[] alpn = Array.Empty<string>();
+    Array.Append<string>(alpn, "http/1.1");
+    Fiber<unit> scenario = spawn (() => TlsScenario(alpn, codes, texts));
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+    CheckTls(codes, texts, "http/1.1");
+}
+
+// Test fixtures generated with openssl (see tests/interop/certs). Test-only keys.
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] RootCertDer() {
+    string s = "3082019b30820141a00302010202143cc5b42faaa832daa7def808045536bbb6ddf944300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a301b3119301706035504030c104265736b6964205465737420526f6f743059301306072a8648ce3d020106082a8648ce3d030107034200048f4684a2e70c8677b376730c494a3546e98fb943810d320fcfffa26392a5110bc6e1f045"
+        + "ac328a4017509ec27c8201c8e65d18f99bafb9e40ef52c7821d5d50aa3633061301d0603551d0e0416041446dda763d1978ccc27a6f76bd7519ff9619f4eb7301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300f0603"
+        + "551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d040302034800304502200c22ab56867a1fda253fb2c517682802dd87d91a6f152a0fd8ff2c4572d11bb2022100e8f98b28d498dfc5f8aae457d71cd4f433"
+        + "94ab8ac6d6ca6d526e21bc35bd1e7a"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] OtherRootDer() {
+    string s = "3082019d30820143a003020102021422b448412db580482e90edb7c50dcdc35797077a300a06082a8648ce3d040302301c311a301806035504030c114265736b6964204f7468657220526f6f74301e170d3236313030353132343733385a170d33363130"
+        + "30323132343733385a301c311a301806035504030c114265736b6964204f7468657220526f6f743059301306072a8648ce3d020106082a8648ce3d03010703420004c67185df52c09306465e9498801541d5f92e7e28549f8663af21b5a31a4c0f1f49ca"
+        + "f5871f196a8fdde8c397df47df3a6482ee8a1ed203338906c625d601dc81a3633061301d0603551d0e041604145894b5a440564b4682c08196da0b47ff40569b5a301f0603551d230418301680145894b5a440564b4682c08196da0b47ff40569b5a300f"
+        + "0603551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d0403020348003045022011276a9734d15db15ee2adcf0bf128606a2566644b64bf3afacd8ae38d7cee58022100fcaaf51e97c30943c53aef2a2b4b31"
+        + "0b3ddb7e3e657a08cce286269c085c2ed4"
+        ;
+    return Hex.Of(s);
+}

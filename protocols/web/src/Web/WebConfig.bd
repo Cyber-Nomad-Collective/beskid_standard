@@ -1,0 +1,107 @@
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Http.Types;
+use Http2.Connection;
+use Tls.TlsConfig;
+
+// Client and server policy of the Web facade. Fields are plain values: build a
+// default and assign the fields that differ (`config.alpn = ...`).
+
+// HTTP/3 use for https:// requests. `Prefer` tries QUIC first and falls back to
+// TCP when QUIC fails. Until the Http3 QUIC path is linked into this package
+// (branch claude/net-h3quic), `Prefer` behaves like `Off`.
+pub enum Http3Mode {
+    Off(),
+    Prefer(),
+}
+
+pub type WebClientConfig {
+    // ALPN protocols offered over TLS, in preference order ("h2", "http/1.1").
+    pub string[] alpn,
+    // Certificate trust; empty means the system bundle (loaded per request,
+    // fail closed when it is missing or empty).
+    pub Option<CertificateVerification> trust,
+    // http:// URLs speak HTTP/2 with prior knowledge (RFC 9113 section 3.3).
+    pub bool h2cPriorKnowledge,
+    // Deadline for Happy Eyeballs plus the TLS handshake.
+    pub i64 connectTimeoutMillis,
+    // Read and write deadline for the exchange after the handshake; 0 = none.
+    pub i64 requestTimeoutMillis,
+    // HTTP/1.1 message limits (corelib Http.Types).
+    pub Limits limits,
+    // HTTP/2 settings and limits (scheme is set per request).
+    pub Config h2,
+    pub Http3Mode http3,
+}
+
+pub type WebServerConfig {
+    // HTTP/2 settings and limits.
+    pub Config h2,
+    // HTTP/1.1 message limits.
+    pub Limits limits,
+    // ServePlain: detect the HTTP/2 connection preface and serve h2c.
+    pub bool h2cPriorKnowledge,
+    // Deadline for the TLS handshake.
+    pub i64 handshakeTimeoutMillis,
+    // Deadline for each accept; 0 waits without a deadline.
+    pub i64 acceptTimeoutMillis,
+    // HTTP/1.1: deadline for the next request on a kept-alive connection.
+    pub i64 idleTimeoutMillis,
+    // Connections to serve before returning; 0 = until accept fails.
+    pub i64 maxConnections,
+    // HTTP/1.1 requests per connection; 0 = unlimited.
+    pub i64 maxRequestsPerConnection,
+}
+
+// Body limit shared by the HTTP/1.1 and HTTP/2 defaults: the 0.5.2 runtime
+// holds about 160 KiB of live arrays per process (COMPILER-GAPS W5).
+pub i64 DefaultMaxBodyBytes() { return 131072_i64; }
+
+pub Limits DefaultLimits() {
+    return Limits { maxStartLine: 8192_i64, maxHeaderBytes: 16384_i64, maxHeaders: 128_i64, maxBodyBytes: DefaultMaxBodyBytes() };
+}
+
+pub string[] DefaultAlpn() {
+    mut string[] out = Array.Empty<string>();
+    Array.Append<string>(out, "h2");
+    Array.Append<string>(out, "http/1.1");
+    return out;
+}
+
+pub WebClientConfig DefaultClient() {
+    Config h2 = Connection.DefaultConfig();
+    h2.maxBodyBytes = DefaultMaxBodyBytes();
+    return WebClientConfig {
+        alpn: DefaultAlpn(),
+        trust: Option.Empty<CertificateVerification>(),
+        h2cPriorKnowledge: false,
+        connectTimeoutMillis: 10000_i64,
+        requestTimeoutMillis: 30000_i64,
+        limits: DefaultLimits(),
+        h2: h2,
+        http3: Http3Mode::Off(),
+    };
+}
+
+pub WebServerConfig DefaultServer() {
+    Config h2 = Connection.DefaultConfig();
+    h2.maxBodyBytes = DefaultMaxBodyBytes();
+    h2.timeoutMillis = 10000_i64;
+    return WebServerConfig {
+        h2: h2,
+        limits: DefaultLimits(),
+        h2cPriorKnowledge: true,
+        handshakeTimeoutMillis: 10000_i64,
+        acceptTimeoutMillis: 0_i64,
+        idleTimeoutMillis: 15000_i64,
+        maxConnections: 0_i64,
+        maxRequestsPerConnection: 0_i64,
+    };
+}
+
+// A TLS server configuration offering "h2" and "http/1.1" (server preference order).
+pub TlsServerConfig ServerTls(Blob[] certificateChain, u8[] privateKey) {
+    mut TlsServerConfig config = TlsConfig.Server(certificateChain, privateKey);
+    config.alpn = DefaultAlpn();
+    return config;
+}

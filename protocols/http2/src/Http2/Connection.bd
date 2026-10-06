@@ -1,0 +1,946 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.IO.IoError;
+use Core.IO.Stream;
+use Core.Results;
+use Core.Time;
+use Core.Time.Instant;
+use Http2.Frame;
+use Http2.FrameErrors;
+use Http2.Hpack;
+use Http2.HpackDecoder;
+use Http2.HpackEncoder;
+use Http2.Mapping;
+use Http2.MemoryTransport;
+use Http2.Settings;
+use Http2.Streams;
+
+// RFC 9113 connection core shared by the client and the server: preface,
+// SETTINGS exchange, frame dispatch, stream table, header block assembly,
+// flow control and GOAWAY.
+//
+// The transport is any `Core.IO.Stream`. It is passed to every call because
+// 0.5.2 cannot store a contract value in a struct field. One fiber at a time
+// reads frames (`readBusy`) and one at a time writes (`writeBusy`); other
+// fibers wait with short sleeps. No channel is used (the 0.5.2 runtime has a
+// fixed 64-entry channel table). Blocking reads and writes rely on transport
+// deadlines (for `TcpStream`: `SetDeadlines`); waits for the reader or writer
+// role, a stream slot or a response end after `config.timeoutMillis`.
+
+// Local behaviour. Windows stay at or below 64 KiB (0.5.2 buffer limits).
+pub type Config {
+    // SETTINGS_INITIAL_WINDOW_SIZE this endpoint advertises (stream receive window).
+    pub i64 initialWindowSize,
+    // SETTINGS_MAX_CONCURRENT_STREAMS this endpoint advertises (peer-initiated streams).
+    pub i64 maxConcurrentStreams,
+    // SETTINGS_MAX_HEADER_LIST_SIZE and the HPACK decoder bound.
+    pub i64 maxHeaderListSize,
+    // Largest request or response body this endpoint buffers.
+    pub i64 maxBodyBytes,
+    // Bound for waits on other fibers (reader role, stream slot); 0 waits forever.
+    pub i64 timeoutMillis,
+    // :scheme for client requests in origin form.
+    pub string scheme,
+    // Server: send GOAWAY(NO_ERROR) after this many requests (0 = unlimited).
+    pub i64 maxRequests,
+}
+
+pub Config DefaultConfig() {
+    return Config { initialWindowSize: 65535_i64, maxConcurrentStreams: 100_i64, maxHeaderListSize: 65536_i64, maxBodyBytes: 131072_i64, timeoutMillis: 30000_i64, scheme: "http", maxRequests: 0_i64 };
+}
+
+// Connection receive window target; the connection window cannot be set by SETTINGS.
+pub i64 ConnectionWindow() { return 65535_i64; }
+// Largest frame this endpoint accepts and sends (SETTINGS_MAX_FRAME_SIZE stays at its default).
+pub i64 LocalMaxFrameSize() { return 16384_i64; }
+// Recently closed stream ids kept to tell "closed" from "never opened".
+i64 ClosedRing() { return 64_i64; }
+
+u8[] AppendText(mut u8[] out, string text) {
+    u8[] bytes = Convert.StringToBytes(text);
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) { Array.Append<u8>(out, bytes[i]); i = i + 1_i64; }
+    return out;
+}
+u8[] AppendCrlfCrlf(mut u8[] out) {
+    Array.Append<u8>(out, 13_u8); Array.Append<u8>(out, 10_u8); Array.Append<u8>(out, 13_u8); Array.Append<u8>(out, 10_u8);
+    return out;
+}
+// The 24-octet client connection preface (section 3.4).
+pub u8[] Preface() {
+    mut u8[] out = Slice.New(0_i64);
+    out = AppendText(out, "PRI * HTTP/2.0");
+    out = AppendCrlfCrlf(out);
+    out = AppendText(out, "SM");
+    out = AppendCrlfCrlf(out);
+    return out;
+}
+
+pub type Connection {
+    pub bool isClient,
+    pub Config config,
+    pub Settings localSent,
+    pub Settings localAcked,
+    pub Settings remote,
+    pub bool remoteSettingsSeen,
+    pub Decoder decoder,
+    pub Encoder encoder,
+    pub StreamState[] streams,
+    // Connection-level flow-control windows.
+    pub i64 sendWindow,
+    pub i64 recvWindow,
+    pub i64 lastPeerStreamId,
+    pub i64 nextStreamId,
+    // Header block assembly: the stream expecting CONTINUATION (0 = none).
+    pub i64 continuationStream,
+    pub bool continuationEndStream,
+    pub u8[] block,
+    pub bool goAwaySent,
+    pub i64 goAwayLastId,
+    pub i64 goAwayCode,
+    // -1 while healthy; otherwise the error code this connection failed with.
+    pub i64 failed,
+    pub bool peerClosed,
+    pub bool writeBusy,
+    pub bool readBusy,
+    pub u8[] inBuf,
+    pub u8[] outBuf,
+    pub i64[] closedIds,
+    pub i64 closedNext,
+    pub i64 pingAcks,
+    pub i64 settingsAcks,
+    pub i64 handledRequests,
+    // WINDOW_UPDATE frames received (diagnostics and tests).
+    pub i64 windowUpdates,
+}
+
+Settings LocalSettings(bool isClient, Config config) {
+    Settings s = Settings.Defaults();
+    if isClient { s.enablePush = 0_i64; }
+    s.maxConcurrentStreams = config.maxConcurrentStreams;
+    s.initialWindowSize = config.initialWindowSize;
+    s.maxHeaderListSize = config.maxHeaderListSize;
+    return s;
+}
+
+i64[] Ring() {
+    mut i64[] ring = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while i < ClosedRing() { Array.Append<i64>(ring, 0_i64); i = i + 1_i64; }
+    return ring;
+}
+
+// A connection in its initial state. Nothing is written yet.
+pub Result<Connection,Http2Error> New(bool isClient, Config config) {
+    if config.initialWindowSize < 0_i64 || config.initialWindowSize > Frame.MaxWindow() || config.maxConcurrentStreams < 0_i64 || config.maxHeaderListSize < 0_i64 {
+        return Result::Error(Http2Error::InvalidMessage);
+    }
+    DecoderLimits limits = DecoderLimits { settingsTableSize: Hpack.DefaultTableSize(), maxHeaderListSize: config.maxHeaderListSize, maxStringLength: config.maxHeaderListSize, maxFields: 512_i64 };
+    Result<Decoder,HpackError> decoder = HpackDecoder.NewDecoder(limits);
+    Result<Encoder,HpackError> encoder = HpackEncoder.NewEncoder(HpackEncoder.DefaultEncoderPolicy());
+    mut i64 next = 2_i64;
+    if isClient { next = 1_i64; }
+    return match decoder {
+        Result::Error(_) => Result::Error(Http2Error::InvalidMessage),
+        Result::Ok(d) => match encoder {
+            Result::Error(_) => Result::Error(Http2Error::InvalidMessage),
+            Result::Ok(e) => Result::Ok(Connection {
+                isClient: isClient, config: config,
+                localSent: LocalSettings(isClient, config), localAcked: Settings.Defaults(), remote: Settings.Defaults(), remoteSettingsSeen: false,
+                decoder: d, encoder: e, streams: Array.Empty<StreamState>(),
+                sendWindow: Settings.DefaultInitialWindowSize(), recvWindow: ConnectionWindow(),
+                lastPeerStreamId: 0_i64, nextStreamId: next,
+                continuationStream: 0_i64, continuationEndStream: false, block: Slice.New(0_i64),
+                goAwaySent: false, goAwayLastId: -1_i64, goAwayCode: -1_i64,
+                failed: -1_i64, peerClosed: false, writeBusy: false, readBusy: false,
+                inBuf: Slice.New(Frame.HeaderLength() + LocalMaxFrameSize()),
+                outBuf: Slice.New(Frame.HeaderLength() + LocalMaxFrameSize()),
+                closedIds: Ring(), closedNext: 0_i64, pingAcks: 0_i64, settingsAcks: 0_i64, handledRequests: 0_i64, windowUpdates: 0_i64,
+            }),
+        },
+    };
+}
+
+// ---- accessors ----
+// Nested field paths (`conn.config.x`) inside arithmetic comparisons are an
+// ICE in 0.5.2 (COMPILER-GAPS.md), so nested settings go through these.
+
+pub i64 TimeoutMillis(Connection conn) { Config c = conn.config; return c.timeoutMillis; }
+pub i64 MaxBodyBytes(Connection conn) { Config c = conn.config; return c.maxBodyBytes; }
+pub i64 MaxHeaderList(Connection conn) { Config c = conn.config; return c.maxHeaderListSize; }
+pub i64 MaxRequests(Connection conn) { Config c = conn.config; return c.maxRequests; }
+pub string SchemeOf(Connection conn) { Config c = conn.config; return c.scheme; }
+pub i64 RemoteMaxStreams(Connection conn) { Settings s = conn.remote; return s.maxConcurrentStreams; }
+pub i64 RemoteInitialWindow(Connection conn) { Settings s = conn.remote; return s.initialWindowSize; }
+pub i64 RemoteMaxFrame(Connection conn) { Settings s = conn.remote; return s.maxFrameSize; }
+pub i64 RemoteTableSize(Connection conn) { Settings s = conn.remote; return s.headerTableSize; }
+pub i64 SentInitialWindow(Connection conn) { Settings s = conn.localSent; return s.initialWindowSize; }
+pub i64 SentMaxStreams(Connection conn) { Settings s = conn.localSent; return s.maxConcurrentStreams; }
+pub i64 AckedInitialWindow(Connection conn) { Settings s = conn.localAcked; return s.initialWindowSize; }
+
+// ---- waiting ----
+
+pub i64 ElapsedMillis(Instant started) {
+    return Time.DurationToMilliseconds(Time.SubtractInstants(Time.MonotonicNow(), started));
+}
+
+// Sleeps one poll period; Timeout once `config.timeoutMillis` passed since `started`.
+pub Result<unit,Http2Error> Pause(Connection conn, Instant started) {
+    i64 timeout = TimeoutMillis(conn);
+    if timeout > 0_i64 && ElapsedMillis(started) > timeout { return Result::Error(Http2Error::Timeout); }
+    return match Time.Sleep(Time.FromMilliseconds(1_i64)) {
+        Result::Ok(_) => Result::Ok(()),
+        Result::Error(_) => Result::Error(Http2Error::Closed),
+    };
+}
+
+// The error a failed connection reports to every waiting caller.
+pub Http2Error FailureOf(Connection conn) {
+    if conn.failed > 0_i64 { return Http2Error::Connection(conn.failed); }
+    return Http2Error::Closed;
+}
+
+pub bool Usable(Connection conn) { return conn.failed < 0_i64 && !conn.peerClosed; }
+
+// ---- writing ----
+
+Result<unit,Http2Error> Lock(Connection conn) {
+    Instant started = Time.MonotonicNow();
+    while conn.writeBusy {
+        Result<unit,Http2Error> waited = Pause(conn, started);
+        match waited {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+    }
+    conn.writeBusy = true;
+    return Result::Ok(());
+}
+
+unit Unlock(Connection conn) { conn.writeBusy = false; return; }
+
+// Writes `count` octets of `bytes`; the caller holds the write lock.
+Result<unit,Http2Error> WriteLocked(Connection conn, Stream transport, u8[] bytes, i64 count) {
+    Result<unit,IoError> written = IO.WriteAll(transport, bytes, 0_i64, count);
+    match written {
+        Result::Ok(_) => { return Result::Ok(()); },
+        Result::Error(error) => {
+            if conn.failed < 0_i64 { conn.failed = 0_i64; }
+            return Result::Error(Http2Error::Transport(error));
+        },
+    };
+    return Result::Ok(());
+}
+
+// Writes one complete frame (or several concatenated frames) atomically.
+pub Result<unit,Http2Error> WriteFrame(Connection conn, Stream transport, u8[] bytes) {
+    Result<unit,Http2Error> locked = Lock(conn);
+    match locked {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    Result<unit,Http2Error> written = WriteLocked(conn, transport, bytes, Slice.Len(bytes));
+    Unlock(conn);
+    return written;
+}
+
+// Sends GOAWAY with `code`, marks the connection failed and returns the error.
+pub Http2Error Fail(Connection conn, Stream transport, i64 code) {
+    if !conn.goAwaySent && conn.failed < 0_i64 {
+        conn.goAwaySent = true;
+        WriteFrame(conn, transport, Frame.GoAwayFrame(conn.lastPeerStreamId, code, Slice.New(0_i64)));
+    }
+    if conn.failed < 0_i64 { conn.failed = code; }
+    return Http2Error::Connection(code);
+}
+
+// Graceful shutdown: GOAWAY(NO_ERROR) with the last processed peer stream id.
+pub Result<unit,Http2Error> GoAway(Connection conn, Stream transport) {
+    if conn.goAwaySent { return Result::Ok(()); }
+    conn.goAwaySent = true;
+    return WriteFrame(conn, transport, Frame.GoAwayFrame(conn.lastPeerStreamId, FrameErrors.NoError(), Slice.New(0_i64)));
+}
+
+// Client preface (section 3.4) followed by SETTINGS.
+pub Result<unit,Http2Error> WriteClientPreface(Connection conn, Stream transport) {
+    u8[] preface = Preface();
+    u8[] settings = Settings.EncodeFrame(conn.localSent);
+    u8[] both = Slice.New(Slice.Len(preface) + Slice.Len(settings));
+    Slice.Copy(both, 0_i64, preface, 0_i64, Slice.Len(preface));
+    Slice.Copy(both, Slice.Len(preface), settings, 0_i64, Slice.Len(settings));
+    return WriteFrame(conn, transport, both);
+}
+
+pub Result<unit,Http2Error> WriteSettings(Connection conn, Stream transport) {
+    return WriteFrame(conn, transport, Settings.EncodeFrame(conn.localSent));
+}
+
+// Sends RST_STREAM and closes the stream locally.
+pub unit ResetStream(Connection conn, Stream transport, StreamState s, i64 code) {
+    if s.state != Streams.Closed() { RecordClosed(conn, s.id); }
+    Streams.Reset(s, code, false);
+    WriteFrame(conn, transport, Frame.RstStreamFrame(s.id, code));
+    return;
+}
+
+unit ResetId(Connection conn, Stream transport, i64 id, i64 code) {
+    WriteFrame(conn, transport, Frame.RstStreamFrame(id, code));
+    return;
+}
+
+// Encodes `fields` and writes HEADERS plus CONTINUATION frames as one unit,
+// so no other frame interleaves (section 6.10). The caller holds the lock.
+Result<unit,Http2Error> WriteHeaderBlockLocked(Connection conn, Stream transport, i64 id, HeaderField[] fields, bool endStream) {
+    u8[] block = HpackEncoder.Encode(conn.encoder, fields);
+    i64 total = Slice.Len(block);
+    i64 limit = LocalMaxFrameSize();
+    mut i64 offset = 0_i64;
+    mut bool first = true;
+    while first || offset < total {
+        mut i64 chunk = total - offset;
+        if chunk > limit { chunk = limit; }
+        bool last = offset + chunk >= total;
+        mut i64 flags = 0_i64;
+        if last { flags = flags | Frame.FlagEndHeaders(); }
+        mut i64 kind = Frame.TypeContinuation();
+        if first {
+            kind = Frame.TypeHeaders();
+            if endStream { flags = flags | Frame.FlagEndStream(); }
+        }
+        Frame.PutHeader(conn.outBuf, 0_i64, chunk, kind, flags, id);
+        if chunk > 0_i64 { Slice.Copy(conn.outBuf, Frame.HeaderLength(), block, offset, chunk); }
+        Result<unit,Http2Error> written = WriteLocked(conn, transport, conn.outBuf, Frame.HeaderLength() + chunk);
+        match written {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+        offset = offset + chunk;
+        first = false;
+    }
+    return Result::Ok(());
+}
+
+// Sends a header section on an existing stream (response headers or trailers).
+pub Result<unit,Http2Error> SendHeaders(Connection conn, Stream transport, StreamState s, HeaderField[] fields, bool endStream) {
+    Result<unit,Http2Error> locked = Lock(conn);
+    match locked {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    Result<unit,Http2Error> written = WriteHeaderBlockLocked(conn, transport, s.id, fields, endStream);
+    Unlock(conn);
+    match written {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    if endStream { LocalEndedStream(conn, s); }
+    return Result::Ok(());
+}
+
+// Opens a new local stream: allocates the next id and writes its HEADERS
+// under one lock so stream ids reach the wire in increasing order (5.1.1).
+pub Result<StreamState,Http2Error> OpenStream(Connection conn, Stream transport, HeaderField[] fields, bool endStream) {
+    Result<unit,Http2Error> locked = Lock(conn);
+    match locked {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    i64 id = conn.nextStreamId;
+    if id > Frame.MaxStreamId() { Unlock(conn); return Result::Error(Http2Error::Closed); }
+    conn.nextStreamId = id + 2_i64;
+    StreamState s = Streams.New(id, RemoteInitialWindow(conn), AckedInitialWindow(conn));
+    Streams.Opened(s, endStream, false);
+    mut StreamState[] table = conn.streams;
+    Array.Append<StreamState>(table, s);
+    conn.streams = table;
+    Result<unit,Http2Error> written = WriteHeaderBlockLocked(conn, transport, id, fields, endStream);
+    Unlock(conn);
+    return match written {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(_) => Result::Ok(s),
+    };
+}
+
+unit LocalEndedStream(Connection conn, StreamState s) {
+    Streams.LocalEnded(s);
+    if Streams.IsClosed(s) { RecordClosed(conn, s.id); }
+    return;
+}
+
+i64 Min(i64 a, i64 b) { if a < b { return a; } return b; }
+
+// Sends as much pending DATA as the connection and stream windows allow.
+// Returns true when at least one frame was written.
+pub Result<bool,Http2Error> FlushData(Connection conn, Stream transport) {
+    mut bool any = false;
+    mut bool progressed = true;
+    while progressed {
+        progressed = false;
+        mut i64 i = 0_i64;
+        while i < Array.Len<StreamState>(conn.streams) {
+            StreamState s = Array.Get<StreamState>(conn.streams, i);
+            if s.outPending && Streams.LocalOpen(s) {
+                Result<bool,Http2Error> sent = FlushStream(conn, transport, s);
+                match sent {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(wrote) => { if wrote { progressed = true; any = true; } },
+                };
+            }
+            i = i + 1_i64;
+        }
+    }
+    return Result::Ok(any);
+}
+
+// One DATA frame for `s`, if the windows allow it.
+Result<bool,Http2Error> FlushStream(Connection conn, Stream transport, StreamState s) {
+    Result<unit,Http2Error> locked = Lock(conn);
+    match locked {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    if !s.outPending || !Streams.LocalOpen(s) { Unlock(conn); return Result::Ok(false); }
+    i64 remaining = Streams.OutRemaining(s);
+    mut i64 chunk = Min(remaining, Min(s.sendWindow, conn.sendWindow));
+    i64 peerFrame = RemoteMaxFrame(conn);
+    chunk = Min(chunk, Min(peerFrame, LocalMaxFrameSize()));
+    if chunk < 0_i64 { chunk = 0_i64; }
+    if chunk == 0_i64 && remaining > 0_i64 { Unlock(conn); return Result::Ok(false); }
+    bool last = chunk == remaining;
+    mut i64 flags = 0_i64;
+    if last { flags = Frame.FlagEndStream(); }
+    Frame.PutHeader(conn.outBuf, 0_i64, chunk, Frame.TypeData(), flags, s.id);
+    if chunk > 0_i64 { Slice.Copy(conn.outBuf, Frame.HeaderLength(), s.outBody, s.outOffset, chunk); }
+    Result<unit,Http2Error> written = WriteLocked(conn, transport, conn.outBuf, Frame.HeaderLength() + chunk);
+    s.outOffset = s.outOffset + chunk;
+    s.sendWindow = s.sendWindow - chunk;
+    conn.sendWindow = conn.sendWindow - chunk;
+    if last { s.outPending = false; }
+    Unlock(conn);
+    match written {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    if last { LocalEndedStream(conn, s); }
+    return Result::Ok(true);
+}
+
+// Queues `body` as the outgoing body of `s`; FlushData sends it with END_STREAM.
+pub unit QueueBody(StreamState s, u8[] body) {
+    s.outBody = body;
+    s.outOffset = 0_i64;
+    s.outPending = true;
+    return;
+}
+
+// ---- stream table ----
+
+// Index of stream `id` in the table, or -1.
+pub i64 IndexOf(Connection conn, i64 id) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<StreamState>(conn.streams) {
+        StreamState s = Array.Get<StreamState>(conn.streams, i);
+        if s.id == id { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+pub StreamState At(Connection conn, i64 index) { return Array.Get<StreamState>(conn.streams, index); }
+
+unit RecordClosed(Connection conn, i64 id) {
+    conn.closedIds[conn.closedNext % ClosedRing()] = id;
+    conn.closedNext = conn.closedNext + 1_i64;
+    return;
+}
+
+bool RecentlyClosed(Connection conn, i64 id) {
+    mut i64 i = 0_i64;
+    while i < ClosedRing() { if conn.closedIds[i] == id { return true; } i = i + 1_i64; }
+    return false;
+}
+
+// Removes `s` from the table (its owner finished with it).
+pub unit Remove(Connection conn, StreamState s) {
+    if !Streams.IsClosed(s) { RecordClosed(conn, s.id); s.state = Streams.Closed(); }
+    mut StreamState[] kept = Array.Empty<StreamState>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<StreamState>(conn.streams) {
+        StreamState other = Array.Get<StreamState>(conn.streams, i);
+        if other.id != s.id { Array.Append<StreamState>(kept, other); }
+        i = i + 1_i64;
+    }
+    conn.streams = kept;
+    return;
+}
+
+bool PeerInitiated(Connection conn, i64 id) {
+    bool odd = (id % 2_i64) == 1_i64;
+    if conn.isClient { return !odd; }
+    return odd;
+}
+
+// A stream id in the idle state: never opened by either side (section 5.1).
+pub bool IsIdle(Connection conn, i64 id) {
+    if PeerInitiated(conn, id) { return id > conn.lastPeerStreamId; }
+    return id >= conn.nextStreamId;
+}
+
+// Streams counted against a concurrency limit: open or half-closed, initiated by `peer`.
+pub i64 ActiveStreams(Connection conn, bool peer) {
+    mut i64 count = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Array.Len<StreamState>(conn.streams) {
+        StreamState s = Array.Get<StreamState>(conn.streams, i);
+        if !Streams.IsClosed(s) && PeerInitiated(conn, s.id) == peer { count = count + 1_i64; }
+        i = i + 1_i64;
+    }
+    return count;
+}
+
+// ---- reading ----
+
+Http2Error ReadFailure(Connection conn, IoError error) {
+    bool eof = match error { IoError::UnexpectedEof(_) => true, _ => false, };
+    if eof {
+        conn.peerClosed = true;
+        return Http2Error::Closed;
+    }
+    if conn.failed < 0_i64 { conn.failed = 0_i64; }
+    return Http2Error::Transport(error);
+}
+
+// Reads exactly `count` octets of the client preface (server side).
+pub Result<unit,Http2Error> ReadPreface(Connection conn, Stream transport) {
+    u8[] expected = Preface();
+    i64 count = Slice.Len(expected);
+    Result<unit,IoError> got = IO.ReadExact(transport, conn.inBuf, 0_i64, count);
+    match got {
+        Result::Error(error) => { return Result::Error(ReadFailure(conn, error)); },
+        Result::Ok(_) => (),
+    };
+    mut i64 i = 0_i64;
+    while i < count {
+        if conn.inBuf[i] != expected[i] { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+// Reads and decodes one frame. Frame errors are handled here: a connection
+// error sends GOAWAY and fails; a stream error sends RST_STREAM and yields
+// `Frame::Unknown(-1, id)` so the caller skips it. A stream error on HEADERS
+// would desynchronize HPACK, so it is a connection error here.
+pub Result<Frame,Http2Error> ReadFrame(Connection conn, Stream transport) {
+    Result<unit,IoError> head = IO.ReadExact(transport, conn.inBuf, 0_i64, Frame.HeaderLength());
+    match head {
+        Result::Error(error) => { return Result::Error(ReadFailure(conn, error)); },
+        Result::Ok(_) => (),
+    };
+    FrameHeader header = Frame.ParseHeader(conn.inBuf, 0_i64);
+    if header.length > LocalMaxFrameSize() { return Result::Error(Fail(conn, transport, FrameErrors.FrameSizeError())); }
+    if header.length > 0_i64 {
+        Result<unit,IoError> body = IO.ReadExact(transport, conn.inBuf, Frame.HeaderLength(), header.length);
+        match body {
+            Result::Error(error) => { return Result::Error(ReadFailure(conn, error)); },
+            Result::Ok(_) => (),
+        };
+    }
+    Result<Frame,FrameError> decoded = Frame.DecodePayload(header, conn.inBuf, Frame.HeaderLength(), LocalMaxFrameSize());
+    return match decoded {
+        Result::Ok(frame) => Result::Ok(frame),
+        Result::Error(error) => HandleFrameError(conn, transport, header, error),
+    };
+}
+
+Result<Frame,Http2Error> HandleFrameError(Connection conn, Stream transport, FrameHeader header, FrameError error) {
+    match error {
+        FrameError::Connection(code) => { return Result::Error(Fail(conn, transport, code)); },
+        FrameError::Stream(id, code) => {
+            if header.kind == Frame.TypeHeaders() || conn.continuationStream != 0_i64 { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+            if IsIdle(conn, id) && header.kind != Frame.TypePriority() { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+            i64 index = IndexOf(conn, id);
+            if index >= 0_i64 { ResetStream(conn, transport, At(conn, index), code); } else { ResetId(conn, transport, id, code); }
+            return Result::Ok(Frame::Unknown(-1_i64, id));
+        },
+    };
+    return Result::Ok(Frame::Unknown(-1_i64, 0_i64));
+}
+
+// Reads one frame and applies it.
+pub Result<unit,Http2Error> PumpOnce(Connection conn, Stream transport) {
+    if !Usable(conn) { return Result::Error(FailureOf(conn)); }
+    Result<Frame,Http2Error> read = ReadFrame(conn, transport);
+    return match read {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(frame) => Process(conn, transport, frame),
+    };
+}
+
+// Becomes the reader if no other fiber is, and pumps one frame; otherwise
+// sleeps one poll period. Used by every wait loop.
+pub Result<unit,Http2Error> Step(Connection conn, Stream transport, Instant started) {
+    if !Usable(conn) { return Result::Error(FailureOf(conn)); }
+    if conn.readBusy { return Pause(conn, started); }
+    conn.readBusy = true;
+    Result<unit,Http2Error> pumped = PumpOnce(conn, transport);
+    conn.readBusy = false;
+    return pumped;
+}
+
+// ---- frame processing ----
+
+pub Result<unit,Http2Error> Process(Connection conn, Stream transport, Frame frame) {
+    if conn.continuationStream != 0_i64 {
+        bool continuation = match frame { Frame::Continuation(_, _, _) => true, _ => false, };
+        if !continuation { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+    }
+    return match frame {
+        Frame::Data(id, endStream, flowLength, data) => OnData(conn, transport, id, endStream, flowLength, data),
+        Frame::Headers(id, endStream, endHeaders, _, _, _, _, fragment) => OnHeaders(conn, transport, id, endStream, endHeaders, fragment),
+        Frame::Priority(_, _, _, _) => Result::Ok(()),
+        Frame::RstStream(id, code) => OnRstStream(conn, transport, id, code),
+        Frame::Settings(ack, ids, values) => OnSettings(conn, transport, ack, ids, values),
+        Frame::PushPromise(_, _, _, _) => Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())),
+        Frame::Ping(ack, opaque) => OnPing(conn, transport, ack, opaque),
+        Frame::GoAway(last, code, _) => OnGoAway(conn, last, code),
+        Frame::WindowUpdate(id, increment) => OnWindowUpdate(conn, transport, id, increment),
+        Frame::Continuation(id, endHeaders, fragment) => OnContinuation(conn, transport, id, endHeaders, fragment),
+        Frame::Unknown(_, _) => Result::Ok(()),
+    };
+}
+
+// Returns consumed DATA credit to the peer once half of a window is used.
+Result<unit,Http2Error> Replenish(Connection conn, Stream transport, i64 streamId, i64 window, i64 target) {
+    if window > target / 2_i64 { return Result::Ok(()); }
+    i64 increment = target - window;
+    if increment <= 0_i64 { return Result::Ok(()); }
+    return WriteFrame(conn, transport, Frame.WindowUpdateFrame(streamId, increment));
+}
+
+Result<unit,Http2Error> ReplenishConnection(Connection conn, Stream transport) {
+    if conn.recvWindow > ConnectionWindow() / 2_i64 { return Result::Ok(()); }
+    i64 increment = ConnectionWindow() - conn.recvWindow;
+    conn.recvWindow = ConnectionWindow();
+    return WriteFrame(conn, transport, Frame.WindowUpdateFrame(0_i64, increment));
+}
+
+Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool endStream, i64 flowLength, u8[] data) {
+    conn.recvWindow = conn.recvWindow - flowLength;
+    if conn.recvWindow < 0_i64 { return Result::Error(Fail(conn, transport, FrameErrors.FlowControlError())); }
+    i64 index = IndexOf(conn, id);
+    if index < 0_i64 {
+        if IsIdle(conn, id) { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+        ResetId(conn, transport, id, FrameErrors.StreamClosed());
+        return ReplenishConnection(conn, transport);
+    }
+    StreamState s = At(conn, index);
+    if !Streams.RemoteOpen(s) {
+        if s.state != Streams.Closed() || !s.resetByPeer { ResetStream(conn, transport, s, FrameErrors.StreamClosed()); }
+        return ReplenishConnection(conn, transport);
+    }
+    s.recvWindow = s.recvWindow - flowLength;
+    if s.recvWindow < 0_i64 {
+        ResetStream(conn, transport, s, FrameErrors.FlowControlError());
+        return ReplenishConnection(conn, transport);
+    }
+    i64 count = Slice.Len(data);
+    i64 maxBody = MaxBodyBytes(conn);
+    if s.received + count > maxBody {
+        s.bodyTooLarge = true;
+        ResetStream(conn, transport, s, FrameErrors.Cancel());
+        return ReplenishConnection(conn, transport);
+    }
+    s.body = Place(s.body, s.received, data, s.contentLength);
+    s.received = s.received + count;
+    Result<unit,Http2Error> conWindow = ReplenishConnection(conn, transport);
+    match conWindow {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    if endStream { return RemoteEnd(conn, transport, s); }
+    i64 target = SentInitialWindow(conn);
+    if s.recvWindow <= target / 2_i64 && target - s.recvWindow > 0_i64 {
+        i64 increment = target - s.recvWindow;
+        s.recvWindow = target;
+        return WriteFrame(conn, transport, Frame.WindowUpdateFrame(id, increment));
+    }
+    return Result::Ok(());
+}
+
+// Copies `data` into `buf` at `used`, growing by doubling (or straight to
+// `expected` when a content-length is known). Byte-wise Array.Append on an
+// array held in a struct field reallocates every call in 0.5.2, which
+// exhausted the heap in the curl interop run.
+u8[] Place(u8[] buf, i64 used, u8[] data, i64 expected) {
+    i64 count = Slice.Len(data);
+    if count == 0_i64 { return buf; }
+    i64 need = used + count;
+    mut u8[] target = buf;
+    if need > Slice.Len(buf) {
+        mut i64 size = Slice.Len(buf) * 2_i64;
+        if size < 4096_i64 { size = 4096_i64; }
+        if expected >= need && expected > size { size = expected; }
+        if size < need { size = need; }
+        target = Slice.New(size);
+        if used > 0_i64 { Slice.Copy(target, 0_i64, buf, 0_i64, used); }
+    }
+    Slice.Copy(target, used, data, 0_i64, count);
+    return target;
+}
+
+// The received body without spare capacity.
+pub u8[] BodyOf(StreamState s) {
+    if Slice.Len(s.body) == s.received { return s.body; }
+    return Slice.SubSlice(s.body, 0_i64, s.received);
+}
+
+// END_STREAM received: checks content-length (section 8.1.1) and updates the state.
+Result<unit,Http2Error> RemoteEnd(Connection conn, Stream transport, StreamState s) {
+    if s.contentLength >= 0_i64 && !s.headRequest && s.contentLength != s.received {
+        ResetStream(conn, transport, s, FrameErrors.ProtocolError());
+        return Result::Ok(());
+    }
+    Streams.RemoteEnded(s);
+    if Streams.IsClosed(s) { RecordClosed(conn, s.id); }
+    return Result::Ok(());
+}
+
+Result<unit,Http2Error> OnHeaders(Connection conn, Stream transport, i64 id, bool endStream, bool endHeaders, u8[] fragment) {
+    conn.block = fragment;
+    if !endHeaders {
+        conn.continuationStream = id;
+        conn.continuationEndStream = endStream;
+        return Result::Ok(());
+    }
+    return HeaderBlock(conn, transport, id, endStream);
+}
+
+Result<unit,Http2Error> OnContinuation(Connection conn, Stream transport, i64 id, bool endHeaders, u8[] fragment) {
+    if conn.continuationStream == 0_i64 || conn.continuationStream != id { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+    i64 count = Slice.Len(fragment);
+    i64 blockLimit = MaxHeaderList(conn) + LocalMaxFrameSize();
+    i64 have = Slice.Len(conn.block);
+    if have + count > blockLimit { return Result::Error(Fail(conn, transport, FrameErrors.EnhanceYourCalm())); }
+    conn.block = MemoryTransport.Join(conn.block, fragment);
+    if !endHeaders { return Result::Ok(()); }
+    conn.continuationStream = 0_i64;
+    return HeaderBlock(conn, transport, id, conn.continuationEndStream);
+}
+
+// HPACK result: the fields (empty after a stream-level size error), or a connection failure.
+Result<HeaderField[],Http2Error> DecodeBlock(Connection conn, Stream transport) {
+    Result<HeaderField[],HpackError> decoded = HpackDecoder.Decode(conn.decoder, conn.block);
+    conn.block = Slice.New(0_i64);
+    return match decoded {
+        Result::Ok(fields) => Result::Ok(fields),
+        Result::Error(error) => match error {
+            HpackError::HeaderListTooLarge(_) => Result::Ok(Array.Empty<HeaderField>()),
+            HpackError::TooManyFields => Result::Ok(Array.Empty<HeaderField>()),
+            _ => Result::Error(Fail(conn, transport, FrameErrors.CompressionError())),
+        },
+    };
+}
+
+// A complete header section for stream `id` (section 8.1).
+Result<unit,Http2Error> HeaderBlock(Connection conn, Stream transport, i64 id, bool endStream) {
+    Result<HeaderField[],Http2Error> decoded = DecodeBlock(conn, transport);
+    match decoded {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(fields) => { return ApplySection(conn, transport, id, endStream, fields); },
+    };
+}
+
+Result<unit,Http2Error> ApplySection(Connection conn, Stream transport, i64 id, bool endStream, HeaderField[] fields) {
+    bool empty = Array.Len<HeaderField>(fields) == 0_i64;
+    i64 index = IndexOf(conn, id);
+    if index < 0_i64 {
+        if !PeerInitiated(conn, id) {
+            if IsIdle(conn, id) { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+            return Result::Error(Fail(conn, transport, FrameErrors.StreamClosed()));
+        }
+        if !IsIdle(conn, id) {
+            if RecentlyClosed(conn, id) { return Result::Error(Fail(conn, transport, FrameErrors.StreamClosed())); }
+            return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError()));
+        }
+        return NewPeerStream(conn, transport, id, endStream, fields);
+    }
+    StreamState s = At(conn, index);
+    if !Streams.RemoteOpen(s) {
+        ResetStream(conn, transport, s, FrameErrors.StreamClosed());
+        return Result::Ok(());
+    }
+    if empty { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); return Result::Ok(()); }
+    if s.hasHeaders || !conn.isClient {
+        // Trailers: must end the stream and carry no pseudo-headers.
+        if !endStream || Mapping.ValidateTrailers(fields) != 0_i64 { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); return Result::Ok(()); }
+        s.trailers = fields;
+        return RemoteEnd(conn, transport, s);
+    }
+    if Mapping.ValidateResponse(fields) != 0_i64 { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); return Result::Ok(()); }
+    i64 status = Mapping.StatusOf(fields);
+    if status < 200_i64 {
+        // Interim response (section 8.1): skipped; it cannot end the stream.
+        if endStream { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); }
+        return Result::Ok(());
+    }
+    i64 declared = Mapping.ContentLength(fields);
+    if declared == -2_i64 { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); return Result::Ok(()); }
+    s.headers = fields;
+    s.hasHeaders = true;
+    if status != 204_i64 && status != 304_i64 { s.contentLength = declared; }
+    if endStream { return RemoteEnd(conn, transport, s); }
+    return Result::Ok(());
+}
+
+// A HEADERS frame opening a stream from the peer (server side).
+Result<unit,Http2Error> NewPeerStream(Connection conn, Stream transport, i64 id, bool endStream, HeaderField[] fields) {
+    conn.lastPeerStreamId = id;
+    StreamState s = Streams.New(id, RemoteInitialWindow(conn), AckedInitialWindow(conn));
+    Streams.Opened(s, false, endStream);
+    if conn.goAwaySent {
+        // Streams opened after GOAWAY are ignored (section 6.8).
+        RecordClosed(conn, id);
+        return Result::Ok(());
+    }
+    i64 localMax = SentMaxStreams(conn);
+    if ActiveStreams(conn, true) >= localMax {
+        RecordClosed(conn, id);
+        ResetId(conn, transport, id, FrameErrors.RefusedStream());
+        return Result::Ok(());
+    }
+    mut StreamState[] table = conn.streams;
+    Array.Append<StreamState>(table, s);
+    conn.streams = table;
+    if Array.Len<HeaderField>(fields) == 0_i64 || Mapping.ValidateRequest(fields) != 0_i64 {
+        ResetStream(conn, transport, s, FrameErrors.ProtocolError());
+        return Result::Ok(());
+    }
+    i64 declared = Mapping.ContentLength(fields);
+    if declared == -2_i64 { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); return Result::Ok(()); }
+    s.headers = fields;
+    s.hasHeaders = true;
+    s.contentLength = declared;
+    s.headRequest = Mapping.PseudoText(fields, ":method") == "HEAD";
+    if endStream && declared > 0_i64 { ResetStream(conn, transport, s, FrameErrors.ProtocolError()); }
+    return Result::Ok(());
+}
+
+Result<unit,Http2Error> OnRstStream(Connection conn, Stream transport, i64 id, i64 code) {
+    i64 index = IndexOf(conn, id);
+    if index < 0_i64 {
+        if IsIdle(conn, id) { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+        return Result::Ok(());
+    }
+    StreamState s = At(conn, index);
+    if !Streams.IsClosed(s) { RecordClosed(conn, id); }
+    Streams.Reset(s, code, true);
+    return Result::Ok(());
+}
+
+Result<unit,Http2Error> OnSettings(Connection conn, Stream transport, bool ack, i64[] ids, i64[] values) {
+    if ack {
+        // Our SETTINGS now apply: receive windows of open streams move by the delta (6.9.2).
+        i64 sentWindow = SentInitialWindow(conn);
+        i64 ackedWindow = AckedInitialWindow(conn);
+        i64 delta = sentWindow - ackedWindow;
+        mut i64 i = 0_i64;
+        while i < Array.Len<StreamState>(conn.streams) {
+            StreamState s = Array.Get<StreamState>(conn.streams, i);
+            s.recvWindow = s.recvWindow + delta;
+            i = i + 1_i64;
+        }
+        conn.localAcked = Settings.Copy(conn.localSent);
+        conn.settingsAcks = conn.settingsAcks + 1_i64;
+        return Result::Ok(());
+    }
+    i64 oldWindow = RemoteInitialWindow(conn);
+    i64 oldTable = RemoteTableSize(conn);
+    Result<unit,FrameError> applied = Settings.Apply(conn.remote, ids, values, conn.isClient);
+    match applied {
+        Result::Error(error) => {
+            i64 code = match error { FrameError::Connection(c) => c, FrameError::Stream(_, c) => c, };
+            return Result::Error(Fail(conn, transport, code));
+        },
+        Result::Ok(_) => (),
+    };
+    i64 newWindow = RemoteInitialWindow(conn);
+    i64 delta = newWindow - oldWindow;
+    if delta != 0_i64 {
+        mut i64 i = 0_i64;
+        while i < Array.Len<StreamState>(conn.streams) {
+            StreamState s = Array.Get<StreamState>(conn.streams, i);
+            s.sendWindow = s.sendWindow + delta;
+            if s.sendWindow > Frame.MaxWindow() { return Result::Error(Fail(conn, transport, FrameErrors.FlowControlError())); }
+            i = i + 1_i64;
+        }
+    }
+    i64 newTable = RemoteTableSize(conn);
+    if newTable != oldTable {
+        HpackEncoder.SetMaxTableSize(conn.encoder, Min(newTable, Hpack.DefaultTableSize()));
+    }
+    conn.remoteSettingsSeen = true;
+    return WriteFrame(conn, transport, Frame.SettingsAckFrame());
+}
+
+Result<unit,Http2Error> OnPing(Connection conn, Stream transport, bool ack, u8[] opaque) {
+    if ack { conn.pingAcks = conn.pingAcks + 1_i64; return Result::Ok(()); }
+    return WriteFrame(conn, transport, Frame.PingFrame(opaque, true));
+}
+
+Result<unit,Http2Error> OnGoAway(Connection conn, i64 last, i64 code) {
+    conn.goAwayLastId = last;
+    conn.goAwayCode = code;
+    // Local streams above `last` were not processed and may be retried (section 6.8).
+    mut i64 i = 0_i64;
+    while i < Array.Len<StreamState>(conn.streams) {
+        StreamState s = Array.Get<StreamState>(conn.streams, i);
+        if !PeerInitiated(conn, s.id) && s.id > last && !Streams.IsClosed(s) {
+            s.refusedByGoAway = true;
+            RecordClosed(conn, s.id);
+            Streams.Reset(s, FrameErrors.RefusedStream(), true);
+        }
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+Result<unit,Http2Error> OnWindowUpdate(Connection conn, Stream transport, i64 id, i64 increment) {
+    conn.windowUpdates = conn.windowUpdates + 1_i64;
+    if id == 0_i64 {
+        conn.sendWindow = conn.sendWindow + increment;
+        if conn.sendWindow > Frame.MaxWindow() { return Result::Error(Fail(conn, transport, FrameErrors.FlowControlError())); }
+        return Result::Ok(());
+    }
+    i64 index = IndexOf(conn, id);
+    if index < 0_i64 {
+        if IsIdle(conn, id) { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
+        return Result::Ok(());
+    }
+    StreamState s = At(conn, index);
+    if Streams.IsClosed(s) { return Result::Ok(()); }
+    s.sendWindow = s.sendWindow + increment;
+    if s.sendWindow > Frame.MaxWindow() { ResetStream(conn, transport, s, FrameErrors.FlowControlError()); }
+    return Result::Ok(());
+}
+
+// Sends PING and pumps frames until its ACK arrives.
+pub Result<unit,Http2Error> Ping(Connection conn, Stream transport, u8[] opaque) {
+    i64 before = conn.pingAcks;
+    Result<unit,Http2Error> sent = WriteFrame(conn, transport, Frame.PingFrame(opaque, false));
+    match sent {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    Instant started = Time.MonotonicNow();
+    while conn.pingAcks == before {
+        Result<unit,Http2Error> stepped = Step(conn, transport, started);
+        match stepped {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+    }
+    return Result::Ok(());
+}

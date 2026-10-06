@@ -550,3 +550,62 @@ without double or trailing underscores, and must be unique per target.
 Note: struct fields cannot be declared `mut`, but assigning a field (`c.dcid = x`) and
 `Array.Append` through a field (`Array.Append<T>(c.list, v)`) both work and are visible to
 callers.
+
+## 2026-10-05, http2 (framing and connection slice)
+
+1. **Nested field path inside an arithmetic comparison is an ICE.**
+   `bool M(Connection c) { return c.config.max + K() > 5_i64; }` fails at CLIF
+   time with "no ISLE lowering rule or fact for `BinaryExpression`".
+   `return c.config.max + K();`, `K() > c.config.max` and
+   `c.recv > c.config.max` all lower. Workaround: read nested settings through
+   accessor functions (`Config c = conn.config; return c.max;`) and bind them to
+   locals before comparing (`Http2/Connection.bd`, "accessors").
+2. **`return match` with a block arm that ends in `return` is an ICE when the
+   function returns a plain enum** (not `Result`): `Http2Error F(IoError e) {
+   return match e { IoError::UnexpectedEof(_) => { x = 1; return A; }, _ => {
+   return B(e); }, }; }` fails with "no ISLE lowering rule or fact for
+   `MatchExpression`". Workaround: compute a `bool` with an expression match,
+   then use `if`, or use a statement `match` with a trailing `return`.
+3. **Contract conformance is nominal and is checked only at specialization.**
+   A type declared `: Stream` passed as `Core.IO.Stream` to `IO.ReadExact`
+   (which takes `Reader`) type-checks, but every test that reaches the call
+   fails at JIT time with "missing contract conformance for MemoryTransport".
+   Workaround: transports declare `Stream, Reader, Writer, Closer` (as
+   `Network.Tcp.TcpStream` does). A future `TlsStream` must do the same to be
+   accepted by `Http2.Client`/`Http2.Server`.
+4. **`mut T[]` parameter growth must be published.** A `unit F(mut u8[] out)`
+   that calls `Array.Append(out, ..)` is rejected ("grown handle ... discarded").
+   Workaround: return the array and rebind (`out = F(out);`), or keep growable
+   arrays in struct fields and assign the grown local back (`conn.block = block`).
+5. Tooling note: a target with loopback networking plus the full HTTP/2 stack
+   takes 5-10 minutes to JIT on a loaded host (load ~12); JIT compiles lazily
+   and reports only the first ICE per test, so each compiler gap costs one full
+   cycle. Editing package sources while `beskid test` runs fails the run with
+   "prepared workspace content mutated during phase `prepare_targets`".
+6. No string escapes (`\r\n`) in string literals: the preface is built from
+   bytes (`Connection.Preface()`).
+7. **Runtime: byte-wise `Array.Append` growth of a body exhausted the AOT heap.**
+   The interop server appended each received DATA octet to an array kept in a
+   struct field (`mut u8[] b = s.body; Array.Append<u8>(b, x); s.body = b;`).
+   After two connections with a 100 KB POST it trapped
+   `out_of_memory (5): R1 req=104 live=64160 committed=1073741824` (live data
+   small, committed heap at the 1 GiB cap). Workaround: grow buffers by
+   doubling with `Slice.New` + `Slice.Copy` (`Connection.Place`); with that the
+   same run passes.
+8. **AOT entry: `TcpListener.Accept` from `Main` fails at once** (the server
+   reported three immediate accept failures). Workaround: run the network code
+   in a spawned fiber (`spawn Run()` from `Main`, then `Join`). Also `beskid
+   run` needs a debug runtime kit; the local kit has only `release`, so the
+   interop script uses `beskid build --release` and runs the binary.
+9. **Runtime: `--all-targets` runs every target in one process and the heap
+   cap is shared.** For `protocols/http2/tests` the matrix passes the first 12
+   targets (smoke, 8 HPACK, frame, loopback, server-error) and then traps
+   `out_of_memory (5): R1 req=57344 live=262032 committed=1073741824` in the
+   13th target (flow control); live data stays near 256 KiB, committed memory
+   reaches the 1 GiB cap. `Assert.CollectGarbage()` before each connection did
+   not help. Replacing byte-wise `Array.Append` growth of the test transport
+   by `Slice.New` + `Slice.Copy` (exact or doubling) made the flow-control
+   target trap even alone, so `MemoryTransport` keeps byte-wise appends on a
+   local copy. Every target passes when run alone with `--target <Name>`.
+   Workaround: run the HTTP/2 connection targets one by one; open item: a
+   runtime that reuses freed segments, or a per-target process in the matrix.

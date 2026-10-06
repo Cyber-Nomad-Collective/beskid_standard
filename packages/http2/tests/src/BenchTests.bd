@@ -1,0 +1,244 @@
+/// HTTP/2 throughput over prior-knowledge h2c on loopback TCP (see
+/// docs/networking/BENCHMARKS.md). The server answers every GET with one body that it
+/// allocated once; the client issues sequential GETs on one connection: 2048 x 4 KiB
+/// (8 MiB of DATA) and 64 x 16 KiB (1 MiB). The receiving side allocates every response
+/// body; above 4 KiB that allocation is the 0.5.3 append path (COMPILER-GAPS PERF1).
+/// Client and server are fibers of one process on one thread. No TLS, so the crypto
+/// provider does not apply.
+use Testing.Assert;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Http.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Network.Types as NetworkTypes;
+use Core.Bytes.Convert;
+use Http2.Client;
+use Http2.Connection;
+use Http2.Frame;
+use Http2.FrameErrors;
+use Http2.Hpack;
+use Http2.HpackDecoder;
+use Http2.HpackEncoder;
+use Http2.HpackHuffman;
+use Http2.Server;
+
+i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+unit Throughput(string name, i64 bytes, i64 nanos) {
+    i64 safe = nanos + 1_i64;
+    i64 centi = bytes * 100000_i64 / safe;
+    i64 frac = centi % 100_i64;
+    mut string pad = "";
+    if frac < 10_i64 { pad = "0"; }
+    Output.WriteLine("BENCH " + name + ": " + Dec(centi / 100_i64) + "." + pad + Dec(frac) + " MB/s (" + Dec(safe / 1000_i64) + " us total)");
+    return;
+}
+
+
+SocketAddress Loopback() {
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: NetworkTypes.PortBytes(0_u8, 0_u8) };
+}
+
+Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+type Blob16k: RequestHandler {
+    u8[] body,
+    pub Response Handle(Request request) { return AnswerFor(this); }
+}
+
+Response AnswerFor(Blob16k handler) { return Answer(handler.body); }
+
+Response Answer(u8[] body) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Content-Type", value: "application/octet-stream" });
+    return Response { status: 200_i64, reason: "OK", headers: headers, body: body };
+}
+
+Config BenchConfig() {
+    Config config = Connection.DefaultConfig();
+    config.timeoutMillis = 60000_i64;
+    return config;
+}
+
+i64 ServeOne(TcpListener listener, u8[] body) {
+    Blob16k handler = Blob16k { body: body };
+    Result<i64,Http2Error> served = Server.AcceptAndServe(listener, handler, BenchConfig(), Within(60000_i64));
+    return match served { Result::Ok(count) => count, Result::Error(error) => -100_i64 - FrameErrors.CodeOf(error), };
+}
+
+Request Get() {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "bench.test" });
+    return Request { method: "GET", target: "/blob", headers: headers, body: Slice.New(0_i64) };
+}
+
+// Returns 0 on success; info[0] = transfer nanos, info[1] = bytes received.
+i64 Run(i64 size, i64 requests, i64[] info) {
+    u8[] body = Slice.New(size);
+    mut i64 i = 0_i64;
+    while i < size { body[i] = u8(i & 255_i64); i = i + 1_i64; }
+    Result<TcpListener, NetworkError> bound = TcpListener.Bind(Loopback(), 4_i64);
+    match bound {
+        Result::Error(_) => { return 99_i64; },
+        Result::Ok(listener) => {
+            SocketAddress address = match listener.LocalAddress() { Result::Ok(a) => a, Result::Error(_) => Loopback(), };
+            TcpListener l = listener;
+            Fiber<i64> server = spawn (() => ServeOne(l, body));
+            Result<TcpStream, NetworkError> connected = TcpStream.Connect(address, NetworkTypes.DefaultSocketOptions(), Within(5000_i64));
+            match connected {
+                Result::Error(_) => { return 98_i64; },
+                Result::Ok(stream) => {
+                    match Client.Open(stream, BenchConfig()) {
+                        Result::Error(_) => { return 97_i64; },
+                        Result::Ok(conn) => {
+                            Request request = Get();
+                            i64 t0 = NowNanos();
+                            mut i64 n = 0_i64;
+                            mut i64 bytes = 0_i64;
+                            while n < requests {
+                                Result<Response, Http2Error> sent = Client.Send(conn, stream, request);
+                                match sent {
+                                    Result::Error(_) => { return 10_i64; },
+                                    Result::Ok(response) => { bytes = bytes + Slice.Len(response.body); },
+                                };
+                                n = n + 1_i64;
+                            }
+                            info[0] = NowNanos() - t0;
+                            info[1] = bytes;
+                            Client.Close(conn, stream);
+                        },
+                    };
+                    i64 served = match server.Join() { Result::Ok(c) => c, Result::Error(_) => -1_i64, };
+                    stream.Close();
+                    listener.Close();
+                    if served != requests { return 20_i64; }
+                    return 0_i64;
+                },
+            };
+        },
+    };
+}
+
+unit Scenario(i64 size, i64 requests, i64[] info) {
+    info[2] = Run(size, requests, info);
+    return;
+}
+
+unit Measure(string label, i64 size, i64 requests) {
+    i64[] info = [0_i64, 0_i64, -1_i64];
+    Fiber<unit> run = spawn (() => Scenario(size, requests, info));
+    run.Join();
+    Assert.Equal<i64>(info[2], 0_i64, "scenario");
+    Assert.Equal<i64>(info[1], requests * size, "bytes");
+    Throughput(label, info[1], info[0]);
+    return;
+}
+
+test bench_h2c_loopback_data {
+    Measure("h2c 2048 GETs x 4KiB DATA (8MiB)", 4096_i64, 2048_i64);
+    Measure("h2c 64 GETs x 16KiB DATA (1MiB)", 16384_i64, 64_i64);
+}
+
+unit PerOp(string name, i64 ops, i64 nanos) {
+    i64 safe = nanos + 1_i64;
+    Output.WriteLine("BENCH " + name + ": " + Dec(safe / ops) + " ns/op over " + Dec(ops));
+    return;
+}
+
+HeaderField[] RequestFields() {
+    mut HeaderField[] f = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(f, Hpack.Field(":method", "GET"));
+    Array.Append<HeaderField>(f, Hpack.Field(":scheme", "http"));
+    Array.Append<HeaderField>(f, Hpack.Field(":path", "/static/app/main.0f3c9a.js?v=20261006"));
+    Array.Append<HeaderField>(f, Hpack.Field(":authority", "bench.example.test"));
+    Array.Append<HeaderField>(f, Hpack.Field("user-agent", "beskid-bench/0.5.3 (linux x86_64)"));
+    Array.Append<HeaderField>(f, Hpack.Field("accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"));
+    return f;
+}
+
+unit HpackRounds(mut Encoder encoder, mut Decoder decoder) {
+    mut i64 i = 0_i64;
+    HeaderField[] fields = RequestFields();
+    i64 rounds = 200_i64;
+    mut i64 encNanos = 0_i64;
+    mut i64 decNanos = 0_i64;
+    while i < rounds {
+        i64 a = NowNanos();
+        u8[] block = HpackEncoder.Encode(encoder, fields);
+        i64 b = NowNanos();
+        bool ok = match HpackDecoder.Decode(decoder, block) { Result::Ok(got) => Array.Len<HeaderField>(got) == 6_i64, Result::Error(_) => false, };
+        i64 c = NowNanos();
+        Assert.True(ok, "hpack round trip");
+        encNanos = encNanos + (b - a);
+        decNanos = decNanos + (c - b);
+        i = i + 1_i64;
+    }
+    PerOp("hpack encode 6-field request (Huffman, dynamic table)", rounds, encNanos);
+    PerOp("hpack decode 6-field request (Huffman, dynamic table)", rounds, decNanos);
+    return;
+}
+
+// Component timings for the h2c path: DATA frame decode and encode, HPACK encode and decode
+// of a browser-like request with Huffman strings, Huffman decode alone.
+test bench_h2_components {
+    u8[] body = Slice.New(4096_i64);
+    u8[] frame = Frame.DataFrame(1_i64, body, false);
+    i64 ops = 256_i64;
+    mut i64 t0 = NowNanos();
+    mut i64 i = 0_i64;
+    while i < ops {
+        bool ok = match Frame.Decode(frame, 16384_i64) { Result::Ok(_) => true, Result::Error(_) => false, };
+        Assert.True(ok, "decodes");
+        i = i + 1_i64;
+    }
+    Throughput("h2 DATA frame decode 4KiB", ops * 4096_i64, NowNanos() - t0);
+    t0 = NowNanos();
+    i = 0_i64;
+    while i < ops { u8[] f = Frame.DataFrame(1_i64, body, false); i = i + 1_i64; }
+    Throughput("h2 DATA frame encode 4KiB", ops * 4096_i64, NowNanos() - t0);
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    policy.huffman = HuffmanMode::Always();
+    Result<Encoder,HpackError> madeEncoder = HpackEncoder.NewEncoder(policy);
+    Result<Decoder,HpackError> madeDecoder = HpackDecoder.NewDecoder(HpackDecoder.DefaultDecoderLimits());
+    match madeEncoder {
+        Result::Error(_) => { Assert.Fail("encoder"); },
+        Result::Ok(e) => {
+            match madeDecoder {
+                Result::Error(_) => { Assert.Fail("decoder"); },
+                Result::Ok(d) => { HpackRounds(e, d); },
+            };
+        },
+    };
+    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+    u8[] text = Convert.StringToBytes("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8");
+    u8[] coded = HpackHuffman.HuffmanEncode(tables, Slice.New(0_i64), text);
+    i64 n = Slice.Len(coded);
+    t0 = NowNanos();
+    i = 0_i64;
+    while i < 1000_i64 {
+        bool ok = match HpackHuffman.HuffmanDecode(tables, coded, 0_i64, n, 4096_i64) { Result::Ok(v) => Slice.Len(v) == Slice.Len(text), Result::Error(_) => false, };
+        Assert.True(ok, "huffman");
+        i = i + 1_i64;
+    }
+    PerOp("huffman decode 64-char value (" + Dec(n) + " octets)", 1000_i64, NowNanos() - t0);
+}

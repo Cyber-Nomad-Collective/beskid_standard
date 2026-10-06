@@ -49,6 +49,8 @@ beskid test --project packages/<pkg>/tests --target <Target> --plain
   and on the exact sibling packages whose modules its `src` imports
   (`corelib_concurrency`, `corelib_network`, `corelib_http`, `corelib_<pkg>`).
   It never depends on the aggregate, because the aggregate depends on it.
+- `packages/crypto-openssl` (`corelib_crypto_openssl`) is opt-in and is not in
+  the aggregate (R20). Its tests depend on the aggregate plus the package.
 - A test or interop project depends only on the aggregate
   (`dependency "corelib"`, path to `beskid_corelib`), like `corelib_tests`.
 

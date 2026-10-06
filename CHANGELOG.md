@@ -17,6 +17,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Requires compiler 0.5.3, which grants corelib authority per service file.
   Program notes, compiler gap log, rulings, and repros are in
   `docs/networking/`.
+- Add the opt-in `corelib_crypto_openssl` package (`packages/crypto-openssl`),
+  a Linux OpenSSL 3 provider for `corelib_crypto`. It is not part of the
+  aggregate, so the aggregate still loads on hosts without OpenSSL 3.
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent

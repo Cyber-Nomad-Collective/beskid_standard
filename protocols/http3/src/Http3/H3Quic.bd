@@ -314,13 +314,13 @@ pub unit Nap() {
 /// A QUIC configuration fit for HTTP/3: each side allows the peer the three
 /// unidirectional streams HTTP/3 opens (control, QPACK encoder and decoder,
 /// RFC 9114 section 6.2) and up to eight concurrent request streams.
-pub QuicConfig ForH3(QuicConfig c) {
-    return QuicConfig {
-        alpn: c.alpn, serverName: c.serverName, idleTimeoutMs: c.idleTimeoutMs, maxData: c.maxData,
-        streamBuffer: c.streamBuffer, maxStreamsBidi: 8_i64, maxStreamsUni: 3_i64,
-        requireRetry: c.requireRetry, handshake: c.handshake,
-    };
-}
+pub QuicConfig ForH3(QuicConfig c) { return QuicConfig.WithStreamLimits(c, PeerBidiStreams(), PeerUniStreams()); }
+
+/// Concurrent request streams each side grants its peer (R18).
+pub i64 PeerBidiStreams() { return 8_i64; }
+
+/// Unidirectional streams each side grants its peer: control, QPACK encoder and decoder.
+pub i64 PeerUniStreams() { return 3_i64; }
 
 pub QuicConfig ClientConfig(TlsClientConfig tls) { return ForH3(QuicConfig.TlsClientConfigFor(tls, [AlpnH3()])); }
 
@@ -598,17 +598,20 @@ bool QIsFinished(H3QuicSession s, i64 id) {
     return QuicConnection.StreamAtEnd(Conn(s), id);
 }
 
+// The code is remembered once seen, because QUIC frees the stream slot after
+// the reset was read and both directions are done.
 i64 QPeerResetCode(H3QuicSession s, i64 id) {
     i64 at = IndexOfId(s, id);
     if at >= 0_i64 && s.resets[at] >= 0_i64 { return s.resets[at]; }
     if Released(s) { return -1_i64; }
-    // A zero-length read reports a reset (-2) without consuming data.
-    Connection c = Conn(s);
-    i64 n = QuicConnection.StreamRead(c, id, s.scratch, 0_i64, 0_i64);
-    if n != -2_i64 { return -1_i64; }
-    i64 code = QuicConnection.StreamResetCode(c, id);
-    NoteReset(s, id, code);
+    i64 code = QuicConnection.StreamResetCode(Conn(s), id);
+    if code >= 0_i64 { NoteReset(s, id, code); }
     return code;
+}
+
+i64 QPeerStopCode(H3QuicSession s, i64 id) {
+    if Released(s) { return -1_i64; }
+    return QuicConnection.StreamPeerStopCode(Conn(s), id);
 }
 
 unit QReset(H3QuicSession s, i64 id, i64 code) {
@@ -778,13 +781,12 @@ pub i64 PeerResetCode(QuicLink link, i64 id) {
     };
 }
 
-/// STOP_SENDING code the peer sent for our send side of `id`, or -1. The
-/// QUIC package exposes no accessor for it yet: a QUIC link reports -1 and
-/// the stop shows up as a failed Write.
+/// STOP_SENDING code the peer sent for our send side of `id`, or -1. A QUIC
+/// link reports -1 again once the stream slot is freed.
 pub i64 PeerStopCode(QuicLink link, i64 id) {
     return match link {
         QuicLink::Memory(m) => MemPeerStopCode(m, id),
-        QuicLink::Quic(s) => -1_i64,
+        QuicLink::Quic(s) => QPeerStopCode(s, id),
     };
 }
 

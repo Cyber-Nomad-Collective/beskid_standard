@@ -1,0 +1,91 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Codec.Hex;
+use Http.Types;
+use Http3.H3Client;
+use Http3.H3Connection;
+use Http3.H3Errors;
+use Http3.H3Quic;
+use Http3.H3Server;
+
+// Server-to-client rules (push is never enabled) and a request whose field
+// section blocks on QPACK encoder stream data that arrives later.
+
+i64 Uni(QuicLink link, string hex) {
+    i64 id = H3Quic.OpenUni(link);
+    bool ok = H3Quic.Write(link, id, Hex.Of(hex), false);
+    return id;
+}
+
+Request Get() {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.com" });
+    return Request { method: "GET", target: "/", headers: headers, body: Slice.New(0_i64) };
+}
+
+i64 StartOk(mut H3Conn client) {
+    Result<i64,H3Error> started = H3Client.Start(client, Get());
+    return match started {
+        Result::Ok(id) => id,
+        Result::Error(_) => -1_i64,
+    };
+}
+
+test h3_client_rejects_push_and_server_rules {
+    QuicLink[] p1 = H3Quic.NewPair();
+    QuicLink fake1 = Array.Get<QuicLink>(p1, 1_i64);
+    i64 c1 = Uni(fake1, "000400");
+    mut H3Conn client1 = H3Client.Connect(Array.Get<QuicLink>(p1, 0_i64), H3Connection.DefaultConfig());
+    i64 id1 = StartOk(client1);
+    bool promised = H3Quic.Write(fake1, id1, Hex.Of("050100"), false);
+    H3Outcome o1 = H3Client.Poll(client1, id1);
+    Assert.Equal<i64>(H3Connection.ErrorCode(client1), H3Errors.IdError(), "PUSH_PROMISE without MAX_PUSH_ID");
+    QuicLink[] p2 = H3Quic.NewPair();
+    QuicLink fake2 = Array.Get<QuicLink>(p2, 1_i64);
+    i64 c2 = Uni(fake2, "0004000d0100");
+    mut H3Conn client2 = H3Client.Connect(Array.Get<QuicLink>(p2, 0_i64), H3Connection.DefaultConfig());
+    i64 id2 = StartOk(client2);
+    H3Outcome o2 = H3Client.Poll(client2, id2);
+    Assert.Equal<i64>(H3Connection.ErrorCode(client2), H3Errors.FrameUnexpected(), "MAX_PUSH_ID sent to a client");
+    QuicLink[] p3 = H3Quic.NewPair();
+    QuicLink fake3 = Array.Get<QuicLink>(p3, 1_i64);
+    i64 c3 = Uni(fake3, "000400");
+    mut H3Conn client3 = H3Client.Connect(Array.Get<QuicLink>(p3, 0_i64), H3Connection.DefaultConfig());
+    i64 id3 = StartOk(client3);
+    i64 serverBidi = H3Quic.OpenBidi(fake3);
+    H3Outcome o3 = H3Client.Poll(client3, id3);
+    Assert.Equal<i64>(H3Connection.ErrorCode(client3), H3Errors.StreamCreationError(), "server-initiated bidirectional stream");
+    QuicLink[] p4 = H3Quic.NewPair();
+    QuicLink fake4 = Array.Get<QuicLink>(p4, 1_i64);
+    i64 c4 = Uni(fake4, "000400070102");
+    mut H3Conn client4 = H3Client.Connect(Array.Get<QuicLink>(p4, 0_i64), H3Connection.DefaultConfig());
+    i64 id4 = StartOk(client4);
+    H3Outcome o4 = H3Client.Poll(client4, id4);
+    Assert.Equal<i64>(H3Connection.ErrorCode(client4), H3Errors.IdError(), "GOAWAY with a non-request stream id");
+}
+
+test h3_blocked_request_resumes_after_encoder_data {
+    QuicLink[] p = H3Quic.NewPair();
+    QuicLink fake = Array.Get<QuicLink>(p, 0_i64);
+    i64 control = Uni(fake, "000400");
+    i64 encoderStream = Uni(fake, "02");
+    mut H3Conn server = H3Server.Accept(Array.Get<QuicLink>(p, 1_i64), H3Connection.DefaultConfig());
+    H3Incoming before = H3Server.Next(server);
+    // Required Insert Count 1, Base 1; :method GET :scheme https :path /
+    // static, then the dynamic entry 0 (:authority example.com).
+    i64 id = H3Quic.OpenBidi(fake);
+    bool sent = H3Quic.Write(fake, id, Hex.Of("0106" + "0200d1d7c180"), true);
+    H3Incoming blocked = H3Server.Next(server);
+    Assert.Equal<i64>(blocked.streamId, -1_i64, "blocked on the encoder stream");
+    Assert.Equal<i64>(H3Connection.ErrorCode(server), -1_i64, "blocking is not an error");
+    bool inserted = H3Quic.Write(fake, encoderStream, Hex.Of("3fe11f" + "c00b6578616d706c652e636f6d"), false);
+    H3Incoming resumed = H3Server.Next(server);
+    Assert.Equal<i64>(resumed.streamId, id, "request decoded after the insert");
+    Request request = resumed.request;
+    Header hostHeader = Array.Get<Header>(request.headers, 0_i64);
+    Assert.Equal<string>(hostHeader.value, "example.com", "authority from the dynamic table");
+    u8[] acks = H3Quic.Read(fake, 11_i64, 64_i64);
+    Assert.Equal<string>(Hex.Encode(acks), "0380", "decoder stream type, then Section Acknowledgment for stream 0");
+}

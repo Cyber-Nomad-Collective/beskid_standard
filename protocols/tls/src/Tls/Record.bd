@@ -1,0 +1,175 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.AesGcm;
+use Crypto.ChaCha20Poly1305;
+use Crypto.Errors;
+use Tls.Alert;
+use Tls.KeySchedule;
+use Tls.Suites;
+use Tls.TlsErrors;
+use Tls.Wire;
+
+// TLS 1.3 record protection (RFC 8446 section 5.2-5.3). Records are sealed and opened
+// in place inside one caller-owned buffer laid out as
+//   [0, 5)                      record header
+//   [5, 5 + n)                  TLSInnerPlaintext content
+//   5 + n                       inner content type
+//   [6 + n, 6 + n + padding)    zero padding
+//   then the 16-byte AEAD tag.
+// `BufferLength()` bytes hold any legal record, so one buffer per direction suffices.
+
+pub enum AeadKey { Aes(AesGcmKey key), ChaCha(u8[] key), }
+
+/// One direction's traffic keys and its 64-bit record sequence number.
+pub type RecordKeys {
+    pub CipherSuite suite,
+    AeadKey key,
+    u8[] iv,
+    // [0] sequence number of the next record.
+    i64[] seq,
+    pub u8[] secret,
+}
+
+/// Result of opening a protected record: the inner content type and the content length
+/// (content starts at offset 5 of the buffer).
+pub type Opened { pub i64 contentType, pub i64 length, }
+
+/// Room for the largest legal record: header + 2^14 + 256 bytes of ciphertext expansion.
+pub i64 BufferLength() { return 5_i64 + 16384_i64 + 256_i64; }
+
+/// AES-GCM confidentiality limit (RFC 8446 section 5.5): update keys well before 2^24.5 records.
+pub i64 KeyUpdateThreshold() { return 16777216_i64; }
+
+Result<AeadKey, TlsError> MakeKey(CipherSuite suite, u8[] key) {
+    if Suites.Code(suite) == 0x1303_i64 {
+        if Slice.Len(key) != 32_i64 { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
+        return Result::Ok(AeadKey::ChaCha(key));
+    }
+    Result<AesGcmKey, CryptoError> made = AesGcm.New(key);
+    return match made {
+        Result::Ok(k) => Result::Ok(AeadKey::Aes(k)),
+        Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.InternalError())),
+    };
+}
+
+/// Keys for one direction from a traffic secret (RFC 8446 section 7.3).
+pub Result<RecordKeys, TlsError> FromSecret(CipherSuite suite, u8[] secret) {
+    u8[] key = KeySchedule.TrafficKey(suite, secret);
+    u8[] iv = KeySchedule.TrafficIv(suite, secret);
+    if Slice.Len(iv) != 12_i64 { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
+    Result<AeadKey, TlsError> made = MakeKey(suite, key);
+    match made {
+        Result::Ok(k) => { return Result::Ok(RecordKeys { suite: suite, key: k, iv: iv, seq: [0_i64], secret: secret }); },
+        Result::Error(e) => { return Result::Error(e); },
+    };
+}
+
+/// Keys from an explicit key and IV (QUIC and tests).
+pub Result<RecordKeys, TlsError> FromKeyIv(CipherSuite suite, u8[] key, u8[] iv) {
+    if Slice.Len(iv) != 12_i64 { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
+    Result<AeadKey, TlsError> made = MakeKey(suite, key);
+    match made {
+        Result::Ok(k) => { return Result::Ok(RecordKeys { suite: suite, key: k, iv: iv, seq: [0_i64], secret: Slice.New(0_i64) }); },
+        Result::Error(e) => { return Result::Error(e); },
+    };
+}
+
+pub i64 Sequence(RecordKeys keys) { return keys.seq[0]; }
+
+/// Per-record nonce: the IV XORed with the 64-bit sequence number, left-padded to 12 bytes.
+pub u8[] Nonce(u8[] iv, i64 sequence) {
+    u8[] nonce = Slice.New(12_i64);
+    mut i64 i = 0_i64;
+    while i < 12_i64 {
+        mut i64 s = 0_i64;
+        if i >= 4_i64 { s = (sequence >> ((11_i64 - i) * 8_i64)) & 255_i64; }
+        i64 v = i64(iv[i]);
+        nonce[i] = u8((v | s) - (v & s));
+        i = i + 1_i64;
+    }
+    return nonce;
+}
+
+Result<unit, CryptoError> SealRaw(AeadKey key, u8[] nonce, u8[] aad, u8[] buf, i64 offset, i64 count) {
+    return match key {
+        AeadKey::Aes(k) => AesGcm.SealInto(k, nonce, aad, buf, offset, count, buf, offset),
+        AeadKey::ChaCha(k) => ChaCha20Poly1305.SealInto(k, nonce, aad, buf, offset, count, buf, offset),
+    };
+}
+
+Result<i64, CryptoError> OpenRaw(AeadKey key, u8[] nonce, u8[] aad, u8[] buf, i64 offset, i64 count) {
+    return match key {
+        AeadKey::Aes(k) => AesGcm.OpenInto(k, nonce, aad, buf, offset, count, buf, offset),
+        AeadKey::ChaCha(k) => ChaCha20Poly1305.OpenInto(k, nonce, aad, buf, offset, count, buf, offset),
+    };
+}
+
+/// Writes a record header at `buf[offset]`.
+pub unit WriteHeader(u8[] buf, i64 offset, i64 contentType, i64 length) {
+    buf[offset] = u8(contentType & 255_i64);
+    buf[offset + 1_i64] = 3_u8;
+    buf[offset + 2_i64] = 3_u8;
+    buf[offset + 3_i64] = u8((length >> 8_i64) & 255_i64);
+    buf[offset + 4_i64] = u8(length & 255_i64);
+    return;
+}
+
+/// Protects the `length` content bytes at `buf[5]` as one record with inner type
+/// `contentType` and `padding` zero bytes. Returns the total record length (header included).
+pub Result<i64, TlsError> Seal(RecordKeys keys, u8[] buf, i64 contentType, i64 length, i64 padding) {
+    if length < 0_i64 || length > Wire.MaxPlaintext() || padding < 0_i64 {
+        return Result::Error(TlsErrors.Fatal(Alert.InternalError()));
+    }
+    i64 inner = length + 1_i64 + padding;
+    if inner > Wire.MaxPlaintext() + 1_i64 { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
+    i64 total = inner + 16_i64;
+    if 5_i64 + total > Slice.Len(buf) { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
+    buf[5_i64 + length] = u8(contentType & 255_i64);
+    mut i64 i = 0_i64;
+    while i < padding { buf[6_i64 + length + i] = 0_u8; i = i + 1_i64; }
+    WriteHeader(buf, 0_i64, Wire.ContentApplicationData(), total);
+    u8[] aad = Slice.SubSlice(buf, 0_i64, 5_i64);
+    i64 sequence = keys.seq[0];
+    if sequence < 0_i64 { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); }
+    u8[] nonce = Nonce(keys.iv, sequence);
+    Result<unit, CryptoError> sealed = SealRaw(keys.key, nonce, aad, buf, 5_i64, inner);
+    match sealed {
+        Result::Ok(_) => {
+            keys.seq[0] = sequence + 1_i64;
+            return Result::Ok(5_i64 + total);
+        },
+        Result::Error(_) => { return Result::Error(TlsErrors.Fatal(Alert.InternalError())); },
+    };
+}
+
+/// Opens the protected record of `recordLength` bytes (header included) in `buf`.
+/// bad_record_mac on a wrong tag, record_overflow on oversized records,
+/// unexpected_message when the inner plaintext has no non-zero content type.
+pub Result<Opened, TlsError> Open(RecordKeys keys, u8[] buf, i64 recordLength) {
+    i64 total = recordLength - 5_i64;
+    if total > Wire.MaxCiphertext() { return Result::Error(TlsErrors.Fatal(Alert.RecordOverflow())); }
+    if total < 17_i64 { return Result::Error(TlsErrors.Fatal(Alert.BadRecordMac())); }
+    if i64(buf[0]) != Wire.ContentApplicationData() { return Result::Error(TlsErrors.Fatal(Alert.UnexpectedMessage())); }
+    u8[] aad = Slice.SubSlice(buf, 0_i64, 5_i64);
+    i64 sequence = keys.seq[0];
+    u8[] nonce = Nonce(keys.iv, sequence);
+    Result<i64, CryptoError> opened = OpenRaw(keys.key, nonce, aad, buf, 5_i64, total);
+    match opened {
+        Result::Error(_) => { return Result::Error(TlsErrors.Fatal(Alert.BadRecordMac())); },
+        Result::Ok(inner) => {
+            keys.seq[0] = sequence + 1_i64;
+            if inner > Wire.MaxPlaintext() + 1_i64 { return Result::Error(TlsErrors.Fatal(Alert.RecordOverflow())); }
+            mut i64 end = inner;
+            while end > 0_i64 && buf[4_i64 + end] == 0_u8 { end = end - 1_i64; }
+            if end == 0_i64 { return Result::Error(TlsErrors.Fatal(Alert.UnexpectedMessage())); }
+            i64 contentType = i64(buf[4_i64 + end]);
+            return Result::Ok(Opened { contentType: contentType, length: end - 1_i64 });
+        },
+    };
+}
+
+/// Replaces `keys` by the next generation (KeyUpdate) and returns the new keys.
+pub Result<RecordKeys, TlsError> Next(RecordKeys keys) {
+    u8[] next = KeySchedule.NextTrafficSecret(Suites.Hash(keys.suite), keys.secret);
+    return FromSecret(keys.suite, next);
+}

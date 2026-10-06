@@ -1,0 +1,442 @@
+use Core.Collections.Array;
+use Quic.QuicCongestion;
+
+// Loss detection (RFC 9002 sections 5-6 and appendix A): RTT estimation, ACK processing,
+// packet- and time-threshold loss, probe timeouts and persistent congestion, feeding the
+// NewReno controller in `cc`. All times are monotonic nanoseconds passed in by the caller.
+//
+// Sent packets are kept per packet number space (0 Initial, 1 Handshake, 2 Application) in a
+// bounded ring of records. Each record carries up to ItemsPerPacket() retransmittable items
+// [kind, offset, length, extra]: kind >= 0 is a stream id, kind -1 is CRYPTO data; extra is
+// the FIN flag for data, or an ItemControl* code for per-stream control frames.
+// Acknowledged and lost records are marked and left for the connection to drain with
+// `Drain*` before their slots are reused.
+
+pub i64 Granularity() { return 1000000_i64; }
+pub i64 InitialRtt() { return 333000000_i64; }
+pub i64 PacketThreshold() { return 3_i64; }
+pub i64 ItemsPerPacket() { return 4_i64; }
+
+// Record states.
+pub i64 StateFree() { return 0_i64; }
+pub i64 StateOutstanding() { return 1_i64; }
+pub i64 StateAcked() { return 2_i64; }
+pub i64 StateLost() { return 3_i64; }
+
+// Record flags.
+pub i64 FlagAckEliciting() { return 1_i64; }
+pub i64 FlagInFlight() { return 2_i64; }
+pub i64 FlagHandshakeDone() { return 16_i64; }
+pub i64 FlagMaxData() { return 32_i64; }
+pub i64 FlagMaxStreamsBidi() { return 64_i64; }
+pub i64 FlagMaxStreamsUni() { return 128_i64; }
+
+// Item extra codes for per-stream control frames.
+pub i64 ItemControlMaxStreamData() { return 2_i64; }
+pub i64 ItemControlReset() { return 3_i64; }
+pub i64 ItemControlStopSending() { return 4_i64; }
+
+i64 Stride() { return 24_i64; }
+
+pub type Recovery {
+    // [latest, smoothed, rttvar, min, hasSample, firstSampleTime, maxAckDelay, ptoCount]
+    i64[] rtt,
+    // Per space, stride 8: [largestAcked, lossTime, lastAckElicitingTime, ackElicitingInFlight,
+    // head, tail, capacity, discarded]
+    i64[] sp,
+    i64[] initial,
+    i64[] handshake,
+    i64[] application,
+    // NewReno state (QuicCongestion).
+    pub i64[] cc,
+}
+
+i64[] Zeros(i64 n) {
+    mut i64[] a = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while i < n { Array.Append<i64>(a, 0_i64); i = i + 1_i64; }
+    return a;
+}
+
+/// A recovery state with ring capacities per space and the peer's max_ack_delay (ns).
+pub Recovery New(i64 initialCapacity, i64 handshakeCapacity, i64 applicationCapacity, i64 maxDatagram) {
+    i64[] sp = Zeros(24_i64);
+    mut i64 s = 0_i64;
+    while s < 3_i64 { sp[s * 8_i64] = -1_i64; sp[s * 8_i64 + 1_i64] = -1_i64; s = s + 1_i64; }
+    sp[6] = initialCapacity;
+    sp[14] = handshakeCapacity;
+    sp[22] = applicationCapacity;
+    i64[] rtt = [0_i64, 333000000_i64, 166500000_i64, 0_i64, 0_i64, 0_i64, 25000000_i64, 0_i64];
+    return Recovery {
+        rtt: rtt, sp: sp,
+        initial: Zeros(initialCapacity * Stride()),
+        handshake: Zeros(handshakeCapacity * Stride()),
+        application: Zeros(applicationCapacity * Stride()),
+        cc: QuicCongestion.New(maxDatagram),
+    };
+}
+
+i64[] Ring(Recovery rec, i64 space) {
+    if space == 0_i64 { return rec.initial; }
+    if space == 1_i64 { return rec.handshake; }
+    return rec.application;
+}
+
+i64 Sp(Recovery rec, i64 space, i64 field) { return rec.sp[space * 8_i64 + field]; }
+unit SetSp(Recovery rec, i64 space, i64 field, i64 v) { rec.sp[space * 8_i64 + field] = v; return; }
+
+/// Record base index of ring position `position` (a monotonic counter).
+i64 At(Recovery rec, i64 space, i64 position) { return (position % Sp(rec, space, 6_i64)) * Stride(); }
+
+pub i64 LatestRtt(Recovery rec) { return rec.rtt[0]; }
+pub i64 SmoothedRtt(Recovery rec) { return rec.rtt[1]; }
+pub i64 RttVar(Recovery rec) { return rec.rtt[2]; }
+pub i64 MinRtt(Recovery rec) { return rec.rtt[3]; }
+pub bool HasRttSample(Recovery rec) { return rec.rtt[4] == 1_i64; }
+pub i64 PtoCount(Recovery rec) { return rec.rtt[7]; }
+pub i64 LargestAcked(Recovery rec, i64 space) { return Sp(rec, space, 0_i64); }
+pub i64 AckElicitingInFlight(Recovery rec, i64 space) { return Sp(rec, space, 3_i64); }
+pub unit SetMaxAckDelay(Recovery rec, i64 nanos) { rec.rtt[6] = nanos; return; }
+
+/// RTT estimation (RFC 9002 section 5.3).
+pub unit UpdateRtt(Recovery rec, i64 latest, i64 ackDelay, bool handshakeConfirmed, i64 now) {
+    rec.rtt[0] = latest;
+    if rec.rtt[4] == 0_i64 {
+        rec.rtt[3] = latest;
+        rec.rtt[1] = latest;
+        rec.rtt[2] = latest / 2_i64;
+        rec.rtt[4] = 1_i64;
+        rec.rtt[5] = now;
+        return;
+    }
+    if latest < rec.rtt[3] { rec.rtt[3] = latest; }
+    mut i64 delay = ackDelay;
+    if handshakeConfirmed && delay > rec.rtt[6] { delay = rec.rtt[6]; }
+    mut i64 adjusted = latest;
+    if latest >= rec.rtt[3] + delay { adjusted = latest - delay; }
+    mut i64 diff = rec.rtt[1] - adjusted;
+    if diff < 0_i64 { diff = -diff; }
+    rec.rtt[2] = (3_i64 * rec.rtt[2] + diff) / 4_i64;
+    rec.rtt[1] = (7_i64 * rec.rtt[1] + adjusted) / 8_i64;
+    return;
+}
+
+/// True when another packet can be tracked in the space.
+pub bool HasRoom(Recovery rec, i64 space) {
+    return Sp(rec, space, 5_i64) - Sp(rec, space, 4_i64) < Sp(rec, space, 6_i64);
+}
+
+/// Records a sent packet; returns its record index (for AddItem/AddFlags) or -1 when full.
+pub i64 OnPacketSent(Recovery rec, i64 space, i64 pn, i64 now, i64 size, bool ackEliciting, bool inFlight) {
+    if !HasRoom(rec, space) { return -1_i64; }
+    i64[] ring = Ring(rec, space);
+    i64 tail = Sp(rec, space, 5_i64);
+    i64 b = At(rec, space, tail);
+    ring[b] = pn;
+    ring[b + 1_i64] = now;
+    ring[b + 2_i64] = size;
+    mut i64 flags = 0_i64;
+    if ackEliciting { flags = flags | 1_i64; }
+    if inFlight { flags = flags | 2_i64; }
+    ring[b + 3_i64] = flags;
+    ring[b + 4_i64] = 1_i64;
+    ring[b + 5_i64] = 0_i64;
+    SetSp(rec, space, 5_i64, tail + 1_i64);
+    if inFlight {
+        QuicCongestion.OnPacketSent(rec.cc, size);
+        if ackEliciting {
+            SetSp(rec, space, 2_i64, now);
+            SetSp(rec, space, 3_i64, Sp(rec, space, 3_i64) + 1_i64);
+        }
+    }
+    return b;
+}
+
+/// Adds a retransmittable item to a record; false when the record is full.
+pub bool AddItem(Recovery rec, i64 space, i64 record, i64 kind, i64 offset, i64 length, i64 extra) {
+    i64[] ring = Ring(rec, space);
+    i64 n = ring[record + 5_i64];
+    if n >= ItemsPerPacket() { return false; }
+    i64 at = record + 8_i64 + n * 4_i64;
+    ring[at] = kind;
+    ring[at + 1_i64] = offset;
+    ring[at + 2_i64] = length;
+    ring[at + 3_i64] = extra;
+    ring[record + 5_i64] = n + 1_i64;
+    return true;
+}
+
+pub bool ItemRoom(Recovery rec, i64 space, i64 record) {
+    i64[] ring = Ring(rec, space);
+    return ring[record + 5_i64] < ItemsPerPacket();
+}
+
+/// Adds control flags (FlagHandshakeDone, FlagMaxData, ...) to a record.
+pub unit AddFlags(Recovery rec, i64 space, i64 record, i64 flags) {
+    i64[] ring = Ring(rec, space);
+    ring[record + 3_i64] = ring[record + 3_i64] | flags;
+    return;
+}
+
+bool InRanges(i64[] ranges, i64 pn) {
+    mut i64 i = 0_i64;
+    while i + 1_i64 < Array.Len<i64>(ranges) {
+        if pn <= ranges[i] && pn >= ranges[i + 1_i64] { return true; }
+        i = i + 2_i64;
+    }
+    return false;
+}
+
+unit LeaveFlight(Recovery rec, i64 space, i64[] ring, i64 b) {
+    if (ring[b + 3_i64] & 3_i64) == 3_i64 { SetSp(rec, space, 3_i64, Sp(rec, space, 3_i64) - 1_i64); }
+    return;
+}
+
+/// Processes an ACK frame (RFC 9002 appendix A.7). `ranges` are [largest, smallest] pairs in
+/// descending order; `ackDelay` is already scaled to nanoseconds. Newly acknowledged records
+/// are marked StateAcked, lost ones StateLost. Returns the number of newly acknowledged packets.
+pub i64 OnAckReceived(Recovery rec, i64 space, i64[] ranges, i64 ackDelay, i64 now, bool handshakeConfirmed) {
+    if Array.Len<i64>(ranges) < 2_i64 { return 0_i64; }
+    i64 largest = ranges[0];
+    if largest > Sp(rec, space, 0_i64) { SetSp(rec, space, 0_i64, largest); }
+    i64[] ring = Ring(rec, space);
+    mut i64 newly = 0_i64;
+    mut bool eliciting = false;
+    mut i64 largestNewlyTime = -1_i64;
+    mut i64 largestNewlyPn = -1_i64;
+    mut i64 p = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while p < tail {
+        i64 b = At(rec, space, p);
+        if ring[b + 4_i64] == 1_i64 && InRanges(ranges, ring[b]) {
+            ring[b + 4_i64] = 2_i64;
+            newly = newly + 1_i64;
+            i64 flags = ring[b + 3_i64];
+            if (flags & 1_i64) != 0_i64 { eliciting = true; }
+            if ring[b] > largestNewlyPn { largestNewlyPn = ring[b]; largestNewlyTime = ring[b + 1_i64]; }
+            LeaveFlight(rec, space, ring, b);
+            if (flags & 2_i64) != 0_i64 { QuicCongestion.OnPacketAcked(rec.cc, ring[b + 2_i64], ring[b + 1_i64], false); }
+        }
+        p = p + 1_i64;
+    }
+    if newly == 0_i64 { return 0_i64; }
+    if largestNewlyPn == largest && eliciting {
+        mut i64 delay = 0_i64;
+        if space == 2_i64 { delay = ackDelay; }
+        UpdateRtt(rec, now - largestNewlyTime, delay, handshakeConfirmed, now);
+    }
+    DetectLost(rec, space, now);
+    rec.rtt[7] = 0_i64;
+    return newly;
+}
+
+/// Loss delay: max(9/8 * max(latest, smoothed), granularity).
+pub i64 LossDelay(Recovery rec) {
+    mut i64 m = rec.rtt[0];
+    if rec.rtt[1] > m { m = rec.rtt[1]; }
+    m = (m * 9_i64) / 8_i64;
+    if m < Granularity() { m = Granularity(); }
+    return m;
+}
+
+/// Persistent congestion duration (RFC 9002 section 7.6.1).
+pub i64 PersistentDuration(Recovery rec) {
+    mut i64 v = 4_i64 * rec.rtt[2];
+    if v < Granularity() { v = Granularity(); }
+    return (rec.rtt[1] + v + rec.rtt[6]) * QuicCongestion.PersistentCongestionThreshold();
+}
+
+/// Packet- and time-threshold loss detection (appendix A.10).
+pub unit DetectLost(Recovery rec, i64 space, i64 now) {
+    SetSp(rec, space, 1_i64, -1_i64);
+    i64 largest = Sp(rec, space, 0_i64);
+    if largest < 0_i64 { return; }
+    i64 lossDelay = LossDelay(rec);
+    i64 lostSendTime = now - lossDelay;
+    i64[] ring = Ring(rec, space);
+    mut i64 lostBytes = 0_i64;
+    mut i64 newestLostTime = -1_i64;
+    mut i64 earliestEliciting = -1_i64;
+    mut i64 latestEliciting = -1_i64;
+    mut i64 p = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while p < tail {
+        i64 b = At(rec, space, p);
+        if ring[b + 4_i64] == 1_i64 && ring[b] <= largest {
+            i64 sent = ring[b + 1_i64];
+            if sent <= lostSendTime || largest >= ring[b] + PacketThreshold() {
+                ring[b + 4_i64] = 3_i64;
+                LeaveFlight(rec, space, ring, b);
+                if (ring[b + 3_i64] & 2_i64) != 0_i64 {
+                    lostBytes = lostBytes + ring[b + 2_i64];
+                    if sent > newestLostTime { newestLostTime = sent; }
+                }
+                if (ring[b + 3_i64] & 1_i64) != 0_i64 {
+                    if earliestEliciting < 0_i64 || sent < earliestEliciting { earliestEliciting = sent; }
+                    if sent > latestEliciting { latestEliciting = sent; }
+                }
+            } else {
+                i64 due = sent + lossDelay;
+                i64 current = Sp(rec, space, 1_i64);
+                if current < 0_i64 || due < current { SetSp(rec, space, 1_i64, due); }
+            }
+        }
+        p = p + 1_i64;
+    }
+    if newestLostTime >= 0_i64 {
+        bool persistent = IsPersistent(rec, space, earliestEliciting, latestEliciting);
+        QuicCongestion.OnPacketsLost(rec.cc, lostBytes, newestLostTime, now, persistent);
+    }
+    return;
+}
+
+bool IsPersistent(Recovery rec, i64 space, i64 earliest, i64 latest) {
+    if rec.rtt[4] == 0_i64 || earliest < 0_i64 || earliest <= rec.rtt[5] { return false; }
+    if latest - earliest <= PersistentDuration(rec) { return false; }
+    i64[] ring = Ring(rec, space);
+    mut i64 p = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while p < tail {
+        i64 b = At(rec, space, p);
+        if ring[b + 4_i64] == 2_i64 && ring[b + 1_i64] > earliest && ring[b + 1_i64] < latest { return false; }
+        p = p + 1_i64;
+    }
+    return true;
+}
+
+/// Probe timeout period for a space with the current backoff.
+pub i64 PtoPeriod(Recovery rec, i64 space) {
+    mut i64 v = 4_i64 * rec.rtt[2];
+    if v < Granularity() { v = Granularity(); }
+    mut i64 d = rec.rtt[1] + v;
+    if space == 2_i64 { d = d + rec.rtt[6]; }
+    mut i64 k = 0_i64;
+    while k < rec.rtt[7] && k < 16_i64 { d = d * 2_i64; k = k + 1_i64; }
+    return d;
+}
+
+/// The loss detection timer (appendix A.8): earliest loss time, otherwise the earliest PTO
+/// among spaces with ack-eliciting packets in flight (Application only once the handshake is
+/// confirmed). `antiDeadlock` arms a PTO from `now` for a client with nothing in flight.
+/// Writes out = [deadline, space, isPto]; deadline -1 means no timer.
+pub unit Timer(Recovery rec, bool handshakeConfirmed, bool antiDeadlock, i64 now, i64[] out) {
+    out[0] = -1_i64;
+    out[1] = -1_i64;
+    out[2] = 0_i64;
+    mut i64 s = 0_i64;
+    while s < 3_i64 {
+        i64 lt = Sp(rec, s, 1_i64);
+        if lt >= 0_i64 && Sp(rec, s, 7_i64) == 0_i64 && (out[0] < 0_i64 || lt < out[0]) { out[0] = lt; out[1] = s; }
+        s = s + 1_i64;
+    }
+    if out[0] >= 0_i64 { return; }
+    out[2] = 1_i64;
+    s = 0_i64;
+    mut bool any = false;
+    while s < 3_i64 {
+        if Sp(rec, s, 7_i64) == 0_i64 && Sp(rec, s, 3_i64) > 0_i64 && (s < 2_i64 || handshakeConfirmed) {
+            any = true;
+            i64 t = Sp(rec, s, 2_i64) + PtoPeriod(rec, s);
+            if out[0] < 0_i64 || t < out[0] { out[0] = t; out[1] = s; }
+        }
+        s = s + 1_i64;
+    }
+    if !any && antiDeadlock {
+        out[0] = now + PtoPeriod(rec, 0_i64);
+        out[1] = 0_i64;
+        if Sp(rec, 0_i64, 7_i64) == 1_i64 { out[1] = 1_i64; }
+    }
+    return;
+}
+
+/// Handles an expired timer (appendix A.9). Returns the space whose loss detection ran
+/// (0..2), or 10 + space when a PTO fired and probes must be sent in that space.
+pub i64 OnTimeout(Recovery rec, bool handshakeConfirmed, bool antiDeadlock, i64 now) {
+    i64[] t = [0_i64, 0_i64, 0_i64];
+    Timer(rec, handshakeConfirmed, antiDeadlock, now, t);
+    if t[0] < 0_i64 || t[0] > now { return -1_i64; }
+    if t[2] == 0_i64 {
+        DetectLost(rec, t[1], now);
+        return t[1];
+    }
+    rec.rtt[7] = rec.rtt[7] + 1_i64;
+    return 10_i64 + t[1];
+}
+
+/// Discards a packet number space when its keys are dropped (section 6.4): its packets leave
+/// the flight without a congestion response and its timers stop.
+pub unit DiscardSpace(Recovery rec, i64 space) {
+    i64[] ring = Ring(rec, space);
+    mut i64 p = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while p < tail {
+        i64 b = At(rec, space, p);
+        if ring[b + 4_i64] == 1_i64 && (ring[b + 3_i64] & 2_i64) != 0_i64 { QuicCongestion.RemoveFromFlight(rec.cc, ring[b + 2_i64]); }
+        ring[b + 4_i64] = 0_i64;
+        p = p + 1_i64;
+    }
+    SetSp(rec, space, 4_i64, tail);
+    SetSp(rec, space, 1_i64, -1_i64);
+    SetSp(rec, space, 3_i64, 0_i64);
+    SetSp(rec, space, 7_i64, 1_i64);
+    rec.rtt[7] = 0_i64;
+    return;
+}
+
+pub bool IsDiscarded(Recovery rec, i64 space) { return Sp(rec, space, 7_i64) == 1_i64; }
+
+/// Marks every outstanding packet of the space lost without a congestion response (used to
+/// retransmit everything after a Retry or for 0-RTT rejection). Returns how many were marked.
+pub i64 MarkAllLost(Recovery rec, i64 space) {
+    i64[] ring = Ring(rec, space);
+    mut i64 n = 0_i64;
+    mut i64 p = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while p < tail {
+        i64 b = At(rec, space, p);
+        if ring[b + 4_i64] == 1_i64 {
+            ring[b + 4_i64] = 3_i64;
+            LeaveFlight(rec, space, ring, b);
+            if (ring[b + 3_i64] & 2_i64) != 0_i64 { QuicCongestion.RemoveFromFlight(rec.cc, ring[b + 2_i64]); }
+            n = n + 1_i64;
+        }
+        p = p + 1_i64;
+    }
+    return n;
+}
+
+// ------------------------------------------------------------ draining marked records
+
+/// Record index of the next acknowledged or lost record (state), or -1. The caller reads it
+/// with Record* accessors and then calls Release.
+pub i64 NextMarked(Recovery rec, i64 space, i64 state) {
+    i64[] ring = Ring(rec, space);
+    mut i64 p = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while p < tail {
+        i64 b = At(rec, space, p);
+        if ring[b + 4_i64] == state { return b; }
+        p = p + 1_i64;
+    }
+    return -1_i64;
+}
+
+pub i64 RecordPn(Recovery rec, i64 space, i64 record) { i64[] ring = Ring(rec, space); return ring[record]; }
+pub i64 RecordFlags(Recovery rec, i64 space, i64 record) { i64[] ring = Ring(rec, space); return ring[record + 3_i64]; }
+pub i64 RecordItems(Recovery rec, i64 space, i64 record) { i64[] ring = Ring(rec, space); return ring[record + 5_i64]; }
+/// Item field: 0 kind, 1 offset, 2 length, 3 extra.
+pub i64 Item(Recovery rec, i64 space, i64 record, i64 index, i64 field) {
+    i64[] ring = Ring(rec, space);
+    return ring[record + 8_i64 + index * 4_i64 + field];
+}
+
+/// Frees a drained record and advances the ring head past free records.
+pub unit Release(Recovery rec, i64 space, i64 record) {
+    i64[] ring = Ring(rec, space);
+    ring[record + 4_i64] = 0_i64;
+    mut i64 head = Sp(rec, space, 4_i64);
+    i64 tail = Sp(rec, space, 5_i64);
+    while head < tail && ring[At(rec, space, head) + 4_i64] == 0_i64 { head = head + 1_i64; }
+    SetSp(rec, space, 4_i64, head);
+    return;
+}

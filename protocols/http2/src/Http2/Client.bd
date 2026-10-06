@@ -1,0 +1,129 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO.Stream;
+use Core.Results;
+use Core.Time;
+use Core.Time.Instant;
+use Http.Types;
+use Http2.Connection;
+use Http2.FrameErrors;
+use Http2.Hpack;
+use Http2.Mapping;
+use Http2.Streams;
+
+// HTTP/2 client over any `Core.IO.Stream` (RFC 9113 section 3.3: prior
+// knowledge; over TLS the caller negotiates ALPN "h2" first).
+//
+// Several fibers may call `Send` on one connection: the fiber that waits for
+// its response reads frames for every stream while the others poll their own
+// stream state, so no fiber per stream and no channel is needed.
+
+// Writes the connection preface and SETTINGS. The server's SETTINGS are
+// processed while the first response is read.
+pub Result<Connection,Http2Error> Open(Stream transport, Config config) {
+    Result<Connection,Http2Error> created = Connection.New(true, config);
+    match created {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(conn) => {
+            Result<unit,Http2Error> written = Connection.WriteClientPreface(conn, transport);
+            match written {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(_) => { return Result::Ok(conn); },
+            };
+        },
+    };
+}
+
+// Sends one request and returns its response. :method, :scheme, :authority
+// and :path come from `request` (target plus Host header, or an absolute-form
+// target); connection-specific header fields are dropped.
+pub Result<Response,Http2Error> Send(Connection conn, Stream transport, Request request) {
+    Result<HeaderField[],Http2Error> mapped = Mapping.RequestFields(request, Connection.SchemeOf(conn));
+    match mapped {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(fields) => { return SendFields(conn, transport, fields, request.body, request.method == "HEAD"); },
+    };
+}
+
+Result<unit,Http2Error> WaitForSlot(Connection conn, Stream transport) {
+    Instant started = Time.MonotonicNow();
+    while Connection.ActiveStreams(conn, false) >= Connection.RemoteMaxStreams(conn) {
+        if conn.goAwayLastId >= 0_i64 { return Result::Error(Http2Error::PeerGoAway(conn.goAwayLastId, conn.goAwayCode)); }
+        Result<unit,Http2Error> stepped = Connection.Step(conn, transport, started);
+        match stepped {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+    }
+    return Result::Ok(());
+}
+
+Result<Response,Http2Error> SendFields(Connection conn, Stream transport, HeaderField[] fields, u8[] body, bool head) {
+    if !Connection.Usable(conn) { return Result::Error(Connection.FailureOf(conn)); }
+    if conn.goAwayLastId >= 0_i64 { return Result::Error(Http2Error::PeerGoAway(conn.goAwayLastId, conn.goAwayCode)); }
+    Result<unit,Http2Error> slot = WaitForSlot(conn, transport);
+    match slot {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => (),
+    };
+    bool hasBody = Slice.Len(body) > 0_i64;
+    Result<StreamState,Http2Error> opened = Connection.OpenStream(conn, transport, fields, !hasBody);
+    match opened {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(s) => {
+            s.headRequest = head;
+            if hasBody { Connection.QueueBody(s, body); }
+            Result<unit,Http2Error> done = AwaitResponse(conn, transport, s);
+            Connection.Remove(conn, s);
+            match done {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(_) => { return Finish(s); },
+            };
+        },
+    };
+}
+
+// Sends the request body and reads frames until the response ends.
+Result<unit,Http2Error> AwaitResponse(Connection conn, Stream transport, StreamState s) {
+    Instant started = Time.MonotonicNow();
+    while !Streams.RemoteDone(s) {
+        Result<bool,Http2Error> flushed = Connection.FlushData(conn, transport);
+        match flushed {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+        if Streams.RemoteDone(s) { return Result::Ok(()); }
+        Result<unit,Http2Error> stepped = Connection.Step(conn, transport, started);
+        match stepped {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+    }
+    if s.outPending && s.resetCode < 0_i64 {
+        // The response ended before the request body was sent (section 8.1).
+        Connection.ResetStream(conn, transport, s, FrameErrors.NoError());
+        s.resetCode = -1_i64;
+    }
+    return Result::Ok(());
+}
+
+Result<Response,Http2Error> Finish(StreamState s) {
+    if s.refusedByGoAway { return Result::Error(Http2Error::PeerGoAway(s.id - 2_i64, FrameErrors.RefusedStream())); }
+    if s.bodyTooLarge { return Result::Error(Http2Error::BodyTooLarge); }
+    if s.resetCode >= 0_i64 {
+        if s.resetByPeer { return Result::Error(Http2Error::PeerReset(s.id, s.resetCode)); }
+        return Result::Error(Http2Error::Stream(s.id, s.resetCode));
+    }
+    if !s.hasHeaders { return Result::Error(Http2Error::InvalidMessage); }
+    return Mapping.ResponseFromFields(s.headers, Connection.BodyOf(s));
+}
+
+// Sends PING and waits for its ACK.
+pub Result<unit,Http2Error> Ping(Connection conn, Stream transport, u8[] opaque) {
+    return Connection.Ping(conn, transport, opaque);
+}
+
+// Graceful close: GOAWAY(NO_ERROR). The caller then closes the transport.
+pub Result<unit,Http2Error> Close(Connection conn, Stream transport) {
+    return Connection.GoAway(conn, transport);
+}

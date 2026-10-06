@@ -1,0 +1,335 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Quic.QuicWire;
+
+// QUIC frames (RFC 9000 section 19): decoding with validation, encoding, and the
+// frame-type permissions per packet type (section 12.4, table 3).
+// CRYPTO and STREAM data are not copied: the frame records where the data lies in the
+// packet buffer (`start`, `length`); encoding reads it from a caller-supplied source.
+
+pub i64 TypePadding() { return 0_i64; }
+pub i64 TypePing() { return 1_i64; }
+pub i64 TypeAck() { return 2_i64; }
+pub i64 TypeAckEcn() { return 3_i64; }
+pub i64 TypeResetStream() { return 4_i64; }
+pub i64 TypeStopSending() { return 5_i64; }
+pub i64 TypeCrypto() { return 6_i64; }
+pub i64 TypeNewToken() { return 7_i64; }
+pub i64 TypeStream() { return 8_i64; }
+pub i64 TypeMaxData() { return 16_i64; }
+pub i64 TypeMaxStreamData() { return 17_i64; }
+pub i64 TypeMaxStreamsBidi() { return 18_i64; }
+pub i64 TypeMaxStreamsUni() { return 19_i64; }
+pub i64 TypeDataBlocked() { return 20_i64; }
+pub i64 TypeStreamDataBlocked() { return 21_i64; }
+pub i64 TypeStreamsBlockedBidi() { return 22_i64; }
+pub i64 TypeStreamsBlockedUni() { return 23_i64; }
+pub i64 TypeNewConnectionId() { return 24_i64; }
+pub i64 TypeRetireConnectionId() { return 25_i64; }
+pub i64 TypePathChallenge() { return 26_i64; }
+pub i64 TypePathResponse() { return 27_i64; }
+pub i64 TypeConnectionClose() { return 28_i64; }
+pub i64 TypeApplicationClose() { return 29_i64; }
+pub i64 TypeHandshakeDone() { return 30_i64; }
+
+/// Largest ACK ranges kept from one ACK frame; further ranges are parsed and ignored.
+pub i64 MaxAckRanges() { return 64_i64; }
+
+/// An ACK frame. `ranges` holds [largest, smallest] pairs in descending order.
+pub type AckFrame {
+    pub i64 delay,
+    pub i64[] ranges,
+    pub bool ecn,
+    pub i64 ect0,
+    pub i64 ect1,
+    pub i64 ce,
+}
+
+pub enum Frame {
+    Padding(i64 count),
+    Ping(),
+    Ack(AckFrame ack),
+    ResetStream(i64 streamId, i64 errorCode, i64 finalSize),
+    StopSending(i64 streamId, i64 errorCode),
+    Crypto(i64 offset, i64 start, i64 length),
+    NewToken(u8[] token),
+    Stream(i64 streamId, i64 offset, i64 start, i64 length, bool fin),
+    MaxData(i64 maximum),
+    MaxStreamData(i64 streamId, i64 maximum),
+    MaxStreams(bool bidi, i64 maximum),
+    DataBlocked(i64 limit),
+    StreamDataBlocked(i64 streamId, i64 limit),
+    StreamsBlocked(bool bidi, i64 limit),
+    NewConnectionId(i64 sequence, i64 retirePriorTo, u8[] cid, u8[] resetToken),
+    RetireConnectionId(i64 sequence),
+    PathChallenge(u8[] data),
+    PathResponse(u8[] data),
+    ConnectionClose(bool application, i64 errorCode, i64 frameType, u8[] reason),
+    HandshakeDone(),
+}
+
+i64 MaxVar() { return 4611686018427387903_i64; }
+i64 MaxStreamCount() { return 1152921504606846976_i64; }
+
+/// Wire type of a frame (STREAM reports 0x08 with its flag bits).
+pub i64 TypeOf(Frame f) {
+    return match f {
+        Frame::Padding(_) => 0_i64,
+        Frame::Ping() => 1_i64,
+        Frame::Ack(a) => AckType(a),
+        Frame::ResetStream(_, _, _) => 4_i64,
+        Frame::StopSending(_, _) => 5_i64,
+        Frame::Crypto(_, _, _) => 6_i64,
+        Frame::NewToken(_) => 7_i64,
+        Frame::Stream(_, offset, _, _, fin) => StreamType(offset, fin),
+        Frame::MaxData(_) => 16_i64,
+        Frame::MaxStreamData(_, _) => 17_i64,
+        Frame::MaxStreams(bidi, _) => Pick(bidi, 18_i64, 19_i64),
+        Frame::DataBlocked(_) => 20_i64,
+        Frame::StreamDataBlocked(_, _) => 21_i64,
+        Frame::StreamsBlocked(bidi, _) => Pick(bidi, 22_i64, 23_i64),
+        Frame::NewConnectionId(_, _, _, _) => 24_i64,
+        Frame::RetireConnectionId(_) => 25_i64,
+        Frame::PathChallenge(_) => 26_i64,
+        Frame::PathResponse(_) => 27_i64,
+        Frame::ConnectionClose(app, _, _, _) => Pick(app, 29_i64, 28_i64),
+        Frame::HandshakeDone() => 30_i64,
+    };
+}
+
+i64 Pick(bool c, i64 a, i64 b) { if c { return a; } return b; }
+i64 AckType(AckFrame a) { if a.ecn { return 3_i64; } return 2_i64; }
+i64 StreamType(i64 offset, bool fin) {
+    mut i64 t = 10_i64;
+    if offset > 0_i64 { t = t | 4_i64; }
+    if fin { t = t | 1_i64; }
+    return t;
+}
+
+/// True for frames that elicit an acknowledgement (all but PADDING, ACK and CONNECTION_CLOSE).
+pub bool IsAckEliciting(i64 frameType) {
+    return frameType != 0_i64 && frameType != 2_i64 && frameType != 3_i64 && frameType != 28_i64 && frameType != 29_i64;
+}
+
+/// Frame-type permission per packet kind (RFC 9000 section 12.4): kind 0 Initial, 1 0-RTT,
+/// 2 Handshake, 5 1-RTT.
+pub bool AllowedIn(i64 frameType, i64 kind) {
+    if kind == 0_i64 || kind == 2_i64 {
+        return frameType == 0_i64 || frameType == 1_i64 || frameType == 2_i64 || frameType == 3_i64 || frameType == 6_i64 || frameType == 28_i64;
+    }
+    if kind == 1_i64 {
+        return !(frameType == 2_i64 || frameType == 3_i64 || frameType == 6_i64 || frameType == 7_i64 || frameType == 25_i64 || frameType == 27_i64 || frameType == 30_i64);
+    }
+    return kind == 5_i64;
+}
+
+Frame Fail(Reader r, i64 code) {
+    QuicWire.Fail(r, code);
+    return Frame::Padding(0_i64);
+}
+
+/// Decodes one frame. On failure the reader records the error (FRAME_ENCODING_ERROR for
+/// malformed frames and unknown types) and a placeholder is returned.
+pub Frame Decode(Reader r) {
+    u8[] buf = r.buf;
+    i64 at = QuicWire.Pos(r);
+    i64 t = QuicWire.Var(r);
+    if !QuicWire.Ok(r) { return Frame::Padding(0_i64); }
+    if t >= 64_i64 || QuicWire.Pos(r) != at + 1_i64 { return Fail(r, 7_i64); }
+    if t == 0_i64 {
+        mut i64 n = 1_i64;
+        while !QuicWire.AtEnd(r) && buf[QuicWire.Pos(r)] == 0_u8 { QuicWire.Skip(r, 1_i64); n = n + 1_i64; }
+        return Frame::Padding(n);
+    }
+    if t == 1_i64 { return Frame::Ping(); }
+    if t == 2_i64 || t == 3_i64 { return DecodeAck(r, t == 3_i64); }
+    if t == 4_i64 {
+        i64 id = QuicWire.Var(r);
+        i64 code = QuicWire.Var(r);
+        i64 size = QuicWire.Var(r);
+        return Frame::ResetStream(id, code, size);
+    }
+    if t == 5_i64 {
+        i64 sid = QuicWire.Var(r);
+        return Frame::StopSending(sid, QuicWire.Var(r));
+    }
+    if t == 6_i64 {
+        i64 offset = QuicWire.Var(r);
+        i64 length = QuicWire.Var(r);
+        i64 start = QuicWire.Skip(r, length);
+        if offset + length > MaxVar() { return Fail(r, 7_i64); }
+        return Frame::Crypto(offset, start, length);
+    }
+    if t == 7_i64 {
+        i64 tl = QuicWire.Var(r);
+        if tl == 0_i64 { return Fail(r, 7_i64); }
+        return Frame::NewToken(QuicWire.Take(r, tl));
+    }
+    if t >= 8_i64 && t <= 15_i64 { return DecodeStream(r, t); }
+    if t == 16_i64 { return Frame::MaxData(QuicWire.Var(r)); }
+    if t == 17_i64 {
+        i64 msid = QuicWire.Var(r);
+        return Frame::MaxStreamData(msid, QuicWire.Var(r));
+    }
+    if t == 18_i64 || t == 19_i64 || t == 22_i64 || t == 23_i64 {
+        i64 count = QuicWire.Var(r);
+        if count > MaxStreamCount() { return Fail(r, 7_i64); }
+        if t < 20_i64 { return Frame::MaxStreams(t == 18_i64, count); }
+        return Frame::StreamsBlocked(t == 22_i64, count);
+    }
+    if t == 20_i64 { return Frame::DataBlocked(QuicWire.Var(r)); }
+    if t == 21_i64 {
+        i64 bsid = QuicWire.Var(r);
+        return Frame::StreamDataBlocked(bsid, QuicWire.Var(r));
+    }
+    if t == 24_i64 {
+        i64 seq = QuicWire.Var(r);
+        i64 prior = QuicWire.Var(r);
+        i64 cl = QuicWire.Byte(r);
+        if cl < 1_i64 || cl > 20_i64 || prior > seq { return Fail(r, 7_i64); }
+        u8[] cid = QuicWire.Take(r, cl);
+        return Frame::NewConnectionId(seq, prior, cid, QuicWire.Take(r, 16_i64));
+    }
+    if t == 25_i64 { return Frame::RetireConnectionId(QuicWire.Var(r)); }
+    if t == 26_i64 { return Frame::PathChallenge(QuicWire.Take(r, 8_i64)); }
+    if t == 27_i64 { return Frame::PathResponse(QuicWire.Take(r, 8_i64)); }
+    if t == 28_i64 || t == 29_i64 {
+        i64 ec = QuicWire.Var(r);
+        mut i64 ft = 0_i64;
+        if t == 28_i64 { ft = QuicWire.Var(r); }
+        i64 rl = QuicWire.Var(r);
+        return Frame::ConnectionClose(t == 29_i64, ec, ft, QuicWire.Take(r, rl));
+    }
+    if t == 30_i64 { return Frame::HandshakeDone(); }
+    return Fail(r, 7_i64);
+}
+
+Frame DecodeStream(Reader r, i64 t) {
+    i64 id = QuicWire.Var(r);
+    mut i64 offset = 0_i64;
+    if (t & 4_i64) != 0_i64 { offset = QuicWire.Var(r); }
+    mut i64 length = QuicWire.Left(r);
+    if (t & 2_i64) != 0_i64 { length = QuicWire.Var(r); }
+    i64 start = QuicWire.Skip(r, length);
+    if offset + length > MaxVar() { return Fail(r, 7_i64); }
+    return Frame::Stream(id, offset, start, length, (t & 1_i64) != 0_i64);
+}
+
+Frame DecodeAck(Reader r, bool ecn) {
+    i64 largest = QuicWire.Var(r);
+    i64 delay = QuicWire.Var(r);
+    i64 count = QuicWire.Var(r);
+    i64 first = QuicWire.Var(r);
+    mut i64[] ranges = Array.Empty<i64>();
+    mut i64 smallest = largest - first;
+    if smallest < 0_i64 { return Fail(r, 7_i64); }
+    Array.Append<i64>(ranges, largest);
+    Array.Append<i64>(ranges, smallest);
+    mut i64 i = 0_i64;
+    while i < count && QuicWire.Ok(r) {
+        i64 gap = QuicWire.Var(r);
+        i64 length = QuicWire.Var(r);
+        i64 hi = smallest - gap - 2_i64;
+        smallest = hi - length;
+        if hi < 0_i64 || smallest < 0_i64 { return Fail(r, 7_i64); }
+        if i < MaxAckRanges() - 1_i64 {
+            Array.Append<i64>(ranges, hi);
+            Array.Append<i64>(ranges, smallest);
+        }
+        i = i + 1_i64;
+    }
+    mut i64 e0 = 0_i64;
+    mut i64 e1 = 0_i64;
+    mut i64 ce = 0_i64;
+    if ecn {
+        e0 = QuicWire.Var(r);
+        e1 = QuicWire.Var(r);
+        ce = QuicWire.Var(r);
+    }
+    return Frame::Ack(AckFrame { delay: delay, ranges: ranges, ecn: ecn, ect0: e0, ect1: e1, ce: ce });
+}
+
+/// Writes an ACK frame from [largest, smallest] pairs in descending order.
+pub unit WriteAck(Writer w, AckFrame a) {
+    i64 pairs = Array.Len<i64>(a.ranges) / 2_i64;
+    if pairs == 0_i64 { return; }
+    QuicWire.PutByte(w, AckType(a));
+    QuicWire.PutVar(w, a.ranges[0]);
+    QuicWire.PutVar(w, a.delay);
+    QuicWire.PutVar(w, pairs - 1_i64);
+    QuicWire.PutVar(w, a.ranges[0] - a.ranges[1]);
+    mut i64 i = 1_i64;
+    while i < pairs {
+        i64 hi = a.ranges[i * 2_i64];
+        i64 lo = a.ranges[i * 2_i64 + 1_i64];
+        QuicWire.PutVar(w, a.ranges[i * 2_i64 - 1_i64] - hi - 2_i64);
+        QuicWire.PutVar(w, hi - lo);
+        i = i + 1_i64;
+    }
+    if a.ecn {
+        QuicWire.PutVar(w, a.ect0);
+        QuicWire.PutVar(w, a.ect1);
+        QuicWire.PutVar(w, a.ce);
+    }
+    return;
+}
+
+/// Writes a STREAM frame carrying src[srcOffset..srcOffset+length) with an explicit length.
+pub unit WriteStream(Writer w, i64 streamId, i64 offset, u8[] src, i64 srcOffset, i64 length, bool fin) {
+    QuicWire.PutByte(w, StreamType(offset, fin));
+    QuicWire.PutVar(w, streamId);
+    if offset > 0_i64 { QuicWire.PutVar(w, offset); }
+    QuicWire.PutVar(w, length);
+    QuicWire.PutBytes(w, src, srcOffset, length);
+    return;
+}
+
+/// Overhead in bytes of a STREAM frame header with explicit length.
+pub i64 StreamOverhead(i64 streamId, i64 offset, i64 length) {
+    mut i64 n = 1_i64 + QuicWire.VarLen(streamId) + QuicWire.VarLen(length);
+    if offset > 0_i64 { n = n + QuicWire.VarLen(offset); }
+    return n;
+}
+
+/// Writes a CRYPTO frame carrying src[srcOffset..srcOffset+length).
+pub unit WriteCrypto(Writer w, i64 offset, u8[] src, i64 srcOffset, i64 length) {
+    QuicWire.PutByte(w, 6_i64);
+    QuicWire.PutVar(w, offset);
+    QuicWire.PutVar(w, length);
+    QuicWire.PutBytes(w, src, srcOffset, length);
+    return;
+}
+
+/// Encodes any frame. STREAM and CRYPTO data is read from `data` at the frame's `start`.
+pub unit Encode(Writer w, Frame f, u8[] data) {
+    match f {
+        Frame::Padding(n) => { QuicWire.PutZeros(w, n); },
+        Frame::Ping() => { QuicWire.PutByte(w, 1_i64); },
+        Frame::Ack(a) => { WriteAck(w, a); },
+        Frame::ResetStream(id, code, size) => { QuicWire.PutByte(w, 4_i64); QuicWire.PutVar(w, id); QuicWire.PutVar(w, code); QuicWire.PutVar(w, size); },
+        Frame::StopSending(id, code) => { QuicWire.PutByte(w, 5_i64); QuicWire.PutVar(w, id); QuicWire.PutVar(w, code); },
+        Frame::Crypto(offset, start, length) => { WriteCrypto(w, offset, data, start, length); },
+        Frame::NewToken(token) => { QuicWire.PutByte(w, 7_i64); QuicWire.PutVar(w, Slice.Len(token)); QuicWire.PutAll(w, token); },
+        Frame::Stream(id, offset, start, length, fin) => { WriteStream(w, id, offset, data, start, length, fin); },
+        Frame::MaxData(m) => { QuicWire.PutByte(w, 16_i64); QuicWire.PutVar(w, m); },
+        Frame::MaxStreamData(id, m) => { QuicWire.PutByte(w, 17_i64); QuicWire.PutVar(w, id); QuicWire.PutVar(w, m); },
+        Frame::MaxStreams(bidi, m) => { QuicWire.PutByte(w, Pick(bidi, 18_i64, 19_i64)); QuicWire.PutVar(w, m); },
+        Frame::DataBlocked(m) => { QuicWire.PutByte(w, 20_i64); QuicWire.PutVar(w, m); },
+        Frame::StreamDataBlocked(id, m) => { QuicWire.PutByte(w, 21_i64); QuicWire.PutVar(w, id); QuicWire.PutVar(w, m); },
+        Frame::StreamsBlocked(bidi, m) => { QuicWire.PutByte(w, Pick(bidi, 22_i64, 23_i64)); QuicWire.PutVar(w, m); },
+        Frame::NewConnectionId(seq, prior, cid, token) => {
+            QuicWire.PutByte(w, 24_i64); QuicWire.PutVar(w, seq); QuicWire.PutVar(w, prior);
+            QuicWire.PutByte(w, Slice.Len(cid)); QuicWire.PutAll(w, cid); QuicWire.PutAll(w, token);
+        },
+        Frame::RetireConnectionId(seq) => { QuicWire.PutByte(w, 25_i64); QuicWire.PutVar(w, seq); },
+        Frame::PathChallenge(d) => { QuicWire.PutByte(w, 26_i64); QuicWire.PutAll(w, d); },
+        Frame::PathResponse(d) => { QuicWire.PutByte(w, 27_i64); QuicWire.PutAll(w, d); },
+        Frame::ConnectionClose(app, code, ft, reason) => {
+            QuicWire.PutByte(w, Pick(app, 29_i64, 28_i64)); QuicWire.PutVar(w, code);
+            if !app { QuicWire.PutVar(w, ft); }
+            QuicWire.PutVar(w, Slice.Len(reason)); QuicWire.PutAll(w, reason);
+        },
+        Frame::HandshakeDone() => { QuicWire.PutByte(w, 30_i64); },
+    };
+    return;
+}

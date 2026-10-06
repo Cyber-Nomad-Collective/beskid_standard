@@ -1,0 +1,90 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Tls.Alert;
+use Tls.Der;
+use Tls.TlsErrors;
+
+// Public keys taken from a peer's end-entity certificate, and private keys for servers.
+
+/// kind 1: P-256 (point = uncompressed SEC 1), kind 2: RSA (modulus, exponent big-endian).
+pub type PeerKey { pub i64 kind, pub u8[] point, pub u8[] modulus, pub u8[] exponent, }
+
+pub i64 KindP256() { return 1_i64; }
+pub i64 KindRsa() { return 2_i64; }
+
+TlsError BadCert() { return TlsErrors.Fatal(Alert.BadCertificate()); }
+
+u8[] Empty() { return Slice.New(0_i64); }
+
+/// Parses a SubjectPublicKeyInfo element at `offset` (P-256 EC or rsaEncryption keys).
+pub Result<PeerKey, TlsError> FromSpki(u8[] buf, i64 offset, i64 limit) {
+    Tlv spki = Der.Expect(buf, offset, limit, 0x30_i64);
+    if !spki.ok { return Result::Error(BadCert()); }
+    Tlv alg = Der.Expect(buf, spki.start, spki.end, 0x30_i64);
+    if !alg.ok { return Result::Error(BadCert()); }
+    Tlv oid = Der.Expect(buf, alg.start, alg.end, 0x06_i64);
+    if !oid.ok { return Result::Error(BadCert()); }
+    Tlv bits = Der.Expect(buf, alg.end, spki.end, 0x03_i64);
+    if !bits.ok || bits.length < 2_i64 || buf[bits.start] != 0_u8 || bits.end != spki.end { return Result::Error(BadCert()); }
+    if Der.ContentEquals(buf, oid, Der.OidEcPublicKey()) {
+        Tlv curve = Der.Expect(buf, oid.end, alg.end, 0x06_i64);
+        if !curve.ok || !Der.ContentEquals(buf, curve, Der.OidPrime256v1()) {
+            return Result::Error(TlsErrors.Fatal(Alert.UnsupportedCertificate()));
+        }
+        u8[] point = Slice.SubSlice(buf, bits.start + 1_i64, bits.length - 1_i64);
+        if Slice.Len(point) != 65_i64 || point[0] != 4_u8 { return Result::Error(BadCert()); }
+        return Result::Ok(PeerKey { kind: 1_i64, point: point, modulus: Empty(), exponent: Empty() });
+    }
+    if Der.ContentEquals(buf, oid, Der.OidRsaEncryption()) {
+        Tlv rsa = Der.Expect(buf, bits.start + 1_i64, bits.end, 0x30_i64);
+        if !rsa.ok { return Result::Error(BadCert()); }
+        Tlv n = Der.Expect(buf, rsa.start, rsa.end, 0x02_i64);
+        if !n.ok { return Result::Error(BadCert()); }
+        Tlv e = Der.Expect(buf, n.end, rsa.end, 0x02_i64);
+        if !e.ok || e.end != rsa.end { return Result::Error(BadCert()); }
+        return Result::Ok(PeerKey { kind: 2_i64, point: Empty(), modulus: Der.Content(buf, n), exponent: Der.Content(buf, e) });
+    }
+    return Result::Error(TlsErrors.Fatal(Alert.UnsupportedCertificate()));
+}
+
+/// The subject public key of a DER X.509 certificate.
+pub Result<PeerKey, TlsError> FromCertificate(u8[] cert) {
+    i64 n = Slice.Len(cert);
+    Tlv outer = Der.Expect(cert, 0_i64, n, 0x30_i64);
+    if !outer.ok || outer.end != n { return Result::Error(BadCert()); }
+    Tlv tbs = Der.Expect(cert, outer.start, outer.end, 0x30_i64);
+    if !tbs.ok { return Result::Error(BadCert()); }
+    mut i64 at = tbs.start;
+    Tlv first = Der.Read(cert, at, tbs.end);
+    if !first.ok { return Result::Error(BadCert()); }
+    if first.tag == 0xA0_i64 { at = first.end; }
+    // serialNumber, signature, issuer, validity, subject.
+    mut i64 i = 0_i64;
+    while i < 5_i64 {
+        Tlv t = Der.Read(cert, at, tbs.end);
+        if !t.ok { return Result::Error(BadCert()); }
+        at = t.end;
+        i = i + 1_i64;
+    }
+    return FromSpki(cert, at, tbs.end);
+}
+
+/// A P-256 private scalar (32 bytes) from DER PKCS#8 PrivateKeyInfo or SEC 1 ECPrivateKey.
+pub Result<u8[], TlsError> P256PrivateKeyFromDer(u8[] der) {
+    i64 n = Slice.Len(der);
+    Tlv outer = Der.Expect(der, 0_i64, n, 0x30_i64);
+    TlsError bad = TlsError::InvalidConfig(TlsErrors.ConfigInvalidPrivateKey());
+    if !outer.ok { return Result::Error(bad); }
+    Tlv version = Der.Expect(der, outer.start, outer.end, 0x02_i64);
+    if !version.ok { return Result::Error(bad); }
+    Tlv next = Der.Read(der, version.end, outer.end);
+    if !next.ok { return Result::Error(bad); }
+    if next.tag == 0x30_i64 {
+        // PKCS#8: AlgorithmIdentifier then OCTET STRING { ECPrivateKey }.
+        Tlv octets = Der.Expect(der, next.end, outer.end, 0x04_i64);
+        if !octets.ok { return Result::Error(bad); }
+        return P256PrivateKeyFromDer(Der.Content(der, octets));
+    }
+    if next.tag != 0x04_i64 || next.length != 32_i64 { return Result::Error(bad); }
+    return Result::Ok(Der.Content(der, next));
+}

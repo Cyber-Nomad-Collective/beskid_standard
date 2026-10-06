@@ -1,0 +1,134 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Codec.Varint;
+use Http3.H3Errors;
+
+// RFC 9114 section 7: frame layout (type varint, length varint, payload),
+// frame types, and which frames each stream kind may carry.
+
+pub i64 TypeData() { return 0_i64; }
+pub i64 TypeHeaders() { return 1_i64; }
+pub i64 TypeCancelPush() { return 3_i64; }
+pub i64 TypeSettings() { return 4_i64; }
+pub i64 TypePushPromise() { return 5_i64; }
+pub i64 TypeGoaway() { return 7_i64; }
+pub i64 TypeMaxPushId() { return 13_i64; }
+
+/// Stream kinds a frame can arrive on.
+pub i64 KindControl() { return 0_i64; }
+pub i64 KindRequest() { return 1_i64; }
+pub i64 KindPush() { return 2_i64; }
+
+/// Frame types reserved because they exist in HTTP/2 (section 7.2.8).
+pub bool IsReservedHttp2(i64 frameType) {
+    return frameType == 2_i64 || frameType == 6_i64 || frameType == 8_i64 || frameType == 9_i64;
+}
+
+/// Reserved greasing values 0x1f * N + 0x21 (sections 7.2.8, 6.2.3, 7.2.4.1).
+pub bool IsGrease(i64 value) { return value >= 33_i64 && ((value - 33_i64) % 31_i64) == 0_i64; }
+
+/// Frame types this implementation understands.
+pub bool IsKnown(i64 frameType) {
+    return frameType == 0_i64 || frameType == 1_i64 || frameType == 3_i64 || frameType == 4_i64 || frameType == 5_i64
+        || frameType == 7_i64 || frameType == 13_i64;
+}
+
+/// Reads a QUIC varint at `offset` before `end`: the value, or -1 when truncated.
+pub i64 VarintAt(u8[] buf, i64 offset, i64 end) {
+    if offset >= end { return -1_i64; }
+    i64 length = Varint.LengthFromFirstByte(buf[offset]);
+    if offset + length > end { return -1_i64; }
+    mut i64 acc = i64(buf[offset]) & 63_i64;
+    mut i64 i = 1_i64;
+    while i < length { acc = (acc << 8_i64) | i64(buf[offset + i]); i = i + 1_i64; }
+    return acc;
+}
+
+/// Encoded length of the varint starting with `first`.
+pub i64 VarintLength(u8 first) { return Varint.LengthFromFirstByte(first); }
+
+/// Appends `value` as a QUIC varint (0 <= value < 2^62).
+pub u8[] AppendVarint(mut u8[] out, i64 value) {
+    i64 length = Varint.EncodedLength(value);
+    mut i64 marker = 0_i64;
+    if length == 2_i64 { marker = 64_i64; }
+    if length == 4_i64 { marker = 128_i64; }
+    if length == 8_i64 { marker = 192_i64; }
+    mut i64 i = length - 1_i64;
+    while i >= 0_i64 {
+        mut i64 b = (value >> (8_i64 * i)) & 255_i64;
+        if i == length - 1_i64 { b = b | marker; }
+        Array.Append<u8>(out, u8(b));
+        i = i - 1_i64;
+    }
+    return out;
+}
+
+/// Appends a whole frame.
+pub u8[] AppendFrame(mut u8[] out, i64 frameType, u8[] payload) {
+    out = AppendVarint(out, frameType);
+    out = AppendVarint(out, Slice.Len(payload));
+    mut i64 i = 0_i64;
+    while i < Slice.Len(payload) { Array.Append<u8>(out, payload[i]); i = i + 1_i64; }
+    return out;
+}
+
+/// A frame header read from a buffer. `status` is Complete() when the
+/// whole payload buf[start .. start+length) is present, NeedMore() when the
+/// header or payload is incomplete, or an H3 error code.
+pub type FrameHead { pub i64 status, pub i64 frameType, pub i64 start, pub i64 length, pub i64 next, }
+
+pub i64 Complete() { return 0_i64; }
+pub i64 NeedMore() { return 1_i64; }
+
+FrameHead Head(i64 status, i64 frameType, i64 start, i64 length) {
+    return FrameHead { status: status, frameType: frameType, start: start, length: length, next: start + length };
+}
+
+/// Reads the frame at `offset` in buf[.. end). Payloads above `maxPayload`
+/// are H3_EXCESSIVE_LOAD (section 10.5) so a peer cannot force unbounded
+/// buffering.
+pub FrameHead ReadFrame(u8[] buf, i64 offset, i64 end, i64 maxPayload) {
+    i64 frameType = VarintAt(buf, offset, end);
+    if frameType < 0_i64 { return Head(NeedMore(), 0_i64, offset, 0_i64); }
+    i64 lengthAt = offset + VarintLength(buf[offset]);
+    i64 length = VarintAt(buf, lengthAt, end);
+    if length < 0_i64 { return Head(NeedMore(), frameType, offset, 0_i64); }
+    i64 start = lengthAt + VarintLength(buf[lengthAt]);
+    if length > maxPayload { return Head(H3Errors.ExcessiveLoad(), frameType, start, length); }
+    if start + length > end { return Head(NeedMore(), frameType, start, length); }
+    return Head(Complete(), frameType, start, length);
+}
+
+/// The single varint payload of GOAWAY, MAX_PUSH_ID or CANCEL_PUSH, or -1
+/// when the payload is not exactly one varint (H3_FRAME_ERROR).
+pub i64 SingleVarint(u8[] buf, i64 start, i64 length) {
+    if length <= 0_i64 { return -1_i64; }
+    i64 value = VarintAt(buf, start, start + length);
+    if value < 0_i64 || VarintLength(buf[start]) != length { return -1_i64; }
+    return value;
+}
+
+/// The frame payload as a new array.
+pub u8[] Payload(u8[] buf, FrameHead head) {
+    u8[] out = Slice.New(head.length);
+    if head.length > 0_i64 { Slice.Copy(out, 0_i64, buf, head.start, head.length); }
+    return out;
+}
+
+/// 0 when a frame of `frameType` may arrive on a stream of `kind` at an
+/// endpoint that `isServer`; otherwise H3_FRAME_UNEXPECTED (section 7.2).
+/// Unknown and grease types are allowed (and ignored by the caller).
+pub i64 CheckAllowed(i64 kind, i64 frameType, bool isServer) {
+    i64 unexpected = H3Errors.FrameUnexpected();
+    if IsReservedHttp2(frameType) { return unexpected; }
+    if !IsKnown(frameType) { return 0_i64; }
+    if kind == KindControl() {
+        if frameType == TypeData() || frameType == TypeHeaders() || frameType == TypePushPromise() { return unexpected; }
+        if frameType == TypeMaxPushId() && !isServer { return unexpected; }
+        return 0_i64;
+    }
+    if frameType == TypeData() || frameType == TypeHeaders() { return 0_i64; }
+    if frameType == TypePushPromise() && kind == KindRequest() && !isServer { return 0_i64; }
+    return unexpected;
+}

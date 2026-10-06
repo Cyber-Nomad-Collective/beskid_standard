@@ -1,0 +1,187 @@
+use Testing.Assert;
+use Concurrency.Fiber;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Time;
+use Core.Time.Deadline;
+use Http.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Network.Types as NetworkTypes;
+use Http2.Client;
+use Http2.Connection;
+use Http2.FrameErrors;
+use Http2.Mapping;
+use Http2.Server;
+
+// Several requests on one h2c connection: sequential, and concurrent from several fibers.
+
+pub SocketAddress Loopback(i64 port) {
+    Port value = match NetworkTypes.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => NetworkTypes.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+pub Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+unit Guard(TcpStream stream) {
+    TransferDeadlines policy = TransferDeadlines { read: Within(20000_i64), write: Within(20000_i64) };
+    stream.SetDeadlines(policy);
+    return;
+}
+
+string HeaderValue(Header[] headers, string name) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header header = Array.Get<Header>(headers, i);
+        if header.name == name { return header.value; }
+        i = i + 1_i64;
+    }
+    return "";
+}
+
+// GET answers "path=<target> host=<host>"; POST echoes the body.
+type Echo: RequestHandler {
+    i64 tag,
+    pub Response Handle(Request request) { return EchoResponse(request); }
+}
+
+Response EchoResponse(Request request) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Content-Type", value: "application/octet-stream" });
+    Array.Append<Header>(headers, Header { name: "x-method", value: request.method });
+    if request.method == "POST" {
+        return Response { status: 200_i64, reason: "OK", headers: headers, body: request.body };
+    }
+    string text = "path=" + request.target + " host=" + HeaderValue(request.headers, "host");
+    return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes(text) };
+}
+
+Config SmallWindows() {
+    Config config = Connection.DefaultConfig();
+    config.initialWindowSize = 16384_i64;
+    config.timeoutMillis = 20000_i64;
+    return config;
+}
+
+i64 ServeOne(TcpListener listener) {
+    Echo handler = Echo { tag: 1_i64 };
+    Result<i64,Http2Error> served = Server.AcceptAndServe(listener, handler, SmallWindows(), Within(20000_i64));
+    return match served {
+        Result::Ok(count) => count,
+        Result::Error(error) => -100_i64 - FrameErrors.CodeOf(error),
+    };
+}
+
+Fiber<i64> StartServer(TcpListener listener) {
+    return spawn (() => ServeOne(listener));
+}
+
+Request Get(string target) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
+    Array.Append<Header>(headers, Header { name: "Connection", value: "keep-alive" });
+    return Request { method: "GET", target: target, headers: headers, body: Slice.New(0_i64) };
+}
+
+string BodyText(Response response) {
+    return match Convert.BytesToString(response.body) { Result::Ok(text) => text, Result::Error(_) => "<binary>", };
+}
+
+i64 JoinCount(Fiber<i64> server) {
+    return match server.Join() { Result::Ok(count) => count, Result::Error(_) => -1_i64, };
+}
+
+
+string Fetch(Connection conn, TcpStream stream, string path) {
+    return match Client.Send(conn, stream, Get(path)) {
+        Result::Ok(response) => BodyText(response),
+        Result::Error(error) => "error " + FrameErrors.KindOf(error),
+    };
+}
+
+// 1 when the response body matches `path`, else 0.
+i64 FetchCheck(Connection conn, TcpStream stream, string path) {
+    string expected = "path=" + path + " host=example.test";
+    if Fetch(conn, stream, path) == expected { return 1_i64; }
+    return 0_i64;
+}
+
+Fiber<i64> SpawnFetch(Connection conn, TcpStream stream, string path) {
+    return spawn (() => FetchCheck(conn, stream, path));
+}
+
+i64 JoinOk(Fiber<i64> f) {
+    return match f.Join() { Result::Ok(v) => v, Result::Error(_) => 0_i64, };
+}
+
+Result<unit,NetworkError> Sequential() {
+    TcpListener listener = TcpListener.Bind(Loopback(0_i64), 4_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Fiber<i64> server = StartServer(listener);
+    TcpStream stream = TcpStream.Connect(address, NetworkTypes.DefaultSocketOptions(), Within(5000_i64))?;
+    Guard(stream);
+    match Client.Open(stream, SmallWindows()) {
+        Result::Error(_) => Assert.Fail("client preface"),
+        Result::Ok(conn) => {
+            mut i64 ok = 0_i64;
+            mut i64 i = 0_i64;
+            while i < 5_i64 {
+                ok = ok + FetchCheck(conn, stream, "/seq/" + Mapping.DecimalText(i));
+                i = i + 1_i64;
+            }
+            Assert.Equal<i64>(ok, 5_i64, "five responses on one connection");
+            Assert.Equal<i64>(conn.nextStreamId, 11_i64, "stream ids 1,3,5,7,9");
+            Assert.True(match Client.Ping(conn, stream, Slice.New(8_i64)) { Result::Ok(_) => true, Result::Error(_) => false, }, "PING round trip");
+            Client.Close(conn, stream);
+        },
+    };
+    Assert.Equal<i64>(JoinCount(server), 5_i64, "server handled five");
+    stream.Close();
+    listener.Close();
+    return Result::Ok(());
+}
+
+Result<unit,NetworkError> Concurrent() {
+    TcpListener listener = TcpListener.Bind(Loopback(0_i64), 4_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    Fiber<i64> server = StartServer(listener);
+    TcpStream stream = TcpStream.Connect(address, NetworkTypes.DefaultSocketOptions(), Within(5000_i64))?;
+    Guard(stream);
+    match Client.Open(stream, SmallWindows()) {
+        Result::Error(_) => Assert.Fail("client preface"),
+        Result::Ok(conn) => {
+            Fiber<i64> a = SpawnFetch(conn, stream, "/a");
+            Fiber<i64> b = SpawnFetch(conn, stream, "/b");
+            Fiber<i64> c = SpawnFetch(conn, stream, "/c");
+            i64 ok = JoinOk(a) + JoinOk(b) + JoinOk(c);
+            Assert.Equal<i64>(ok, 3_i64, "three concurrent requests from three fibers");
+            Client.Close(conn, stream);
+        },
+    };
+    Assert.Equal<i64>(JoinCount(server), 3_i64, "server handled three");
+    stream.Close();
+    listener.Close();
+    return Result::Ok(());
+}
+
+unit RunSequential() { match Sequential() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("network setup"), }; }
+unit RunConcurrent() { match Concurrent() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("network setup"), }; }
+
+test multiple_sequential_requests_and_ping {
+    Fiber<unit> scenario = spawn RunSequential();
+    match scenario.Join() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("scenario"), };
+}
+
+test concurrent_requests_from_fibers {
+    Fiber<unit> scenario = spawn RunConcurrent();
+    match scenario.Join() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("scenario"), };
+}

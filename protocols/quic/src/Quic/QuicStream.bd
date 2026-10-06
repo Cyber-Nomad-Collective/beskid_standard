@@ -1,0 +1,400 @@
+use Core.Bytes.Slice;
+use Quic.QuicRanges;
+use Quic.QuicWire;
+
+// QUIC streams (RFC 9000 sections 2-4): stream identifiers, send and receive state machines,
+// bounded ring buffers with ordered reassembly, and per-stream flow control.
+// A send buffer holds unacknowledged data from `base` (lowest unacknowledged offset) to
+// `written`; a receive buffer holds data from `read` (next byte for the application) up to
+// the advertised limit, so the flow-control window never exceeds the buffer capacity.
+// CRYPTO streams reuse the same type with flow control disabled.
+
+// Send states (section 3.1).
+pub i64 SendReady() { return 0_i64; }
+pub i64 SendSending() { return 1_i64; }
+pub i64 SendDataSent() { return 2_i64; }
+pub i64 SendDataRecvd() { return 3_i64; }
+pub i64 SendResetSent() { return 4_i64; }
+pub i64 SendResetRecvd() { return 5_i64; }
+// Receive states (section 3.2).
+pub i64 RecvRecv() { return 0_i64; }
+pub i64 RecvSizeKnown() { return 1_i64; }
+pub i64 RecvDataRecvd() { return 2_i64; }
+pub i64 RecvDataRead() { return 3_i64; }
+pub i64 RecvResetRecvd() { return 4_i64; }
+pub i64 RecvResetRead() { return 5_i64; }
+
+// Pending control-frame flags.
+pub i64 FlagMaxStreamData() { return 1_i64; }
+pub i64 FlagReset() { return 2_i64; }
+pub i64 FlagStopSending() { return 4_i64; }
+pub i64 FlagBlocked() { return 8_i64; }
+pub i64 FlagFin() { return 16_i64; }
+
+// s indices.
+i64 Base() { return 0_i64; }
+i64 Written() { return 1_i64; }
+i64 Next() { return 2_i64; }
+i64 FinState() { return 3_i64; }
+i64 SendMax() { return 4_i64; }
+i64 SendSt() { return 5_i64; }
+i64 Read() { return 6_i64; }
+i64 Highest() { return 7_i64; }
+i64 Final() { return 8_i64; }
+i64 RecvMax() { return 9_i64; }
+i64 RecvSt() { return 10_i64; }
+i64 Flags() { return 11_i64; }
+i64 ResetCode() { return 12_i64; }
+i64 StopCode() { return 13_i64; }
+i64 PeerResetCode() { return 14_i64; }
+i64 PeerStopCode() { return 15_i64; }
+i64 SendCap() { return 16_i64; }
+i64 RecvCap() { return 17_i64; }
+i64 Opened() { return 18_i64; }
+i64 Count() { return 19_i64; }
+
+pub type Stream {
+    pub i64 id,
+    i64[] s,
+    u8[] sendBuf,
+    u8[] recvBuf,
+    i64[] acked,
+    i64[] lost,
+    i64[] recvd,
+}
+
+// ------------------------------------------------------------ identifiers (section 2.1)
+
+pub bool IsServerInitiated(i64 id) { return (id & 1_i64) == 1_i64; }
+pub bool IsUnidirectional(i64 id) { return (id & 2_i64) == 2_i64; }
+/// The n-th (0-based) stream of a type: bit 0 initiator, bit 1 direction.
+pub i64 IdOf(i64 index, bool server, bool uni) {
+    mut i64 t = 0_i64;
+    if server { t = t | 1_i64; }
+    if uni { t = t | 2_i64; }
+    return index * 4_i64 + t;
+}
+pub i64 IndexOf(i64 id) { return id >> 2_i64; }
+/// True when this endpoint may send on the stream.
+pub bool CanSend(i64 id, bool isServer) { return !IsUnidirectional(id) || IsServerInitiated(id) == isServer; }
+/// True when this endpoint may receive on the stream.
+pub bool CanReceive(i64 id, bool isServer) { return !IsUnidirectional(id) || IsServerInitiated(id) != isServer; }
+
+// ------------------------------------------------------------ construction
+
+/// A stream with `sendCapacity` / `recvCapacity` byte buffers. `peerMax` is the peer's initial
+/// MAX_STREAM_DATA for this stream; the receive limit advertised starts at `recvCapacity`.
+/// A capacity of 0 marks a direction that does not exist (unidirectional streams).
+pub Stream New(i64 id, i64 sendCapacity, i64 recvCapacity, i64 peerMax) {
+    i64[] s = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, -1_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 1_i64, 0_i64];
+    s[SendMax()] = peerMax;
+    s[RecvMax()] = recvCapacity;
+    s[SendCap()] = sendCapacity;
+    s[RecvCap()] = recvCapacity;
+    if sendCapacity == 0_i64 { s[SendSt()] = SendDataRecvd(); }
+    if recvCapacity == 0_i64 { s[RecvSt()] = RecvDataRead(); }
+    return Stream { id: id, s: s, sendBuf: Slice.New(sendCapacity), recvBuf: Slice.New(recvCapacity), acked: QuicRanges.New(16_i64), lost: QuicRanges.New(16_i64), recvd: QuicRanges.New(32_i64) };
+}
+
+pub i64 SendState(Stream st) { return st.s[SendSt()]; }
+pub i64 RecvState(Stream st) { return st.s[RecvSt()]; }
+pub i64 PendingFlags(Stream st) { return st.s[Flags()]; }
+pub unit ClearFlag(Stream st, i64 flag) { st.s[Flags()] = st.s[Flags()] - (st.s[Flags()] & flag); return; }
+pub unit SetFlag(Stream st, i64 flag) { st.s[Flags()] = st.s[Flags()] | flag; return; }
+pub i64 ResetCodeOf(Stream st) { return st.s[ResetCode()]; }
+pub i64 StopCodeOf(Stream st) { return st.s[StopCode()]; }
+pub i64 PeerResetCodeOf(Stream st) { return st.s[PeerResetCode()]; }
+pub i64 PeerStopCodeOf(Stream st) { return st.s[PeerStopCode()]; }
+pub i64 RecvLimit(Stream st) { return st.s[RecvMax()]; }
+pub i64 SendLimit(Stream st) { return st.s[SendMax()]; }
+pub i64 SentOffset(Stream st) { return st.s[Next()]; }
+pub i64 WrittenOffset(Stream st) { return st.s[Written()]; }
+pub i64 ReadOffset(Stream st) { return st.s[Read()]; }
+pub i64 HighestReceived(Stream st) { return st.s[Highest()]; }
+pub i64 FinalSize(Stream st) { return st.s[Final()]; }
+pub bool IsOpen(Stream st) { return st.s[Opened()] == 1_i64; }
+pub unit MarkClosed(Stream st) { st.s[Opened()] = 0_i64; return; }
+
+/// Both directions reached a terminal state (the stream can be forgotten).
+pub bool IsFinished(Stream st) {
+    i64 a = st.s[SendSt()];
+    i64 b = st.s[RecvSt()];
+    return (a == SendDataRecvd() || a == SendResetRecvd()) && (b == RecvDataRead() || b == RecvResetRead());
+}
+
+// ------------------------------------------------------------ sending
+
+/// Free space in the send buffer.
+pub i64 SendSpace(Stream st) {
+    return st.s[SendCap()] - (st.s[Written()] - st.s[Base()]);
+}
+
+/// Copies up to `count` bytes into the send buffer; returns how many were accepted.
+/// Fails (-1) after Finish or Reset.
+pub i64 Write(Stream st, u8[] src, i64 offset, i64 count) {
+    i64 state = st.s[SendSt()];
+    if (state != SendReady() && state != SendSending()) || st.s[FinState()] != 0_i64 { return -1_i64; }
+    mut i64 n = SendSpace(st);
+    if count < n { n = count; }
+    i64 cap = st.s[SendCap()];
+    i64 at = st.s[Written()] % cap;
+    mut i64 first = n;
+    if at + first > cap { first = cap - at; }
+    Slice.Copy(st.sendBuf, at, src, offset, first);
+    if n > first { Slice.Copy(st.sendBuf, 0_i64, src, offset + first, n - first); }
+    st.s[Written()] = st.s[Written()] + n;
+    return n;
+}
+
+/// Marks the end of the stream (FIN after the written data).
+pub bool Finish(Stream st) {
+    i64 state = st.s[SendSt()];
+    if state != SendReady() && state != SendSending() { return false; }
+    if st.s[FinState()] == 0_i64 { st.s[FinState()] = 1_i64; SetFlag(st, FlagFin()); }
+    return true;
+}
+
+/// Abandons sending with an application error code (RESET_STREAM).
+pub bool Reset(Stream st, i64 code) {
+    i64 state = st.s[SendSt()];
+    if state == SendDataRecvd() || state == SendResetSent() || state == SendResetRecvd() { return false; }
+    st.s[SendSt()] = SendResetSent();
+    st.s[ResetCode()] = code;
+    QuicRanges.Clear(st.lost);
+    SetFlag(st, FlagReset());
+    return true;
+}
+
+/// Asks the peer to stop sending (STOP_SENDING); received data is discarded from now on.
+pub bool StopSending(Stream st, i64 code) {
+    i64 state = st.s[RecvSt()];
+    if state != RecvRecv() && state != RecvSizeKnown() { return false; }
+    st.s[StopCode()] = code;
+    SetFlag(st, FlagStopSending());
+    return true;
+}
+
+/// The next chunk to transmit, at most `room` bytes of data and `allowance` bytes of new
+/// (never sent) data under connection flow control. Lost data goes first.
+/// Writes out = [offset, length, fin(0/1), isNew(0/1)]; returns false when nothing is due.
+pub bool NextChunk(Stream st, i64 room, i64 allowance, i64[] out) {
+    i64 state = st.s[SendSt()];
+    if state != SendSending() && state != SendReady() && state != SendDataSent() { return false; }
+    if room <= 0_i64 { return false; }
+    i64 base = st.s[Base()];
+    QuicRanges.DropBelow(st.lost, base);
+    while !QuicRanges.IsEmpty(st.lost) {
+        i64 lo = QuicRanges.Lo(st.lost, 0_i64);
+        i64 hi = QuicRanges.Hi(st.lost, 0_i64);
+        // Skip parts already acknowledged.
+        i64 ackedEnd = QuicRanges.ContiguousEnd(st.acked, lo);
+        if ackedEnd > lo { QuicRanges.Remove(st.lost, lo, ackedEnd); } else {
+            mut i64 end = hi;
+            mut i64 k = 0_i64;
+            while k < QuicRanges.Count(st.acked) {
+                i64 alo = QuicRanges.Lo(st.acked, k);
+                if alo > lo && alo < end { end = alo; }
+                k = k + 1_i64;
+            }
+            mut i64 n = end - lo;
+            if n > room { n = room; }
+            out[0] = lo;
+            out[1] = n;
+            out[2] = 0_i64;
+            if lo + n == st.s[Written()] && st.s[FinState()] >= 1_i64 { out[2] = 1_i64; }
+            out[3] = 0_i64;
+            return true;
+        }
+    }
+    i64 next = st.s[Next()];
+    mut i64 n = st.s[Written()] - next;
+    if n > room { n = room; }
+    if n > allowance { n = allowance; }
+    if next + n > st.s[SendMax()] { n = st.s[SendMax()] - next; }
+    if n < 0_i64 { n = 0_i64; }
+    bool finDue = (PendingFlags(st) & FlagFin()) != 0_i64 && next + n == st.s[Written()];
+    if n == 0_i64 && !finDue {
+        if st.s[Written()] > next && next >= st.s[SendMax()] { SetFlag(st, FlagBlocked()); }
+        return false;
+    }
+    out[0] = next;
+    out[1] = n;
+    out[2] = 0_i64;
+    if finDue { out[2] = 1_i64; }
+    out[3] = 1_i64;
+    return true;
+}
+
+/// Records that the chunk chosen by NextChunk was put in a packet.
+pub unit OnChunkSent(Stream st, i64 offset, i64 length, bool fin) {
+    QuicRanges.Remove(st.lost, offset, offset + length);
+    if offset + length > st.s[Next()] { st.s[Next()] = offset + length; }
+    if fin {
+        ClearFlag(st, FlagFin());
+        if st.s[FinState()] < 2_i64 { st.s[FinState()] = 2_i64; }
+    }
+    if st.s[SendSt()] == SendReady() { st.s[SendSt()] = SendSending(); }
+    if st.s[FinState()] >= 2_i64 && st.s[Next()] == st.s[Written()] && st.s[SendSt()] == SendSending() { st.s[SendSt()] = SendDataSent(); }
+    return;
+}
+
+/// Copies stream data [offset, offset+length) from the ring into a packet.
+pub unit CopyOut(Stream st, Writer w, i64 offset, i64 length) {
+    i64 cap = st.s[SendCap()];
+    if length == 0_i64 { return; }
+    i64 at = offset % cap;
+    mut i64 first = length;
+    if at + first > cap { first = cap - at; }
+    QuicWire.PutBytes(w, st.sendBuf, at, first);
+    if length > first { QuicWire.PutBytes(w, st.sendBuf, 0_i64, length - first); }
+    return;
+}
+
+/// An acknowledged chunk: frees buffer space and advances the send state.
+pub unit OnChunkAcked(Stream st, i64 offset, i64 length, bool fin) {
+    if st.s[SendSt()] == SendResetSent() || st.s[SendSt()] == SendResetRecvd() { return; }
+    QuicRanges.Add(st.acked, offset, offset + length);
+    i64 base = st.s[Base()];
+    i64 end = QuicRanges.ContiguousEnd(st.acked, base);
+    if end > base {
+        st.s[Base()] = end;
+        QuicRanges.DropBelow(st.acked, end);
+    }
+    if fin { st.s[FinState()] = 3_i64; }
+    if st.s[FinState()] == 3_i64 && st.s[Base()] == st.s[Written()] { st.s[SendSt()] = SendDataRecvd(); }
+    return;
+}
+
+/// A lost chunk is queued for retransmission (a lost FIN is re-armed).
+pub unit OnChunkLost(Stream st, i64 offset, i64 length, bool fin) {
+    i64 state = st.s[SendSt()];
+    if state == SendResetSent() || state == SendResetRecvd() || state == SendDataRecvd() { return; }
+    i64 base = st.s[Base()];
+    mut i64 lo = offset;
+    if lo < base { lo = base; }
+    if offset + length > lo { QuicRanges.Add(st.lost, lo, offset + length); }
+    if fin && st.s[FinState()] == 2_i64 { SetFlag(st, FlagFin()); st.s[FinState()] = 1_i64; }
+    return;
+}
+
+/// The RESET_STREAM frame was acknowledged.
+pub unit OnResetAcked(Stream st) { st.s[SendSt()] = SendResetRecvd(); return; }
+
+/// Applies a MAX_STREAM_DATA increase.
+pub unit OnMaxStreamData(Stream st, i64 maximum) {
+    if maximum > st.s[SendMax()] { st.s[SendMax()] = maximum; }
+    return;
+}
+
+/// The peer sent STOP_SENDING: answer with RESET_STREAM carrying the same code.
+pub unit OnStopSending(Stream st, i64 code) {
+    st.s[PeerStopCode()] = code;
+    Reset(st, code);
+    return;
+}
+
+// ------------------------------------------------------------ receiving
+
+/// Accepts STREAM (or CRYPTO) data at `offset` from src[start..start+length).
+/// Returns the increase of the highest received offset (for connection flow control), or a
+/// negative transport error code: -3 FLOW_CONTROL_ERROR, -6 FINAL_SIZE_ERROR,
+/// -13 CRYPTO_BUFFER_EXCEEDED style overflow (reported as -3 for streams by the caller),
+/// -100 when the reassembly table is full (drop the packet without acknowledging it).
+pub i64 OnData(Stream st, i64 offset, u8[] src, i64 start, i64 length, bool fin) {
+    i64 end = offset + length;
+    i64 known = st.s[Final()];
+    i64 state = st.s[RecvSt()];
+    if fin {
+        if known >= 0_i64 && known != end { return -6_i64; }
+        if end < st.s[Highest()] { return -6_i64; }
+    }
+    if known >= 0_i64 && end > known { return -6_i64; }
+    if end > st.s[RecvMax()] { return -3_i64; }
+    if state == RecvResetRecvd() || state == RecvResetRead() || state == RecvDataRead() { return 0_i64; }
+    i64 read = st.s[Read()];
+    mut i64 lo = offset;
+    if lo < read { lo = read; }
+    if end > lo && (st.s[Flags()] & FlagStopSending()) == 0_i64 {
+        if !QuicRanges.Add(st.recvd, lo, end) { return -100_i64; }
+        i64 cap = st.s[RecvCap()];
+        i64 at = lo % cap;
+        i64 n = end - lo;
+        mut i64 first = n;
+        if at + first > cap { first = cap - at; }
+        Slice.Copy(st.recvBuf, at, src, start + (lo - offset), first);
+        if n > first { Slice.Copy(st.recvBuf, 0_i64, src, start + (lo - offset) + first, n - first); }
+    }
+    mut i64 grew = 0_i64;
+    if end > st.s[Highest()] { grew = end - st.s[Highest()]; st.s[Highest()] = end; }
+    if fin && known < 0_i64 {
+        st.s[Final()] = end;
+        st.s[RecvSt()] = RecvSizeKnown();
+    }
+    if st.s[RecvSt()] == RecvSizeKnown() && QuicRanges.ContiguousEnd(st.recvd, read) >= st.s[Final()] {
+        st.s[RecvSt()] = RecvDataRecvd();
+    }
+    return grew;
+}
+
+/// Bytes the application can read now.
+pub i64 Readable(Stream st) {
+    i64 read = st.s[Read()];
+    return QuicRanges.ContiguousEnd(st.recvd, read) - read;
+}
+
+/// True when every byte up to the final size was read.
+pub bool AtEnd(Stream st) {
+    return st.s[Final()] >= 0_i64 && st.s[Read()] >= st.s[Final()];
+}
+
+/// Copies up to `count` in-order bytes to dst[offset..]; returns the number copied.
+/// Advances the receive window: when less than half the buffer remains advertised,
+/// the limit moves to read + capacity and MAX_STREAM_DATA is flagged.
+pub i64 ReadInto(Stream st, u8[] dst, i64 offset, i64 count) {
+    mut i64 n = Readable(st);
+    if count < n { n = count; }
+    i64 read = st.s[Read()];
+    i64 cap = st.s[RecvCap()];
+    if n > 0_i64 {
+        i64 at = read % cap;
+        mut i64 first = n;
+        if at + first > cap { first = cap - at; }
+        Slice.Copy(dst, offset, st.recvBuf, at, first);
+        if n > first { Slice.Copy(dst, offset + first, st.recvBuf, 0_i64, n - first); }
+        st.s[Read()] = read + n;
+        QuicRanges.DropBelow(st.recvd, read + n);
+    }
+    if AtEnd(st) {
+        st.s[RecvSt()] = RecvDataRead();
+    } else {
+        if st.s[Final()] < 0_i64 && st.s[RecvMax()] - st.s[Read()] <= cap / 2_i64 {
+            st.s[RecvMax()] = st.s[Read()] + cap;
+            SetFlag(st, FlagMaxStreamData());
+        }
+    }
+    return n;
+}
+
+/// The peer reset the stream. Returns the highest-offset increase (final size accounting)
+/// or -6 for a FINAL_SIZE_ERROR, -3 for a flow-control violation.
+pub i64 OnReset(Stream st, i64 code, i64 finalSize) {
+    i64 known = st.s[Final()];
+    if known >= 0_i64 && known != finalSize { return -6_i64; }
+    if finalSize < st.s[Highest()] { return -6_i64; }
+    if finalSize > st.s[RecvMax()] { return -3_i64; }
+    mut i64 grew = 0_i64;
+    if finalSize > st.s[Highest()] { grew = finalSize - st.s[Highest()]; st.s[Highest()] = finalSize; }
+    st.s[Final()] = finalSize;
+    i64 state = st.s[RecvSt()];
+    if state != RecvDataRead() && state != RecvResetRead() {
+        st.s[RecvSt()] = RecvResetRecvd();
+        st.s[PeerResetCode()] = code;
+    }
+    return grew;
+}
+
+/// The application observed the reset.
+pub unit AcknowledgeReset(Stream st) {
+    if st.s[RecvSt()] == RecvResetRecvd() { st.s[RecvSt()] = RecvResetRead(); }
+    return;
+}

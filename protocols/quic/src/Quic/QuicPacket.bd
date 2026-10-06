@@ -1,0 +1,183 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Quic.QuicWire;
+
+// QUIC packet headers (RFC 9000 section 17), packet number encoding (appendix A.2/A.3)
+// and Version Negotiation. Header parsing never allocates beyond the connection IDs and
+// token and reports failures through `Header.error` (0 means well formed).
+
+pub i64 Version1() { return 1_i64; }
+pub i64 MaxCidLength() { return 20_i64; }
+
+pub i64 KindInitial() { return 0_i64; }
+pub i64 KindZeroRtt() { return 1_i64; }
+pub i64 KindHandshake() { return 2_i64; }
+pub i64 KindRetry() { return 3_i64; }
+pub i64 KindVersionNegotiation() { return 4_i64; }
+pub i64 KindOneRtt() { return 5_i64; }
+/// A long header with a version other than 1 and 0; the server answers with Version Negotiation.
+pub i64 KindUnsupportedVersion() { return 6_i64; }
+
+/// A parsed, still header-protected packet header.
+pub type Header {
+    pub i64 kind,
+    pub i64 version,
+    pub u8[] dcid,
+    pub u8[] scid,
+    // Initial token, or the Retry token.
+    pub u8[] token,
+    // Offset of the first byte of the packet.
+    pub i64 start,
+    // Offset of the packet number field; -1 for Retry and Version Negotiation.
+    pub i64 pnOffset,
+    // Offset after this packet: the next coalesced packet starts here.
+    pub i64 end,
+    // 0 when well formed, otherwise a transport error code (the packet is dropped).
+    pub i64 error,
+}
+
+u8[] NoBytes() { return Slice.New(0_i64); }
+
+Header Bad(i64 start, i64 end) {
+    return Header { kind: -1_i64, version: 0_i64, dcid: NoBytes(), scid: NoBytes(), token: NoBytes(), start: start, pnOffset: -1_i64, end: end, error: 7_i64 };
+}
+
+/// Parses the header at buf[offset..end). Short headers need the local connection ID
+/// length because it is not encoded on the wire.
+pub Header ParseHeader(u8[] buf, i64 offset, i64 end, i64 shortDcidLength) {
+    Reader r = QuicWire.NewReader(buf, offset, end);
+    i64 first = QuicWire.Byte(r);
+    if !QuicWire.Ok(r) { return Bad(offset, end); }
+    if (first & 128_i64) == 0_i64 {
+        if (first & 64_i64) == 0_i64 { return Bad(offset, end); }
+        u8[] dcid = QuicWire.Take(r, shortDcidLength);
+        if !QuicWire.Ok(r) || QuicWire.Left(r) < 20_i64 { return Bad(offset, end); }
+        return Header { kind: KindOneRtt(), version: 1_i64, dcid: dcid, scid: NoBytes(), token: NoBytes(), start: offset, pnOffset: QuicWire.Pos(r), end: end, error: 0_i64 };
+    }
+    i64 version = QuicWire.Uint(r, 4_i64);
+    i64 dl = QuicWire.Byte(r);
+    u8[] dcid = QuicWire.Take(r, dl);
+    i64 sl = QuicWire.Byte(r);
+    u8[] scid = QuicWire.Take(r, sl);
+    if !QuicWire.Ok(r) { return Bad(offset, end); }
+    if version == 0_i64 {
+        return Header { kind: KindVersionNegotiation(), version: 0_i64, dcid: dcid, scid: scid, token: NoBytes(), start: offset, pnOffset: -1_i64, end: end, error: 0_i64 };
+    }
+    if version != 1_i64 {
+        return Header { kind: KindUnsupportedVersion(), version: version, dcid: dcid, scid: scid, token: NoBytes(), start: offset, pnOffset: -1_i64, end: end, error: 0_i64 };
+    }
+    if dl > 20_i64 || sl > 20_i64 || (first & 64_i64) == 0_i64 { return Bad(offset, end); }
+    i64 kind = (first >> 4_i64) & 3_i64;
+    if kind == KindRetry() {
+        i64 tokenLength = QuicWire.Left(r) - 16_i64;
+        if tokenLength < 0_i64 { return Bad(offset, end); }
+        u8[] retryToken = QuicWire.Take(r, tokenLength);
+        return Header { kind: kind, version: version, dcid: dcid, scid: scid, token: retryToken, start: offset, pnOffset: -1_i64, end: end, error: 0_i64 };
+    }
+    mut u8[] token = NoBytes();
+    if kind == KindInitial() {
+        i64 tl = QuicWire.Var(r);
+        token = QuicWire.Take(r, tl);
+    }
+    i64 length = QuicWire.Var(r);
+    if !QuicWire.Ok(r) || length > QuicWire.Left(r) || length < 20_i64 { return Bad(offset, end); }
+    i64 pnOffset = QuicWire.Pos(r);
+    return Header { kind: kind, version: version, dcid: dcid, scid: scid, token: token, start: offset, pnOffset: pnOffset, end: pnOffset + length, error: 0_i64 };
+}
+
+/// Reads the destination connection ID of the packet at `offset` for demultiplexing.
+pub u8[] PeekDcid(u8[] buf, i64 offset, i64 end, i64 shortDcidLength) {
+    if offset >= end { return NoBytes(); }
+    if (i64(buf[offset]) & 128_i64) == 0_i64 {
+        if offset + 1_i64 + shortDcidLength > end { return NoBytes(); }
+        return QuicWire.CopyOf(buf, offset + 1_i64, shortDcidLength);
+    }
+    if offset + 6_i64 > end { return NoBytes(); }
+    i64 dl = i64(buf[offset + 5_i64]);
+    if offset + 6_i64 + dl > end { return NoBytes(); }
+    return QuicWire.CopyOf(buf, offset + 6_i64, dl);
+}
+
+/// Encoded packet number length in bytes (RFC 9000 appendix A.2). `largestAcked` is -1
+/// when nothing in the space was acknowledged yet.
+pub i64 PnLength(i64 pn, i64 largestAcked) {
+    mut i64 unacked = pn + 1_i64;
+    if largestAcked >= 0_i64 { unacked = pn - largestAcked; }
+    if unacked < 128_i64 { return 1_i64; }
+    if unacked < 32768_i64 { return 2_i64; }
+    if unacked < 8388608_i64 { return 3_i64; }
+    return 4_i64;
+}
+
+/// Recovers a full packet number from its truncated encoding (RFC 9000 appendix A.3).
+pub i64 DecodePn(i64 largest, i64 truncated, i64 bits) {
+    i64 expected = largest + 1_i64;
+    i64 win = 1_i64 << bits;
+    i64 hwin = win / 2_i64;
+    i64 mask = win - 1_i64;
+    i64 candidate = (expected - (expected & mask)) | truncated;
+    if candidate <= expected - hwin && candidate < 4611686018427387904_i64 - win { return candidate + win; }
+    if candidate > expected + hwin && candidate >= win { return candidate - win; }
+    return candidate;
+}
+
+/// Writes a long header for Initial, 0-RTT or Handshake with a two-byte Length placeholder
+/// and the packet number. Returns the offset of the Length field; the packet number
+/// follows it at +2. Patch the length with `PatchLength` once the payload is known.
+pub i64 WriteLongHeader(Writer w, i64 kind, u8[] dcid, u8[] scid, u8[] token, i64 pnLength, i64 pn) {
+    QuicWire.PutByte(w, 192_i64 | (kind << 4_i64) | (pnLength - 1_i64));
+    QuicWire.PutUint(w, 4_i64, 1_i64);
+    QuicWire.PutByte(w, Slice.Len(dcid));
+    QuicWire.PutAll(w, dcid);
+    QuicWire.PutByte(w, Slice.Len(scid));
+    QuicWire.PutAll(w, scid);
+    if kind == KindInitial() {
+        QuicWire.PutVar(w, Slice.Len(token));
+        QuicWire.PutAll(w, token);
+    }
+    i64 at = QuicWire.WPos(w);
+    QuicWire.PutUint(w, 2_i64, 0_i64);
+    QuicWire.PutUint(w, pnLength, pn);
+    return at;
+}
+
+/// Writes the two-byte varint Length (packet number + payload + tag, at most 16383).
+pub unit PatchLength(u8[] buf, i64 at, i64 length) {
+    buf[at] = u8(64_i64 | ((length >> 8_i64) & 63_i64));
+    buf[at + 1_i64] = u8(length & 255_i64);
+    return;
+}
+
+/// Writes a 1-RTT short header. Returns the packet number offset.
+pub i64 WriteShortHeader(Writer w, u8[] dcid, i64 keyPhase, i64 pnLength, i64 pn) {
+    QuicWire.PutByte(w, 64_i64 | ((keyPhase & 1_i64) << 2_i64) | (pnLength - 1_i64));
+    QuicWire.PutAll(w, dcid);
+    i64 at = QuicWire.WPos(w);
+    QuicWire.PutUint(w, pnLength, pn);
+    return at;
+}
+
+/// A Version Negotiation packet answering a client packet with `clientDcid`/`clientScid`.
+pub u8[] VersionNegotiation(u8[] clientDcid, u8[] clientScid, i64 unusedBits) {
+    u8[] out = Slice.New(7_i64 + Slice.Len(clientDcid) + Slice.Len(clientScid) + 8_i64);
+    Writer w = QuicWire.NewWriter(out, 0_i64, Slice.Len(out));
+    QuicWire.PutByte(w, 128_i64 | (unusedBits & 127_i64));
+    QuicWire.PutUint(w, 4_i64, 0_i64);
+    QuicWire.PutByte(w, Slice.Len(clientScid));
+    QuicWire.PutAll(w, clientScid);
+    QuicWire.PutByte(w, Slice.Len(clientDcid));
+    QuicWire.PutAll(w, clientDcid);
+    QuicWire.PutUint(w, 4_i64, 1_i64);
+    // A reserved version (0x?a?a?a?a) exercises version negotiation (RFC 9000 section 15).
+    QuicWire.PutUint(w, 4_i64, 0x1a2a3a4a_i64);
+    return out;
+}
+
+/// Supported versions listed by a Version Negotiation packet (after its header).
+pub i64[] NegotiationVersions(u8[] buf, Header h) {
+    mut i64[] list = Array.Empty<i64>();
+    i64 at = h.start + 7_i64 + Slice.Len(h.dcid) + Slice.Len(h.scid);
+    Reader r = QuicWire.NewReader(buf, at, h.end);
+    while QuicWire.Left(r) >= 4_i64 { Array.Append<i64>(list, QuicWire.Uint(r, 4_i64)); }
+    return list;
+}

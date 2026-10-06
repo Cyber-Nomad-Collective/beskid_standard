@@ -1,0 +1,526 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Codec.Cursor;
+use Codec.Errors;
+use Codec.Vec;
+use Tls.Alert;
+use Tls.Emit;
+use Tls.TlsErrors;
+use Tls.Wire;
+
+// Handshake message encoding and strict decoding (RFC 8446 section 4). Every decoder
+// rejects truncation, trailing bytes and out-of-range vector lengths with decode_error.
+
+pub type Extension { pub i64 kind, pub u8[] data, }
+pub type KeyShareEntry { pub i64 group, pub u8[] keyExchange, }
+pub type CertificateEntry { pub u8[] data, pub Extension[] extensions, }
+
+pub type ClientHello {
+    pub i64 legacyVersion,
+    pub u8[] random,
+    pub u8[] sessionId,
+    pub i64[] cipherSuites,
+    pub u8[] compressionMethods,
+    pub Extension[] extensions,
+}
+
+pub type ServerHello {
+    pub i64 legacyVersion,
+    pub u8[] random,
+    pub u8[] sessionId,
+    pub i64 cipherSuite,
+    pub i64 compressionMethod,
+    pub Extension[] extensions,
+}
+
+pub type CertificateMsg { pub u8[] context, pub CertificateEntry[] entries, }
+pub type CertificateVerifyMsg { pub i64 scheme, pub u8[] signature, }
+pub type CertificateRequestMsg { pub u8[] context, pub Extension[] extensions, }
+pub type NewSessionTicketMsg {
+    pub i64 lifetime,
+    pub i64 ageAdd,
+    pub u8[] nonce,
+    pub u8[] ticket,
+    pub Extension[] extensions,
+}
+
+/// One framed handshake message: type, body, and the full encoding (header included).
+pub type Framed { pub i64 kind, pub u8[] body, pub u8[] encoded, }
+
+// HelloRetryRequest.random = SHA-256("HelloRetryRequest").
+pub u8[] RetryRandom() {
+    return [0xCF_u8, 0x21_u8, 0xAD_u8, 0x74_u8, 0xE5_u8, 0x9A_u8, 0x61_u8, 0x11_u8, 0xBE_u8, 0x1D_u8, 0x8C_u8, 0x02_u8, 0x1E_u8, 0x65_u8, 0xB8_u8, 0x91_u8,
+        0xC2_u8, 0xA2_u8, 0x11_u8, 0x16_u8, 0x7A_u8, 0xBB_u8, 0x8C_u8, 0x5E_u8, 0x07_u8, 0x9E_u8, 0x09_u8, 0xE2_u8, 0xC8_u8, 0xA8_u8, 0x33_u8, 0x9C_u8];
+}
+
+// ---------------------------------------------------------------- decode helpers
+
+TlsError Decode() { return TlsErrors.Fatal(Alert.DecodeError()); }
+
+pub Result<i64, TlsError> Int(Result<i64, CodecError> r) {
+    return match r { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(Decode()), };
+}
+
+pub Result<u8[], TlsError> Blob(Result<u8[], CodecError> r) {
+    return match r { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(Decode()), };
+}
+
+pub Result<Cursor, TlsError> Sub(Result<Cursor, CodecError> r) {
+    return match r { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(Decode()), };
+}
+
+pub Result<unit, TlsError> End(Cursor c) {
+    if c.IsEnd() { return Result::Ok(()); }
+    return Result::Error(Decode());
+}
+
+/// Reads an extension block `Extension extensions<min..2^16-1>`. Duplicate types are
+/// illegal_parameter (RFC 8446 section 4.2).
+pub Result<Extension[], TlsError> ReadExtensions(Cursor c, i64 min) {
+    mut Extension[] list = Array.Empty<Extension>();
+    Cursor block = Sub(Vec.Open(c, 2_i64, min, 65535_i64))?;
+    while !block.IsEnd() {
+        i64 kind = Int(block.U16())?;
+        u8[] data = Blob(Vec.Read(block, 2_i64, 0_i64, 65535_i64))?;
+        if Find(list, kind) >= 0_i64 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+        Array.Append<Extension>(list, Extension { kind: kind, data: data });
+    }
+    return Result::Ok(list);
+}
+
+/// Index of the extension of `kind`, or -1.
+pub i64 Find(Extension[] list, i64 kind) {
+    i64 n = Array.Len<Extension>(list);
+    mut i64 i = 0_i64;
+    while i < n {
+        Extension e = list[i];
+        if e.kind == kind { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+pub bool Has(Extension[] list, i64 kind) { return Find(list, kind) >= 0_i64; }
+
+/// Data of the extension of `kind` (empty when absent; check `Has` first).
+pub u8[] Data(Extension[] list, i64 kind) {
+    i64 at = Find(list, kind);
+    if at < 0_i64 { return Slice.New(0_i64); }
+    Extension e = list[at];
+    return e.data;
+}
+
+pub bool InList(i64[] list, i64 value) {
+    i64 n = Array.Len<i64>(list);
+    mut i64 i = 0_i64;
+    while i < n { if list[i] == value { return true; } i = i + 1_i64; }
+    return false;
+}
+
+/// Splits handshake bytes at the start of `buf[offset, offset+count)` into one message.
+/// Returns the total message length when complete, 0 when more bytes are needed.
+pub Result<i64, TlsError> MessageLength(u8[] buf, i64 offset, i64 count) {
+    if count < 4_i64 { return Result::Ok(0_i64); }
+    i64 length = (i64(buf[offset + 1_i64]) << 16_i64) | (i64(buf[offset + 2_i64]) << 8_i64) | i64(buf[offset + 3_i64]);
+    if length > Wire.MaxHandshakeMessage() { return Result::Error(Decode()); }
+    if count < 4_i64 + length { return Result::Ok(0_i64); }
+    return Result::Ok(4_i64 + length);
+}
+
+/// Frames one encoded message (header included) into its parts.
+pub Framed Frame(u8[] encoded) {
+    i64 n = Slice.Len(encoded);
+    return Framed { kind: i64(encoded[0]), body: Slice.SubSlice(encoded, 4_i64, n - 4_i64), encoded: encoded };
+}
+
+// ---------------------------------------------------------------- encode helpers
+
+/// type || uint24 length || body.
+pub u8[] Wrap(i64 kind, u8[] body) {
+    Emitter e = Emit.New();
+    Emit.U8(e, kind);
+    Emit.U24(e, Slice.Len(body));
+    Emit.Raw(e, body);
+    return Emit.Bytes(e);
+}
+
+pub unit WriteExtensions(Emitter e, Extension[] list) {
+    i64 mark = Emit.Open(e, 2_i64);
+    i64 n = Array.Len<Extension>(list);
+    mut i64 i = 0_i64;
+    while i < n {
+        Extension x = list[i];
+        Emit.U16(e, x.kind);
+        Emit.Vec(e, 2_i64, x.data);
+        i = i + 1_i64;
+    }
+    Emit.Close(e, mark, 2_i64);
+    return;
+}
+
+pub Extension Ext(i64 kind, u8[] data) { return Extension { kind: kind, data: data }; }
+
+// ---------------------------------------------------------------- ClientHello
+
+pub Result<ClientHello, TlsError> DecodeClientHello(u8[] body) {
+    Cursor c = Cursor.New(body);
+    i64 version = Int(c.U16())?;
+    u8[] random = Blob(c.Bytes(32_i64))?;
+    u8[] sessionId = Blob(Vec.Read(c, 1_i64, 0_i64, 32_i64))?;
+    Cursor suites = Sub(Vec.Open(c, 2_i64, 2_i64, 65534_i64))?;
+    if suites.Remaining() % 2_i64 != 0_i64 { return Result::Error(Decode()); }
+    mut i64[] list = Array.Empty<i64>();
+    while !suites.IsEnd() { Array.Append<i64>(list, Int(suites.U16())?); }
+    u8[] compression = Blob(Vec.Read(c, 1_i64, 1_i64, 255_i64))?;
+    mut Extension[] exts = Array.Empty<Extension>();
+    if !c.IsEnd() { exts = ReadExtensions(c, 0_i64)?; }
+    End(c)?;
+    return Result::Ok(ClientHello { legacyVersion: version, random: random, sessionId: sessionId, cipherSuites: list, compressionMethods: compression, extensions: exts });
+}
+
+pub u8[] EncodeClientHello(ClientHello m) {
+    Emitter e = Emit.New();
+    Emit.U16(e, m.legacyVersion);
+    Emit.Raw(e, m.random);
+    Emit.Vec(e, 1_i64, m.sessionId);
+    i64 mark = Emit.Open(e, 2_i64);
+    i64 n = Array.Len<i64>(m.cipherSuites);
+    mut i64 i = 0_i64;
+    while i < n { Emit.U16(e, m.cipherSuites[i]); i = i + 1_i64; }
+    Emit.Close(e, mark, 2_i64);
+    Emit.Vec(e, 1_i64, m.compressionMethods);
+    WriteExtensions(e, m.extensions);
+    return Wrap(Wire.MsgClientHello(), Emit.Bytes(e));
+}
+
+// ---------------------------------------------------------------- ServerHello / HRR
+
+pub Result<ServerHello, TlsError> DecodeServerHello(u8[] body) {
+    Cursor c = Cursor.New(body);
+    i64 version = Int(c.U16())?;
+    u8[] random = Blob(c.Bytes(32_i64))?;
+    u8[] sessionId = Blob(Vec.Read(c, 1_i64, 0_i64, 32_i64))?;
+    i64 suite = Int(c.U16())?;
+    i64 compression = Int(c.U8())?;
+    Extension[] exts = ReadExtensions(c, 0_i64)?;
+    End(c)?;
+    return Result::Ok(ServerHello { legacyVersion: version, random: random, sessionId: sessionId, cipherSuite: suite, compressionMethod: compression, extensions: exts });
+}
+
+pub u8[] EncodeServerHello(ServerHello m) {
+    Emitter e = Emit.New();
+    Emit.U16(e, m.legacyVersion);
+    Emit.Raw(e, m.random);
+    Emit.Vec(e, 1_i64, m.sessionId);
+    Emit.U16(e, m.cipherSuite);
+    Emit.U8(e, m.compressionMethod);
+    WriteExtensions(e, m.extensions);
+    return Wrap(Wire.MsgServerHello(), Emit.Bytes(e));
+}
+
+pub bool IsRetryRequest(ServerHello m) { return Slice.Compare(m.random, RetryRandom()) == 0_i64; }
+
+// ---------------------------------------------------------------- EncryptedExtensions
+
+pub Result<Extension[], TlsError> DecodeEncryptedExtensions(u8[] body) {
+    Cursor c = Cursor.New(body);
+    Extension[] exts = ReadExtensions(c, 0_i64)?;
+    End(c)?;
+    return Result::Ok(exts);
+}
+
+pub u8[] EncodeEncryptedExtensions(Extension[] exts) {
+    Emitter e = Emit.New();
+    WriteExtensions(e, exts);
+    return Wrap(Wire.MsgEncryptedExtensions(), Emit.Bytes(e));
+}
+
+// ---------------------------------------------------------------- Certificate
+
+pub Result<CertificateMsg, TlsError> DecodeCertificate(u8[] body) {
+    Cursor c = Cursor.New(body);
+    u8[] context = Blob(Vec.Read(c, 1_i64, 0_i64, 255_i64))?;
+    Cursor list = Sub(Vec.Open(c, 3_i64, 0_i64, 16777215_i64))?;
+    mut CertificateEntry[] entries = Array.Empty<CertificateEntry>();
+    while !list.IsEnd() {
+        u8[] data = Blob(Vec.Read(list, 3_i64, 1_i64, 16777215_i64))?;
+        Extension[] exts = ReadExtensions(list, 0_i64)?;
+        Array.Append<CertificateEntry>(entries, CertificateEntry { data: data, extensions: exts });
+    }
+    End(c)?;
+    return Result::Ok(CertificateMsg { context: context, entries: entries });
+}
+
+/// Certificate message with no per-entry extensions.
+pub u8[] EncodeCertificate(u8[] context, CertificateEntry[] entries) {
+    Emitter e = Emit.New();
+    Emit.Vec(e, 1_i64, context);
+    i64 mark = Emit.Open(e, 3_i64);
+    i64 n = Array.Len<CertificateEntry>(entries);
+    mut i64 i = 0_i64;
+    while i < n {
+        CertificateEntry x = entries[i];
+        Emit.Vec(e, 3_i64, x.data);
+        WriteExtensions(e, x.extensions);
+        i = i + 1_i64;
+    }
+    Emit.Close(e, mark, 3_i64);
+    return Wrap(Wire.MsgCertificate(), Emit.Bytes(e));
+}
+
+// ---------------------------------------------------------------- CertificateVerify
+
+pub Result<CertificateVerifyMsg, TlsError> DecodeCertificateVerify(u8[] body) {
+    Cursor c = Cursor.New(body);
+    i64 scheme = Int(c.U16())?;
+    u8[] signature = Blob(Vec.Read(c, 2_i64, 0_i64, 65535_i64))?;
+    End(c)?;
+    return Result::Ok(CertificateVerifyMsg { scheme: scheme, signature: signature });
+}
+
+pub u8[] EncodeCertificateVerify(i64 scheme, u8[] signature) {
+    Emitter e = Emit.New();
+    Emit.U16(e, scheme);
+    Emit.Vec(e, 2_i64, signature);
+    return Wrap(Wire.MsgCertificateVerify(), Emit.Bytes(e));
+}
+
+/// The signed content: 64 spaces, the context string, a zero byte, then the transcript hash.
+pub u8[] SignedContent(bool server, u8[] transcriptHash) {
+    Emitter e = Emit.New();
+    mut i64 i = 0_i64;
+    while i < 64_i64 { Emit.U8(e, 32_i64); i = i + 1_i64; }
+    if server { Emit.Text(e, "TLS 1.3, server CertificateVerify"); } else { Emit.Text(e, "TLS 1.3, client CertificateVerify"); }
+    Emit.U8(e, 0_i64);
+    Emit.Raw(e, transcriptHash);
+    return Emit.Bytes(e);
+}
+
+// ---------------------------------------------------------------- CertificateRequest
+
+pub Result<CertificateRequestMsg, TlsError> DecodeCertificateRequest(u8[] body) {
+    Cursor c = Cursor.New(body);
+    u8[] context = Blob(Vec.Read(c, 1_i64, 0_i64, 255_i64))?;
+    Extension[] exts = ReadExtensions(c, 2_i64)?;
+    End(c)?;
+    if !Has(exts, Wire.ExtSignatureAlgorithms()) { return Result::Error(TlsErrors.Fatal(Alert.MissingExtension())); }
+    return Result::Ok(CertificateRequestMsg { context: context, extensions: exts });
+}
+
+// ---------------------------------------------------------------- Finished / KeyUpdate / NST
+
+pub u8[] EncodeFinished(u8[] verifyData) { return Wrap(Wire.MsgFinished(), verifyData); }
+
+pub u8[] EncodeKeyUpdate(bool requested) {
+    mut i64 v = 0_i64;
+    if requested { v = 1_i64; }
+    return Wrap(Wire.MsgKeyUpdate(), [u8(v)]);
+}
+
+/// 0 (update_not_requested) or 1 (update_requested); other values are illegal_parameter.
+pub Result<i64, TlsError> DecodeKeyUpdate(u8[] body) {
+    if Slice.Len(body) != 1_i64 { return Result::Error(Decode()); }
+    i64 v = i64(body[0]);
+    if v > 1_i64 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+    return Result::Ok(v);
+}
+
+pub Result<NewSessionTicketMsg, TlsError> DecodeNewSessionTicket(u8[] body) {
+    Cursor c = Cursor.New(body);
+    i64 lifetime = Int(c.U32())?;
+    i64 ageAdd = Int(c.U32())?;
+    u8[] nonce = Blob(Vec.Read(c, 1_i64, 0_i64, 255_i64))?;
+    u8[] ticket = Blob(Vec.Read(c, 2_i64, 1_i64, 65535_i64))?;
+    Extension[] exts = ReadExtensions(c, 0_i64)?;
+    End(c)?;
+    if lifetime > 604800_i64 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+    return Result::Ok(NewSessionTicketMsg { lifetime: lifetime, ageAdd: ageAdd, nonce: nonce, ticket: ticket, extensions: exts });
+}
+
+// ---------------------------------------------------------------- extension bodies
+
+/// supported_versions in ClientHello: `ProtocolVersion versions<2..254>`.
+pub Result<i64[], TlsError> ClientVersions(u8[] data) {
+    Cursor c = Cursor.New(data);
+    Cursor list = Sub(Vec.Open(c, 1_i64, 2_i64, 254_i64))?;
+    if list.Remaining() % 2_i64 != 0_i64 { return Result::Error(Decode()); }
+    mut i64[] out = Array.Empty<i64>();
+    while !list.IsEnd() { Array.Append<i64>(out, Int(list.U16())?); }
+    End(c)?;
+    return Result::Ok(out);
+}
+
+/// supported_versions in ServerHello / HelloRetryRequest: one ProtocolVersion.
+pub Result<i64, TlsError> ServerVersion(u8[] data) {
+    Cursor c = Cursor.New(data);
+    i64 v = Int(c.U16())?;
+    End(c)?;
+    return Result::Ok(v);
+}
+
+pub u8[] EncodeClientVersions() { return [2_u8, 3_u8, 4_u8]; }
+pub u8[] EncodeServerVersion() { return [3_u8, 4_u8]; }
+
+/// A list of uint16 values with a 2-byte length (supported_groups, signature_algorithms).
+pub Result<i64[], TlsError> U16List(u8[] data, i64 min) {
+    Cursor c = Cursor.New(data);
+    Cursor list = Sub(Vec.Open(c, 2_i64, min, 65534_i64))?;
+    if list.Remaining() % 2_i64 != 0_i64 { return Result::Error(Decode()); }
+    mut i64[] out = Array.Empty<i64>();
+    while !list.IsEnd() { Array.Append<i64>(out, Int(list.U16())?); }
+    End(c)?;
+    return Result::Ok(out);
+}
+
+pub u8[] EncodeU16List(i64[] values) {
+    Emitter e = Emit.New();
+    i64 mark = Emit.Open(e, 2_i64);
+    i64 n = Array.Len<i64>(values);
+    mut i64 i = 0_i64;
+    while i < n { Emit.U16(e, values[i]); i = i + 1_i64; }
+    Emit.Close(e, mark, 2_i64);
+    return Emit.Bytes(e);
+}
+
+/// key_share in ClientHello: `KeyShareEntry client_shares<0..2^16-1>`.
+pub Result<KeyShareEntry[], TlsError> ClientShares(u8[] data) {
+    Cursor c = Cursor.New(data);
+    Cursor list = Sub(Vec.Open(c, 2_i64, 0_i64, 65535_i64))?;
+    mut KeyShareEntry[] out = Array.Empty<KeyShareEntry>();
+    while !list.IsEnd() {
+        i64 group = Int(list.U16())?;
+        u8[] key = Blob(Vec.Read(list, 2_i64, 1_i64, 65535_i64))?;
+        Array.Append<KeyShareEntry>(out, KeyShareEntry { group: group, keyExchange: key });
+    }
+    End(c)?;
+    return Result::Ok(out);
+}
+
+/// key_share in ServerHello: one KeyShareEntry.
+pub Result<KeyShareEntry, TlsError> ServerShare(u8[] data) {
+    Cursor c = Cursor.New(data);
+    i64 group = Int(c.U16())?;
+    u8[] key = Blob(Vec.Read(c, 2_i64, 1_i64, 65535_i64))?;
+    End(c)?;
+    return Result::Ok(KeyShareEntry { group: group, keyExchange: key });
+}
+
+/// key_share in HelloRetryRequest: the selected NamedGroup.
+pub Result<i64, TlsError> RetryGroup(u8[] data) {
+    Cursor c = Cursor.New(data);
+    i64 group = Int(c.U16())?;
+    End(c)?;
+    return Result::Ok(group);
+}
+
+pub u8[] EncodeClientShares(KeyShareEntry[] shares) {
+    Emitter e = Emit.New();
+    i64 mark = Emit.Open(e, 2_i64);
+    i64 n = Array.Len<KeyShareEntry>(shares);
+    mut i64 i = 0_i64;
+    while i < n {
+        KeyShareEntry s = shares[i];
+        Emit.U16(e, s.group);
+        Emit.Vec(e, 2_i64, s.keyExchange);
+        i = i + 1_i64;
+    }
+    Emit.Close(e, mark, 2_i64);
+    return Emit.Bytes(e);
+}
+
+pub u8[] EncodeServerShare(i64 group, u8[] key) {
+    Emitter e = Emit.New();
+    Emit.U16(e, group);
+    Emit.Vec(e, 2_i64, key);
+    return Emit.Bytes(e);
+}
+
+pub u8[] EncodeRetryGroup(i64 group) {
+    Emitter e = Emit.New();
+    Emit.U16(e, group);
+    return Emit.Bytes(e);
+}
+
+/// server_name (RFC 6066 section 3): the host_name entry, or "" when there is none.
+/// Empty names, embedded NUL bytes and a trailing dot are decode_error / illegal_parameter.
+pub Result<string, TlsError> ServerName(u8[] data) {
+    Cursor c = Cursor.New(data);
+    Cursor list = Sub(Vec.Open(c, 2_i64, 1_i64, 65535_i64))?;
+    mut string found = "";
+    mut bool seen = false;
+    while !list.IsEnd() {
+        i64 kind = Int(list.U8())?;
+        u8[] name = Blob(Vec.Read(list, 2_i64, 1_i64, 65535_i64))?;
+        if kind == 0_i64 {
+            if seen { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+            seen = true;
+            i64 n = Slice.Len(name);
+            mut i64 i = 0_i64;
+            while i < n {
+                u8 b = name[i];
+                if b == 0_u8 || b > 126_u8 || b < 33_u8 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+                i = i + 1_i64;
+            }
+            if name[n - 1_i64] == 46_u8 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+            found = String.FromUtf8CodeUnits(name);
+        }
+    }
+    End(c)?;
+    return Result::Ok(found);
+}
+
+pub u8[] EncodeServerName(string name) {
+    Emitter e = Emit.New();
+    i64 mark = Emit.Open(e, 2_i64);
+    Emit.U8(e, 0_i64);
+    Emit.Vec(e, 2_i64, Emit.TextBytes(name));
+    Emit.Close(e, mark, 2_i64);
+    return Emit.Bytes(e);
+}
+
+/// ALPN (RFC 7301): `ProtocolName protocol_name_list<2..2^16-1>`, names 1..255 bytes.
+pub Result<string[], TlsError> AlpnList(u8[] data) {
+    Cursor c = Cursor.New(data);
+    Cursor list = Sub(Vec.Open(c, 2_i64, 2_i64, 65535_i64))?;
+    mut string[] out = Array.Empty<string>();
+    while !list.IsEnd() {
+        u8[] name = Blob(Vec.Read(list, 1_i64, 1_i64, 255_i64))?;
+        Array.Append<string>(out, String.FromUtf8CodeUnits(name));
+    }
+    End(c)?;
+    return Result::Ok(out);
+}
+
+pub u8[] EncodeAlpn(string[] names) {
+    Emitter e = Emit.New();
+    i64 mark = Emit.Open(e, 2_i64);
+    i64 n = Array.Len<string>(names);
+    mut i64 i = 0_i64;
+    while i < n { Emit.Vec(e, 1_i64, Emit.TextBytes(names[i])); i = i + 1_i64; }
+    Emit.Close(e, mark, 2_i64);
+    return Emit.Bytes(e);
+}
+
+/// psk_key_exchange_modes: `PskKeyExchangeMode ke_modes<1..255>`.
+pub Result<u8[], TlsError> PskModes(u8[] data) {
+    Cursor c = Cursor.New(data);
+    u8[] modes = Blob(Vec.Read(c, 1_i64, 1_i64, 255_i64))?;
+    End(c)?;
+    return Result::Ok(modes);
+}
+
+/// cookie: `opaque cookie<1..2^16-1>`.
+pub Result<u8[], TlsError> Cookie(u8[] data) {
+    Cursor c = Cursor.New(data);
+    u8[] cookie = Blob(Vec.Read(c, 2_i64, 1_i64, 65535_i64))?;
+    End(c)?;
+    return Result::Ok(cookie);
+}
+
+pub u8[] EncodeCookie(u8[] cookie) {
+    Emitter e = Emit.New();
+    Emit.Vec(e, 2_i64, cookie);
+    return Emit.Bytes(e);
+}

@@ -1,0 +1,200 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Codec.Hex;
+use Testing.Assert;
+use Tls.Handshake;
+use Tls.Messages;
+use Tls.PeerKeys;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.Wire;
+
+// In-memory engine tests: two sans-I/O engines connected directly (the QUIC shape, RFC 9001),
+// plus malformed and out-of-order handshake rejection.
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+unit Expect(i64 actual, i64 expected, string what) {
+    if actual != expected { Assert.Fail(what + ": got " + Dec(actual) + ", want " + Dec(expected)); }
+    return;
+}
+
+i64 Code(Result<unit, TlsError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => TlsErrors.Code(e), }; }
+
+TlsServerConfig ServerConfig() {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    return TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key);
+}
+
+// Moves every queued event of `from` into `to`. Returns the first Feed failure code (0 when
+// none). `seen` counts [0] secrets per level bitmask, [1] connected events.
+i64 Transfer(HandshakeEngine from, HandshakeEngine to, i64[] seen) {
+    while Handshake.HasEvent(from) {
+        TlsEvent ev = Handshake.TakeEvent(from);
+        match ev {
+            TlsEvent::Send(level, data) => {
+                i64 c = Code(Handshake.Feed(to, level, data, 0_i64, Slice.Len(data)));
+                if c != 0_i64 { return c; }
+            },
+            TlsEvent::ReadSecret(level, _) => { seen[0] = seen[0] | (1_i64 << level); },
+            TlsEvent::WriteSecret(level, _) => { seen[0] = seen[0] | (1_i64 << (level + 8_i64)); },
+            TlsEvent::Connected => { seen[1] = seen[1] + 1_i64; },
+        };
+    }
+    return 0_i64;
+}
+
+// Runs the handshake to completion; returns 0 or the first failure code.
+i64 Converse(HandshakeEngine client, HandshakeEngine server, i64[] seen) {
+    i64 started = Code(Handshake.Start(client));
+    if started != 0_i64 { return started; }
+    mut i64 rounds = 0_i64;
+    while rounds < 6_i64 {
+        i64 a = Transfer(client, server, seen);
+        if a != 0_i64 { return a; }
+        i64 b = Transfer(server, client, seen);
+        if b != 0_i64 { return b; }
+        rounds = rounds + 1_i64;
+    }
+    return 0_i64;
+}
+
+unit QuicHandshake() {
+    TlsClientConfig c = TlsConfig.Client("localhost", TlsConfig.AcceptAnyCertificateForTestsOnly());
+    c.quic = true;
+    c.quicTransportParameters = Hex.Of("0104000075300304000005dc");
+    c.alpn = ["h3"];
+    c.alpnRequired = true;
+    TlsServerConfig s = ServerConfig();
+    s.quic = true;
+    s.quicTransportParameters = Hex.Of("0104000061a8");
+    s.alpn = ["h3"];
+    match Handshake.NewClient(c) {
+        Result::Error(_) => { Assert.Fail("client engine"); },
+        Result::Ok(client) => {
+            match Handshake.NewServer(s) {
+                Result::Error(_) => { Assert.Fail("server engine"); },
+                Result::Ok(server) => {
+                    i64[] seen = [0_i64, 0_i64];
+                    Expect(Converse(client, server, seen), 0_i64, "QUIC-mode handshake");
+                    Expect(seen[1], 2_i64, "both sides connected");
+                    // Read and write secrets for the handshake (2) and application (3) levels.
+                    Expect(seen[0], (12_i64 << 8_i64) | 12_i64, "secrets per level");
+                    Assert.True(Handshake.NegotiatedAlpn(client) == "h3", "client ALPN h3");
+                    Assert.True(Handshake.NegotiatedAlpn(server) == "h3", "server ALPN h3");
+                    Assert.True(Slice.Compare(Handshake.PeerTransportParameters(client), Hex.Of("0104000061a8")) == 0_i64, "server transport parameters reach the client");
+                    Assert.True(Slice.Compare(Handshake.PeerTransportParameters(server), Hex.Of("0104000075300304000005dc")) == 0_i64, "client transport parameters reach the server");
+                    Result<u8[], TlsError> ce = Handshake.ExportKeyingMaterial(client, "EXPERIMENTAL test", Hex.Of("01"), 32_i64);
+                    Result<u8[], TlsError> se = Handshake.ExportKeyingMaterial(server, "EXPERIMENTAL test", Hex.Of("01"), 32_i64);
+                    u8[] a = match ce { Result::Ok(v) => v, Result::Error(_) => Slice.New(1_i64), };
+                    u8[] b = match se { Result::Ok(v) => v, Result::Error(_) => Slice.New(2_i64), };
+                    Assert.True(Slice.Len(a) == 32_i64 && Slice.Compare(a, b) == 0_i64, "exporters agree");
+                    Expect(Code(Handshake.RequestKeyUpdate(client, false)), 1080_i64, "no TLS KeyUpdate in QUIC");
+                    u8[] ku = Messages.EncodeKeyUpdate(false);
+                    Expect(Code(Handshake.Feed(server, 3_i64, ku, 0_i64, Slice.Len(ku))), 1010_i64, "KeyUpdate message in QUIC is unexpected_message");
+                },
+            };
+        },
+    };
+    return;
+}
+
+// Feeds `message` (a full handshake message) to a fresh server; returns the code.
+i64 ServerGets(u8[] message) {
+    match Handshake.NewServer(ServerConfig()) {
+        Result::Error(_) => { return -1_i64; },
+        Result::Ok(server) => { return Code(Handshake.Feed(server, 0_i64, message, 0_i64, Slice.Len(message))); },
+    };
+}
+
+Extension[] Without(Extension[] list, i64 kind) {
+    mut Extension[] out = Array.Empty<Extension>();
+    i64 n = Array.Len<Extension>(list);
+    mut i64 i = 0_i64;
+    while i < n {
+        Extension x = list[i];
+        if x.kind != kind { Array.Append<Extension>(out, x); }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+u8[] RewriteHello(u8[] hello, i64 dropKind, i64 suite) {
+    match Messages.DecodeClientHello(Slice.SubSlice(hello, 4_i64, Slice.Len(hello) - 4_i64)) {
+        Result::Error(_) => { return Slice.New(0_i64); },
+        Result::Ok(ch) => {
+            ch.extensions = Without(ch.extensions, dropKind);
+            if suite > 0_i64 {
+                mut i64[] only = Array.Empty<i64>();
+                Array.Append<i64>(only, suite);
+                ch.cipherSuites = only;
+            }
+            return Messages.EncodeClientHello(ch);
+        },
+    };
+}
+
+unit Rejections() {
+    TlsClientConfig c = TlsConfig.Client("localhost", TlsConfig.AcceptAnyCertificateForTestsOnly());
+    match Handshake.NewClient(c) {
+        Result::Error(_) => { Assert.Fail("client"); },
+        Result::Ok(client) => {
+            Expect(Code(Handshake.Start(client)), 0_i64, "start");
+            TlsEvent ev = Handshake.TakeEvent(client);
+            u8[] hello = match ev { TlsEvent::Send(_, d) => d, _ => Slice.New(0_i64), };
+            Expect(ServerGets(RewriteHello(hello, Wire.ExtSupportedVersions(), 0_i64)), 1070_i64, "no supported_versions: protocol_version");
+            Expect(ServerGets(RewriteHello(hello, Wire.ExtSignatureAlgorithms(), 0_i64)), 1109_i64, "no signature_algorithms: missing_extension");
+            Expect(ServerGets(RewriteHello(hello, Wire.ExtKeyShare(), 0_i64)), 1109_i64, "supported_groups without key_share: missing_extension");
+            Expect(ServerGets(RewriteHello(hello, 9999_i64, 0x1304_i64)), 1040_i64, "no common cipher suite: handshake_failure");
+            Expect(ServerGets(Slice.SubSlice(hello, 0_i64, 40_i64)), 0_i64, "partial message is buffered");
+            u8[] fin = Messages.EncodeFinished(Slice.New(32_i64));
+            Expect(ServerGets(fin), 1010_i64, "Finished before ClientHello: unexpected_message");
+            // A TLS 1.2 ServerHello carrying the downgrade sentinel.
+            u8[] random = Hex.Of("000102030405060708090a0b0c0d0e0f1011121314151617444f574e47524401");
+            mut Extension[] none = Array.Empty<Extension>();
+            Messages.ServerHello sh = Messages.ServerHello { legacyVersion: 0x0303_i64, random: random, sessionId: Slice.New(0_i64), cipherSuite: 0x1301_i64, compressionMethod: 0_i64, extensions: none };
+            u8[] shBytes = Messages.EncodeServerHello(sh);
+            Expect(Code(Handshake.Feed(client, 0_i64, shBytes, 0_i64, Slice.Len(shBytes))), 1047_i64, "downgrade sentinel: illegal_parameter");
+        },
+    };
+    match Handshake.NewClient(c) {
+        Result::Error(_) => { Assert.Fail("client 2"); },
+        Result::Ok(client) => {
+            Handshake.Start(client);
+            u8[] ee = Messages.EncodeEncryptedExtensions(Array.Empty<Extension>());
+            Expect(Code(Handshake.Feed(client, 0_i64, ee, 0_i64, Slice.Len(ee))), 1010_i64, "EncryptedExtensions before ServerHello: unexpected_message");
+        },
+    };
+    TlsClientConfig noName = TlsConfig.Client("", TlsConfig.AcceptAnyCertificateForTestsOnly());
+    Result<HandshakeEngine, TlsError> bad = Handshake.NewClient(noName);
+    Expect(match bad { Result::Error(e) => TlsErrors.Code(e), Result::Ok(_) => 0_i64, }, 5001_i64, "server name is required");
+    return;
+}
+
+// One test function: each test recompiles the whole engine under the 0.5.2 JIT.
+test engine_quic_handshake_and_message_rejection {
+    QuicHandshake();
+    Rejections();
+}
+
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}

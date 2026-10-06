@@ -1,0 +1,1466 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Crypto.Entropy;
+use Quic.QuicConfig;
+use Quic.QuicCongestion;
+use Quic.QuicErrors;
+use Quic.QuicFrame;
+use Quic.QuicHandshake;
+use Quic.QuicPacket;
+use Quic.QuicProtection;
+use Quic.QuicRanges;
+use Quic.QuicRecovery;
+use Quic.QuicStream;
+use Quic.QuicTransportParams;
+use Quic.QuicWire;
+
+// A sans-I/O QUIC connection (RFC 9000): datagrams in, datagrams out, timers driven by the
+// caller with monotonic nanoseconds. Packet number spaces: 0 Initial, 1 Handshake,
+// 2 Application. 0-RTT is not offered and 0-RTT packets are dropped (rejected).
+
+// Connection states.
+pub i64 StateHandshaking() { return 0_i64; }
+pub i64 StateEstablished() { return 1_i64; }
+pub i64 StateClosing() { return 2_i64; }
+pub i64 StateDraining() { return 3_i64; }
+pub i64 StateClosed() { return 4_i64; }
+
+/// Datagram size used for every packet (no path MTU discovery).
+pub i64 DatagramSize() { return 1200_i64; }
+
+// n indices.
+i64 NState() { return 0_i64; }
+i64 NConfirmed() { return 1_i64; }
+i64 NKeyPhase() { return 2_i64; }
+i64 NNextPn() { return 4_i64; }          // + space
+i64 NLargestRecv() { return 7_i64; }     // + space
+i64 NAckEliciting() { return 10_i64; }   // + space
+i64 NAckDue() { return 13_i64; }
+i64 NBytesReceived() { return 14_i64; }
+i64 NBytesSent() { return 15_i64; }
+i64 NValidated() { return 16_i64; }
+i64 NIdleTimeout() { return 17_i64; }
+i64 NIdleDeadline() { return 18_i64; }
+i64 NCloseDeadline() { return 19_i64; }
+i64 NCloseCode() { return 20_i64; }
+i64 NCloseIsApp() { return 21_i64; }
+i64 NCloseFrameType() { return 22_i64; }
+i64 NPeerCloseCode() { return 23_i64; }
+i64 NPeerCloseIsApp() { return 24_i64; }
+i64 NClosePending() { return 25_i64; }
+i64 NCloseReason() { return 26_i64; }   // 0 none, 1 local close, 2 peer close, 3 idle, 4 version negotiation, 5 local error
+i64 NConnMaxData() { return 27_i64; }
+i64 NConnSent() { return 28_i64; }
+i64 NConnMaxAdv() { return 29_i64; }
+i64 NConnRecvHighest() { return 30_i64; }
+i64 NConnConsumed() { return 31_i64; }
+i64 NMaxDataPending() { return 32_i64; }
+i64 NPeerMaxStreams() { return 33_i64; } // + 0 bidi, + 1 uni (what we may open)
+i64 NOpened() { return 35_i64; }         // + 0 bidi, + 1 uni (local streams opened)
+i64 NLocalMaxStreams() { return 37_i64; }// + 0 bidi, + 1 uni (limit advertised to the peer)
+i64 NPeerOpened() { return 39_i64; }     // + 0 bidi, + 1 uni (peer streams opened)
+i64 NMaxStreamsPending() { return 41_i64; }
+i64 NHandshakeDonePending() { return 42_i64; }
+i64 NProbes() { return 43_i64; }         // + space
+i64 NRetried() { return 46_i64; }
+i64 NParamsApplied() { return 47_i64; }
+i64 NPeerAckExponent() { return 48_i64; }
+i64 NPathResponsePending() { return 50_i64; }
+i64 NAlert() { return 51_i64; }
+i64 NKeys() { return 52_i64; }
+i64 NRoundRobin() { return 53_i64; }
+i64 NFirstPhasePn() { return 54_i64; }
+i64 NKeyUpdates() { return 55_i64; }
+i64 NLastCloseSent() { return 56_i64; }
+i64 NAckNew() { return 57_i64; }         // + space
+i64 NLargestRecvTime() { return 60_i64; }
+i64 NReceivedAny() { return 61_i64; }
+i64 NPeerKeyUpdates() { return 62_i64; }
+i64 NAccepted() { return 63_i64; }
+// Pending (built, not yet sealed) packet descriptor.
+i64 PSpace() { return 64_i64; }
+i64 PStart() { return 65_i64; }
+i64 PPnOffset() { return 66_i64; }
+i64 PPnLength() { return 67_i64; }
+i64 PPn() { return 68_i64; }
+i64 PLengthAt() { return 69_i64; }
+i64 PEliciting() { return 70_i64; }
+i64 PFlags() { return 71_i64; }
+i64 PItems() { return 72_i64; }          // count; items follow at 73 (4 x 4)
+i64 NCount() { return 90_i64; }
+
+// Key slots.
+i64 KeyTx(i64 space) { return space * 2_i64; }
+i64 KeyRx(i64 space) { return space * 2_i64 + 1_i64; }
+i64 KeyRxNext() { return 6_i64; }
+
+pub type Connection {
+    pub bool isServer,
+    i64[] n,
+    pub u8[] scid,
+    pub u8[] dcid,
+    u8[] odcid,
+    u8[] retryScid,
+    u8[] token,
+    u8[] pathData,
+    PacketKeys[] keys,
+    Stream[] crypto,
+    Stream[] streams,
+    i64[] recvInitial,
+    i64[] recvHandshake,
+    i64[] recvApplication,
+    pub Recovery rec,
+    CryptoHandshake hs,
+    TransportParams local,
+    TransportParams[] peer,
+    QuicConfig config,
+    /// The datagram being built; valid for the length returned by BuildDatagram.
+    pub u8[] out,
+    u8[] scratch,
+}
+
+// ------------------------------------------------------------ construction
+
+u8[] RandomCid() {
+    return match Entropy.Bytes(8_i64) { Result::Ok(b) => b, Result::Error(_) => Slice.New(8_i64), };
+}
+
+i64[] Zeros(i64 count) {
+    mut i64[] a = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while i < count { Array.Append<i64>(a, 0_i64); i = i + 1_i64; }
+    return a;
+}
+
+Stream[] PlaceholderStreams() {
+    mut Stream[] list = Array.Empty<Stream>();
+    mut i64 i = 0_i64;
+    while i < QuicConfig.MaxStreamSlots() {
+        Stream s = QuicStream.New(-1_i64, 0_i64, 0_i64, 0_i64);
+        QuicStream.MarkClosed(s);
+        Array.Append<Stream>(list, s);
+        i = i + 1_i64;
+    }
+    return list;
+}
+
+PacketKeys[] KeySlots(PacketKeys k) {
+    mut PacketKeys[] list = Array.Empty<PacketKeys>();
+    mut i64 i = 0_i64;
+    while i < 7_i64 { Array.Append<PacketKeys>(list, k); i = i + 1_i64; }
+    return list;
+}
+
+TransportParams LocalParams(QuicConfig cfg, u8[] scid, bool isServer, u8[] odcid, u8[] retryScid) {
+    TransportParams p = QuicTransportParams.Empty();
+    QuicTransportParams.Set(p, QuicTransportParams.MaxIdleTimeout(), cfg.idleTimeoutMs);
+    QuicTransportParams.Set(p, QuicTransportParams.MaxUdpPayloadSize(), 1472_i64);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxData(), cfg.maxData);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxStreamDataBidiLocal(), cfg.streamBuffer);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxStreamDataBidiRemote(), cfg.streamBuffer);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxStreamDataUni(), cfg.streamBuffer);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxStreamsBidi(), cfg.maxStreamsBidi);
+    QuicTransportParams.Set(p, QuicTransportParams.InitialMaxStreamsUni(), cfg.maxStreamsUni);
+    QuicTransportParams.Set(p, QuicTransportParams.DisableActiveMigration(), 1_i64);
+    QuicTransportParams.SetBytes(p, QuicTransportParams.InitialScid(), scid);
+    if isServer {
+        QuicTransportParams.SetBytes(p, QuicTransportParams.OriginalDcid(), odcid);
+        if Slice.Len(retryScid) > 0_i64 { QuicTransportParams.SetBytes(p, QuicTransportParams.RetryScid(), retryScid); }
+    }
+    return p;
+}
+
+CryptoHandshake MakeHandshake(QuicConfig cfg, bool isServer, u8[] params) {
+    HandshakeKind kind = cfg.handshake;
+    return match kind {
+        HandshakeKind::InsecureLoopback(suite) => MakeLoopback(cfg, isServer, params, suite),
+        HandshakeKind::TlsClient(tc) => QuicHandshake.TlsClient(tc, cfg.alpn, params),
+        HandshakeKind::TlsServer(ts) => QuicHandshake.TlsServer(ts, cfg.alpn, params),
+    };
+}
+
+CryptoHandshake MakeLoopback(QuicConfig cfg, bool isServer, u8[] params, i64 suite) {
+    if isServer { return QuicHandshake.InsecureLoopbackServer(cfg.alpn, params, suite); }
+    return QuicHandshake.InsecureLoopbackClient(cfg.alpn, params, suite);
+}
+
+Connection Make(QuicConfig cfg, bool isServer, u8[] scid, u8[] dcid, u8[] odcid, u8[] retryScid, InitialKeys initial) {
+    i64[] n = Zeros(NCount());
+    mut i64 s = 0_i64;
+    while s < 3_i64 { n[NLargestRecv() + s] = -1_i64; s = s + 1_i64; }
+    n[NAckDue()] = -1_i64;
+    n[NIdleDeadline()] = -1_i64;
+    n[NCloseDeadline()] = -1_i64;
+    n[NConnMaxAdv()] = cfg.maxData;
+    n[NLocalMaxStreams()] = cfg.maxStreamsBidi;
+    n[NLocalMaxStreams() + 1_i64] = cfg.maxStreamsUni;
+    n[NPeerAckExponent()] = 3_i64;
+    n[NFirstPhasePn()] = 0_i64;
+    n[NIdleTimeout()] = cfg.idleTimeoutMs * 1000000_i64;
+    TransportParams local = LocalParams(cfg, scid, isServer, odcid, retryScid);
+    mut TransportParams[] peer = Array.Empty<TransportParams>();
+    Array.Append<TransportParams>(peer, QuicTransportParams.Empty());
+    mut Stream[] crypto = Array.Empty<Stream>();
+    Array.Append<Stream>(crypto, QuicStream.New(-1_i64, 4096_i64, 4096_i64, 4611686018427387903_i64));
+    Array.Append<Stream>(crypto, QuicStream.New(-2_i64, 16384_i64, 16384_i64, 4611686018427387903_i64));
+    Array.Append<Stream>(crypto, QuicStream.New(-3_i64, 2048_i64, 4096_i64, 4611686018427387903_i64));
+    PacketKeys[] keys = KeySlots(initial.client);
+    if isServer {
+        keys[KeyTx(0_i64)] = initial.server;
+        keys[KeyRx(0_i64)] = initial.client;
+    } else {
+        keys[KeyTx(0_i64)] = initial.client;
+        keys[KeyRx(0_i64)] = initial.server;
+    }
+    n[NKeys()] = 3_i64;
+    return Connection {
+        isServer: isServer, n: n, scid: scid, dcid: dcid, odcid: odcid, retryScid: retryScid,
+        token: Slice.New(0_i64), pathData: Slice.New(8_i64), keys: keys, crypto: crypto,
+        streams: PlaceholderStreams(), recvInitial: QuicRanges.New(16_i64), recvHandshake: QuicRanges.New(16_i64),
+        recvApplication: QuicRanges.New(32_i64), rec: QuicRecovery.New(32_i64, 32_i64, 128_i64, DatagramSize()),
+        hs: MakeHandshake(cfg, isServer, QuicTransportParams.Encode(local)), local: local, peer: peer, config: cfg,
+        out: Slice.New(1500_i64), scratch: Slice.New(2048_i64),
+    };
+}
+
+/// A client connection with random connection IDs; the first flight is queued.
+pub Connection NewClient(QuicConfig cfg, i64 now) {
+    u8[] dcid = RandomCid();
+    Connection c = Make(cfg, false, RandomCid(), dcid, dcid, Slice.New(0_i64), QuicProtection.DeriveInitial(dcid));
+    c.n[NIdleDeadline()] = IdleDeadlineFrom(c, now);
+    i64 alert = QuicHandshake.Start(c.hs);
+    if alert != 0_i64 { CloseWithError(c, QuicErrors.CryptoErrorBase() + alert, 6_i64, now); return c; }
+    ProcessEvents(c, now);
+    return c;
+}
+
+/// A server connection for a client Initial with destination `clientDcid` and source
+/// `clientScid`. `odcid` is the client's original destination connection ID (equal to
+/// `clientDcid` unless a Retry happened, then `retryScid` is the Retry's source ID and the
+/// address counts as validated, and the connection keeps `clientDcid` as its own ID).
+pub Connection NewServer(QuicConfig cfg, u8[] clientDcid, u8[] clientScid, u8[] odcid, u8[] retryScid, i64 now) {
+    mut u8[] local = RandomCid();
+    if Slice.Len(retryScid) > 0_i64 { local = clientDcid; }
+    Connection c = Make(cfg, true, local, clientScid, odcid, retryScid, QuicProtection.DeriveInitial(clientDcid));
+    if Slice.Len(retryScid) > 0_i64 { c.n[NValidated()] = 1_i64; }
+    c.n[NIdleDeadline()] = IdleDeadlineFrom(c, now);
+    i64 alert = QuicHandshake.BrokenAlert(c.hs);
+    if alert != 0_i64 { CloseWithError(c, QuicErrors.CryptoErrorBase() + alert, 6_i64, now); }
+    return c;
+}
+
+// ------------------------------------------------------------ accessors
+
+pub i64 State(Connection c) { return c.n[NState()]; }
+pub bool IsEstablished(Connection c) { return c.n[NState()] == StateEstablished(); }
+pub bool IsHandshakeConfirmed(Connection c) { return c.n[NConfirmed()] == 1_i64; }
+pub bool IsClosed(Connection c) { return c.n[NState()] == StateClosed(); }
+pub bool IsClosingOrClosed(Connection c) { return c.n[NState()] >= StateClosing(); }
+pub string Alpn(Connection c) { return QuicHandshake.Alpn(c.hs); }
+pub i64 KeyUpdates(Connection c) { return c.n[NKeyUpdates()] + c.n[NPeerKeyUpdates()]; }
+pub bool Retried(Connection c) { return c.n[NRetried()] == 1_i64; }
+pub bool AddressValidated(Connection c) { return c.n[NValidated()] == 1_i64; }
+pub i64 BytesSent(Connection c) { return c.n[NBytesSent()]; }
+pub i64 BytesReceived(Connection c) { return c.n[NBytesReceived()]; }
+pub TransportParams PeerParams(Connection c) { return c.peer[0]; }
+pub u8[] OriginalDcid(Connection c) { return c.odcid; }
+pub bool Accepted(Connection c) { return c.n[NAccepted()] == 1_i64; }
+pub unit MarkAccepted(Connection c) { c.n[NAccepted()] = 1_i64; return; }
+
+/// Why the connection ended, as a QuicError (Closed when it is still open or closed cleanly).
+pub QuicError Error(Connection c) {
+    i64 reason = c.n[NCloseReason()];
+    if reason == 2_i64 { return QuicError::PeerClosed(c.n[NPeerCloseCode()], c.n[NPeerCloseIsApp()] == 1_i64); }
+    if reason == 3_i64 { return QuicError::IdleTimeout(); }
+    if reason == 4_i64 { return QuicError::VersionNegotiation(); }
+    if reason == 5_i64 { return QuicError::Transport(c.n[NCloseCode()]); }
+    if reason == 1_i64 && c.n[NCloseIsApp()] == 1_i64 { return QuicError::Application(c.n[NCloseCode()]); }
+    return QuicError::Closed();
+}
+
+bool HasKey(Connection c, i64 slot) { return ((c.n[NKeys()] >> slot) & 1_i64) == 1_i64; }
+unit SetKey(Connection c, i64 slot, PacketKeys k) {
+    c.keys[slot] = k;
+    c.n[NKeys()] = c.n[NKeys()] | (1_i64 << slot);
+    return;
+}
+unit DropKey(Connection c, i64 slot) {
+    c.n[NKeys()] = c.n[NKeys()] - (c.n[NKeys()] & (1_i64 << slot));
+    return;
+}
+
+i64[] RecvRanges(Connection c, i64 space) {
+    if space == 0_i64 { return c.recvInitial; }
+    if space == 1_i64 { return c.recvHandshake; }
+    return c.recvApplication;
+}
+
+i64 SpaceOfLevel(i64 level) {
+    if level == 0_i64 { return 0_i64; }
+    if level == 2_i64 { return 1_i64; }
+    return 2_i64;
+}
+
+i64 LevelOfSpace(i64 space) {
+    if space == 0_i64 { return 0_i64; }
+    if space == 1_i64 { return 2_i64; }
+    return 3_i64;
+}
+
+i64 PtoNanos(Connection c) { return QuicRecovery.PtoPeriod(c.rec, 2_i64); }
+
+i64 IdleDeadlineFrom(Connection c, i64 now) {
+    i64 t = c.n[NIdleTimeout()];
+    if t <= 0_i64 { return -1_i64; }
+    mut i64 floor = 3_i64 * PtoNanos(c);
+    if t > floor { floor = t; }
+    return now + floor;
+}
+
+// ------------------------------------------------------------ closing
+
+unit EnterClosing(Connection c, i64 code, bool app, i64 frameType, i64 reason, i64 now) {
+    if c.n[NState()] >= StateClosing() { return; }
+    c.n[NState()] = StateClosing();
+    c.n[NCloseCode()] = code;
+    c.n[NCloseIsApp()] = 0_i64;
+    if app { c.n[NCloseIsApp()] = 1_i64; }
+    c.n[NCloseFrameType()] = frameType;
+    c.n[NCloseReason()] = reason;
+    c.n[NClosePending()] = 1_i64;
+    c.n[NCloseDeadline()] = now + 3_i64 * PtoNanos(c);
+    return;
+}
+
+/// Closes the connection with an application error code (CONNECTION_CLOSE 0x1d).
+pub unit Close(Connection c, i64 code, i64 now) {
+    EnterClosing(c, code, true, 0_i64, 1_i64, now);
+    return;
+}
+
+/// Closes the connection after a local transport error.
+pub unit CloseWithError(Connection c, i64 code, i64 frameType, i64 now) {
+    EnterClosing(c, code, false, frameType, 5_i64, now);
+    return;
+}
+
+unit EnterDraining(Connection c, i64 code, bool app, i64 now) {
+    if c.n[NState()] >= StateDraining() { return; }
+    if c.n[NState()] != StateClosing() {
+        c.n[NPeerCloseCode()] = code;
+        c.n[NPeerCloseIsApp()] = 0_i64;
+        if app { c.n[NPeerCloseIsApp()] = 1_i64; }
+        c.n[NCloseReason()] = 2_i64;
+    }
+    c.n[NState()] = StateDraining();
+    c.n[NClosePending()] = 0_i64;
+    c.n[NCloseDeadline()] = now + 3_i64 * PtoNanos(c);
+    return;
+}
+
+/// Ends the connection immediately without sending anything (endpoint shutdown).
+pub unit Abandon(Connection c) {
+    c.n[NState()] = StateClosed();
+    if c.n[NCloseReason()] == 0_i64 { c.n[NCloseReason()] = 1_i64; }
+    return;
+}
+
+// ------------------------------------------------------------ handshake events
+
+unit ProcessEvents(Connection c, i64 now) {
+    while QuicHandshake.HasEvent(c.hs) {
+        HandshakeEvent ev = QuicHandshake.TakeEvent(c.hs);
+        match ev {
+            HandshakeEvent::Send(level, data) => { QueueCrypto(c, level, data, now); },
+            HandshakeEvent::ReadSecret(level, secret) => { InstallSecret(c, level, secret, false); },
+            HandshakeEvent::WriteSecret(level, secret) => { InstallSecret(c, level, secret, true); },
+            HandshakeEvent::Connected() => { OnHandshakeComplete(c, now); },
+        };
+    }
+    if c.n[NParamsApplied()] == 0_i64 && Slice.Len(QuicHandshake.PeerTransportParameters(c.hs)) > 0_i64 {
+        i64 code = ApplyPeerParams(c);
+        if code != 0_i64 { CloseWithError(c, code, 6_i64, now); }
+    }
+    return;
+}
+
+unit QueueCrypto(Connection c, i64 level, u8[] data, i64 now) {
+    Stream st = c.crypto[SpaceOfLevel(level)];
+    i64 n = Slice.Len(data);
+    if QuicStream.Write(st, data, 0_i64, n) != n { CloseWithError(c, QuicErrors.InternalError(), 6_i64, now); }
+    return;
+}
+
+unit InstallSecret(Connection c, i64 level, u8[] secret, bool write) {
+    if level == 1_i64 { return; }
+    i64 space = SpaceOfLevel(level);
+    PacketKeys k = QuicProtection.DeriveKeys(QuicHandshake.Suite(c.hs), secret);
+    if write { SetKey(c, KeyTx(space), k); } else { SetKey(c, KeyRx(space), k); }
+    return;
+}
+
+unit OnHandshakeComplete(Connection c, i64 now) {
+    if c.n[NState()] == StateHandshaking() { c.n[NState()] = StateEstablished(); }
+    if c.isServer {
+        c.n[NConfirmed()] = 1_i64;
+        c.n[NHandshakeDonePending()] = 1_i64;
+        DiscardSpace(c, 1_i64);
+    }
+    return;
+}
+
+unit DiscardSpace(Connection c, i64 space) {
+    if QuicRecovery.IsDiscarded(c.rec, space) { return; }
+    QuicRecovery.DiscardSpace(c.rec, space);
+    DropKey(c, KeyTx(space));
+    DropKey(c, KeyRx(space));
+    c.n[NAckEliciting() + space] = 0_i64;
+    c.n[NAckNew() + space] = 0_i64;
+    c.n[NProbes() + space] = 0_i64;
+    return;
+}
+
+i64 ApplyPeerParams(Connection c) {
+    u8[] raw = QuicHandshake.PeerTransportParameters(c.hs);
+    Result<TransportParams, QuicError> decoded = QuicTransportParams.Decode(raw, !c.isServer);
+    return ApplyDecoded(c, decoded);
+}
+
+i64 ApplyDecoded(Connection c, Result<TransportParams, QuicError> decoded) {
+    return match decoded {
+        Result::Error(e) => QuicErrors.WireCode(e),
+        Result::Ok(p) => ApplyParams(c, p),
+    };
+}
+
+i64 ApplyParams(Connection c, TransportParams p) {
+    i64 check = QuicTransportParams.CheckConnectionIds(p, !c.isServer, c.dcid, c.odcid, c.retryScid, c.n[NRetried()] == 1_i64);
+    if check != 0_i64 { return check; }
+    c.peer[0] = p;
+    c.n[NParamsApplied()] = 1_i64;
+    c.n[NConnMaxData()] = QuicTransportParams.Get(p, QuicTransportParams.InitialMaxData());
+    c.n[NPeerMaxStreams()] = QuicTransportParams.Get(p, QuicTransportParams.InitialMaxStreamsBidi());
+    c.n[NPeerMaxStreams() + 1_i64] = QuicTransportParams.Get(p, QuicTransportParams.InitialMaxStreamsUni());
+    c.n[NPeerAckExponent()] = QuicTransportParams.Get(p, QuicTransportParams.AckDelayExponent());
+    QuicRecovery.SetMaxAckDelay(c.rec, QuicTransportParams.Get(p, QuicTransportParams.MaxAckDelay()) * 1000000_i64);
+    i64 peerIdle = QuicTransportParams.Get(p, QuicTransportParams.MaxIdleTimeout()) * 1000000_i64;
+    if peerIdle > 0_i64 && (c.n[NIdleTimeout()] <= 0_i64 || peerIdle < c.n[NIdleTimeout()]) { c.n[NIdleTimeout()] = peerIdle; }
+    return 0_i64;
+}
+
+// ------------------------------------------------------------ receiving
+
+/// Processes one received datagram buf[0..end).
+pub unit OnDatagram(Connection c, u8[] buf, i64 end, i64 now) {
+    if c.n[NState()] == StateClosed() { return; }
+    c.n[NBytesReceived()] = c.n[NBytesReceived()] + end;
+    mut i64 offset = 0_i64;
+    while offset < end {
+        Header h = QuicPacket.ParseHeader(buf, offset, end, Slice.Len(c.scid));
+        if h.error != 0_i64 { return; }
+        i64 next = h.end;
+        ProcessPacket(c, buf, h, now);
+        offset = next;
+    }
+    return;
+}
+
+i64 SpaceOfKind(i64 kind) {
+    if kind == 0_i64 { return 0_i64; }
+    if kind == 2_i64 { return 1_i64; }
+    if kind == 5_i64 { return 2_i64; }
+    return -1_i64;
+}
+
+unit ProcessPacket(Connection c, u8[] buf, Header h, i64 now) {
+    i64 state = c.n[NState()];
+    if state >= StateDraining() { return; }
+    i64 kind = h.kind;
+    if kind == QuicPacket.KindVersionNegotiation() { OnVersionNegotiation(c, buf, h); return; }
+    if kind == QuicPacket.KindRetry() { OnRetry(c, buf, h, now); return; }
+    i64 space = SpaceOfKind(kind);
+    if space < 0_i64 { return; }
+    // Destination check: our CID, or (server, Initial) the client's original choice.
+    bool ours = QuicWire.Equal(h.dcid, c.scid) || (c.isServer && space == 0_i64);
+    if !ours || !HasKey(c, KeyRx(space)) { return; }
+    i64[] info = [0_i64, 0_i64, 0_i64];
+    PacketKeys rx = c.keys[KeyRx(space)];
+    if !QuicProtection.Unmask(rx, buf, h.start, h.pnOffset, h.end, c.n[NLargestRecv() + space], info) { return; }
+    i64 pn = info[0];
+    i64 pnLength = info[1];
+    mut i64 plain = -1_i64;
+    mut bool rotated = false;
+    if space == 2_i64 && info[2] != c.n[NKeyPhase()] {
+        // A key update by the peer (RFC 9001 section 6.2): try the next generation.
+        if !HasKey(c, KeyRxNext()) { SetKey(c, KeyRxNext(), QuicProtection.NextKeys(rx)); }
+        plain = QuicProtection.Open(c.keys[KeyRxNext()], buf, h.start, h.pnOffset, pnLength, pn, h.end);
+        rotated = plain >= 0_i64;
+    } else {
+        plain = QuicProtection.Open(rx, buf, h.start, h.pnOffset, pnLength, pn, h.end);
+    }
+    if plain < 0_i64 { return; }
+    if rotated { OnPeerKeyUpdate(c, now); }
+    if state == StateClosing() {
+        if now - c.n[NLastCloseSent()] > 1000000_i64 { c.n[NClosePending()] = 1_i64; }
+        return;
+    }
+    if !QuicProtection.ReservedBitsClear(buf, h.start) { CloseWithError(c, QuicErrors.ProtocolViolation(), 0_i64, now); return; }
+    i64[] ranges = RecvRanges(c, space);
+    if QuicRanges.Contains(ranges, pn) || (QuicRanges.Count(ranges) > 0_i64 && pn < QuicRanges.Lo(ranges, 0_i64)) { return; }
+    if !c.isServer && space == 0_i64 && c.n[NReceivedAny()] == 0_i64 {
+        // The server chose its connection ID: use it from now on.
+        c.dcid = h.scid;
+    }
+    c.n[NReceivedAny()] = 1_i64;
+    if c.isServer && space == 1_i64 {
+        c.n[NValidated()] = 1_i64;
+        DiscardSpace(c, 0_i64);
+    }
+    i64 payload = h.pnOffset + pnLength;
+    i64 result = ProcessFrames(c, buf, payload, payload + plain, kind, space, now);
+    if result == -100_i64 { return; }
+    QuicRanges.AddEvicting(ranges, pn, pn + 1_i64);
+    if pn > c.n[NLargestRecv() + space] {
+        c.n[NLargestRecv() + space] = pn;
+        if space == 2_i64 { c.n[NLargestRecvTime()] = now; }
+    }
+    c.n[NAckNew() + space] = c.n[NAckNew() + space] + 1_i64;
+    if result == 1_i64 {
+        c.n[NAckEliciting() + space] = c.n[NAckEliciting() + space] + 1_i64;
+        if space == 2_i64 && c.n[NAckDue()] < 0_i64 { c.n[NAckDue()] = now + 20000000_i64; }
+    }
+    if result > 1_i64 { CloseWithError(c, result, 0_i64, now); return; }
+    if c.n[NState()] < StateClosing() { c.n[NIdleDeadline()] = IdleDeadlineFrom(c, now); }
+    return;
+}
+
+unit OnPeerKeyUpdate(Connection c, i64 now) {
+    c.keys[KeyRx(2_i64)] = c.keys[KeyRxNext()];
+    DropKey(c, KeyRxNext());
+    c.n[NKeyPhase()] = 1_i64 - c.n[NKeyPhase()];
+    // Our next packets use the new phase as well.
+    if HasKey(c, KeyTx(2_i64)) {
+        PacketKeys tx = c.keys[KeyTx(2_i64)];
+        c.keys[KeyTx(2_i64)] = QuicProtection.NextKeys(tx);
+    }
+    c.n[NFirstPhasePn()] = c.n[NNextPn() + 2_i64];
+    c.n[NPeerKeyUpdates()] = c.n[NPeerKeyUpdates()] + 1_i64;
+    return;
+}
+
+/// Starts a key update (RFC 9001 section 6.1). Allowed once the handshake is confirmed and a
+/// packet sent with the current keys was acknowledged. Returns false when not allowed now.
+pub bool InitiateKeyUpdate(Connection c) {
+    if c.n[NConfirmed()] == 0_i64 || !HasKey(c, KeyTx(2_i64)) { return false; }
+    if QuicRecovery.LargestAcked(c.rec, 2_i64) < c.n[NFirstPhasePn()] { return false; }
+    PacketKeys tx = c.keys[KeyTx(2_i64)];
+    c.keys[KeyTx(2_i64)] = QuicProtection.NextKeys(tx);
+    PacketKeys rx = c.keys[KeyRx(2_i64)];
+    SetKey(c, KeyRxNext(), QuicProtection.NextKeys(rx));
+    // Receive side switches when the peer answers with the new phase (handled as a peer
+    // update, which must not rotate our send keys again).
+    c.n[NKeyPhase()] = 1_i64 - c.n[NKeyPhase()];
+    c.keys[KeyRx(2_i64)] = c.keys[KeyRxNext()];
+    DropKey(c, KeyRxNext());
+    c.n[NFirstPhasePn()] = c.n[NNextPn() + 2_i64];
+    c.n[NKeyUpdates()] = c.n[NKeyUpdates()] + 1_i64;
+    return true;
+}
+
+unit OnVersionNegotiation(Connection c, u8[] buf, Header h) {
+    if c.isServer || c.n[NReceivedAny()] == 1_i64 || !QuicWire.Equal(h.dcid, c.scid) { return; }
+    i64[] versions = QuicPacket.NegotiationVersions(buf, h);
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(versions) {
+        if versions[i] == 1_i64 { return; }
+        i = i + 1_i64;
+    }
+    c.n[NState()] = StateClosed();
+    c.n[NCloseReason()] = 4_i64;
+    return;
+}
+
+unit OnRetry(Connection c, u8[] buf, Header h, i64 now) {
+    if c.isServer || c.n[NRetried()] == 1_i64 || c.n[NReceivedAny()] == 1_i64 { return; }
+    if !QuicWire.Equal(h.dcid, c.scid) || Slice.Len(h.token) == 0_i64 { return; }
+    if !QuicProtection.RetryValid(c.odcid, buf, h.start, h.end) { return; }
+    c.n[NRetried()] = 1_i64;
+    c.retryScid = h.scid;
+    c.dcid = h.scid;
+    c.token = h.token;
+    InitialKeys keys = QuicProtection.DeriveInitial(h.scid);
+    c.keys[KeyTx(0_i64)] = keys.client;
+    c.keys[KeyRx(0_i64)] = keys.server;
+    // Everything sent in Initial packets is sent again under the new keys.
+    QuicRecovery.MarkAllLost(c.rec, 0_i64);
+    DrainSpace(c, 0_i64);
+    return;
+}
+
+// Returns 0 (only non-eliciting frames), 1 (ack-eliciting), -100 (drop the packet unacknowledged)
+// or a transport error code > 1.
+i64 ProcessFrames(Connection c, u8[] buf, i64 start, i64 end, i64 kind, i64 space, i64 now) {
+    Reader r = QuicWire.NewReader(buf, start, end);
+    mut i64 eliciting = 0_i64;
+    if start >= end { return QuicErrors.ProtocolViolation(); }
+    while !QuicWire.AtEnd(r) {
+        Frame f = QuicFrame.Decode(r);
+        if !QuicWire.Ok(r) { return QuicWire.Error(r); }
+        i64 t = QuicFrame.TypeOf(f);
+        i64 base = t;
+        if !QuicFrame.AllowedIn(base, kind) && !(base >= 8_i64 && base <= 15_i64 && kind == 5_i64) { return QuicErrors.ProtocolViolation(); }
+        if QuicFrame.IsAckEliciting(base) { eliciting = 1_i64; }
+        i64 code = HandleFrame(c, f, buf, space, now);
+        if code != 0_i64 { return code; }
+        if c.n[NState()] >= StateDraining() { return eliciting; }
+    }
+    return eliciting;
+}
+
+i64 HandleFrame(Connection c, Frame f, u8[] buf, i64 space, i64 now) {
+    return match f {
+        Frame::Padding(_) => 0_i64,
+        Frame::Ping() => 0_i64,
+        Frame::Ack(a) => OnAck(c, a, space, now),
+        Frame::ResetStream(id, code, size) => OnResetStream(c, id, code, size),
+        Frame::StopSending(id, code) => OnStopSending(c, id, code),
+        Frame::Crypto(offset, start, length) => OnCrypto(c, space, offset, buf, start, length, now),
+        Frame::NewToken(token) => OnNewToken(c, token),
+        Frame::Stream(id, offset, start, length, fin) => OnStreamData(c, id, offset, buf, start, length, fin),
+        Frame::MaxData(m) => OnMaxData(c, m),
+        Frame::MaxStreamData(id, m) => OnMaxStreamData(c, id, m),
+        Frame::MaxStreams(bidi, m) => OnMaxStreams(c, bidi, m),
+        Frame::DataBlocked(_) => 0_i64,
+        Frame::StreamDataBlocked(id, _) => CheckReceiveStream(c, id),
+        Frame::StreamsBlocked(_, _) => 0_i64,
+        Frame::NewConnectionId(seq, prior, cid, token) => OnNewConnectionId(c, seq, prior, cid),
+        Frame::RetireConnectionId(_) => QuicErrors.ProtocolViolation(),
+        Frame::PathChallenge(data) => OnPathChallenge(c, data),
+        Frame::PathResponse(_) => 0_i64,
+        Frame::ConnectionClose(app, code, _, _) => OnConnectionClose(c, app, code, now),
+        Frame::HandshakeDone() => OnHandshakeDone(c),
+    };
+}
+
+i64 OnAck(Connection c, AckFrame a, i64 space, i64 now) {
+    i64[] ranges = a.ranges;
+    i64 largest = ranges[0];
+    if largest >= c.n[NNextPn() + space] { return QuicErrors.ProtocolViolation(); }
+    mut i64 delay = 0_i64;
+    if space == 2_i64 {
+        i64 exponent = c.n[NPeerAckExponent()];
+        delay = (a.delay << exponent) * 1000_i64;
+    }
+    QuicRecovery.OnAckReceived(c.rec, space, ranges, delay, now, c.n[NConfirmed()] == 1_i64);
+    DrainSpace(c, space);
+    return 0_i64;
+}
+
+i64 OnCrypto(Connection c, i64 space, i64 offset, u8[] buf, i64 start, i64 length, i64 now) {
+    Stream st = c.crypto[space];
+    i64 grew = QuicStream.OnData(st, offset, buf, start, length, false);
+    if grew == -100_i64 { return -100_i64; }
+    if grew < 0_i64 { return QuicErrors.CryptoBufferExceeded(); }
+    while QuicStream.Readable(st) > 0_i64 {
+        i64 n = QuicStream.ReadInto(st, c.scratch, 0_i64, 2048_i64);
+        i64 alert = QuicHandshake.Feed(c.hs, LevelOfSpace(space), c.scratch, 0_i64, n);
+        if alert != 0_i64 { return QuicErrors.CryptoErrorBase() + alert; }
+    }
+    ProcessEvents(c, now);
+    return 0_i64;
+}
+
+i64 OnNewToken(Connection c, u8[] token) {
+    if c.isServer { return QuicErrors.ProtocolViolation(); }
+    return 0_i64;
+}
+
+i64 OnHandshakeDone(Connection c) {
+    if c.isServer { return QuicErrors.ProtocolViolation(); }
+    if c.n[NConfirmed()] == 0_i64 {
+        c.n[NConfirmed()] = 1_i64;
+        DiscardSpace(c, 1_i64);
+    }
+    return 0_i64;
+}
+
+i64 OnConnectionClose(Connection c, bool app, i64 code, i64 now) {
+    EnterDraining(c, code, app, now);
+    return 0_i64;
+}
+
+i64 OnPathChallenge(Connection c, u8[] data) {
+    c.pathData = data;
+    c.n[NPathResponsePending()] = 1_i64;
+    return 0_i64;
+}
+
+i64 OnNewConnectionId(Connection c, i64 seq, i64 prior, u8[] cid) {
+    // Only the handshake connection ID is used; spare IDs are accepted and ignored, and a
+    // request to retire the one in use is honoured by switching to the newly offered ID.
+    if prior > 0_i64 && seq >= prior { c.dcid = cid; }
+    return 0_i64;
+}
+
+i64 OnMaxData(Connection c, i64 m) {
+    if m > c.n[NConnMaxData()] { c.n[NConnMaxData()] = m; }
+    return 0_i64;
+}
+
+i64 OnMaxStreams(Connection c, bool bidi, i64 m) {
+    mut i64 at = NPeerMaxStreams() + 1_i64;
+    if bidi { at = NPeerMaxStreams(); }
+    if m > c.n[at] { c.n[at] = m; }
+    return 0_i64;
+}
+
+// ------------------------------------------------------------ streams
+
+i64 TypeIndex(i64 id) { if QuicStream.IsUnidirectional(id) { return 1_i64; } return 0_i64; }
+
+/// Slot of an open stream, or -1.
+pub i64 FindStream(Connection c, i64 id) {
+    mut i64 i = 0_i64;
+    while i < QuicConfig.MaxStreamSlots() {
+        Stream st = c.streams[i];
+        if st.id == id && QuicStream.IsOpen(st) { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+i64 FreeSlot(Connection c) {
+    mut i64 i = 0_i64;
+    while i < QuicConfig.MaxStreamSlots() {
+        Stream st = c.streams[i];
+        if !QuicStream.IsOpen(st) { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+i64 PeerParam(Connection c, i64 id) {
+    TransportParams p = c.peer[0];
+    return QuicTransportParams.Get(p, id);
+}
+
+Stream CreateStream(Connection c, i64 id) {
+    i64 buffer = c.config.streamBuffer;
+    bool local = QuicStream.IsServerInitiated(id) == c.isServer;
+    bool uni = QuicStream.IsUnidirectional(id);
+    mut i64 sendCap = buffer;
+    mut i64 recvCap = buffer;
+    mut i64 peerMax = 0_i64;
+    if uni {
+        if local { recvCap = 0_i64; peerMax = PeerParam(c, QuicTransportParams.InitialMaxStreamDataUni()); } else { sendCap = 0_i64; }
+    } else {
+        if local { peerMax = PeerParam(c, QuicTransportParams.InitialMaxStreamDataBidiRemote()); } else { peerMax = PeerParam(c, QuicTransportParams.InitialMaxStreamDataBidiLocal()); }
+    }
+    return QuicStream.New(id, sendCap, recvCap, peerMax);
+}
+
+// Slot of the stream for a frame from the peer: opens peer streams implicitly (RFC 9000
+// section 3.2). Returns the slot, -1 when the stream is already gone (ignore the frame), or a
+// negative transport error: -4 STREAM_LIMIT_ERROR, -5 STREAM_STATE_ERROR.
+i64 StreamForFrame(Connection c, i64 id) {
+    i64 found = FindStream(c, id);
+    if found >= 0_i64 { return found; }
+    i64 t = TypeIndex(id);
+    i64 index = QuicStream.IndexOf(id);
+    bool local = QuicStream.IsServerInitiated(id) == c.isServer;
+    if local {
+        if index >= c.n[NOpened() + t] { return -5_i64; }
+        return -1_i64;
+    }
+    if index < c.n[NPeerOpened() + t] { return -1_i64; }
+    if index >= c.n[NLocalMaxStreams() + t] { return -4_i64; }
+    mut i64 k = c.n[NPeerOpened() + t];
+    mut i64 slot = -1_i64;
+    while k <= index {
+        i64 free = FreeSlot(c);
+        if free < 0_i64 { return -4_i64; }
+        i64 sid = QuicStream.IdOf(k, !c.isServer, t == 1_i64);
+        c.streams[free] = CreateStream(c, sid);
+        slot = free;
+        k = k + 1_i64;
+    }
+    c.n[NPeerOpened() + t] = index + 1_i64;
+    return slot;
+}
+
+i64 StreamError(i64 slot) {
+    if slot == -4_i64 { return QuicErrors.StreamLimitError(); }
+    return QuicErrors.StreamStateError();
+}
+
+i64 CheckReceiveStream(Connection c, i64 id) {
+    if !QuicStream.CanReceive(id, c.isServer) { return QuicErrors.StreamStateError(); }
+    i64 slot = StreamForFrame(c, id);
+    if slot < -1_i64 { return StreamError(slot); }
+    return 0_i64;
+}
+
+i64 OnStreamData(Connection c, i64 id, i64 offset, u8[] buf, i64 start, i64 length, bool fin) {
+    if !QuicStream.CanReceive(id, c.isServer) { return QuicErrors.StreamStateError(); }
+    i64 slot = StreamForFrame(c, id);
+    if slot == -1_i64 { return 0_i64; }
+    if slot < 0_i64 { return StreamError(slot); }
+    Stream st = c.streams[slot];
+    i64 grew = QuicStream.OnData(st, offset, buf, start, length, fin);
+    return Grew(c, grew);
+}
+
+i64 Grew(Connection c, i64 grew) {
+    if grew == -100_i64 { return -100_i64; }
+    if grew == -3_i64 { return QuicErrors.FlowControlError(); }
+    if grew == -6_i64 { return QuicErrors.FinalSizeError(); }
+    c.n[NConnRecvHighest()] = c.n[NConnRecvHighest()] + grew;
+    if c.n[NConnRecvHighest()] > c.n[NConnMaxAdv()] { return QuicErrors.FlowControlError(); }
+    return 0_i64;
+}
+
+i64 OnResetStream(Connection c, i64 id, i64 code, i64 size) {
+    if !QuicStream.CanReceive(id, c.isServer) { return QuicErrors.StreamStateError(); }
+    i64 slot = StreamForFrame(c, id);
+    if slot == -1_i64 { return 0_i64; }
+    if slot < 0_i64 { return StreamError(slot); }
+    Stream st = c.streams[slot];
+    return Grew(c, QuicStream.OnReset(st, code, size));
+}
+
+i64 OnStopSending(Connection c, i64 id, i64 code) {
+    if !QuicStream.CanSend(id, c.isServer) { return QuicErrors.StreamStateError(); }
+    i64 slot = StreamForFrame(c, id);
+    if slot == -1_i64 { return 0_i64; }
+    if slot < 0_i64 { return StreamError(slot); }
+    Stream st = c.streams[slot];
+    QuicStream.OnStopSending(st, code);
+    return 0_i64;
+}
+
+i64 OnMaxStreamData(Connection c, i64 id, i64 m) {
+    if !QuicStream.CanSend(id, c.isServer) { return QuicErrors.StreamStateError(); }
+    i64 slot = StreamForFrame(c, id);
+    if slot == -1_i64 { return 0_i64; }
+    if slot < 0_i64 { return StreamError(slot); }
+    Stream st = c.streams[slot];
+    QuicStream.OnMaxStreamData(st, m);
+    return 0_i64;
+}
+
+/// Opens a local stream. Returns its id, -1 when the peer's MAX_STREAMS forbids it or no
+/// slot is free, -2 before the peer's transport parameters are known.
+pub i64 OpenStream(Connection c, bool bidi) {
+    if c.n[NParamsApplied()] == 0_i64 || c.n[NState()] >= StateClosing() { return -2_i64; }
+    mut i64 t = 1_i64;
+    if bidi { t = 0_i64; }
+    i64 index = c.n[NOpened() + t];
+    if index >= c.n[NPeerMaxStreams() + t] { return -1_i64; }
+    i64 slot = FreeSlot(c);
+    if slot < 0_i64 { return -1_i64; }
+    i64 id = QuicStream.IdOf(index, c.isServer, !bidi);
+    c.streams[slot] = CreateStream(c, id);
+    Stream st = c.streams[slot];
+    QuicStream.SetFlag(st, 64_i64);
+    c.n[NOpened() + t] = index + 1_i64;
+    return id;
+}
+
+/// Next peer-opened stream not yet handed to the application, or -1.
+pub i64 AcceptStream(Connection c) {
+    mut i64 best = -1_i64;
+    mut i64 i = 0_i64;
+    while i < QuicConfig.MaxStreamSlots() {
+        Stream st = c.streams[i];
+        if QuicStream.IsOpen(st) && (QuicStream.PendingFlags(st) & 64_i64) == 0_i64 && QuicStream.IsServerInitiated(st.id) != c.isServer {
+            if best < 0_i64 || st.id < best { best = st.id; }
+        }
+        i = i + 1_i64;
+    }
+    if best >= 0_i64 {
+        Stream chosen = c.streams[FindStream(c, best)];
+        QuicStream.SetFlag(chosen, 64_i64);
+    }
+    return best;
+}
+
+/// Buffers data on a stream; returns bytes accepted (possibly 0 when the buffer is full),
+/// -1 for an unknown stream or one that cannot send anymore.
+pub i64 StreamWrite(Connection c, i64 id, u8[] data, i64 offset, i64 count) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 || !QuicStream.CanSend(id, c.isServer) || c.n[NState()] >= StateClosing() { return -1_i64; }
+    Stream st = c.streams[slot];
+    return QuicStream.Write(st, data, offset, count);
+}
+
+/// Reads in-order data. Returns bytes copied; 0 with `StreamAtEnd` at the end of the stream;
+/// -1 unknown stream; -2 the peer reset the stream (see StreamResetCode).
+pub i64 StreamRead(Connection c, i64 id, u8[] dst, i64 offset, i64 count) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 || !QuicStream.CanReceive(id, c.isServer) { return -1_i64; }
+    Stream st = c.streams[slot];
+    i64 state = QuicStream.RecvState(st);
+    if state == QuicStream.RecvResetRecvd() || state == QuicStream.RecvResetRead() {
+        QuicStream.AcknowledgeReset(st);
+        return -2_i64;
+    }
+    i64 n = QuicStream.ReadInto(st, dst, offset, count);
+    if n > 0_i64 {
+        c.n[NConnConsumed()] = c.n[NConnConsumed()] + n;
+        i64 window = c.config.maxData;
+        if c.n[NConnMaxAdv()] - c.n[NConnConsumed()] <= window / 2_i64 {
+            c.n[NConnMaxAdv()] = c.n[NConnConsumed()] + window;
+            c.n[NMaxDataPending()] = 1_i64;
+        }
+    }
+    return n;
+}
+
+pub bool StreamAtEnd(Connection c, i64 id) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 { return true; }
+    Stream st = c.streams[slot];
+    return QuicStream.AtEnd(st);
+}
+
+pub i64 StreamResetCode(Connection c, i64 id) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 { return -1_i64; }
+    Stream st = c.streams[slot];
+    return QuicStream.PeerResetCodeOf(st);
+}
+
+/// Free space in the stream's send buffer (-1 unknown stream).
+pub i64 StreamSendSpace(Connection c, i64 id) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 { return -1_i64; }
+    Stream st = c.streams[slot];
+    return QuicStream.SendSpace(st);
+}
+
+/// True when everything written on the stream (and its FIN) was acknowledged.
+pub bool StreamSendDone(Connection c, i64 id) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 { return true; }
+    Stream st = c.streams[slot];
+    i64 s = QuicStream.SendState(st);
+    return s == QuicStream.SendDataRecvd() || s == QuicStream.SendResetRecvd();
+}
+
+pub bool StreamFinish(Connection c, i64 id) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 || !QuicStream.CanSend(id, c.isServer) { return false; }
+    Stream st = c.streams[slot];
+    return QuicStream.Finish(st);
+}
+
+pub bool StreamReset(Connection c, i64 id, i64 code) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 || !QuicStream.CanSend(id, c.isServer) { return false; }
+    Stream st = c.streams[slot];
+    return QuicStream.Reset(st, code);
+}
+
+pub bool StreamStopSending(Connection c, i64 id, i64 code) {
+    i64 slot = FindStream(c, id);
+    if slot < 0_i64 || !QuicStream.CanReceive(id, c.isServer) { return false; }
+    Stream st = c.streams[slot];
+    return QuicStream.StopSending(st, code);
+}
+
+/// Forgets finished streams; a finished peer stream returns its credit with MAX_STREAMS.
+unit ReleaseStreams(Connection c) {
+    mut i64 i = 0_i64;
+    while i < QuicConfig.MaxStreamSlots() {
+        Stream st = c.streams[i];
+        if QuicStream.IsOpen(st) && QuicStream.IsFinished(st) && (QuicStream.PendingFlags(st) & 7_i64) == 0_i64 {
+            QuicStream.MarkClosed(st);
+            if QuicStream.IsServerInitiated(st.id) != c.isServer {
+                i64 t = TypeIndex(st.id);
+                c.n[NLocalMaxStreams() + t] = c.n[NLocalMaxStreams() + t] + 1_i64;
+                c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] | (1_i64 << t);
+            }
+        }
+        i = i + 1_i64;
+    }
+    return;
+}
+
+// ------------------------------------------------------------ acknowledged and lost packets
+
+unit DrainSpace(Connection c, i64 space) {
+    mut i64 r = QuicRecovery.NextMarked(c.rec, space, QuicRecovery.StateAcked());
+    while r >= 0_i64 {
+        OnRecord(c, space, r, true);
+        QuicRecovery.Release(c.rec, space, r);
+        r = QuicRecovery.NextMarked(c.rec, space, QuicRecovery.StateAcked());
+    }
+    r = QuicRecovery.NextMarked(c.rec, space, QuicRecovery.StateLost());
+    while r >= 0_i64 {
+        OnRecord(c, space, r, false);
+        QuicRecovery.Release(c.rec, space, r);
+        r = QuicRecovery.NextMarked(c.rec, space, QuicRecovery.StateLost());
+    }
+    return;
+}
+
+unit OnRecord(Connection c, i64 space, i64 r, bool acked) {
+    i64 items = QuicRecovery.RecordItems(c.rec, space, r);
+    mut i64 i = 0_i64;
+    while i < items {
+        i64 kind = QuicRecovery.Item(c.rec, space, r, i, 0_i64);
+        i64 offset = QuicRecovery.Item(c.rec, space, r, i, 1_i64);
+        i64 length = QuicRecovery.Item(c.rec, space, r, i, 2_i64);
+        i64 extra = QuicRecovery.Item(c.rec, space, r, i, 3_i64);
+        if kind < 0_i64 {
+            Stream cs = c.crypto[space];
+            if acked { QuicStream.OnChunkAcked(cs, offset, length, false); } else { QuicStream.OnChunkLost(cs, offset, length, false); }
+        } else {
+            i64 slot = FindStream(c, kind);
+            if slot >= 0_i64 { OnStreamItem(c.streams[slot], offset, length, extra, acked); }
+        }
+        i = i + 1_i64;
+    }
+    if !acked {
+        i64 flags = QuicRecovery.RecordFlags(c.rec, space, r);
+        if (flags & QuicRecovery.FlagHandshakeDone()) != 0_i64 { c.n[NHandshakeDonePending()] = 1_i64; }
+        if (flags & QuicRecovery.FlagMaxData()) != 0_i64 { c.n[NMaxDataPending()] = 1_i64; }
+        if (flags & QuicRecovery.FlagMaxStreamsBidi()) != 0_i64 { c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] | 1_i64; }
+        if (flags & QuicRecovery.FlagMaxStreamsUni()) != 0_i64 { c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] | 2_i64; }
+    }
+    return;
+}
+
+unit OnStreamItem(Stream st, i64 offset, i64 length, i64 extra, bool acked) {
+    if extra <= 1_i64 {
+        if acked { QuicStream.OnChunkAcked(st, offset, length, extra == 1_i64); } else { QuicStream.OnChunkLost(st, offset, length, extra == 1_i64); }
+        return;
+    }
+    if extra == QuicRecovery.ItemControlReset() {
+        if acked { QuicStream.OnResetAcked(st); } else { QuicStream.SetFlag(st, QuicStream.FlagReset()); }
+        return;
+    }
+    if acked { return; }
+    if extra == QuicRecovery.ItemControlMaxStreamData() { QuicStream.SetFlag(st, QuicStream.FlagMaxStreamData()); }
+    if extra == QuicRecovery.ItemControlStopSending() { QuicStream.SetFlag(st, QuicStream.FlagStopSending()); }
+    return;
+}
+
+// ------------------------------------------------------------ timers
+
+/// The earliest deadline (monotonic ns) at which OnTimeout must run, or -1.
+pub i64 NextTimeout(Connection c, i64 now) {
+    i64 state = c.n[NState()];
+    if state == StateClosed() { return -1_i64; }
+    if state >= StateClosing() { return c.n[NCloseDeadline()]; }
+    mut i64 best = c.n[NIdleDeadline()];
+    i64[] t = [0_i64, 0_i64, 0_i64];
+    QuicRecovery.Timer(c.rec, c.n[NConfirmed()] == 1_i64, AntiDeadlock(c), now, t);
+    if t[0] >= 0_i64 && (best < 0_i64 || t[0] < best) { best = t[0]; }
+    i64 ack = c.n[NAckDue()];
+    if ack >= 0_i64 && (best < 0_i64 || ack < best) { best = ack; }
+    return best;
+}
+
+bool AntiDeadlock(Connection c) { return !c.isServer && c.n[NConfirmed()] == 0_i64; }
+
+/// Runs expired timers: closing/draining end, idle timeout, loss detection and PTO.
+pub unit OnTimeout(Connection c, i64 now) {
+    i64 state = c.n[NState()];
+    if state == StateClosed() { return; }
+    if state >= StateClosing() {
+        if now >= c.n[NCloseDeadline()] { c.n[NState()] = StateClosed(); }
+        return;
+    }
+    i64 idle = c.n[NIdleDeadline()];
+    if idle >= 0_i64 && now >= idle {
+        c.n[NState()] = StateClosed();
+        c.n[NCloseReason()] = 3_i64;
+        return;
+    }
+    i64 fired = QuicRecovery.OnTimeout(c.rec, c.n[NConfirmed()] == 1_i64, AntiDeadlock(c), now);
+    if fired >= 0_i64 && fired < 3_i64 { DrainSpace(c, fired); }
+    if fired >= 10_i64 { OnPto(c, fired - 10_i64); }
+    return;
+}
+
+unit OnPto(Connection c, i64 space) {
+    mut i64 s = space;
+    if !HasKey(c, KeyTx(s)) && s == 0_i64 { s = 1_i64; }
+    c.n[NProbes() + s] = 2_i64;
+    // Probes carry unacknowledged data again when there is some.
+    Stream cs = c.crypto[s];
+    QuicStream.OnChunkLost(cs, 0_i64, QuicStream.SentOffset(cs), false);
+    if s == 2_i64 {
+        mut i64 i = 0_i64;
+        while i < QuicConfig.MaxStreamSlots() {
+            Stream st = c.streams[i];
+            if QuicStream.IsOpen(st) && QuicStream.CanSend(st.id, c.isServer) { QuicStream.OnChunkLost(st, 0_i64, QuicStream.SentOffset(st), true); }
+            i = i + 1_i64;
+        }
+    }
+    return;
+}
+
+// ------------------------------------------------------------ sending
+
+bool AckWanted(Connection c, i64 space, i64 now) {
+    if c.n[NAckEliciting() + space] == 0_i64 { return false; }
+    if space < 2_i64 || c.n[NAckEliciting() + space] >= 2_i64 { return true; }
+    i64 due = c.n[NAckDue()];
+    return due >= 0_i64 && now >= due;
+}
+
+bool StreamsWantSend(Connection c) {
+    if c.n[NHandshakeDonePending()] == 1_i64 || c.n[NMaxDataPending()] == 1_i64 || c.n[NMaxStreamsPending()] != 0_i64 || c.n[NPathResponsePending()] == 1_i64 { return true; }
+    i64[] chunk = [0_i64, 0_i64, 0_i64, 0_i64];
+    mut i64 i = 0_i64;
+    while i < QuicConfig.MaxStreamSlots() {
+        Stream st = c.streams[i];
+        if QuicStream.IsOpen(st) {
+            if (QuicStream.PendingFlags(st) & 23_i64) != 0_i64 { return true; }
+            if QuicStream.CanSend(st.id, c.isServer) && QuicStream.NextChunk(st, 1000_i64, ConnAllowance(c), chunk) { return true; }
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+i64 ConnAllowance(Connection c) {
+    i64 a = c.n[NConnMaxData()] - c.n[NConnSent()];
+    if a < 0_i64 { return 0_i64; }
+    return a;
+}
+
+/// True when the space has something to send now.
+bool SpaceWantsSend(Connection c, i64 space, i64 now) {
+    if !HasKey(c, KeyTx(space)) || QuicRecovery.IsDiscarded(c.rec, space) { return false; }
+    i64 state = c.n[NState()];
+    if state == StateClosing() { return c.n[NClosePending()] == 1_i64; }
+    if state >= StateDraining() { return false; }
+    if AckWanted(c, space, now) || c.n[NProbes() + space] > 0_i64 { return true; }
+    i64[] chunk = [0_i64, 0_i64, 0_i64, 0_i64];
+    Stream cs = c.crypto[space];
+    if QuicStream.NextChunk(cs, 1000_i64, 1000000_i64, chunk) { return true; }
+    if space == 2_i64 { return StreamsWantSend(c); }
+    return false;
+}
+
+/// Builds the next datagram into `c.out`; returns its length (0 when nothing is due).
+/// Initial, Handshake and 1-RTT packets are coalesced; datagrams with Initial packets are
+/// padded to 1200 bytes; a server stays within three times the bytes it received until the
+/// client address is validated.
+pub i64 BuildDatagram(Connection c, i64 now) {
+    mut i64 limit = DatagramSize();
+    if c.isServer && c.n[NValidated()] == 0_i64 {
+        i64 budget = 3_i64 * c.n[NBytesReceived()] - c.n[NBytesSent()];
+        if budget < limit { limit = budget; }
+    }
+    if limit < 64_i64 { return 0_i64; }
+    Writer w = QuicWire.NewWriter(c.out, 0_i64, limit);
+    mut bool hasInitial = false;
+    mut bool hasHandshake = false;
+    mut bool pending = false;
+    mut i64 s = 0_i64;
+    while s < 3_i64 {
+        if SpaceWantsSend(c, s, now) && QuicWire.WRoom(w) > 64_i64 {
+            if pending { SealPending(c, w, false, now); pending = false; }
+            if WritePacket(c, w, s, now) {
+                pending = true;
+                if s == 0_i64 { hasInitial = true; }
+                if s == 1_i64 { hasHandshake = true; }
+            }
+        }
+        s = s + 1_i64;
+    }
+    if pending { SealPending(c, w, hasInitial && limit >= DatagramSize(), now); }
+    i64 total = QuicWire.WPos(w);
+    if total > 0_i64 {
+        c.n[NBytesSent()] = c.n[NBytesSent()] + total;
+        if !c.isServer && hasHandshake { DiscardSpace(c, 0_i64); }
+    }
+    ReleaseStreams(c);
+    return total;
+}
+
+unit PushItem(Connection c, i64 kind, i64 offset, i64 length, i64 extra) {
+    i64 n = c.n[PItems()];
+    i64 at = PItems() + 1_i64 + n * 4_i64;
+    c.n[at] = kind;
+    c.n[at + 1_i64] = offset;
+    c.n[at + 2_i64] = length;
+    c.n[at + 3_i64] = extra;
+    c.n[PItems()] = n + 1_i64;
+    return;
+}
+
+bool ItemRoom(Connection c) { return c.n[PItems()] < QuicRecovery.ItemsPerPacket(); }
+
+/// Writes header and frames of one packet for `space`; the packet stays unsealed (pending).
+bool WritePacket(Connection c, Writer w, i64 space, i64 now) {
+    i64 start = QuicWire.WPos(w);
+    i64 limit = QuicWire.WLimit(w);
+    i64 pn = c.n[NNextPn() + space];
+    i64 pnLength = QuicPacket.PnLength(pn, QuicRecovery.LargestAcked(c.rec, space));
+    mut i64 lengthAt = -1_i64;
+    mut i64 pnOffset = 0_i64;
+    if space < 2_i64 {
+        mut i64 kind = QuicPacket.KindHandshake();
+        mut u8[] token = Slice.New(0_i64);
+        if space == 0_i64 {
+            kind = QuicPacket.KindInitial();
+            if !c.isServer { token = c.token; }
+        }
+        lengthAt = QuicPacket.WriteLongHeader(w, kind, c.dcid, c.scid, token, pnLength, pn);
+        pnOffset = lengthAt + 2_i64;
+    } else {
+        pnOffset = QuicPacket.WriteShortHeader(w, c.dcid, c.n[NKeyPhase()], pnLength, pn);
+    }
+    if !QuicWire.WOk(w) { QuicWire.WRewind(w, start); return false; }
+    QuicWire.WSetLimit(w, limit - 16_i64);
+    i64 payload = QuicWire.WPos(w);
+    c.n[PItems()] = 0_i64;
+    c.n[PFlags()] = 0_i64;
+    c.n[PEliciting()] = 0_i64;
+    WriteFrames(c, w, space, now);
+    QuicWire.WSetLimit(w, limit);
+    if QuicWire.WPos(w) == payload {
+        QuicWire.WRewind(w, start);
+        return false;
+    }
+    c.n[PSpace()] = space;
+    c.n[PStart()] = start;
+    c.n[PPnOffset()] = pnOffset;
+    c.n[PPnLength()] = pnLength;
+    c.n[PPn()] = pn;
+    c.n[PLengthAt()] = lengthAt;
+    return true;
+}
+
+/// Pads (when asked and as needed), seals and records the pending packet.
+unit SealPending(Connection c, Writer w, bool pad, i64 now) {
+    i64 space = c.n[PSpace()];
+    i64 start = c.n[PStart()];
+    i64 pnOffset = c.n[PPnOffset()];
+    i64 pnLength = c.n[PPnLength()];
+    i64 pn = c.n[PPn()];
+    i64 limit = QuicWire.WLimit(w);
+    mut i64 end = QuicWire.WPos(w);
+    if pnLength + end - pnOffset - pnLength < 4_i64 {
+        QuicWire.PutZeros(w, 4_i64 - (end - pnOffset));
+        end = QuicWire.WPos(w);
+    }
+    mut bool padded = false;
+    if pad && end + 16_i64 < limit {
+        QuicWire.PutZeros(w, limit - 16_i64 - end);
+        end = QuicWire.WPos(w);
+        padded = true;
+    }
+    i64 lengthAt = c.n[PLengthAt()];
+    if lengthAt >= 0_i64 { QuicPacket.PatchLength(c.out, lengthAt, end + 16_i64 - pnOffset); }
+    PacketKeys k = c.keys[KeyTx(space)];
+    i64 sealed = QuicProtection.Seal(k, c.out, start, pnOffset, pnLength, pn, end);
+    QuicWire.WSetPos(w, sealed);
+    c.n[NNextPn() + space] = pn + 1_i64;
+    bool eliciting = c.n[PEliciting()] == 1_i64;
+    if eliciting || padded {
+        i64 record = QuicRecovery.OnPacketSent(c.rec, space, pn, now, sealed - start, eliciting, true);
+        if record >= 0_i64 {
+            mut i64 i = 0_i64;
+            while i < c.n[PItems()] {
+                i64 at = PItems() + 1_i64 + i * 4_i64;
+                QuicRecovery.AddItem(c.rec, space, record, c.n[at], c.n[at + 1_i64], c.n[at + 2_i64], c.n[at + 3_i64]);
+                i = i + 1_i64;
+            }
+            QuicRecovery.AddFlags(c.rec, space, record, c.n[PFlags()]);
+        }
+        if eliciting && c.n[NState()] < StateClosing() { c.n[NIdleDeadline()] = IdleDeadlineFrom(c, now); }
+    }
+    return;
+}
+
+unit WriteFrames(Connection c, Writer w, i64 space, i64 now) {
+    i64 state = c.n[NState()];
+    if state == StateClosing() {
+        WriteClose(c, w, space, now);
+        return;
+    }
+    if c.n[NAckNew() + space] > 0_i64 { WriteAckFrame(c, w, space, now); }
+    bool canTrack = QuicRecovery.HasRoom(c.rec, space);
+    bool probing = c.n[NProbes() + space] > 0_i64;
+    if !canTrack { return; }
+    if !probing && !QuicCongestion.CanSend(c.rec.cc, DatagramSize()) {
+        return;
+    }
+    WriteCryptoFrames(c, w, space);
+    if space == 2_i64 { WriteApplicationFrames(c, w); }
+    if probing {
+        if c.n[PEliciting()] == 0_i64 {
+            QuicWire.PutByte(w, 1_i64);
+            if QuicWire.WOk(w) { c.n[PEliciting()] = 1_i64; }
+        }
+        c.n[NProbes() + space] = c.n[NProbes() + space] - 1_i64;
+    }
+    return;
+}
+
+unit WriteClose(Connection c, Writer w, i64 space, i64 now) {
+    bool app = c.n[NCloseIsApp()] == 1_i64;
+    mut i64 code = c.n[NCloseCode()];
+    mut bool asApp = app;
+    if app && space < 2_i64 {
+        // Application close before 1-RTT keys: a transport close with APPLICATION_ERROR.
+        asApp = false;
+        code = QuicErrors.ApplicationError();
+    }
+    QuicFrame.Encode(w, Frame::ConnectionClose(asApp, code, c.n[NCloseFrameType()], Slice.New(0_i64)), c.out);
+    if space >= HighestTxSpace(c) {
+        c.n[NClosePending()] = 0_i64;
+        c.n[NLastCloseSent()] = now;
+    }
+    return;
+}
+
+i64 HighestTxSpace(Connection c) {
+    if HasKey(c, KeyTx(2_i64)) { return 2_i64; }
+    if HasKey(c, KeyTx(1_i64)) && !QuicRecovery.IsDiscarded(c.rec, 1_i64) { return 1_i64; }
+    return 0_i64;
+}
+
+unit WriteAckFrame(Connection c, Writer w, i64 space, i64 now) {
+    i64[] set = RecvRanges(c, space);
+    i64 count = QuicRanges.Count(set);
+    if count == 0_i64 { return; }
+    mut i64[] pairs = Array.Empty<i64>();
+    mut i64 i = count - 1_i64;
+    while i >= 0_i64 && count - i <= 32_i64 {
+        Array.Append<i64>(pairs, QuicRanges.Hi(set, i) - 1_i64);
+        Array.Append<i64>(pairs, QuicRanges.Lo(set, i));
+        i = i - 1_i64;
+    }
+    mut i64 delay = 0_i64;
+    if space == 2_i64 && c.n[NLargestRecvTime()] > 0_i64 {
+        delay = ((now - c.n[NLargestRecvTime()]) / 1000_i64) >> 3_i64;
+        if delay < 0_i64 { delay = 0_i64; }
+    }
+    i64 before = QuicWire.WPos(w);
+    QuicFrame.WriteAck(w, AckFrame { delay: delay, ranges: pairs, ecn: false, ect0: 0_i64, ect1: 0_i64, ce: 0_i64 });
+    if !QuicWire.WOk(w) { QuicWire.WRewind(w, before); return; }
+    c.n[NAckEliciting() + space] = 0_i64;
+    c.n[NAckNew() + space] = 0_i64;
+    if space == 2_i64 { c.n[NAckDue()] = -1_i64; }
+    return;
+}
+
+unit WriteCryptoFrames(Connection c, Writer w, i64 space) {
+    Stream cs = c.crypto[space];
+    i64[] chunk = [0_i64, 0_i64, 0_i64, 0_i64];
+    while ItemRoom(c) && QuicWire.WRoom(w) > 24_i64 {
+        i64 room = QuicWire.WRoom(w) - 1_i64 - 8_i64 - 2_i64;
+        if !QuicStream.NextChunk(cs, room, 4611686018427387903_i64, chunk) { return; }
+        i64 offset = chunk[0];
+        i64 length = chunk[1];
+        QuicWire.PutByte(w, 6_i64);
+        QuicWire.PutVar(w, offset);
+        QuicWire.PutVar(w, length);
+        QuicStream.CopyOut(cs, w, offset, length);
+        if !QuicWire.WOk(w) { return; }
+        QuicStream.OnChunkSent(cs, offset, length, false);
+        PushItem(c, -1_i64, offset, length, 0_i64);
+        c.n[PEliciting()] = 1_i64;
+    }
+    return;
+}
+
+// Writes a small control frame when it fits; returns false (rolled back) otherwise.
+bool PutFrame(Connection c, Writer w, Frame f) {
+    i64 before = QuicWire.WPos(w);
+    QuicFrame.Encode(w, f, c.out);
+    if !QuicWire.WOk(w) { QuicWire.WRewind(w, before); return false; }
+    c.n[PEliciting()] = 1_i64;
+    return true;
+}
+
+unit WriteApplicationFrames(Connection c, Writer w) {
+    if c.n[NHandshakeDonePending()] == 1_i64 && PutFrame(c, w, Frame::HandshakeDone()) {
+        c.n[NHandshakeDonePending()] = 0_i64;
+        c.n[PFlags()] = c.n[PFlags()] | QuicRecovery.FlagHandshakeDone();
+    }
+    if c.n[NMaxDataPending()] == 1_i64 && PutFrame(c, w, Frame::MaxData(c.n[NConnMaxAdv()])) {
+        c.n[NMaxDataPending()] = 0_i64;
+        c.n[PFlags()] = c.n[PFlags()] | QuicRecovery.FlagMaxData();
+    }
+    if (c.n[NMaxStreamsPending()] & 1_i64) != 0_i64 && PutFrame(c, w, Frame::MaxStreams(true, c.n[NLocalMaxStreams()])) {
+        c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] - 1_i64;
+        c.n[PFlags()] = c.n[PFlags()] | QuicRecovery.FlagMaxStreamsBidi();
+    }
+    if (c.n[NMaxStreamsPending()] & 2_i64) != 0_i64 && PutFrame(c, w, Frame::MaxStreams(false, c.n[NLocalMaxStreams() + 1_i64])) {
+        c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] - 2_i64;
+        c.n[PFlags()] = c.n[PFlags()] | QuicRecovery.FlagMaxStreamsUni();
+    }
+    if c.n[NPathResponsePending()] == 1_i64 && PutFrame(c, w, Frame::PathResponse(c.pathData)) {
+        c.n[NPathResponsePending()] = 0_i64;
+    }
+    i64 slots = QuicConfig.MaxStreamSlots();
+    i64 first = c.n[NRoundRobin()];
+    mut i64 k = 0_i64;
+    while k < slots && ItemRoom(c) && QuicWire.WRoom(w) > 8_i64 {
+        i64 slot = (first + k) % slots;
+        Stream st = c.streams[slot];
+        if QuicStream.IsOpen(st) { WriteStreamFrames(c, w, st); }
+        k = k + 1_i64;
+    }
+    c.n[NRoundRobin()] = (first + 1_i64) % slots;
+    return;
+}
+
+unit WriteStreamFrames(Connection c, Writer w, Stream st) {
+    i64 id = st.id;
+    i64 flags = QuicStream.PendingFlags(st);
+    if (flags & QuicStream.FlagReset()) != 0_i64 && ItemRoom(c) {
+        i64 finalSize = QuicStream.SentOffset(st);
+        if PutFrame(c, w, Frame::ResetStream(id, QuicStream.ResetCodeOf(st), finalSize)) {
+            QuicStream.ClearFlag(st, QuicStream.FlagReset());
+            PushItem(c, id, 0_i64, 0_i64, QuicRecovery.ItemControlReset());
+        }
+    }
+    if (flags & QuicStream.FlagStopSending()) != 0_i64 && ItemRoom(c) && PutFrame(c, w, Frame::StopSending(id, QuicStream.StopCodeOf(st))) {
+        QuicStream.ClearFlag(st, QuicStream.FlagStopSending());
+        PushItem(c, id, 0_i64, 0_i64, QuicRecovery.ItemControlStopSending());
+    }
+    if (flags & QuicStream.FlagMaxStreamData()) != 0_i64 && ItemRoom(c) && PutFrame(c, w, Frame::MaxStreamData(id, QuicStream.RecvLimit(st))) {
+        QuicStream.ClearFlag(st, QuicStream.FlagMaxStreamData());
+        PushItem(c, id, 0_i64, 0_i64, QuicRecovery.ItemControlMaxStreamData());
+    }
+    if (flags & QuicStream.FlagBlocked()) != 0_i64 && PutFrame(c, w, Frame::StreamDataBlocked(id, QuicStream.SendLimit(st))) {
+        QuicStream.ClearFlag(st, QuicStream.FlagBlocked());
+    }
+    if !QuicStream.CanSend(id, c.isServer) { return; }
+    i64[] chunk = [0_i64, 0_i64, 0_i64, 0_i64];
+    while ItemRoom(c) && QuicWire.WRoom(w) > 24_i64 {
+        i64 room = QuicWire.WRoom(w) - 1_i64 - 8_i64 - 8_i64 - 2_i64;
+        if !QuicStream.NextChunk(st, room, ConnAllowance(c), chunk) { return; }
+        i64 offset = chunk[0];
+        i64 length = chunk[1];
+        bool fin = chunk[2] == 1_i64;
+        i64 before = QuicWire.WPos(w);
+        mut i64 t = 10_i64;
+        if offset > 0_i64 { t = t | 4_i64; }
+        if fin { t = t | 1_i64; }
+        QuicWire.PutByte(w, t);
+        QuicWire.PutVar(w, id);
+        if offset > 0_i64 { QuicWire.PutVar(w, offset); }
+        QuicWire.PutVar(w, length);
+        QuicStream.CopyOut(st, w, offset, length);
+        if !QuicWire.WOk(w) { QuicWire.WRewind(w, before); return; }
+        QuicStream.OnChunkSent(st, offset, length, fin);
+        if chunk[3] == 1_i64 { c.n[NConnSent()] = c.n[NConnSent()] + length; }
+        mut i64 extra = 0_i64;
+        if fin { extra = 1_i64; }
+        PushItem(c, id, offset, length, extra);
+        c.n[PEliciting()] = 1_i64;
+        if fin { return; }
+    }
+    return;
+}

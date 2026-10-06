@@ -360,6 +360,66 @@ without double or trailing underscores, and must be unique per target.
   path checks) 75-85 s of codegen per test, so x509 targets keep one heavy test each.
 - Workaround: single-exit functions, sticky `i64` error codes inside the parser
   (`Der.Fail(p, code)`, mapped to `X509Error` once at the API boundary), few tests per target.
+
+## 2026-10-05, tls slice
+
+### `Module.Variant(x)` constructs an enum variant through a module path, then ICEs
+- Symptom: `TlsErrors.InvalidConfig(TlsErrors.ConfigMissingServerName())` type-checks (the
+  module `TlsErrors` declares `enum TlsError { InvalidConfig(i64 reason), ... }`) but fails at
+  CLIF time with `no ISLE lowering rule or fact for CallExpression`, reported at an unrelated
+  line of the calling function.
+- Workaround: always construct variants as `TlsError::InvalidConfig(x)`.
+
+### `?` on a call that passes a contract value
+- Symptom: `no ISLE lowering rule or fact for TryExpression` for `WriteRaw(transport, buf, n)?;`
+  and `i64 t = ReadRecord(c, transport)?;` where `transport` is a `Core.IO.Stream` parameter.
+  `?` on calls without contract arguments lowers fine.
+- Workaround: bind the Result and match:
+  `Result<unit, TlsError> r = WriteRaw(transport, buf, n); match r { Result::Error(e) => { return Result::Error(e); }, Result::Ok(_) => {}, };`
+
+### `return match` with a block arm that returns, and a nested match in a `return match`
+- Symptom: `no ISLE lowering rule or fact for MatchExpression` for
+  `return match suite { CipherSuite::ChaCha20Poly1305Sha256 => { if ... { return ...; } return ...; }, _ => { ...; return match made { ... }; }, };`
+- Workaround: statement `match` with `return` in each arm, or `if` on a code.
+
+### Nested literal pattern in a match arm
+- Symptom: `match r { Result::Error(TlsError::LocalAlert(22)) => true, _ => false, }` ICEs
+  (`CallExpression`).
+- Workaround: bind `Result::Error(e)` and compare `TlsErrors.Code(e)`.
+
+### Array literal with a field/element/parameter element (again)
+- `string[] chosen = [e.names[0]];` and `i64[] st = [state, 0_i64]` (parameter) ICE with
+  `ArrayLiteralExpression`; `[suite]` with a parameter too. Workaround: `Array.Empty` + `Append`,
+  or a literal of constants followed by an element store.
+
+### No nested array types
+- `u8[][]` is a parse error (`expected Identifier`). Workaround: `type Blob { pub u8[] data, }`
+  and `Blob[]`.
+
+### `pub` is not usable as an identifier
+- `u8[] pub = ...;` is a parse error. Use another name.
+
+### Tests that touch the network must run inside a spawned fiber
+- Symptom: `TcpStream.Connect` and `TcpListener.Accept` both failed when the scenario ran on
+  the test's own body with a server fiber; wrapping the whole scenario in
+  `Fiber<unit> f = spawn (() => Scenario(codes)); f.Join();` (as the corelib TCP tests do) works.
+
+### `Assert.Equal` hides values; `Assert.Fail(message)` prints its message
+- Use a helper `Expect(actual, expected, what)` that calls `Assert.Fail(what + ": got " + Dec(actual))`.
+
+### Performance: per-test CLIF generation grows superlinearly with reachable functions
+- Measured (macOS arm64, loaded host): a test reaching the TLS client engine (544 functions)
+  spends 2m15s-2m45s in "Generate CLIF"; a loopback client+server test (722 functions, with
+  X.509) 4m05s-4m35s; type checking the project adds ~20-100 s per target. Runtime is small
+  in comparison (three full loopback handshakes plus echo in ~2.5 s).
+- Every `test` repeats the whole code generation, so a target with four replay tests took
+  11m35s. With `--all-targets`, the default `--matrix-timeout` of 1800 s bounds the whole run.
+- Workaround: one test function per heavy target that calls several scenario functions; keep
+  heavy targets few.
+
+### `beskid test` fails if the project tree changes during a run
+- Symptom: `prepared workspace content mutated during phase execute_target` when a test source
+  is edited while a target runs. Do not edit the test project during runs.
 ## 2026-10-05, websocket slice
 
 ### W1. Array literal with computed elements inside a struct literal is reported as a StructLiteral ICE
@@ -442,3 +502,185 @@ without double or trailing underscores, and must be unique per target.
 ### C53-6. JIT runs at `opt_level=none`; no AES-NI/PCLMUL/SHA-NI opcodes
 - `production_isa_settings_builder` never sets `opt_level`; Cranelift 0.136 has no x86 AES,
   CLMUL or SHA opcodes, so the clif surface cannot reach them.
+## 2026-10-05, http3 slice
+
+### H1. Identifiers that start with `never` are split by the lexer
+- Symptom: `mut u8 neverName = 0_u8;` gives lint "binding `Name` should use
+  lowerCamelCase" and, at CLIF time, `no ISLE lowering rule or fact for LetStatement`.
+  Same family as C8 (`spawnIt`, `host`, `launch`).
+- Repro: `i64 F(bool c) { mut u8 neverName = 0_u8; if c { neverName = 16_u8; } return i64(neverName); }`
+- Workaround: do not start identifiers with a keyword (`never`, `spawn`, ...).
+
+### H2. A type named like its module leaf cannot be imported; type paths from path dependencies do not resolve
+- Symptom: `use Http3.QpackDecoder; use Http3.QpackDecoder.QpackDecoder;` is
+  "duplicate item `QpackDecoder`"; `use Http2.Hpack.HeaderField;` (a type in a
+  path dependency) is "unknown import path".
+- Workaround: `use Http2.Hpack;` already brings the module's types into scope
+  unqualified. Give types names that differ from every module leaf
+  (`QDecoder`, `QEncoder`, `DynTable`, `SettingValues`).
+
+### H3. Codegen cost of the HTTP/3 connection layer
+- Symptom: every test that reaches `H3Connection.Pump` spends 40-57 s in
+  "Generate CLIF" (QPACK, frames, mapping, connection, ~1500 lines reachable); a
+  target with 3-4 such tests takes about 3.5 minutes.
+- Workaround: few loopback tests per target, many assertions per test,
+  `--target-timeout 600`. Pure codec tests (QPACK, frames, mapping) stay cheap
+  (2-10 s per test).
+
+### H4. Tooling: editing sources during `beskid test` fails the run
+- Symptom: after the results print, the run ends with "prepared workspace
+  content mutated during phase `execute_target`" when a test file of the project
+  was edited while it ran.
+- Workaround: do not edit the project while its tests run; stage edits elsewhere.
+
+## 2026-10-06, websocket wss slice
+
+### W8. Codegen cost of the TLS-backed WebSocket path
+- Symptom: `WsTlsTests` (2 tests) takes about 19 minutes on a loaded host (load 6-10),
+  roughly 9 minutes of "Generate CLIF" per test, because every test reaches the whole
+  TLS 1.3 engine, X.509 and crypto through `WsTransport::Tls`. With
+  `--target-timeout 900` the 2 tests finish but the budget expires (exit non-zero).
+- Workaround: run with `--target-timeout 2400` (done), keep wss tests to the minimum,
+  split further targets per scenario. Same family as H3.
+## 2026-10-05, quic slice
+
+### Q1. Codegen cost grows with the field count of parameter types
+- Symptom: 60 trivial functions taking a 25-field struct (`QuicConnection.Connection`) add ~14 s
+  of "Generate CLIF" per test (~0.23 s each); the same functions taking `i64[]` add ~1 s, and a
+  6-field struct ~5 s. A test reaching the whole QUIC connection (~590 functions) spends
+  3.5-4 min in "Generate CLIF"; the UDP loopback test ~7 min per target run.
+- Workaround: one heavy scenario per test and per target; keep hot helpers on primitive arrays.
+  `--all-targets` also runs the front end (~25 s) per target before codegen and has a
+  1800 s matrix budget (`--matrix-timeout`, `BESKID_MATRIX_TIMEOUT_SECS`).
+
+### Q2. The test root is not a fiber: spawned fibers do not run while it sleeps or waits
+- Symptom: a fiber spawned from a `test` body never runs during the root's `Time.Sleep` or a
+  `UdpSocket.ReceiveFrom` wait (a counter written by the child stays 0 for 50 ms); it only
+  runs inside `Join`.
+- Repro: `Fiber<unit> f = spawn (() => Loop(b)); Time.Sleep(50 ms); // b.n[2] still 0`.
+- Workaround: run the scenario in a fiber (`Fiber<i64> s = spawn Scenario(); s.Join();`) and
+  return a step code (assertions inside fibers are not reported, W4).
+
+### Q3. `match` as the right-hand side of an assignment is a parse error
+- Symptom: `sealed = match f() { ... };` (assignment, not declaration) fails with
+  "expected MultiplicationExpression".
+- Workaround: a helper function returning the value, or a declaration `T x = match ...`.
+
+### Q4. `when` is a keyword; enum variant names collide with free functions
+- Symptom: `i64 when = ...` fails to parse. A test function `SocketAddress Loopback()` is
+  rejected with "unqualified enum constructor `Loopback`; use `Handshake::Loopback`" because a
+  dependency declares the variant `Handshake::Loopback`.
+- Workaround: rename locals (`due`) and functions (`LocalHost`).
+
+### Q5. Array literal with computed elements in a match arm is an ICE
+- Symptom: `IpAddress::V4(x, y, z, w) => [4_u8, x, y, z, w, u8(p >> 8_i64), u8(p & 255_i64)]`
+  gives "no ISLE lowering rule or fact for MatchExpression" (variant of the http2 note 8).
+- Workaround: a helper that fills `Slice.New(n)`.
+
+### Q6. `Deadline` exposes no accessor
+- Symptom: `deadline.monotonicNanos` is an "inaccessible struct field"; code that loops over
+  short waits cannot tell when a caller's `Option<Deadline>` expires.
+- Workaround: the QUIC endpoint API takes `i64 timeoutMillis` (-1 = none) and computes an
+  absolute monotonic deadline from `Time.MonotonicNow()`.
+
+Note: struct fields cannot be declared `mut`, but assigning a field (`c.dcid = x`) and
+`Array.Append` through a field (`Array.Append<T>(c.list, v)`) both work and are visible to
+callers.
+
+## 2026-10-05, http2 (framing and connection slice)
+
+1. **Nested field path inside an arithmetic comparison is an ICE.**
+   `bool M(Connection c) { return c.config.max + K() > 5_i64; }` fails at CLIF
+   time with "no ISLE lowering rule or fact for `BinaryExpression`".
+   `return c.config.max + K();`, `K() > c.config.max` and
+   `c.recv > c.config.max` all lower. Workaround: read nested settings through
+   accessor functions (`Config c = conn.config; return c.max;`) and bind them to
+   locals before comparing (`Http2/Connection.bd`, "accessors").
+2. **`return match` with a block arm that ends in `return` is an ICE when the
+   function returns a plain enum** (not `Result`): `Http2Error F(IoError e) {
+   return match e { IoError::UnexpectedEof(_) => { x = 1; return A; }, _ => {
+   return B(e); }, }; }` fails with "no ISLE lowering rule or fact for
+   `MatchExpression`". Workaround: compute a `bool` with an expression match,
+   then use `if`, or use a statement `match` with a trailing `return`.
+3. **Contract conformance is nominal and is checked only at specialization.**
+   A type declared `: Stream` passed as `Core.IO.Stream` to `IO.ReadExact`
+   (which takes `Reader`) type-checks, but every test that reaches the call
+   fails at JIT time with "missing contract conformance for MemoryTransport".
+   Workaround: transports declare `Stream, Reader, Writer, Closer` (as
+   `Network.Tcp.TcpStream` does). A future `TlsStream` must do the same to be
+   accepted by `Http2.Client`/`Http2.Server`.
+4. **`mut T[]` parameter growth must be published.** A `unit F(mut u8[] out)`
+   that calls `Array.Append(out, ..)` is rejected ("grown handle ... discarded").
+   Workaround: return the array and rebind (`out = F(out);`), or keep growable
+   arrays in struct fields and assign the grown local back (`conn.block = block`).
+5. Tooling note: a target with loopback networking plus the full HTTP/2 stack
+   takes 5-10 minutes to JIT on a loaded host (load ~12); JIT compiles lazily
+   and reports only the first ICE per test, so each compiler gap costs one full
+   cycle. Editing package sources while `beskid test` runs fails the run with
+   "prepared workspace content mutated during phase `prepare_targets`".
+6. No string escapes (`\r\n`) in string literals: the preface is built from
+   bytes (`Connection.Preface()`).
+7. **Runtime: byte-wise `Array.Append` growth of a body exhausted the AOT heap.**
+   The interop server appended each received DATA octet to an array kept in a
+   struct field (`mut u8[] b = s.body; Array.Append<u8>(b, x); s.body = b;`).
+   After two connections with a 100 KB POST it trapped
+   `out_of_memory (5): R1 req=104 live=64160 committed=1073741824` (live data
+   small, committed heap at the 1 GiB cap). Workaround: grow buffers by
+   doubling with `Slice.New` + `Slice.Copy` (`Connection.Place`); with that the
+   same run passes.
+8. **AOT entry: `TcpListener.Accept` from `Main` fails at once** (the server
+   reported three immediate accept failures). Workaround: run the network code
+   in a spawned fiber (`spawn Run()` from `Main`, then `Join`). Also `beskid
+   run` needs a debug runtime kit; the local kit has only `release`, so the
+   interop script uses `beskid build --release` and runs the binary.
+9. **Runtime: `--all-targets` runs every target in one process and the heap
+   cap is shared.** For `protocols/http2/tests` the matrix passes the first 12
+   targets (smoke, 8 HPACK, frame, loopback, server-error) and then traps
+   `out_of_memory (5): R1 req=57344 live=262032 committed=1073741824` in the
+   13th target (flow control); live data stays near 256 KiB, committed memory
+   reaches the 1 GiB cap. `Assert.CollectGarbage()` before each connection did
+   not help. Replacing byte-wise `Array.Append` growth of the test transport
+   by `Slice.New` + `Slice.Copy` (exact or doubling) made the flow-control
+   target trap even alone, so `MemoryTransport` keeps byte-wise appends on a
+   local copy. Every target passes when run alone with `--target <Name>`.
+   Workaround: run the HTTP/2 connection targets one by one; open item: a
+   runtime that reuses freed segments, or a per-target process in the matrix.
+
+## 2026-10-06, web facade slice
+
+### WEB1. `Types.X(...)` through `use Http.Types;` ICEs when dependencies also have a `Types` leaf
+- Symptom: in `protocols/web` (which depends on uri, connect, tls, http2: all of them
+  or their dependencies declare a `*.Types` module) the call `Types.LowerAscii(h.name)`
+  with only `use Http.Types;` in the file type-checks but fails at CLIF time with
+  `no ISLE lowering rule or fact for CallExpression` (first seen as a
+  `BinaryExpression` ICE on `Types.LowerAscii(a) == "x" && F(Types.LowerAscii(b))`).
+  Same family as W2: the leaf `Types` resolves to a module other than the one imported.
+- Workaround: never call through a `Types` leaf; use `Uri.Chars.LowerAscii` (or a local
+  helper) and build `Request`/`Response` with struct literals instead of
+  `Types.EmptyRequest`.
+
+### WEB2. A spawn lambda cannot capture a `mut` local
+- Symptom: `mut string[] alpn = Array.Empty<string>(); Array.Append<string>(alpn, "x");
+  Fiber<unit> f = spawn (() => Scenario(alpn, codes));` fails at CLIF time with
+  `spawn legality rejected ... StackReferenceEscapesSpawn` on the captured `alpn`.
+  Immutable locals (`i64[] codes = [...]`, `TcpListener l = listener;`) capture fine.
+- Workaround: build the value in a helper and bind it to an immutable local
+  (`string[] alpn = H1Only();`) before the spawn.
+
+### WEB3. Codegen cost of the full Web stack
+- Every Web test reaches TLS 1.3, X.509, crypto, HTTP/2 and HTTP/1.1 through
+  `Web.Exchange` (the plain-HTTP test too, because the https branch is reachable):
+  "Generate CLIF" takes 9.5-10.5 minutes per test on a loaded host (load ~7), and a
+  target 14-15 minutes. Same family as W8/H3.
+- Workaround: one test per target, `--target-timeout 2400`, scenarios that cover several
+  exchanges per test (WebPlain: HTTP/1.1 and h2c; WebHttpsH2/H1: GET and POST).
+
+### WEB4. AOT link on macOS fails for `Library:"libc.so.6"` externs
+- Symptom: `beskid build --release` of an App that reaches `Crypto.Entropy` (declared
+  `[Extern(Abi:"C", Library:"libc.so.6")]`) links with `-lc.so.6` and fails on macOS:
+  `ld: library 'c.so.6' not found`. The JIT (`beskid test`) is not affected, because it
+  resolves symbols in the process namespace (see "`Library` does not appear to scope
+  symbol lookup" above).
+- Workaround (`protocols/web/interop/curl-interop.sh`): a link shim directory with
+  `libc.so.6.tbd -> $(xcrun --show-sdk-path)/usr/lib/libSystem.tbd` on `LIBRARY_PATH`.
+  Open item: per-platform library names for extern contracts.

@@ -1,0 +1,295 @@
+use Core.Collections.Array;
+use Core.IO.Stream;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Http2.Client;
+use Http2.Connection;
+use Http2.FrameErrors;
+use Network.Types as NetTypes;
+use Network.Tcp.TcpStream;
+use Connect;
+use Connect.Failures;
+use Connect.Policy;
+use Tls;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsStream;
+use Uri.Chars;
+use Uri.Parse;
+use Uri.Scheme;
+use Uri.Types as UriTypes;
+use X509.TrustStore;
+use X509.X509Errors;
+use Web.H1Wire;
+use Web.WebConfig;
+use Web.WebErrors;
+
+// One request per connection: parse the absolute URL, Happy Eyeballs TCP, then
+// - http://  HTTP/1.1, or HTTP/2 with prior knowledge when configured;
+// - https:// TLS 1.3 offering `config.alpn`, then HTTP/2 when the server chose
+//   "h2" and HTTP/1.1 when it chose "http/1.1" (or no ALPN at all while
+//   "http/1.1" was offered).
+// The connection is closed after the response; there is no pooling yet.
+
+/// A response and the protocol that carried it: "h2", "http/1.1" (over TLS),
+/// "h2c" or "http/1.1-plain".
+pub type WebResponse {
+    pub Response response,
+    pub string protocol,
+}
+
+pub Result<Response,WebError> Send(Request request, WebClientConfig config) {
+    Result<WebResponse,WebError> exchanged = Exchange(request, config);
+    return match exchanged {
+        Result::Ok(w) => Result::Ok(w.response),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+/// Like Send, and also reports the negotiated protocol.
+pub Result<WebResponse,WebError> Exchange(Request request, WebClientConfig config) {
+    return match Parse.Parse(request.target) {
+        Result::Error(_) => Result::Error(WebError::InvalidUrl()),
+        Result::Ok(u) => SendUri(u, request, config),
+    };
+}
+
+// Origin-form target of an absolute URI: path ("/" when empty) and query.
+pub string OriginForm(UriRef u) {
+    mut string path = u.path;
+    if String.Len(path) == 0_i64 { path = "/"; }
+    if u.hasQuery { return path + "?" + u.query; }
+    return path;
+}
+
+Result<WebResponse,WebError> SendUri(UriRef u, Request request, WebClientConfig config) {
+    string scheme = Chars.LowerAscii(u.scheme);
+    if !u.hasScheme { return Result::Error(WebError::InvalidUrl()); }
+    if scheme != "http" && scheme != "https" { return Result::Error(WebError::UnsupportedScheme()); }
+    string origin = OriginForm(u);
+    return match Scheme.AuthorityOf(u) {
+        Result::Error(_) => Result::Error(WebError::InvalidUrl()),
+        Result::Ok(authority) => SendAuthority(authority, scheme, origin, request, config),
+    };
+}
+
+// The request as sent on the wire: origin-form target, Host, no hop-by-hop fields.
+Request WireRequest(Request request, string origin, string hostHeader) {
+    mut Header[] headers = Array.Empty<Header>();
+    string given = H1Wire.FieldValue(request.headers, "host");
+    if String.Len(given) == 0_i64 { Array.Append<Header>(headers, Header { name: "host", value: hostHeader }); }
+    Header[] rest = H1Wire.EndToEnd(request.headers);
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(rest) {
+        Array.Append<Header>(headers, Array.Get<Header>(rest, i));
+        i = i + 1_i64;
+    }
+    return Request { method: request.method, target: origin, headers: headers, body: request.body };
+}
+
+Result<WebResponse,WebError> SendAuthority(Authority authority, string scheme, string origin, Request request, WebClientConfig config) {
+    string hostName = authority.hostName;
+    Request wire = WireRequest(request, origin, Scheme.HostHeader(authority));
+    bool secure = scheme == "https";
+    // HTTP/3 hook: with `config.http3 == Http3Mode::Prefer()` and a secure URL,
+    // try Http3.H3Client.ConnectQuic here and fall back to TCP when QUIC fails.
+    // The Http3 QUIC path is not merged yet (branch claude/net-h3quic).
+    return match NetTypes.PortNumber(authority.port) {
+        Result::Error(_) => Result::Error(WebError::InvalidUrl()),
+        Result::Ok(port) => ConnectAndSend(hostName, port, secure, wire, config),
+    };
+}
+
+Option<Deadline> Within(i64 millis) {
+    if millis <= 0_i64 { return Option.Empty<Deadline>(); }
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+// Read and write deadline for the exchange on the TCP stream underneath.
+pub unit ArmDeadline(TcpStream tcp, i64 millis) {
+    TransferDeadlines policy = TransferDeadlines { read: Within(millis), write: Within(millis) };
+    tcp.SetDeadlines(policy);
+    return;
+}
+
+Result<WebResponse,WebError> ConnectAndSend(string hostName, Port port, bool secure, Request request, WebClientConfig config) {
+    ConnectPolicy policy = Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(config.connectTimeoutMillis));
+    Result<TcpStream,ConnectError> connected = Connect.ConnectHost(hostName, port, policy);
+    match connected {
+        Result::Error(error) => { return Result::Error(WebError::ConnectFailed(error)); },
+        Result::Ok(tcp) => {
+            if secure { return OverTls(tcp, hostName, request, config); }
+            return OverTcp(tcp, request, config);
+        },
+    };
+    return Result::Error(WebError::InvalidUrl());
+}
+
+Result<WebResponse,WebError> OverTcp(TcpStream tcp, Request request, WebClientConfig config) {
+    ArmDeadline(tcp, config.requestTimeoutMillis);
+    if config.h2cPriorKnowledge {
+        Result<WebResponse,WebError> h2 = H2Exchange(tcp, request, config, "http", "h2c");
+        tcp.Close();
+        return h2;
+    }
+    Result<WebResponse,WebError> h1 = H1Exchange(tcp, request, config, "http/1.1-plain");
+    tcp.Close();
+    return h1;
+}
+
+// The client trust policy: `config.trust`, else the system bundle. A bundle that
+// cannot be loaded or holds no anchors fails the request (no insecure fallback).
+pub Result<CertificateVerification,WebError> ClientTrust(WebClientConfig config) {
+    Option<CertificateVerification> chosen = config.trust;
+    match chosen {
+        Option::Some(verification) => { return Result::Ok(verification); },
+        Option::None => {},
+    };
+    Result<TrustStore,X509Error> loaded = TrustStore.FromFile(TrustStore.SystemBundlePath());
+    return match loaded {
+        Result::Error(_) => Result::Error(WebError::TrustUnavailable()),
+        Result::Ok(store) => SystemTrust(store),
+    };
+}
+
+Result<CertificateVerification,WebError> SystemTrust(TrustStore store) {
+    if TrustStore.Count(store) == 0_i64 { return Result::Error(WebError::TrustUnavailable()); }
+    return Result::Ok(TlsConfig.WithTrustStore(store));
+}
+
+bool Offers(string[] alpn, string protocol) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(alpn) {
+        string offered = Array.Get<string>(alpn, i);
+        if offered == protocol { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+Result<WebResponse,WebError> OverTls(TcpStream tcp, string hostName, Request request, WebClientConfig config) {
+    if Array.Len<string>(config.alpn) == 0_i64 { tcp.Close(); return Result::Error(WebError::InvalidConfig()); }
+    Result<CertificateVerification,WebError> trust = ClientTrust(config);
+    match trust {
+        Result::Error(error) => { tcp.Close(); return Result::Error(error); },
+        Result::Ok(verification) => { return Handshake(tcp, hostName, verification, request, config); },
+    };
+    return Result::Error(WebError::InvalidConfig());
+}
+
+Result<WebResponse,WebError> Handshake(TcpStream tcp, string hostName, CertificateVerification verification, Request request, WebClientConfig config) {
+    mut TlsClientConfig tlsConfig = TlsConfig.Client(hostName, verification);
+    tlsConfig.alpn = config.alpn;
+    Result<TlsStream,TlsError> secured = Tls.Connect(tcp, tlsConfig, Within(config.connectTimeoutMillis));
+    match secured {
+        Result::Error(error) => { return Result::Error(WebError::TlsFailed(error)); },
+        Result::Ok(stream) => { return Dispatch(stream, request, config); },
+    };
+    return Result::Error(WebError::InvalidConfig());
+}
+
+// Chooses the HTTP version from the negotiated ALPN protocol (RFC 7301).
+Result<WebResponse,WebError> Dispatch(TlsStream stream, Request request, WebClientConfig config) {
+    ArmDeadline(TlsStream.Transport(stream), config.requestTimeoutMillis);
+    string alpn = TlsStream.NegotiatedAlpn(stream);
+    mut Result<WebResponse,WebError> result = Result::Error(WebError::AlpnMismatch(alpn));
+    bool offersH2 = Offers(config.alpn, "h2");
+    bool offersH1 = Offers(config.alpn, "http/1.1");
+    i64 alpnLength = String.Len(alpn);
+    bool choseH2 = alpn == "h2";
+    bool choseH1 = alpn == "http/1.1" || alpnLength == 0_i64;
+    if choseH2 && offersH2 {
+        result = H2Exchange(stream, request, config, "https", "h2");
+    } else {
+        if choseH1 && offersH1 { result = H1Exchange(stream, request, config, "http/1.1"); }
+    }
+    TlsStream.Close(stream);
+    return result;
+}
+
+Config H2Config(WebClientConfig config, string scheme) {
+    Config c = config.h2;
+    return Config { initialWindowSize: c.initialWindowSize, maxConcurrentStreams: c.maxConcurrentStreams, maxHeaderListSize: c.maxHeaderListSize, maxBodyBytes: c.maxBodyBytes, timeoutMillis: c.timeoutMillis, scheme: scheme, maxRequests: c.maxRequests };
+}
+
+Result<WebResponse,WebError> H2Exchange(Stream transport, Request request, WebClientConfig config, string scheme, string protocol) {
+    Result<Connection,Http2Error> opened = Client.Open(transport, H2Config(config, scheme));
+    match opened {
+        Result::Error(error) => { return Result::Error(WebError::Http2Failed(error)); },
+        Result::Ok(conn) => { return H2Send(conn, transport, request, protocol); },
+    };
+    return Result::Error(WebError::InvalidConfig());
+}
+
+Result<WebResponse,WebError> H2Send(Connection conn, Stream transport, Request request, string protocol) {
+    Result<Response,Http2Error> sent = Client.Send(conn, transport, request);
+    Client.Close(conn, transport);
+    return match sent {
+        Result::Error(error) => Result::Error(WebError::Http2Failed(error)),
+        Result::Ok(response) => Result::Ok(WebResponse { response: response, protocol: protocol }),
+    };
+}
+
+MessageRole ResponseRole(string method) {
+    if method == "HEAD" { return MessageRole::HeadResponse(); }
+    return MessageRole::Response();
+}
+
+bool IsInterim(HttpError error) {
+    return match error { HttpError::InterimResponse => true, _ => false, };
+}
+
+Result<WebResponse,WebError> H1Exchange(Stream transport, Request request, WebClientConfig config, string protocol) {
+    mut Header[] headers = request.headers;
+    Array.Append<Header>(headers, Header { name: "connection", value: "close" });
+    Request closing = Request { method: request.method, target: request.target, headers: headers, body: request.body };
+    Result<u8[],HttpError> encoded = Codec.SerializeRequest(closing, config.limits);
+    match encoded {
+        Result::Error(error) => { return Result::Error(WebError::Http1Failed(error)); },
+        Result::Ok(bytes) => { return H1Write(transport, bytes, request.method, config, protocol); },
+    };
+    return Result::Error(WebError::InvalidConfig());
+}
+
+Result<WebResponse,WebError> H1Write(Stream transport, u8[] bytes, string method, WebClientConfig config, string protocol) {
+    Result<unit,HttpError> written = H1Wire.WriteAll(transport, bytes);
+    match written {
+        Result::Error(error) => { return Result::Error(WebError::Http1Failed(error)); },
+        Result::Ok(_) => {},
+    };
+    return H1Read(transport, method, config, protocol);
+}
+
+// Reads the final response; up to four 1xx interim responses are skipped.
+Result<WebResponse,WebError> H1Read(Stream transport, string method, WebClientConfig config, string protocol) {
+    H1Buffer buffer = H1Wire.NewBuffer();
+    MessageRole role = ResponseRole(method);
+    Limits limits = config.limits;
+    mut i64 interim = 0_i64;
+    while interim < 5_i64 {
+        Result<u8[],HttpError> wire = H1Wire.ReadMessage(buffer, transport, limits, role);
+        mut u8[] message = [];
+        match wire {
+            Result::Error(error) => { return Result::Error(WebError::Http1Failed(error)); },
+            Result::Ok(value) => { message = value; },
+        };
+        Result<Response,HttpError> parsed = Codec.ParseResponse(message, limits, role);
+        match parsed {
+            Result::Ok(response) => { return Result::Ok(WebResponse { response: response, protocol: protocol }); },
+            Result::Error(error) => {
+                if !IsInterim(error) { return Result::Error(WebError::Http1Failed(error)); }
+            },
+        };
+        interim = interim + 1_i64;
+    }
+    return Result::Error(WebError::Http1Failed(HttpError::InterimResponse()));
+}

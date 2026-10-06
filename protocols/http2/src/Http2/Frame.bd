@@ -1,0 +1,361 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.FrameErrors;
+
+// RFC 9113 section 4 and 6: the 9-octet frame header and every frame type.
+
+pub i64 TypeData() { return 0_i64; }
+pub i64 TypeHeaders() { return 1_i64; }
+pub i64 TypePriority() { return 2_i64; }
+pub i64 TypeRstStream() { return 3_i64; }
+pub i64 TypeSettings() { return 4_i64; }
+pub i64 TypePushPromise() { return 5_i64; }
+pub i64 TypePing() { return 6_i64; }
+pub i64 TypeGoAway() { return 7_i64; }
+pub i64 TypeWindowUpdate() { return 8_i64; }
+pub i64 TypeContinuation() { return 9_i64; }
+
+pub i64 FlagEndStream() { return 1_i64; }
+pub i64 FlagAck() { return 1_i64; }
+pub i64 FlagEndHeaders() { return 4_i64; }
+pub i64 FlagPadded() { return 8_i64; }
+pub i64 FlagPriority() { return 32_i64; }
+
+pub i64 HeaderLength() { return 9_i64; }
+// SETTINGS_MAX_FRAME_SIZE bounds (section 6.5.2).
+pub i64 MinMaxFrameSize() { return 16384_i64; }
+pub i64 MaxMaxFrameSize() { return 16777215_i64; }
+// Largest stream id and window (2^31 - 1).
+pub i64 MaxStreamId() { return 2147483647_i64; }
+pub i64 MaxWindow() { return 2147483647_i64; }
+
+pub type FrameHeader { pub i64 length, pub i64 kind, pub i64 flags, pub i64 streamId, }
+
+// One decoded frame. Padding is removed; `flowLength` of DATA is the whole
+// payload length including padding, which counts against flow control.
+pub enum Frame {
+    Data(i64 streamId, bool endStream, i64 flowLength, u8[] data),
+    Headers(i64 streamId, bool endStream, bool endHeaders, bool hasPriority, bool exclusive, i64 dependency, i64 weight, u8[] fragment),
+    Priority(i64 streamId, bool exclusive, i64 dependency, i64 weight),
+    RstStream(i64 streamId, i64 code),
+    Settings(bool ack, i64[] ids, i64[] values),
+    PushPromise(i64 streamId, bool endHeaders, i64 promisedId, u8[] fragment),
+    Ping(bool ack, u8[] opaque),
+    GoAway(i64 lastStreamId, i64 code, u8[] debug),
+    WindowUpdate(i64 streamId, i64 increment),
+    Continuation(i64 streamId, bool endHeaders, u8[] fragment),
+    Unknown(i64 kind, i64 streamId),
+}
+
+// ---- encoding ----
+
+pub unit PutU32(u8[] buf, i64 offset, i64 value) {
+    buf[offset] = u8((value >> 24_i64) & 255_i64);
+    buf[offset + 1_i64] = u8((value >> 16_i64) & 255_i64);
+    buf[offset + 2_i64] = u8((value >> 8_i64) & 255_i64);
+    buf[offset + 3_i64] = u8(value & 255_i64);
+    return;
+}
+
+pub i64 GetU32(u8[] buf, i64 offset) {
+    return (i64(buf[offset]) << 24_i64) | (i64(buf[offset + 1_i64]) << 16_i64) | (i64(buf[offset + 2_i64]) << 8_i64) | i64(buf[offset + 3_i64]);
+}
+
+// Writes a 9-octet frame header at `offset`; the reserved bit is sent as 0.
+pub unit PutHeader(u8[] buf, i64 offset, i64 length, i64 kind, i64 flags, i64 streamId) {
+    buf[offset] = u8((length >> 16_i64) & 255_i64);
+    buf[offset + 1_i64] = u8((length >> 8_i64) & 255_i64);
+    buf[offset + 2_i64] = u8(length & 255_i64);
+    buf[offset + 3_i64] = u8(kind & 255_i64);
+    buf[offset + 4_i64] = u8(flags & 255_i64);
+    PutU32(buf, offset + 5_i64, streamId & MaxStreamId());
+    return;
+}
+
+// Reads a frame header; the reserved bit of the stream id is ignored (section 4.1).
+pub FrameHeader ParseHeader(u8[] buf, i64 offset) {
+    i64 length = (i64(buf[offset]) << 16_i64) | (i64(buf[offset + 1_i64]) << 8_i64) | i64(buf[offset + 2_i64]);
+    return FrameHeader { length: length, kind: i64(buf[offset + 3_i64]), flags: i64(buf[offset + 4_i64]), streamId: GetU32(buf, offset + 5_i64) & MaxStreamId() };
+}
+
+// A complete frame with `payload`.
+pub u8[] Encode(i64 kind, i64 flags, i64 streamId, u8[] payload) {
+    i64 count = Slice.Len(payload);
+    u8[] out = Slice.New(HeaderLength() + count);
+    PutHeader(out, 0_i64, count, kind, flags, streamId);
+    if count > 0_i64 { Slice.Copy(out, HeaderLength(), payload, 0_i64, count); }
+    return out;
+}
+
+i64 EndStreamFlag(bool endStream) { if endStream { return FlagEndStream(); } return 0_i64; }
+i64 EndHeadersFlag(bool endHeaders) { if endHeaders { return FlagEndHeaders(); } return 0_i64; }
+
+pub u8[] DataFrame(i64 streamId, u8[] data, bool endStream) {
+    return Encode(TypeData(), EndStreamFlag(endStream), streamId, data);
+}
+
+// DATA with `padLength` octets of zero padding (section 6.1).
+pub u8[] PaddedDataFrame(i64 streamId, u8[] data, i64 padLength, bool endStream) {
+    i64 count = Slice.Len(data);
+    u8[] payload = Slice.New(1_i64 + count + padLength);
+    payload[0] = u8(padLength & 255_i64);
+    if count > 0_i64 { Slice.Copy(payload, 1_i64, data, 0_i64, count); }
+    return Encode(TypeData(), EndStreamFlag(endStream) | FlagPadded(), streamId, payload);
+}
+
+pub u8[] HeadersFrame(i64 streamId, u8[] fragment, bool endStream, bool endHeaders) {
+    return Encode(TypeHeaders(), EndStreamFlag(endStream) | EndHeadersFlag(endHeaders), streamId, fragment);
+}
+
+// HEADERS with the PRIORITY fields and optional padding (section 6.2).
+pub u8[] PriorityHeadersFrame(i64 streamId, u8[] fragment, bool endStream, bool endHeaders, bool exclusive, i64 dependency, i64 weight, i64 padLength) {
+    i64 count = Slice.Len(fragment);
+    mut i64 flags = EndStreamFlag(endStream) | EndHeadersFlag(endHeaders) | FlagPriority();
+    mut i64 at = 0_i64;
+    mut i64 extra = 5_i64;
+    if padLength > 0_i64 { extra = extra + 1_i64 + padLength; flags = flags | FlagPadded(); }
+    u8[] payload = Slice.New(count + extra);
+    if padLength > 0_i64 { payload[0] = u8(padLength & 255_i64); at = 1_i64; }
+    mut i64 dep = dependency & MaxStreamId();
+    if exclusive { dep = dep | 2147483648_i64; }
+    PutU32(payload, at, dep);
+    payload[at + 4_i64] = u8((weight - 1_i64) & 255_i64);
+    if count > 0_i64 { Slice.Copy(payload, at + 5_i64, fragment, 0_i64, count); }
+    return Encode(TypeHeaders(), flags, streamId, payload);
+}
+
+pub u8[] PriorityFrame(i64 streamId, bool exclusive, i64 dependency, i64 weight) {
+    u8[] payload = Slice.New(5_i64);
+    mut i64 dep = dependency & MaxStreamId();
+    if exclusive { dep = dep | 2147483648_i64; }
+    PutU32(payload, 0_i64, dep);
+    payload[4] = u8((weight - 1_i64) & 255_i64);
+    return Encode(TypePriority(), 0_i64, streamId, payload);
+}
+
+pub u8[] RstStreamFrame(i64 streamId, i64 code) {
+    u8[] payload = Slice.New(4_i64);
+    PutU32(payload, 0_i64, code);
+    return Encode(TypeRstStream(), 0_i64, streamId, payload);
+}
+
+pub u8[] SettingsFrame(i64[] ids, i64[] values) {
+    i64 count = Array.Len<i64>(ids);
+    u8[] payload = Slice.New(count * 6_i64);
+    mut i64 i = 0_i64;
+    while i < count {
+        i64 id = ids[i];
+        payload[i * 6_i64] = u8((id >> 8_i64) & 255_i64);
+        payload[i * 6_i64 + 1_i64] = u8(id & 255_i64);
+        PutU32(payload, i * 6_i64 + 2_i64, values[i]);
+        i = i + 1_i64;
+    }
+    return Encode(TypeSettings(), 0_i64, 0_i64, payload);
+}
+
+pub u8[] SettingsAckFrame() {
+    return Encode(TypeSettings(), FlagAck(), 0_i64, Slice.New(0_i64));
+}
+
+pub u8[] PushPromiseFrame(i64 streamId, i64 promisedId, u8[] fragment, bool endHeaders) {
+    i64 count = Slice.Len(fragment);
+    u8[] payload = Slice.New(4_i64 + count);
+    PutU32(payload, 0_i64, promisedId);
+    if count > 0_i64 { Slice.Copy(payload, 4_i64, fragment, 0_i64, count); }
+    return Encode(TypePushPromise(), EndHeadersFlag(endHeaders), streamId, payload);
+}
+
+pub u8[] PingFrame(u8[] opaque, bool ack) {
+    mut i64 flags = 0_i64;
+    if ack { flags = FlagAck(); }
+    return Encode(TypePing(), flags, 0_i64, opaque);
+}
+
+pub u8[] GoAwayFrame(i64 lastStreamId, i64 code, u8[] debug) {
+    i64 count = Slice.Len(debug);
+    u8[] payload = Slice.New(8_i64 + count);
+    PutU32(payload, 0_i64, lastStreamId & MaxStreamId());
+    PutU32(payload, 4_i64, code);
+    if count > 0_i64 { Slice.Copy(payload, 8_i64, debug, 0_i64, count); }
+    return Encode(TypeGoAway(), 0_i64, 0_i64, payload);
+}
+
+pub u8[] WindowUpdateFrame(i64 streamId, i64 increment) {
+    u8[] payload = Slice.New(4_i64);
+    PutU32(payload, 0_i64, increment & MaxWindow());
+    return Encode(TypeWindowUpdate(), 0_i64, streamId, payload);
+}
+
+pub u8[] ContinuationFrame(i64 streamId, u8[] fragment, bool endHeaders) {
+    return Encode(TypeContinuation(), EndHeadersFlag(endHeaders), streamId, fragment);
+}
+
+// ---- decoding ----
+
+Result<Frame,FrameError> ConnError(i64 code) { return Result::Error(FrameError::Connection(code)); }
+Result<Frame,FrameError> StreamError(i64 streamId, i64 code) { return Result::Error(FrameError::Stream(streamId, code)); }
+
+bool HasFlag(i64 flags, i64 flag) { return (flags & flag) != 0_i64; }
+
+// Decodes a whole frame (header plus payload) from `bytes`.
+pub Result<Frame,FrameError> Decode(u8[] bytes, i64 maxFrameSize) {
+    if Slice.Len(bytes) < HeaderLength() { return ConnError(FrameErrors.FrameSizeError()); }
+    FrameHeader header = ParseHeader(bytes, 0_i64);
+    if Slice.Len(bytes) != HeaderLength() + header.length { return ConnError(FrameErrors.FrameSizeError()); }
+    return DecodePayload(header, bytes, HeaderLength(), maxFrameSize);
+}
+
+// Decodes the payload of `header` stored at `buf[offset..offset+header.length]`.
+// `maxFrameSize` is the SETTINGS_MAX_FRAME_SIZE this endpoint advertised.
+pub Result<Frame,FrameError> DecodePayload(FrameHeader header, u8[] buf, i64 offset, i64 maxFrameSize) {
+    i64 length = header.length;
+    i64 id = header.streamId;
+    i64 flags = header.flags;
+    i64 kind = header.kind;
+    if length > maxFrameSize { return ConnError(FrameErrors.FrameSizeError()); }
+    if kind == TypeData() {
+        if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        mut i64 start = offset;
+        mut i64 count = length;
+        if HasFlag(flags, FlagPadded()) {
+            if length < 1_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+            i64 pad = i64(buf[offset]);
+            if pad >= length { return ConnError(FrameErrors.ProtocolError()); }
+            start = offset + 1_i64;
+            count = length - 1_i64 - pad;
+        }
+        return Result::Ok(Frame::Data(id, HasFlag(flags, FlagEndStream()), length, Slice.SubSlice(buf, start, count)));
+    }
+    if kind == TypeHeaders() {
+        if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        mut i64 start = offset;
+        mut i64 remaining = length;
+        mut i64 pad = 0_i64;
+        if HasFlag(flags, FlagPadded()) {
+            if remaining < 1_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+            pad = i64(buf[start]);
+            start = start + 1_i64;
+            remaining = remaining - 1_i64;
+        }
+        bool hasPriority = HasFlag(flags, FlagPriority());
+        mut bool exclusive = false;
+        mut i64 dependency = 0_i64;
+        mut i64 weight = 16_i64;
+        if hasPriority {
+            if remaining < 5_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+            i64 raw = GetU32(buf, start);
+            exclusive = (raw & 2147483648_i64) != 0_i64;
+            dependency = raw & MaxStreamId();
+            weight = i64(buf[start + 4_i64]) + 1_i64;
+            start = start + 5_i64;
+            remaining = remaining - 5_i64;
+        }
+        if pad > remaining { return ConnError(FrameErrors.ProtocolError()); }
+        if hasPriority && dependency == id { return StreamError(id, FrameErrors.ProtocolError()); }
+        return Result::Ok(Frame::Headers(id, HasFlag(flags, FlagEndStream()), HasFlag(flags, FlagEndHeaders()), hasPriority, exclusive, dependency, weight, Slice.SubSlice(buf, start, remaining - pad)));
+    }
+    if kind == TypePriority() {
+        if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        if length != 5_i64 { return StreamError(id, FrameErrors.FrameSizeError()); }
+        i64 raw = GetU32(buf, offset);
+        i64 dependency = raw & MaxStreamId();
+        if dependency == id { return StreamError(id, FrameErrors.ProtocolError()); }
+        return Result::Ok(Frame::Priority(id, (raw & 2147483648_i64) != 0_i64, dependency, i64(buf[offset + 4_i64]) + 1_i64));
+    }
+    if kind == TypeRstStream() {
+        if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        if length != 4_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        return Result::Ok(Frame::RstStream(id, GetU32(buf, offset)));
+    }
+    if kind == TypeSettings() {
+        if id != 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        bool ack = HasFlag(flags, FlagAck());
+        if ack && length != 0_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        if (length % 6_i64) != 0_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        mut i64[] ids = Array.Empty<i64>();
+        mut i64[] values = Array.Empty<i64>();
+        mut i64 at = 0_i64;
+        while at < length {
+            i64 identifier = (i64(buf[offset + at]) << 8_i64) | i64(buf[offset + at + 1_i64]);
+            Array.Append<i64>(ids, identifier);
+            Array.Append<i64>(values, GetU32(buf, offset + at + 2_i64));
+            at = at + 6_i64;
+        }
+        return Result::Ok(Frame::Settings(ack, ids, values));
+    }
+    if kind == TypePushPromise() {
+        if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        mut i64 start = offset;
+        mut i64 remaining = length;
+        mut i64 pad = 0_i64;
+        if HasFlag(flags, FlagPadded()) {
+            if remaining < 1_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+            pad = i64(buf[start]);
+            start = start + 1_i64;
+            remaining = remaining - 1_i64;
+        }
+        if remaining < 4_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        i64 promised = GetU32(buf, start) & MaxStreamId();
+        start = start + 4_i64;
+        remaining = remaining - 4_i64;
+        if pad > remaining { return ConnError(FrameErrors.ProtocolError()); }
+        return Result::Ok(Frame::PushPromise(id, HasFlag(flags, FlagEndHeaders()), promised, Slice.SubSlice(buf, start, remaining - pad)));
+    }
+    if kind == TypePing() {
+        if id != 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        if length != 8_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        return Result::Ok(Frame::Ping(HasFlag(flags, FlagAck()), Slice.SubSlice(buf, offset, 8_i64)));
+    }
+    if kind == TypeGoAway() {
+        if id != 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        if length < 8_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        return Result::Ok(Frame::GoAway(GetU32(buf, offset) & MaxStreamId(), GetU32(buf, offset + 4_i64), Slice.SubSlice(buf, offset + 8_i64, length - 8_i64)));
+    }
+    if kind == TypeWindowUpdate() {
+        if length != 4_i64 { return ConnError(FrameErrors.FrameSizeError()); }
+        i64 increment = GetU32(buf, offset) & MaxWindow();
+        if increment == 0_i64 {
+            if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+            return StreamError(id, FrameErrors.ProtocolError());
+        }
+        return Result::Ok(Frame::WindowUpdate(id, increment));
+    }
+    if kind == TypeContinuation() {
+        if id == 0_i64 { return ConnError(FrameErrors.ProtocolError()); }
+        return Result::Ok(Frame::Continuation(id, HasFlag(flags, FlagEndHeaders()), Slice.SubSlice(buf, offset, length)));
+    }
+    return Result::Ok(Frame::Unknown(kind, id));
+}
+
+// The frame type code of a decoded frame.
+pub i64 KindOf(Frame frame) {
+    return match frame {
+        Frame::Data(_, _, _, _) => TypeData(),
+        Frame::Headers(_, _, _, _, _, _, _, _) => TypeHeaders(),
+        Frame::Priority(_, _, _, _) => TypePriority(),
+        Frame::RstStream(_, _) => TypeRstStream(),
+        Frame::Settings(_, _, _) => TypeSettings(),
+        Frame::PushPromise(_, _, _, _) => TypePushPromise(),
+        Frame::Ping(_, _) => TypePing(),
+        Frame::GoAway(_, _, _) => TypeGoAway(),
+        Frame::WindowUpdate(_, _) => TypeWindowUpdate(),
+        Frame::Continuation(_, _, _) => TypeContinuation(),
+        Frame::Unknown(kind, _) => kind,
+    };
+}
+
+// The stream id of a decoded frame (0 for connection frames).
+pub i64 StreamOf(Frame frame) {
+    return match frame {
+        Frame::Data(id, _, _, _) => id,
+        Frame::Headers(id, _, _, _, _, _, _, _) => id,
+        Frame::Priority(id, _, _, _) => id,
+        Frame::RstStream(id, _) => id,
+        Frame::PushPromise(id, _, _, _) => id,
+        Frame::WindowUpdate(id, _) => id,
+        Frame::Continuation(id, _, _) => id,
+        Frame::Unknown(_, id) => id,
+        _ => 0_i64,
+    };
+}

@@ -1,0 +1,87 @@
+use Beskid.Compiler.Collect;
+use Beskid.Compiler.Query;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.String;
+
+/// Labels select source nodes; only ResolveSyntaxType can issue their authority.
+pub string Decimal(u64 value) {
+    mut u8[] reversed = [];
+    mut u64 remaining = value;
+    while (remaining > 0_u64) {
+        reversed = Array.Append<u8>(reversed, u8(remaining % 10_u64) + 48_u8);
+        remaining = remaining / 10_u64;
+    }
+    if (Array.Len(reversed) == 0_i64) { return "0"; }
+    mut u8[] bytes = [];
+    mut i64 index = Array.Len(reversed);
+    while (index > 0_i64) {
+        index = index - 1_i64;
+        bytes = Array.Append<u8>(bytes, reversed[index]);
+    }
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+pub string Label(CollectRequest request, NodeRef node) {
+    NodeSpan span = Query.Span(node);
+    return request.compilation.entrySourcePath + ":" + Decimal(span.start) + ":" + Decimal(span.end);
+}
+
+bool Annotated(SpannedAttributeList attributes) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len(attributes.items)) {
+        if (attributes.items[index].node.name.node.name == "Serialize") { return true; }
+        index = index + 1_i64;
+    }
+    return false;
+}
+
+pub NodeRef[] Selected(CollectRequest request) {
+    mut NodeRef[] selected = [];
+    NodeRef[] records = Query.OfKind(Query.At(request.compilation.entryRoot), NodeKind::TypeDefinition);
+    mut i64 index = 0_i64;
+    while (index < Array.Len(records)) {
+        match Query.AsTypeDefinition(records[index]) {
+            Option::Some(definition) => {
+                if (Annotated(definition.attributes)) { selected = Array.Append<NodeRef>(selected, records[index]); }
+            },
+            Option::None => { },
+        };
+        index = index + 1_i64;
+    }
+    // Enum attributes are structural children in the required SDK prerequisite.
+    NodeRef[] enums = Query.OfKind(Query.At(request.compilation.entryRoot), NodeKind::EnumDefinition);
+    index = 0_i64;
+    while (index < Array.Len(enums)) {
+        match Query.AsEnumDefinition(enums[index]) {
+            Option::Some(definition) => {
+                if (Annotated(definition.attributes)) { selected = Array.Append<NodeRef>(selected, enums[index]); }
+            },
+            Option::None => { },
+        };
+        index = index + 1_i64;
+    }
+    return selected;
+}
+
+pub CollectTargetSet Targets(CollectRequest request) {
+    NodeRef[] nodes = Selected(request);
+    mut string[] labels = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(nodes)) {
+        labels = Array.Append<string>(labels, Label(request, nodes[index]));
+        index = index + 1_i64;
+    }
+    return CollectTargetSet { targetIds: labels };
+}
+
+pub bool Requested(GenerationRequest request, NodeRef node) {
+    string label = Label(request.context, node);
+    mut i64 index = 0_i64;
+    while (index < Array.Len(request.targets.targetIds)) {
+        if (request.targets.targetIds[index] == label) { return true; }
+        index = index + 1_i64;
+    }
+    return false;
+}

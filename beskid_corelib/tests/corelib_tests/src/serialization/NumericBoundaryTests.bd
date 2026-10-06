@@ -1,0 +1,115 @@
+use Core.Results;
+use Core.String;
+use Core.Serialization.FloatDecimal;
+use Core.Serialization.Limits;
+use Core.Serialization.Numeric;
+use Core.Serialization.Decimal;
+use Testing.Assert;
+
+// SER-05 / SER-06 numeric boundaries (Task 4): exact integer widths, no float coercion.
+
+unit AcceptSigned(string text, i64 width, i64 expected) {
+    match Numeric.ParseSigned(text, width) {
+        Result::Ok(value) => Assert.Equal<i64>(value, expected, "signed boundary admitted exactly"),
+        Result::Error(_) => Assert.Fail("signed boundary must be admitted"),
+    };
+}
+
+unit AcceptUnsigned(string text, i64 width, u64 expected) {
+    match Numeric.ParseUnsigned(text, width) {
+        Result::Ok(value) => Assert.Equal<u64>(value, expected, "unsigned boundary admitted exactly"),
+        Result::Error(_) => Assert.Fail("unsigned boundary must be admitted"),
+    };
+}
+
+test serialization_signed_limits_for_every_wire_width {
+    AcceptSigned("-128", 8_i64, -128_i64);
+    AcceptSigned("127", 8_i64, 127_i64);
+    AcceptSigned("-32768", 16_i64, -32768_i64);
+    AcceptSigned("32767", 16_i64, 32767_i64);
+    AcceptSigned("-2147483648", 32_i64, -2147483648_i64);
+    AcceptSigned("2147483647", 32_i64, 2147483647_i64);
+    AcceptSigned("9223372036854775807", 64_i64, 9223372036854775807_i64);
+    Assert.True(Results.IsError(Numeric.ParseSigned("-32769", 16_i64)), "i16 minimum minus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("32768", 16_i64)), "i16 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("-2147483649", 32_i64)), "i32 minimum minus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("2147483648", 32_i64)), "i32 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("-9223372036854775809", 64_i64)), "i64 minimum minus one");
+}
+
+test serialization_unsigned_limits_for_every_wire_width {
+    AcceptUnsigned("0", 8_i64, 0_u64);
+    AcceptUnsigned("255", 8_i64, 255_u64);
+    AcceptUnsigned("65535", 16_i64, 65535_u64);
+    AcceptUnsigned("4294967295", 32_i64, 4294967295_u64);
+    AcceptUnsigned("18446744073709551615", 64_i64, 18446744073709551615_u64);
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("65536", 16_i64)), "u16 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("4294967296", 32_i64)), "u32 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("256", 8_i64)), "u8 maximum plus one");
+}
+
+test serialization_integers_above_two_pow_53_are_exact_in_both_signs {
+    AcceptSigned("9007199254740993", 64_i64, 9007199254740993_i64);
+    AcceptSigned("-9007199254740993", 64_i64, -9007199254740993_i64);
+    AcceptUnsigned("9007199254740993", 64_i64, 9007199254740993_u64);
+    AcceptUnsigned("18446744073709551614", 64_i64, 18446744073709551614_u64);
+    // Neighbouring odd and even values above 2^53 must stay distinct.
+    AcceptUnsigned("9007199254740995", 64_i64, 9007199254740995_u64);
+    Assert.Equal<string>(Decimal.Signed(-9007199254740993_i64), "-9007199254740993", "formatting does not pass through f64");
+}
+
+test serialization_integer_text_rejects_non_canonical_forms {
+    Assert.True(Results.IsError(Numeric.ParseSigned("", 32_i64)), "empty text");
+    Assert.True(Results.IsError(Numeric.ParseSigned("-", 32_i64)), "sign without digits");
+    Assert.True(Results.IsError(Numeric.ParseSigned("+1", 32_i64)), "explicit plus sign");
+    Assert.True(Results.IsError(Numeric.ParseSigned(" 1", 32_i64)), "leading space");
+    Assert.True(Results.IsError(Numeric.ParseSigned("1e3", 32_i64)), "exponent is not an integer");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("", 32_i64)), "empty unsigned");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("-0", 64_i64)), "unsigned has no negative zero spelling");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("1_u8", 8_i64)), "literal suffix is not wire text");
+}
+
+test serialization_signed_negative_zero_integer_is_plain_zero {
+    AcceptSigned("-0", 32_i64, 0_i64);
+}
+
+unit RoundtripText(string text, u8 width, u64 expectedBits) {
+    match FloatDecimal.Parse(text, width, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("finite decimal text parses"),
+        Result::Ok(bits) => {
+            Assert.Equal<u64>(bits, expectedBits, "exact bit pattern at declared width");
+            match FloatDecimal.Format(bits, width, Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("finite bits format"),
+                Result::Ok(formatted) => {
+                    match FloatDecimal.Parse(formatted, width, Limits.DefaultLimits()) {
+                        Result::Error(_) => Assert.Fail("formatted text parses"),
+                        Result::Ok(again) => Assert.Equal<u64>(again, expectedBits, "format then parse is lossless"),
+                    };
+                },
+            };
+        },
+    };
+}
+
+test serialization_float_negative_zero_keeps_sign_bit_at_both_widths {
+    RoundtripText("-0.0", 64_u8, 9223372036854775808_u64);
+    RoundtripText("-0.0", 32_u8, 2147483648_u64);
+    RoundtripText("0.0", 64_u8, 0_u64);
+    match FloatDecimal.Format(9223372036854775808_u64, 64_u8, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("negative zero formats"),
+        Result::Ok(text) => Assert.Equal<u8>(String.ByteAt(text, 0_i64), 45_u8, "negative zero text starts with a minus sign"),
+    };
+}
+
+test serialization_float_rejects_every_nonfinite_encoding_and_spelling {
+    // f32 infinities and NaNs, plus the f64 negative infinity.
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7f800000_u64, 32_u8, Limits.DefaultLimits())), "f32 +infinity");
+    Assert.True(Results.IsError(FloatDecimal.Format(0xff800000_u64, 32_u8, Limits.DefaultLimits())), "f32 -infinity");
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7fc00000_u64, 32_u8, Limits.DefaultLimits())), "f32 quiet NaN");
+    Assert.True(Results.IsError(FloatDecimal.Format(0xfff0000000000000_u64, 64_u8, Limits.DefaultLimits())), "f64 -infinity");
+    Assert.True(Results.IsError(FloatDecimal.Parse("Infinity", 64_u8, Limits.DefaultLimits())), "Infinity spelling");
+    Assert.True(Results.IsError(FloatDecimal.Parse("-inf", 64_u8, Limits.DefaultLimits())), "-inf spelling");
+    Assert.True(Results.IsError(FloatDecimal.Parse("nan", 32_u8, Limits.DefaultLimits())), "nan spelling");
+    Assert.True(Results.IsError(FloatDecimal.Parse("-1e309", 64_u8, Limits.DefaultLimits())), "f64 negative overflow");
+    Assert.True(Results.IsError(FloatDecimal.Parse("1e39", 32_u8, Limits.DefaultLimits())), "f32 overflow");
+}

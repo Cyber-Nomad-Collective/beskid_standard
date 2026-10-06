@@ -1,0 +1,376 @@
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Beskid.Syntax.NativeFactories;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+
+/// Contribution-local IDs are structural labels, never semantic handles.
+/// The host assigns current source/unit ownership when accepting the tree.
+/// A construction failure is sticky for the current target: the tree built
+/// after it is never published, because Status reports the first failure.
+pub type Builder {
+    pub NodeSpan origin,
+    u32 nextId,
+    CanonicalPath[] corePaths,
+    bool failed,
+    string failureCode,
+    string failureMessage,
+}
+
+pub Builder Create(NodeSpan origin) {
+    return Builder { origin: origin, nextId: 1_u32, corePaths: [], failed: false, failureCode: "", failureMessage: "" };
+}
+
+/// Record the first construction failure of the current target.
+unit Fail(Builder builder, string code, string message) {
+    if (!builder.failed) {
+        builder.failed = true;
+        builder.failureCode = code;
+        builder.failureMessage = message;
+    }
+}
+
+/// Every generation entry point checks this before returning a contribution.
+pub Result<unit, SemanticError> Status(Builder builder) {
+    if (builder.failed) { return Result::Error(SemanticError { code: builder.failureCode, message: builder.failureMessage }); }
+    return Result::Ok(());
+}
+
+u32 Next(Builder builder) {
+    if (builder.nextId == 4294967295_u32) {
+        Fail(builder, "SerializationNodeLimit", "serialization contribution node limit exceeded");
+        return builder.nextId;
+    }
+    u32 result = builder.nextId;
+    builder.nextId = result + 1_u32;
+    return result;
+}
+
+/// Arrays are owner storage; generation copies before extending a caller's list.
+pub T[] Copy<T>(T[] values) {
+    mut T[] result = Array.Empty<T>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<T>(values)) {
+        result = Array.Append<T>(result, values[index]);
+        index = index + 1_i64;
+    }
+    return result;
+}
+
+pub string FreshName(Builder builder) {
+    mut u32 value = Next(builder);
+    mut u8[] reversed = [];
+    while (value > 0_u32) {
+        reversed = Array.Append<u8>(reversed, u8(value % 10_u32) + 48_u8);
+        value = value / 10_u32;
+    }
+    mut u8[] bytes = [];
+    mut i64 index = Array.Len(reversed);
+    while (index > 0_i64) {
+        index = index - 1_i64;
+        bytes = Array.Append<u8>(bytes, reversed[index]);
+    }
+    return "__serialization" + String.FromUtf8CodeUnits(bytes);
+}
+
+pub SpannedIdentifier IdentifierValue(Builder builder, string name) {
+    return SpannedIdentifier { node: Identifier { name: name }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedVisibility Public(Builder builder) {
+    return SpannedVisibility { node: Visibility::Public, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedAttributeTarget AttributeTargetValue(Builder builder, string name) {
+    return SpannedAttributeTarget { node: AttributeTarget { name: IdentifierValue(builder, name) }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedAttributeArgument AttributeArgumentValue(Builder builder, string name, SpannedExpression expression) {
+    AttributeArgument value = AttributeArgument { name: IdentifierValue(builder, name), value: expression };
+    return SpannedAttributeArgument { node: value, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedAttribute AttributeValue(Builder builder, string name, SpannedAttributeArgument[] arguments) {
+    Attribute value = Attribute { name: IdentifierValue(builder, name), arguments: SpannedAttributeArgumentList { items: arguments } };
+    return SpannedAttribute { node: value, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedAttributeParameter AttributeParameterValue(Builder builder, string name, SpannedType ty, SpannedExpression defaultValue) {
+    AttributeParameter value = AttributeParameter { name: IdentifierValue(builder, name), ty: ty, defaultValue: OptionalSpannedExpression::Some(defaultValue) };
+    return SpannedAttributeParameter { node: value, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedAttributeDeclaration AttributeDeclarationValue(Builder builder, string name, SpannedAttributeTarget[] targets, SpannedAttributeParameter[] parameters) {
+    AttributeDeclaration value = AttributeDeclaration { visibility: Public(builder), name: IdentifierValue(builder, name), targets: SpannedAttributeTargetList { items: targets }, parameters: SpannedAttributeParameterList { items: parameters } };
+    return SpannedAttributeDeclaration { node: value, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedType Primitive(Builder builder, PrimitiveType primitive) {
+    SpannedPrimitiveType value = SpannedPrimitiveType { node: primitive, span: builder.origin, id: Next(builder) };
+    return SpannedType { node: Type::Primitive(value), span: builder.origin, id: Next(builder) };
+}
+
+/// Only the terminal segment receives applied generic arguments.
+pub SpannedPath PathValue(Builder builder, string[] names, SpannedType[] arguments) {
+    mut SpannedPathSegment[] segments = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(names)) {
+        mut SpannedType[] applied = [];
+        if (index + 1_i64 == Array.Len(names)) { applied = arguments; }
+        PathSegment segment = PathSegment { name: IdentifierValue(builder, names[index]), typeArgs: SpannedTypeList { items: applied } };
+        segments = Array.Append<SpannedPathSegment>(segments, SpannedPathSegment { node: segment, span: builder.origin, id: Next(builder) });
+        index = index + 1_i64;
+    }
+    return SpannedPath { node: Path { segments: SpannedPathSegmentList { items: segments } }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedType Named(Builder builder, string[] names, SpannedType[] arguments) {
+    return SpannedType { node: Type::Complex(PathValue(builder, names, arguments)), span: builder.origin, id: Next(builder) };
+}
+
+/// A wrapper receives its own contribution identity; the contained path retains its identity.
+pub SpannedType TypeFromPath(Builder builder, SpannedPath path) {
+    return SpannedType { node: Type::Complex(path), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedType ArrayType(Builder builder, SpannedType element) {
+    return SpannedType { node: Type::Array(element), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Name(Builder builder, SpannedPath path) {
+    SpannedPathExpression value = SpannedPathExpression { node: PathExpression { path: path }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Path(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Local(Builder builder, string name) {
+    return Name(builder, PathValue(builder, [name], []));
+}
+
+pub SpannedExpression Member(Builder builder, SpannedExpression target, string member) {
+    SpannedMemberExpression value = SpannedMemberExpression { node: MemberExpression { target: target, member: IdentifierValue(builder, member) }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Member(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Call(Builder builder, SpannedExpression callee, SpannedExpression[] arguments) {
+    SpannedCallExpression value = SpannedCallExpression { node: CallExpression { callee: callee, args: SpannedExpressionList { items: arguments } }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Call(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression LiteralValue(Builder builder, Literal literal) {
+    SpannedLiteral value = SpannedLiteral { node: literal, span: builder.origin, id: Next(builder) };
+    SpannedLiteralExpression expression = SpannedLiteralExpression { node: LiteralExpression { literal: value }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Literal(expression), span: builder.origin, id: Next(builder) };
+}
+
+/// Literal.String retains source spelling. Escape only the language's actual
+/// quote/backslash/interpolation forms; Unicode and LF remain literal UTF-8.
+pub SpannedExpression Text(Builder builder, string text) {
+    mut string raw = "\"";
+    mut i64 position = 0_i64;
+    mut i64 run = 0_i64;
+    while (position < String.Len(text)) {
+        u8 byte = String.ByteAt(text, position);
+        mut bool escaped = byte == 34_u8 || byte == 92_u8;
+        if (byte == 36_u8 && position + 1_i64 < String.Len(text)) {
+            escaped = String.ByteAt(text, position + 1_i64) == 123_u8;
+        }
+        if (escaped) {
+            raw = raw + String.SubSlice(text, run, position - run) + "\\" + String.SubSlice(text, position, 1_i64);
+            run = position + 1_i64;
+        }
+        position = position + 1_i64;
+    }
+    raw = raw + String.SubSlice(text, run, String.Len(text) - run) + "\"";
+    return LiteralValue(builder, Literal::String(raw));
+}
+
+pub SpannedExpression Propagate(Builder builder, SpannedExpression expression) {
+    TryExpression value = TryExpression { expr: expression, errorVariable: OptionalSpannedIdentifier::None, catchBlock: OptionalSpannedBlockExpression::None };
+    return SpannedExpression { node: Expression::Try(SpannedTryExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedEnumPath VariantPath(Builder builder, SpannedPath ty, string variant) {
+    return SpannedEnumPath { node: EnumPath { typePath: ty, variant: IdentifierValue(builder, variant) }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression ConstructVariant(Builder builder, SpannedPath ty, string variant, SpannedExpression[] arguments) {
+    EnumConstructorExpression value = EnumConstructorExpression { path: VariantPath(builder, ty, variant), hasEmptyParens: true, args: SpannedExpressionList { items: arguments } };
+    return SpannedExpression { node: Expression::EnumConstructor(SpannedEnumConstructorExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedPattern Binding(Builder builder, string name) {
+    return SpannedPattern { node: Pattern::Identifier(IdentifierValue(builder, name)), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedPattern VariantPattern(Builder builder, SpannedPath ty, string variant, SpannedPattern[] items) {
+    EnumPattern value = EnumPattern { path: VariantPath(builder, ty, variant), items: SpannedPatternList { items: items } };
+    return SpannedPattern { node: Pattern::Enum(SpannedEnumPattern { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedMatchArm Arm(Builder builder, SpannedPattern pattern, SpannedExpression value) {
+    return SpannedMatchArm { node: MatchArm { pattern: pattern, guard: OptionalSpannedExpression::None, value: value }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression MatchValue(Builder builder, SpannedExpression value, SpannedMatchArm[] arms) {
+    MatchExpression expression = MatchExpression { scrutinee: value, arms: SpannedMatchArmList { items: arms } };
+    return SpannedExpression { node: Expression::Match(SpannedMatchExpression { node: expression, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression BlockValue(Builder builder, SpannedStatement[] statements) {
+    BlockExpression value = BlockExpression { block: Body(builder, statements) };
+    return SpannedExpression { node: Expression::Block(SpannedBlockExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStructLiteralField FieldValue(Builder builder, string name, SpannedExpression value) {
+    return SpannedStructLiteralField { node: StructLiteralField { name: IdentifierValue(builder, name), value: value }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression ConstructRecord(Builder builder, SpannedPath ty, SpannedStructLiteralField[] fields) {
+    StructLiteralExpression value = StructLiteralExpression { path: ty, fields: SpannedStructLiteralFieldList { items: fields } };
+    return SpannedExpression { node: Expression::StructLiteral(SpannedStructLiteralExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Let(Builder builder, string name, SpannedType ty, bool mutable, SpannedExpression value) {
+    LetStatement declaration = LetStatement { mutable: mutable, name: IdentifierValue(builder, name), typeAnnotation: OptionalSpannedType::Some(ty), value: value };
+    return SpannedStatement { node: Statement::Let(SpannedLetStatement { node: declaration, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Index(Builder builder, SpannedExpression target, SpannedExpression index) {
+    return SpannedExpression { node: Expression::Index(SpannedIndexExpression { node: IndexExpression { target: target, index: index }, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Binary(Builder builder, SpannedExpression left, BinaryOp operation, SpannedExpression right) {
+    BinaryExpression value = BinaryExpression { left: left, op: SpannedBinaryOp { node: operation, span: builder.origin, id: Next(builder) }, right: right };
+    return SpannedExpression { node: Expression::Binary(SpannedBinaryExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement While(Builder builder, SpannedExpression condition, SpannedStatement[] statements) {
+    WhileStatement value = WhileStatement { condition: condition, body: Body(builder, statements) };
+    return SpannedStatement { node: Statement::While(SpannedWhileStatement { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Assign(Builder builder, SpannedExpression target, SpannedExpression value) {
+    AssignExpression expression = AssignExpression { target: target, op: SpannedAssignOp { node: AssignOp::Assign, span: builder.origin, id: Next(builder) }, value: value };
+    return Evaluate(builder, SpannedExpression { node: Expression::Assign(SpannedAssignExpression { node: expression, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) });
+}
+
+pub SpannedStatement Evaluate(Builder builder, SpannedExpression expression) {
+    SpannedExpressionStatement value = SpannedExpressionStatement { node: ExpressionStatement { expression: expression }, span: builder.origin, id: Next(builder) };
+    return SpannedStatement { node: Statement::Expression(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Return(Builder builder, SpannedExpression expression) {
+    SpannedReturnStatement value = SpannedReturnStatement { node: ReturnStatement { value: OptionalSpannedExpression::Some(expression) }, span: builder.origin, id: Next(builder) };
+    return SpannedStatement { node: Statement::Return(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedBlock Body(Builder builder, SpannedStatement[] statements) {
+    return SpannedBlock { node: Block { statements: SpannedStatementList { items: statements } }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedParameter ParameterValue(Builder builder, string name, SpannedType ty) {
+    return SpannedParameter { node: Parameter { _bulk: false, mutable: false, name: IdentifierValue(builder, name), ty: ty }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedMethodDefinition Method(Builder builder, SpannedType receiver, string name, SpannedParameter[] parameters, SpannedType result, SpannedStatement[] statements) {
+    MethodDefinition method = MethodDefinition {
+        attributes: SpannedAttributeList { items: [] },
+        visibility: Public(builder), receiverType: receiver, name: IdentifierValue(builder, name),
+        parameters: SpannedParameterList { items: parameters }, parameterDocs: OptionalLeadingDocCommentList { items: [] },
+        returnType: OptionalSpannedType::Some(result), body: Body(builder, statements),
+    };
+    return SpannedMethodDefinition { node: method, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedImplBlock Implementation(Builder builder, SpannedType receiver, SpannedPath contractPath, SpannedMethodDefinition[] methods) {
+    return GenericImplementation(builder, [], [], receiver, contractPath, methods);
+}
+
+pub WhereBound Bound(Builder builder, string parameter, SpannedPath contractPath) {
+    return WhereBound { parameter: IdentifierValue(builder, parameter), _contract: contractPath };
+}
+
+pub SpannedImplBlock GenericImplementation(Builder builder, SpannedIdentifier[] generics, WhereBound[] bounds, SpannedType receiver, SpannedPath contractPath, SpannedMethodDefinition[] methods) {
+    ImplBlock value = NativeFactories.ImplBlockValue(SpannedIdentifierList { items: generics }, WhereBoundList { items: bounds }, receiver, SpannedPathList { items: [contractPath] }, SpannedMethodDefinitionList { items: methods }, OptionalLeadingDocCommentList { items: [] }, SpannedAssociatedTypeBindingList { items: [] });
+    return NativeFactories.SpannedImplBlockValue(value, builder.origin, Next(builder));
+}
+
+pub SpannedStatement If(Builder builder, SpannedExpression condition, SpannedStatement[] statements) {
+    IfStatement value = IfStatement { condition: condition, thenBlock: Body(builder, statements), elseBranch: OptionalSpannedElseBranch::None };
+    return SpannedStatement { node: Statement::If(SpannedIfStatement { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression ArrayValue(Builder builder, SpannedExpression[] values) {
+    ArrayLiteralExpression value = ArrayLiteralExpression { elements: SpannedExpressionList { items: values } };
+    return SpannedExpression { node: Expression::ArrayLiteral(SpannedArrayLiteralExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedFunctionDefinition Function(Builder builder, string name, SpannedIdentifier[] generics, WhereBound[] bounds, SpannedParameter[] parameters, SpannedType result, SpannedStatement[] statements) {
+    FunctionDefinition value = FunctionDefinition {
+        attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), name: IdentifierValue(builder, name),
+        generics: SpannedIdentifierList { items: generics }, whereBounds: WhereBoundList { items: bounds },
+        parameters: SpannedParameterList { items: parameters }, parameterDocs: OptionalLeadingDocCommentList { items: [] },
+        returnType: OptionalSpannedType::Some(result), body: Body(builder, statements),
+    };
+    return SpannedFunctionDefinition { node: value, span: builder.origin, id: Next(builder) };
+}
+
+
+pub type CanonicalPath { pub string logicalName, pub string[] segments, }
+
+pub SpannedPath CorePath(Builder builder, string[] names, SpannedType[] arguments) {
+    mut string logical = "Core";
+    mut i64 index = 0_i64;
+    while (index < Array.Len(names)) { logical = logical + "." + names[index]; index = index + 1_i64; }
+    index = 0_i64;
+    mut i64 selected = -1_i64;
+    while (index < Array.Len(builder.corePaths)) {
+        if (builder.corePaths[index].logicalName == logical) {
+            if (selected >= 0_i64) {
+                Fail(builder, "SerializationCanonicalPath", "ambiguous compiler-issued canonical path plan for " + logical);
+                return PathValue(builder, names, arguments);
+            }
+            selected = index;
+        }
+        index = index + 1_i64;
+    }
+    if (selected < 0_i64) {
+        // The descriptive path is never published: Status reports this failure.
+        Fail(builder, "SerializationCanonicalPath", "missing compiler-issued canonical path plan for " + logical);
+        return PathValue(builder, names, arguments);
+    }
+    return PathValue(builder, builder.corePaths[selected].segments, arguments);
+}
+
+pub SpannedType CoreType(Builder builder, string[] names, SpannedType[] arguments) {
+    return SpannedType { node: Type::Complex(CorePath(builder, names, arguments)), span: builder.origin, id: Next(builder) };
+}
+
+pub Builder CreateWithPaths(NodeSpan origin, CanonicalPath[] paths) {
+    return Builder { origin: origin, nextId: 1_u32, corePaths: paths, failed: false, failureCode: "", failureMessage: "" };
+}
+
+pub SpannedField DataField(Builder builder, string name, SpannedType ty) {
+    Field value = Field { attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), kind: FieldKind::Value,
+        eventCapacity: Optionalusize::None, injectQualifier: OptionalInjectQualifier::None, name: IdentifierValue(builder, name), ty: ty };
+    return SpannedField { node: value, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedTypeDefinition RecordType(Builder builder, string name, SpannedIdentifier[] generics, SpannedField[] fields) {
+    TypeDefinition value = TypeDefinition { attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), name: IdentifierValue(builder, name),
+        generics: SpannedIdentifierList { items: generics }, conformances: SpannedPathList { items: [] }, fields: SpannedFieldList { items: fields },
+        fieldDocs: OptionalLeadingDocCommentList { items: [] }, methods: SpannedMethodDefinitionList { items: [] }, methodDocs: OptionalLeadingDocCommentList { items: [] },
+        associatedTypeBindings: SpannedAssociatedTypeBindingList { items: [] } };
+    return SpannedTypeDefinition { node: value, span: builder.origin, id: Next(builder) };
+}
+
+/// Keep contribution IDs unique across targets while changing exact source origin.
+/// A new target starts without the previous target's construction failure.
+pub unit Rebind(Builder builder, NodeSpan origin, CanonicalPath[] paths) {
+    builder.origin = origin;
+    builder.corePaths = paths;
+    builder.failed = false;
+    builder.failureCode = "";
+    builder.failureMessage = "";
+}

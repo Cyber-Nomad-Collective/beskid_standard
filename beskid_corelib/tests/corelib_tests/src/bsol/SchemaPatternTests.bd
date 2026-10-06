@@ -1,0 +1,344 @@
+use Core.Bsol.Schema;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Limits;
+
+use Core.Environment;
+
+use Core.FS;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Core.String;
+
+use Testing.Assert;
+
+string ReadPattern(string name, string part)
+{
+    match Environment.Get("BESKID_BSOL_CORPUS")
+    {
+        Result::Error(_) => {
+            Assert.Fail("shared pattern corpus root required");
+            return "";
+        },
+
+        Result::Ok(directory) => match FS.ReadAllText(directory + "/cases/schema-patterns/" + name + "." + part + ".bsol")
+        {
+            Result::Error(_) => {
+                Assert.Fail("shared pattern source readable");
+                return "";
+            },
+
+            Result::Ok(source) => {
+                return source;
+            },
+        },
+    };
+}
+
+unit ExpectPatternCode(Schema.Diagnostic[] errors, string code)
+{
+    mut bool found = false;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Schema.Diagnostic>(errors))
+    {
+        Schema.Diagnostic error = errors[i];
+        if (error.code == code)
+        {
+            found = true;
+            Assert.True(error.span.end > error.span.start, "checked pattern failure source-spanned");
+        }
+        i = i + 1_i64;
+    }
+    Assert.True(found, "exact shared pattern diagnostic");
+}
+
+unit CheckPatternCase(string name, string outcome)
+{
+    mut Limits.BsolLimits syntaxLimits = Limits.DefaultLimits();
+    if (name == "subject-over-limit")
+    {
+        syntaxLimits.maxScalarBytes = 1048577_i64;
+    }
+    match Schema.ParseProfile(ReadPattern(name, "profile"), Limits.DefaultLimits())
+    {
+        Result::Error(errors) => {
+            Assert.Equal(outcome, "InvalidPattern", "supported pattern must load profile");
+            ExpectPatternCode(errors, "InvalidPattern");
+        },
+
+        Result::Ok(profile) => {
+            Assert.True(outcome != "InvalidPattern", "invalid grammar cannot publish profile");
+            match Parser.Parse(ReadPattern(name, "input"), syntaxLimits)
+            {
+                Result::Error(_) => Assert.Fail("pattern subject valid BSOL syntax"),
+
+                Result::Ok(document) => match Schema.Validate(document, profile, syntaxLimits)
+                {
+                    Result::Error(errors) => {
+                        Assert.True(outcome != "ok", "shared native pattern must match");
+                        ExpectPatternCode(errors, outcome);
+                    },
+
+                    Result::Ok(_) => Assert.Equal(outcome, "ok", "shared native invalid subject rejected"),
+                },
+            };
+        },
+    };
+}
+
+unit CheckPatternPolicy(string pattern, string value, i64 subject, i64 work, i64 depth, string outcome)
+{
+    string source = "profile \"policy.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"value\" { type = quoted required = true pattern = \"" + pattern + "\" } } }";
+    match Schema.ParseProfile(source, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("caller policy profile valid"),
+
+        Result::Ok(profile) => match Parser.Parse("config { value = \"" + value + "\" }", Limits.DefaultLimits())
+        {
+            Result::Error(_) => Assert.Fail("caller policy subject valid"),
+
+            Result::Ok(document) => {
+                Schema.PatternLimits policy = Schema.PatternLimits
+                {
+                    maxSubjectBytes: subject,
+
+                    maxWork: work,
+
+                    maxDepth: depth,
+                };
+                match Schema.ValidateWithPatternLimits(document, profile, Limits.DefaultLimits(), policy)
+                {
+                    Result::Error(errors) => {
+                        Assert.True(outcome != "ok", "explicit caller policy should succeed");
+                        ExpectPatternCode(errors, outcome);
+                    },
+
+                    Result::Ok(_) => Assert.Equal(outcome, "ok", "explicit caller policy checked failure"),
+                };
+            },
+        },
+    };
+}
+
+/// @native-only
+test bsol_pattern_shared_accepted_grammar
+{
+    CheckPatternCase("anchored-match", "ok");
+
+    CheckPatternCase("prefix-match", "ok");
+
+    CheckPatternCase("alternation", "ok");
+
+    CheckPatternCase("group-plus", "ok");
+
+    CheckPatternCase("class-range", "ok");
+
+    CheckPatternCase("negated-class", "ok");
+
+    CheckPatternCase("escaped-digit", "ok");
+
+    CheckPatternCase("escaped-literal", "ok");
+
+    CheckPatternCase("grammar-escaped-brace", "ok");
+
+    CheckPatternCase("quantified-sequence-backtrack", "ok");
+
+    CheckPatternCase("optional-zero-occurrence", "ok");
+
+    CheckPatternCase("star-zero-occurrence", "ok");
+}
+
+/// @native-only
+test bsol_pattern_shared_nonempty_startzero_rejections
+{
+    CheckPatternCase("anchored-reject", "PatternMismatch");
+
+    CheckPatternCase("substring-reject", "PatternMismatch");
+
+    CheckPatternCase("empty-match-reject", "PatternMismatch");
+}
+
+/// @native-only
+test bsol_pattern_shared_invalid_unsupported_grammar
+{
+    CheckPatternCase("invalid-open-group", "InvalidPattern");
+
+    CheckPatternCase("invalid-empty-alternative", "InvalidPattern");
+
+    CheckPatternCase("unsupported-lookaround", "InvalidPattern");
+
+    CheckPatternCase("unsupported-backreference", "InvalidPattern");
+
+    CheckPatternCase("unsupported-counted", "InvalidPattern");
+}
+
+/// @native-only
+test bsol_pattern_shared_subject_exact_limit
+{
+    CheckPatternCase("subject-at-limit", "ok");
+}
+
+/// @native-only
+test bsol_pattern_shared_subject_over_limit
+{
+    CheckPatternCase("subject-over-limit", "PatternSubjectLimit");
+}
+
+/// @native-only
+test bsol_pattern_shared_nested_default_work_limit
+{
+    CheckPatternCase("nested-work-limit", "PatternWorkLimit");
+}
+
+/// @native-only
+test bsol_pattern_shared_unicode_scalar_grammar
+{
+    CheckPatternCase("unicode-dot-accent", "ok");
+
+    CheckPatternCase("unicode-dot-astral", "ok");
+
+    CheckPatternCase("unicode-class-accent", "ok");
+
+    CheckPatternCase("unicode-class-range", "ok");
+
+    CheckPatternCase("unicode-class-astral-range", "ok");
+
+    CheckPatternCase("unicode-reject-two-scalars", "PatternMismatch");
+
+    CheckPatternCase("unicode-class-reject", "PatternMismatch");
+}
+
+/// @native-only
+test bsol_pattern_caller_work_and_depth_limits
+{
+    CheckPatternPolicy("^abc$", "abc", 1048576_i64, 2_i64, 64_i64, "PatternWorkLimit");
+
+    CheckPatternPolicy("^abc$", "abc", 1048576_i64, 100_i64, 64_i64, "ok");
+
+    CheckPatternPolicy("((abc))", "abc", 1048576_i64, 100_i64, 1_i64, "PatternDepthLimit");
+
+    CheckPatternPolicy("abc", "abc", 1048576_i64, 0_i64, 64_i64, "PatternWorkLimit");
+}
+
+/// @native-only
+test bsol_pattern_unicode_subject_limit_counts_bytes
+{
+    CheckPatternPolicy("^.$", "😀", 4_i64, 100_i64, 64_i64, "ok");
+
+    CheckPatternPolicy("^.$", "😀", 3_i64, 100_i64, 64_i64, "PatternSubjectLimit");
+
+    CheckPatternPolicy("^.$", "é", 2_i64, 100_i64, 64_i64, "ok");
+
+    CheckPatternPolicy("^.$", "é", 1_i64, 100_i64, 64_i64, "PatternSubjectLimit");
+}
+
+/// @native-only
+test bsol_pattern_unicode_failure_has_exact_utf8_assignment_span
+{
+    string source = ReadPattern("unicode-reject-two-scalars", "input");
+
+    match Schema.ParseProfile(ReadPattern("unicode-reject-two-scalars", "profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("Unicode pattern profile valid"),
+
+        Result::Ok(profile) => match Parser.Parse(source, Limits.DefaultLimits())
+        {
+            Result::Error(_) => Assert.Fail("Unicode subject parses"),
+
+            Result::Ok(document) => match Schema.Validate(document, profile, Limits.DefaultLimits())
+            {
+                Result::Ok(_) => Assert.Fail("two scalars rejected"),
+
+                Result::Error(errors) => {
+                    mut bool found = false;
+                    mut i64 i = 0_i64;
+                    while (i < Array.Len<Schema.Diagnostic>(errors))
+                    {
+                        Schema.Diagnostic error = errors[i];
+                        if (error.code == "PatternMismatch")
+                        {
+                            found = true;
+                            Assert.Equal(String.SubSlice(source, error.span.start, error.span.end - error.span.start), "value = \"é😀\"", "exact complete UTF8 assignment boundary");
+                        }
+                        i = i + 1_i64;
+                    }
+                    Assert.True(found, "Unicode mismatch diagnostic");
+                },
+            },
+        },
+    };
+}
+
+unit CheckPatternDocumentPolicy(string profileSource, string input, i64 work, string outcome)
+{
+    match Schema.ParseProfile(profileSource, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("shared policy profile valid"),
+
+        Result::Ok(profile) => match Parser.Parse(input, Limits.DefaultLimits())
+        {
+            Result::Error(_) => Assert.Fail("shared policy document valid"),
+
+            Result::Ok(document) => {
+                Schema.PatternLimits policy = Schema.PatternLimits
+                {
+                    maxSubjectBytes: 1048576_i64,
+
+                    maxWork: work,
+
+                    maxDepth: 64_i64,
+                };
+                match Schema.ValidateWithPatternLimits(document, profile, Limits.DefaultLimits(), policy)
+                {
+                    Result::Error(errors) => {
+                        Assert.True(outcome != "ok", "shared policy should pass");
+                        ExpectPatternCode(errors, outcome);
+                    },
+
+                    Result::Ok(_) => Assert.Equal(outcome, "ok", "shared cumulative budget rejects"),
+                };
+            },
+        },
+    };
+}
+
+/// @native-only
+test bsol_pattern_caller_budget_is_shared_through_inline_and_defaults
+{
+    CheckPatternPolicy("abcdefgh", "abcdefgh", 1048576_i64, 50_i64, 64_i64, "ok");
+
+    string profile = "profile \"limits.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"first\" { type = quoted pattern = \"abcdefgh\" required = true } field \"inside\" { type = inline(holder) required = true } } rule \"holder\" { match = keyword keyword = holder label = forbidden cardinality = many field \"second\" { type = quoted pattern = \"abcdefgh\" required = true } } }";
+
+    string input = "config { first = \"abcdefgh\" inside = holder { second = \"abcdefgh\" } }";
+
+    CheckPatternDocumentPolicy(profile, input, 50_i64, "PatternWorkLimit");
+
+    CheckPatternDocumentPolicy(profile, input, 1000_i64, "ok");
+
+    string defaults = "profile \"limits.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"first\" { type = quoted pattern = \"abcdefgh\" default = \"abcdefgh\" } field \"second\" { type = quoted pattern = \"abcdefgh\" default = \"abcdefgh\" } } }";
+
+    CheckPatternDocumentPolicy(defaults, "config {}", 50_i64, "PatternWorkLimit");
+}
+
+/// @native-only
+test bsol_pattern_invalid_caller_limits_reject_checked
+{
+    CheckPatternPolicy("abc", "abc", 1048576_i64, -1_i64, 64_i64, "InvalidPatternLimits");
+
+    CheckPatternPolicy("abc", "abc", 1048576_i64, 100_i64, 9223372036854775807_i64, "InvalidPatternLimits");
+}
+
+test bsol_pattern_class_work_counts_inspected_ranges_and_initial_accept
+{
+    CheckPatternPolicy("[abc]", "a", 1048576_i64, 11_i64, 64_i64, "ok");
+
+    CheckPatternPolicy("[abc]", "a", 1048576_i64, 10_i64, 64_i64, "PatternWorkLimit");
+
+    CheckPatternPolicy("[abc]", "c", 1048576_i64, 13_i64, 64_i64, "ok");
+
+    CheckPatternPolicy("[abc]", "c", 1048576_i64, 12_i64, 64_i64, "PatternWorkLimit");
+}

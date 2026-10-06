@@ -19,5 +19,5 @@ Other modules (`Core.Collections.*`, `Query.*`, `Core.FS`, `Core.Path`, …) shi
 
 ## Relationship to tooling
 
-- **`beskid pckg pack`** runs doc generation into `.beskid/docs` when packing a project; registry listings include `docs/*.md`, `.beskid/docs/*`, and root `README.md` when present.
+- **`beskid package pack`** runs doc generation into `.beskid/docs` when packing a project; registry listings include `docs/*.md`, `.beskid/docs/*`, and root `README.md` when present.
 - The Starlight **Corelib** section on beskid-lang.org links here via stable GitHub URLs; edit prose in this tree, not only on the website.

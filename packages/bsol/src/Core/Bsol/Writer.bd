@@ -1,0 +1,334 @@
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Limits;
+
+use Core.Bsol.Errors;
+
+use Core.Bsol.Parser;
+
+use Core.Collections.Array;
+
+use Core.String;
+
+
+type Output
+{
+    string text,
+
+    bool failed,
+
+    i64 visited,
+
+    Limits.BsolLimits limits,
+}
+
+unit Put(mut Output output, string text)
+{
+    if (String.Len(text) > output.limits.maxOutputBytes - String.Len(output.text))
+    {
+        output.failed = true;
+    }
+    else if (!output.failed)
+    {
+        output.text = output.text + text;
+    }
+}
+
+/// Escape only ASCII special bytes; copy UTF8 runs without slicing inside a rune.
+string Quote(mut Output output, string text)
+{
+    i64 remaining = output.limits.maxOutputBytes - String.Len(output.text);
+    mut i64 encoded = 2_i64;
+    mut i64 probe = 0_i64;
+    if (encoded > remaining)
+    {
+        output.failed = true;
+        return "";
+    }
+    while (probe < String.Len(text))
+    {
+        u8 byte = String.ByteAt(text, probe);
+        mut i64 width = 1_i64;
+        if (byte == 34_u8 || byte == 92_u8 || byte == 10_u8 || byte == 13_u8 || byte == 9_u8 || byte == 8_u8 || byte == 12_u8)
+        {
+            width = 2_i64;
+        }
+        else if (byte < 32_u8)
+        {
+            width = 6_i64;
+        }
+        if (width > remaining - encoded)
+        {
+            output.failed = true;
+            return "";
+        }
+        encoded = encoded + width;
+        probe = probe + 1_i64;
+    }
+
+    mut string out = "\"";
+    mut i64 i = 0_i64;
+    mut i64 start = 0_i64;
+    while (i < String.Len(text))
+    {
+        u8 b = String.ByteAt(text, i);
+        if (b == 34_u8 || b == 92_u8 || b < 32_u8)
+        {
+            out = out + String.SubSlice(text, start, i - start) + "\\";
+            if (b == 34_u8 || b == 92_u8)
+            {
+                out = out + String.CodeUnitChar(b);
+            }
+            else if (b == 10_u8)
+            {
+                out = out + "n";
+            }
+            else if (b == 13_u8)
+            {
+                out = out + "r";
+            }
+            else if (b == 9_u8)
+            {
+                out = out + "t";
+            }
+            else if (b == 8_u8)
+            {
+                out = out + "b";
+            }
+            else if (b == 12_u8)
+            {
+                out = out + "f";
+            }
+            else
+            {
+                string digits = "0123456789abcdef";
+                out = out + "u00" + String.SubSlice(digits, i64(b) / 16_i64, 1_i64) + String.SubSlice(digits, i64(b) % 16_i64, 1_i64);
+            }
+            start = i + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    return out + String.SubSlice(text, start, String.Len(text) - start) + "\"";
+}
+
+unit Sequence(mut Output output, Syntax.Document document, i64[] children, i64 depth, string separator)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(children) && !output.failed)
+    {
+        if (i > 0_i64)
+        {
+            Put(output, separator);
+        }
+        Emit(output, document, children[i], depth);
+        i = i + 1_i64;
+    }
+}
+
+unit Emit(mut Output output, Syntax.Document document, i64 index, i64 depth)
+{
+    if (output.failed)
+    {
+        return;
+    }
+    if (depth > output.limits.maxDepth || index < 0_i64 || index >= Array.Len<Syntax.Node>(document.nodes) || output.visited >= output.limits.maxNodes)
+    {
+        output.failed = true;
+        return;
+    }
+    output.visited = output.visited + 1_i64;
+    Syntax.Node node = document.nodes[index];
+    bool number = match node.kind
+    {
+        Syntax.NodeKind::Number => true,
+
+        _ => false,
+    };
+    if (String.Len(node.text) > output.limits.maxScalarBytes || String.Len(node.name) > output.limits.maxScalarBytes || String.Len(node.label) > output.limits.maxScalarBytes || (number && String.Len(node.raw) > output.limits.maxScalarBytes))
+    {
+        output.failed = true;
+        return;
+    }
+
+    mut i64 a = 0_i64;
+    while (a < Array.Len<i64>(node.attributes) && !output.failed)
+    {
+        i64 attr = node.attributes[a];
+        if (attr < 0_i64 || attr >= Array.Len<Syntax.Node>(document.nodes))
+        {
+            output.failed = true;
+        }
+        else
+        {
+            bool valid = match document.nodes[attr].kind
+            {
+                Syntax.NodeKind::Attribute => true,
+
+                _ => false,
+            };
+            if (!valid)
+            {
+                output.failed = true;
+            }
+            else
+            {
+                Emit(output, document, attr, depth + 1_i64);
+                Put(output, " ");
+            }
+        }
+        a = a + 1_i64;
+    }
+    match node.kind
+    {
+        Syntax.NodeKind::Block => {
+            Put(output, node.name);
+            if (node.hasLabel)
+            {
+                Put(output, " " + Quote(output, node.label));
+            }
+            if (node.schemaless)
+            {
+                Put(output, " @schemaless");
+            }
+            Put(output, " { ");
+            Sequence(output, document, node.children, depth + 1_i64, " ");
+            Put(output, " }");
+        },
+
+        Syntax.NodeKind::Assignment => {
+            if (Array.Len<i64>(node.children) != 1_i64)
+            {
+                output.failed = true;
+            }
+            else
+            {
+                Put(output, node.name + " = ");
+                Emit(output, document, node.children[0], depth + 1_i64);
+            }
+        },
+
+        Syntax.NodeKind::Attribute => {
+            Put(output, "@" + node.name);
+            if (Array.Len<i64>(node.children) > 0_i64)
+            {
+                Put(output, "(");
+                Sequence(output, document, node.children, depth + 1_i64, ", ");
+                Put(output, ")");
+            }
+        },
+
+        Syntax.NodeKind::String => Put(output, Quote(output, node.text)),
+
+        Syntax.NodeKind::Number => Put(output, node.raw),
+
+        Syntax.NodeKind::Boolean => {
+            if (node.text != "true" && node.text != "false")
+            {
+                output.failed = true;
+            }
+            else
+            {
+                Put(output, node.text);
+            }
+        },
+
+        Syntax.NodeKind::Identifier => Put(output, node.text),
+
+        Syntax.NodeKind::Reference => {
+            Put(output, "@");
+            if (node.name != "")
+            {
+                Put(output, node.name + "/");
+            }
+            Put(output, node.text);
+        },
+
+        Syntax.NodeKind::List => {
+            Put(output, "[");
+            Sequence(output, document, node.children, depth + 1_i64, ", ");
+            Put(output, "]");
+        },
+
+        Syntax.NodeKind::Map => {
+            Put(output, "{");
+            Sequence(output, document, node.children, depth + 1_i64, ", ");
+            Put(output, "}");
+        },
+    };
+}
+
+pub Result<string, Errors.BsolError> Write(Syntax.Document document, Limits.BsolLimits limits)
+{
+    mut Output output = Output
+    {
+        text: "",
+
+        failed: false,
+
+        visited: 0_i64,
+
+        limits: limits,
+    };
+    if (!Limits.Valid(limits) || Array.Len<Syntax.Node>(document.nodes) > limits.maxNodes || Array.Len<Syntax.Trivia>(document.trivia) > limits.maxNodes - Array.Len<Syntax.Node>(document.nodes))
+    {
+        output.failed = true;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Syntax.Trivia>(document.trivia) && !output.failed)
+    {
+        Put(output, document.trivia[i].raw);
+        Put(output, String.CodeUnitChar(10_u8));
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<i64>(document.roots) && !output.failed)
+    {
+        i64 root = document.roots[i];
+        if (root < 0_i64 || root >= Array.Len<Syntax.Node>(document.nodes))
+        {
+            output.failed = true;
+        }
+        else
+        {
+            bool block = match document.nodes[root].kind
+            {
+                Syntax.NodeKind::Block => true,
+
+                _ => false,
+            };
+            if (!block)
+            {
+                output.failed = true;
+            }
+            else
+            {
+                Emit(output, document, root, 1_i64);
+                Put(output, String.CodeUnitChar(10_u8));
+            }
+        }
+        i = i + 1_i64;
+    }
+    if (output.failed)
+    {
+        return Result::Error(Errors.BsolError
+        {
+            kind: Errors.ErrorKind::InvalidSyntax,
+
+            span: Syntax.Span
+            {
+                start: 0_i64,
+
+                end: 0_i64,
+            },
+
+            message: "invalid or over-limit syntax graph",
+        });
+    }
+    return match Parser.Parse(output.text, Limits.OutputParseLimits(limits))
+    {
+        Result::Error(error) => Result::Error(error),
+
+        Result::Ok(_) => Result::Ok(output.text),
+    };
+}

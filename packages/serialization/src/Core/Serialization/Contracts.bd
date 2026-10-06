@@ -1,0 +1,125 @@
+use Core.Results;
+
+use Core.Serialization.Errors;
+
+use Core.Serialization.Limits;
+
+use Core.Serialization.Metadata;
+
+/// A format owns representation and an unpublished transaction. Scalar calls
+/// preserve declared wire widths; container calls follow descriptor order.
+pub contract Encoder
+{
+    Result<unit, SerializationError> Begin(SerializationLimits limits);
+
+    Result<unit, SerializationError> Commit();
+
+    unit Abort();
+
+    Result<unit, SerializationError> WriteUnit();
+
+    Result<unit, SerializationError> WriteBoolean(bool value);
+
+    Result<unit, SerializationError> WriteSigned(i64 value, u8 width);
+
+    Result<unit, SerializationError> WriteUnsigned(u64 value, u8 width);
+
+    Result<unit, SerializationError> WriteFloat(u64 bits, u8 width);
+
+    Result<unit, SerializationError> WriteScalar(char value);
+
+    Result<unit, SerializationError> WriteString(string value);
+
+    Result<unit, SerializationError> WriteBytes(u8[] value);
+
+    Result<unit, SerializationError> BeginRecord(Metadata.ShapeId shape, i64 fieldCount);
+
+    Result<unit, SerializationError> BeginField(string name);
+
+    Result<unit, SerializationError> EndField();
+
+    Result<unit, SerializationError> EndRecord();
+
+    Result<unit, SerializationError> BeginSequence(i64 count);
+
+    Result<unit, SerializationError> EndSequence();
+
+    Result<unit, SerializationError> BeginMap(i64 count);
+
+    Result<unit, SerializationError> BeginMapEntry(string key);
+
+    Result<unit, SerializationError> EndMapEntry();
+
+    Result<unit, SerializationError> EndMap();
+
+    Result<unit, SerializationError> BeginVariant(Metadata.ShapeId shape, string name, i64 payloadCount);
+
+    Result<unit, SerializationError> EndVariant();
+
+    Result<unit, SerializationError> BeginOptional(bool present);
+
+    Result<unit, SerializationError> EndOptional();
+}
+
+/// Generated conformance is a specialized typed body. It accesses declared
+/// fields and variant payloads directly, without boxing every field as dynamic.
+pub contract Serializable<E>
+{
+    Result<unit, SerializationError> WriteTyped(E encoder, SerializationLimits limits);
+}
+
+/// A generated typed decoder binds the format reader and concrete T adapter.
+/// It returns a fresh value only after complete validation; no partial T escapes.
+pub contract Decoder<T>
+{
+    Result<T, SerializationError> ReadTyped(SerializationLimits limits);
+}
+
+pub Result<unit, SerializationError> Encode<T, E>(T value, E encoder, SerializationLimits limits) where T: Serializable<E>, E: Encoder
+{
+    if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64 || limits.maxScalarBytes < 0_i64)
+    {
+        return Result::Error(Errors.NumericError("InvalidLimits"));
+    }
+    // Reserve the source success wrapper before opening the unpublished transaction.
+    // No managed Result allocation may fail after the format has committed publication.
+    Result<unit, SerializationError> success = Result::Ok(());
+    match encoder.Begin(limits)
+    {
+        Result::Error(error) => {
+            encoder.Abort();
+            return Result::Error(error);
+        },
+
+        Result::Ok(_) => { },
+    };
+    match value.WriteTyped(encoder, limits)
+    {
+        Result::Error(error) => {
+            encoder.Abort();
+            return Result::Error(error);
+        },
+
+        Result::Ok(_) => { },
+    };
+    match encoder.Commit()
+    {
+        Result::Error(error) => {
+            encoder.Abort();
+            return Result::Error(error);
+        },
+
+        Result::Ok(_) => {
+            return success;
+        },
+    };
+}
+
+pub Result<T, SerializationError> Decode<T, D>(D decoder, SerializationLimits limits) where D: Decoder<T>
+{
+    if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64 || limits.maxScalarBytes < 0_i64)
+    {
+        return Result::Error(Errors.NumericError("InvalidLimits"));
+    }
+    return decoder.ReadTyped(limits);
+}

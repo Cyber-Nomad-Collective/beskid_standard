@@ -1,0 +1,587 @@
+use Core.Optional;
+use Core.Bsol.Serialization;
+use Core.Bsol.Syntax;
+use Core.FS;
+use Core.Environment;
+use Core.Serialization.Contracts;
+use Core.Serialization.Errors;
+use Core.Serialization.Numeric;
+
+use Core.Collections.Array;
+
+use Core.Results;
+
+use Core.Serialization.DataValue;
+
+use Core.Serialization.Descriptors;
+
+use Core.Serialization.Limits;
+
+use Core.Serialization.Metadata;
+
+use Core.Serialization.Registry;
+
+use Testing.Assert;
+
+string WireFixture(string name) {
+    match Environment.Get("BESKID_BSOL_CORPUS") {
+        Result::Error(_) => { Assert.Fail("shared corpus configured"); return ""; },
+        Result::Ok(root) => match FS.ReadAllText(root + "/cases/serialization-v1/" + name + ".bsol") {
+            Result::Error(_) => { Assert.Fail("shared typed fixture readable"); return ""; },
+            Result::Ok(text) => { return text; },
+        },
+    };
+}
+
+ShapeId Register(Registry.ShapeRegistry table, string signature, ShapeKind kind, u8 width, ShapeId[] arguments)
+{
+    ShapeId id = match Registry.SignatureId(signature, 8388608_i64)
+    {
+        Result::Ok(value) => value,
+
+        Result::Error(_) => {
+            Assert.Fail("fixture signature hash");
+            return Register(table, signature, kind, width, arguments);
+        },
+    };
+    ShapeDescriptor descriptor = ShapeDescriptor
+    {
+        id: id,
+
+        signature: signature,
+
+        packageIdentity: "fixture@1.0.0",
+
+        sourcePath: "Fixture.bd",
+
+        declarationPath: signature,
+
+        schemaVersion: "1",
+
+        kind: kind,
+
+        width: width,
+
+        arguments: arguments,
+
+        fields: Array.Empty<FieldDescriptor>(),
+
+        variants: Array.Empty<VariantDescriptor>(),
+
+        extras: Optional.Empty<ExtrasBinding>(),
+    };
+    Assert.True(Results.IsOk(Registry.Register(table, descriptor, 8388608_i64, 100000_i64)), "fixture descriptor registered");
+    return id;
+}
+
+DataValue Roundtrip(ShapeId shape, DataValue value, Registry.ShapeRegistry table)
+{
+    match Serialization.WriteValue(shape, value, table, Limits.DefaultLimits())
+    {
+        Result::Error(_) => {
+            Assert.Fail("native tagged output");
+        },
+
+        Result::Ok(text) => match Serialization.ReadValue(text, shape, table, Limits.DefaultLimits())
+        {
+            Result::Error(_) => {
+                Assert.Fail("native tagged input");
+            },
+
+            Result::Ok(decoded) => {
+                return decoded;
+            },
+        },
+    };
+    return DataValue::Unit;
+}
+
+string Envelope(ShapeId id, string value)
+{
+    return "serialized \"" + Metadata.FormatShapeId(id) + "\" { version = 1 value = " + value + " }";
+}
+
+test bsol_serialization_wire_exact_unsigned_width
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId shape = Register(table, "unsigned64", ShapeKind::Unsigned, 64_u8, Array.Empty<ShapeId>());
+
+    match Roundtrip(shape, DataValue::Unsigned(18446744073709551615_u64, 64_u8), table)
+    {
+        DataValue::Unsigned(value, width) => {
+            Assert.Equal(value, 18446744073709551615_u64, "u64 has no float intermediate");
+            Assert.Equal(width, 64_u8, "declared width retained");
+        },
+
+        _ => Assert.Fail("unsigned typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(shape, "value \"u32\" { data = 1 }"), shape, table, Limits.DefaultLimits())), "wrong width rejects");
+}
+
+test bsol_serialization_wire_float_preserves_negative_zero
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId shape = Register(table, "float64", ShapeKind::Float, 64_u8, Array.Empty<ShapeId>());
+
+    match Roundtrip(shape, DataValue::Float(9223372036854775808_u64, 64_u8), table)
+    {
+        DataValue::Float(bits, width) => Assert.Equal(bits, 9223372036854775808_u64, "finite decimal retains sign bit"),
+
+        _ => Assert.Fail("float typed tag"),
+    };
+}
+
+test bsol_serialization_wire_strict_canonical_base64
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId shape = Register(table, "bytes", ShapeKind::Bytes, 0_u8, Array.Empty<ShapeId>());
+
+    match Roundtrip(shape, DataValue::Bytes([0_u8, 255_u8, 65_u8]), table)
+    {
+        DataValue::Bytes(bytes) => {
+            Assert.Equal(Array.Len<u8>(bytes), 3_i64, "owned byte output");
+            Assert.Equal(bytes[1_i64], 255_u8, "all bits retained");
+        },
+
+        _ => Assert.Fail("bytes typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(shape, "value \"bytes\" { encoding = base64 data = \"Zh==\" }"), shape, table, Limits.DefaultLimits())), "nonzero unused pad bits reject");
+}
+
+test bsol_serialization_wire_optional_cardinality_and_tag
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId integer = Register(table, "i64", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+
+    ShapeId optional = Register(table, "optional-i64", ShapeKind::Optional, 0_u8, [integer]);
+
+    match Roundtrip(optional, DataValue::Optional(true, [DataValue::Signed(-42_i64, 64_u8)]), table)
+    {
+        DataValue::Optional(present, payload) => {
+            Assert.True(present, "present flag");
+            Assert.Equal(Array.Len<DataValue>(payload), 1_i64, "exact one payload");
+        },
+
+        _ => Assert.Fail("optional typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(optional, "value \"optional\" { present = false value = value \"i64\" { data = 1 } }"), optional, table, Limits.DefaultLimits())), "absent cannot carry payload");
+}
+
+test bsol_serialization_wire_rejects_unknown_duplicate_and_malformed_fields
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId shape = Register(table, "string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(shape, "value \"string\" { data = \"a\" data = \"b\" }"), shape, table, Limits.DefaultLimits())), "duplicate scalar field");
+    match (Serialization.ReadValue(Envelope(shape, "value \"string\" { data = \"a\" data = \"b\" }"), shape, table, Limits.DefaultLimits())) {
+        Result::Ok(_) => Assert.Fail("duplicate has checked source diagnostics"),
+        Result::Error(error) => {
+            Assert.Equal(Errors.Code(error), "DuplicateField");
+            Assert.True(Errors.HasRelated(error), "duplicate retains first declaration span");
+            Assert.True(Errors.RelatedStart(error) >= 0_i64 && Errors.RelatedEnd(error) > Errors.RelatedStart(error), "related span is nonempty");
+            Assert.True(Errors.Start(error) > Errors.RelatedEnd(error) && Errors.End(error) > Errors.Start(error), "primary span belongs to second field");
+        },
+    };
+    Assert.True(!Errors.HasRelated(Errors.NumericError("NoSource")), "source-free errors have no invented related location");
+
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(shape, "value \"string\" { data { } }"), shape, table, Limits.DefaultLimits())), "wrong field node rejects without indexing empty children");
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(shape, "value \"string\" { data = \"a\" extra = true }"), shape, table, Limits.DefaultLimits())), "unknown field closed");
+}
+
+test bsol_serialization_wire_char_scalar_and_depth_policy
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId shape = Register(table, "char", ShapeKind::Scalar, 0_u8, Array.Empty<ShapeId>());
+
+    match Roundtrip(shape, DataValue::Scalar(char(128512_u32)), table)
+    {
+        DataValue::Scalar(value) => Assert.Equal(u32(value), 128512_u32, "astral scalar exact"),
+
+        _ => Assert.Fail("char typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(shape, "value \"char\" { data = \"ab\" }"), shape, table, Limits.DefaultLimits())), "two scalars reject");
+}
+
+test bsol_serialization_wire_array_list_shapes_are_distinct
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId integer = Register(table, "element", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+
+    ShapeId array = Register(table, "i64-array", ShapeKind::Array, 0_u8, [integer]);
+
+    match Roundtrip(array, DataValue::Sequence(SequenceKind::Array, [DataValue::Signed(1_i64, 64_u8)]), table)
+    {
+        DataValue::Sequence(kind, values) => Assert.Equal(Array.Len<DataValue>(values), 1_i64, "array typed contents"),
+
+        _ => Assert.Fail("array tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.WriteValue(array, DataValue::Sequence(SequenceKind::List, Array.Empty<DataValue>()), table, Limits.DefaultLimits())), "writer rejects list under array descriptor");
+
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(array, "value \"list\" { items = [] }"), array, table, Limits.DefaultLimits())), "reader rejects list under array descriptor");
+}
+
+ShapeId RegisterStructured(Registry.ShapeRegistry table, string signature, ShapeKind kind, FieldDescriptor[] fields, VariantDescriptor[] variants)
+{
+    ShapeId id = match Registry.SignatureId(signature, 8388608_i64)
+    {
+        Result::Ok(value) => value,
+
+        Result::Error(_) => {
+            Assert.Fail("structured fixture signature");
+            return RegisterStructured(table, signature, kind, fields, variants);
+        },
+    };
+    ShapeDescriptor descriptor = ShapeDescriptor
+    {
+        id: id,
+
+        signature: signature,
+
+        packageIdentity: "fixture@1.0.0",
+
+        sourcePath: "Fixture.bd",
+
+        declarationPath: signature,
+
+        schemaVersion: "1",
+
+        kind: kind,
+
+        width: 0_u8,
+
+        arguments: Array.Empty<ShapeId>(),
+
+        fields: fields,
+
+        variants: variants,
+
+        extras: Optional.Empty<ExtrasBinding>(),
+    };
+    Assert.True(Results.IsOk(Registry.Register(table, descriptor, 8388608_i64, 100000_i64)), "structured descriptor registered");
+    return id;
+}
+
+test bsol_serialization_wire_record_declared_order_and_required_fields
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId integer = Register(table, "record-element", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+
+    ShapeId record = RegisterStructured(table, "record", ShapeKind::Record, [FieldDescriptor
+    {
+        name: "z",
+
+        shape: integer,
+
+        required: true,
+
+        optional: false,
+
+        defaultSignature: "",
+    }, FieldDescriptor
+    {
+        name: "a",
+
+        shape: integer,
+
+        required: true,
+
+        optional: false,
+
+        defaultSignature: "",
+    }], Array.Empty<VariantDescriptor>());
+
+    match Roundtrip(record, DataValue::Record(record, [RecordField
+    {
+        name: "a",
+
+        value: DataValue::Signed(2_i64, 64_u8),
+    }, RecordField
+    {
+        name: "z",
+
+        value: DataValue::Signed(1_i64, 64_u8),
+    }]), table)
+    {
+        DataValue::Record(identity, fields) => Assert.Equal(fields[0_i64].name, "z", "declaration order rather than alphabetical order"),
+
+        _ => Assert.Fail("record typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.WriteValue(record, DataValue::Record(record, Array.Empty<RecordField>()), table, Limits.DefaultLimits())), "required fields reject");
+}
+
+test bsol_serialization_wire_map_ordinal_keys_and_duplicate_rejection
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId integer = Register(table, "map-element", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+
+    ShapeId map = Register(table, "map", ShapeKind::Map, 0_u8, [integer]);
+
+    match Roundtrip(map, DataValue::Map([MapEntry
+    {
+        key: "é",
+
+        value: DataValue::Signed(2_i64, 64_u8),
+    }, MapEntry
+    {
+        key: "a",
+
+        value: DataValue::Signed(1_i64, 64_u8),
+    }]), table)
+    {
+        DataValue::Map(entries) => Assert.Equal(entries[0_i64].key, "a", "UTF8 ordinal canonical order"),
+
+        _ => Assert.Fail("map typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.WriteValue(map, DataValue::Map([MapEntry
+    {
+        key: "a",
+
+        value: DataValue::Signed(1_i64, 64_u8),
+    }, MapEntry
+    {
+        key: "a",
+
+        value: DataValue::Signed(2_i64, 64_u8),
+    }]), table, Limits.DefaultLimits())), "duplicate map key rejects");
+}
+
+test bsol_serialization_wire_variant_exact_discriminant_and_payload
+{
+    Registry.ShapeRegistry table = Registry.Create();
+
+    ShapeId integer = Register(table, "variant-element", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+
+    ShapeId variant = RegisterStructured(table, "variant", ShapeKind::Variant, Array.Empty<FieldDescriptor>(), [VariantDescriptor
+    {
+        name: "Empty",
+
+        ordinal: 0_u32,
+
+        fields: Array.Empty<FieldDescriptor>(),
+    }, VariantDescriptor
+    {
+        name: "Some",
+
+        ordinal: 1_u32,
+
+        fields: [FieldDescriptor
+        {
+            name: "value",
+
+            shape: integer,
+
+            required: true,
+
+            optional: false,
+
+            defaultSignature: "",
+        }],
+    }]);
+
+    match Roundtrip(variant, DataValue::Variant(variant, "Some", [DataValue::Signed(42_i64, 64_u8)]), table)
+    {
+        DataValue::Variant(identity, name, payload) => {
+            Assert.Equal(name, "Some", "declared variant");
+            Assert.Equal(Array.Len<DataValue>(payload), 1_i64, "exact payload arity");
+        },
+
+        _ => Assert.Fail("variant typed tag"),
+    };
+
+    Assert.True(Results.IsError(Serialization.WriteValue(variant, DataValue::Variant(variant, "Some", Array.Empty<DataValue>()), table, Limits.DefaultLimits())), "missing payload rejects");
+
+    Assert.True(Results.IsError(Serialization.WriteValue(variant, DataValue::Variant(variant, "Foreign", Array.Empty<DataValue>()), table, Limits.DefaultLimits())), "unknown discriminant rejects");
+}
+
+// Exercises the format-independent Encoder directly: no aggregate DataValue tree.
+test bsol_serialization_stream_encoder_validates_shape_and_transaction {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId integer = Register(table, "stream-element", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+    ShapeId record = RegisterStructured(table, "stream-record", ShapeKind::Record,
+        [FieldDescriptor { name: "count", shape: integer, required: true, optional: false, defaultSignature: "" }], Array.Empty<VariantDescriptor>());
+    Serialization.WireEncoder encoder = Serialization.CreateEncoder(record, table);
+    Assert.True(Results.IsOk(encoder.Begin(Limits.DefaultLimits())), "begin private transaction");
+    Assert.True(Results.IsError(Serialization.EncodedText(encoder)), "uncommitted bytes remain private");
+    Assert.True(Results.IsOk(encoder.BeginRecord(record, 1_i64)), "exact record declaration");
+    Assert.True(Results.IsOk(encoder.BeginField("count")), "declared typed field");
+    Assert.True(Results.IsOk(encoder.WriteSigned(9007199254740993_i64, 64_u8)), "ordinary typed signed call");
+    Assert.True(Results.IsOk(encoder.EndField()), "field boundary");
+    Assert.True(Results.IsOk(encoder.EndRecord()), "record arity");
+    Assert.True(Results.IsOk(encoder.Commit()), "atomic publication");
+    match Serialization.EncodedText(encoder) {
+        Result::Error(_) => Assert.Fail("committed native text"),
+        Result::Ok(text) => Assert.True(Results.IsOk(Serialization.ReadValue(text, record, table, Limits.DefaultLimits())), "shared wire policy validates direct stream"),
+    };
+    Assert.True(Results.IsOk(encoder.Begin(Limits.DefaultLimits())), "fresh transaction");
+    Assert.True(Results.IsError(encoder.WriteString("wrong")), "root shape mismatch rejects");
+    Assert.True(Results.IsError(encoder.Commit()), "ignored operation error still poisons transaction");
+    Assert.True(Results.IsError(Serialization.EncodedText(encoder)), "failed transaction publishes no prior/new text");
+    encoder.Abort();
+}
+
+test bsol_serialization_stream_encoder_checks_nested_arity {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId integer = Register(table, "stream-list-element", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+    ShapeId array = Register(table, "stream-array", ShapeKind::Array, 0_u8, [integer]);
+    Serialization.WireEncoder encoder = Serialization.CreateEncoder(array, table);
+    Assert.True(Results.IsOk(encoder.Begin(Limits.DefaultLimits())), "stream begin");
+    Assert.True(Results.IsOk(encoder.BeginSequence(2_i64)), "declared array count");
+    Assert.True(Results.IsOk(encoder.WriteSigned(1_i64, 64_u8)), "first item");
+    Assert.True(Results.IsError(encoder.EndSequence()), "missing second item rejects");
+    Assert.True(Results.IsError(encoder.Commit()), "arity error latches until abort");
+    encoder.Abort();
+}
+
+pub type WireCounter : Contracts.Serializable<Serialization.WireEncoder> {
+    pub i64 count,
+    ShapeId shape,
+
+    pub Result<unit, SerializationError> WriteTyped(Serialization.WireEncoder encoder, SerializationLimits limits) {
+        encoder.BeginRecord(this.shape, 1_i64);
+        encoder.BeginField("count");
+        encoder.WriteSigned(this.count, 64_u8);
+        encoder.EndField();
+        return encoder.EndRecord();
+    }
+}
+
+pub type CounterReader : Serialization.WireReader<WireCounter> {
+    pub Result<WireCounter, SerializationError> ReadSyntax(Syntax.Document document, ShapeId shape, Registry.ShapeRegistry table, SerializationLimits limits) {
+        mut i64 i = 0_i64;
+        while (i < Array.Len<Syntax.Node>(document.nodes)) {
+            Syntax.Node field = document.nodes[i];
+            if (field.kind == Syntax.NodeKind::Block && field.name == "field" && field.hasLabel && field.label == "count") {
+                Syntax.Node fieldAssignment = document.nodes[field.children[0_i64]];
+                Syntax.Node value = document.nodes[fieldAssignment.children[0_i64]];
+                Syntax.Node data = document.nodes[value.children[0_i64]];
+                Syntax.Node number = document.nodes[data.children[0_i64]];
+                match Numeric.ParseSigned(number.raw, 64_i64) {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(count) => { return Result::Ok(WireCounter { count: count, shape: shape }); },
+                };
+            }
+            i = i + 1_i64;
+        }
+        return Result::Error(Errors.NumericError("MissingTypedField"));
+    }
+}
+
+test bsol_serialization_shared_generic_encoder_decoder_constructs_fresh_t {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId integer = Register(table, "generic-count", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+    ShapeId record = RegisterStructured(table, "generic-counter", ShapeKind::Record,
+        [FieldDescriptor { name: "count", shape: integer, required: true, optional: false, defaultSignature: "" }], Array.Empty<VariantDescriptor>());
+    WireCounter original = WireCounter { count: 9007199254740993_i64, shape: record };
+    match Serialization.WriteTyped<WireCounter>(original, record, table, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("shared Serializable<WireEncoder> body"),
+        Result::Ok(text) => {
+            Serialization.WireDecoder<WireCounter, CounterReader> decoder = Serialization.CreateDecoder<WireCounter, CounterReader>(text, record, table, CounterReader { });
+            match Contracts.Decode<WireCounter, Serialization.WireDecoder<WireCounter, CounterReader>>(decoder, Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("concrete Decoder<T> typed constructor"),
+                Result::Ok(decoded) => Assert.Equal(decoded.count, 9007199254740993_i64, "fresh exact T from native syntax"),
+            };
+        },
+    };
+}
+
+test bsol_serialization_shared_tagged_corpus_uses_same_native_policy {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId unsigned = Register(table, "unsigned64", ShapeKind::Unsigned, 64_u8, Array.Empty<ShapeId>());
+    Assert.True(Results.IsOk(Serialization.ReadValue(WireFixture("u64"), unsigned, table, Limits.DefaultLimits())), "shared exact unsigned case");
+    Assert.True(Results.IsError(Serialization.ReadValue(WireFixture("wrong-width"), unsigned, table, Limits.DefaultLimits())), "shared exact width rejection");
+    ShapeId bytes = Register(table, "bytes", ShapeKind::Bytes, 0_u8, Array.Empty<ShapeId>());
+    Assert.True(Results.IsOk(Serialization.ReadValue(WireFixture("bytes"), bytes, table, Limits.DefaultLimits())), "shared canonical base64");
+    Assert.True(Results.IsError(Serialization.ReadValue(WireFixture("bad-padbits"), bytes, table, Limits.DefaultLimits())), "shared canonical pad bits");
+    ShapeId scalar = Register(table, "char", ShapeKind::Scalar, 0_u8, Array.Empty<ShapeId>());
+    Assert.True(Results.IsOk(Serialization.ReadValue(WireFixture("char-astral"), scalar, table, Limits.DefaultLimits())), "shared astral scalar");
+    Assert.True(Results.IsError(Serialization.ReadValue(WireFixture("char-two"), scalar, table, Limits.DefaultLimits())), "shared scalar count");
+}
+
+
+test bsol_serialization_active_path_rejects_cycle_not_shared_siblings {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId recursive = match Registry.SignatureId("recursive-array", 8388608_i64) {
+        Result::Ok(id) => id,
+        Result::Error(_) => { Assert.Fail("recursive fixture identity"); return; },
+    };
+    Register(table, "recursive-array", ShapeKind::Array, 0_u8, [recursive]);
+    mut DataValue[] items = [DataValue::Unit];
+    DataValue cycle = DataValue::Sequence(SequenceKind::Array, items);
+    Array.Set<DataValue>(items, 0_i64, cycle);
+    match Serialization.WriteValue(recursive, cycle, table, Limits.DefaultLimits()) {
+        Result::Ok(_) => Assert.Fail("cyclic managed arena must reject before output"),
+        Result::Error(error) => Assert.Equal(Errors.Code(error), "CycleDetected"),
+    };
+    ShapeId scalar = Register(table, "identity-string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
+    ShapeId sequence = Register(table, "identity-string-array", ShapeKind::Array, 0_u8, [scalar]);
+    DataValue shared = DataValue::String("same allocation in two sibling edges");
+    Assert.True(Results.IsOk(Serialization.WriteValue(sequence, DataValue::Sequence(SequenceKind::Array, [shared, shared]), table, Limits.DefaultLimits())), "acyclic shared aliases remain legal");
+}
+
+
+test checked_array_append_publishes_scalar_and_managed_owners {
+    mut i64[] scalar = Array.Empty<i64>();
+    Assert.True(Array.TryAppend<i64>(scalar, 7_i64), "checked scalar append admitted");
+    Assert.Equal(Array.Len<i64>(scalar), 1_i64);
+    Assert.Equal(scalar[0_i64], 7_i64);
+    mut DataValue[] managed = Array.Empty<DataValue>();
+    DataValue value = DataValue::String("typed rooted payload");
+    Assert.True(Array.TryAppend<DataValue>(managed, value), "checked managed append admitted");
+    Assert.Equal(Array.Len<DataValue>(managed), 1_i64);
+    match managed[0_i64] { DataValue::String(text) => Assert.Equal(text, "typed rooted payload"), _ => Assert.Fail("exact traced payload preserved"), };
+}
+
+
+test serialization_failure_publication_has_no_mutable_payload {
+    SerializationError failure = SerializationError::AllocationFailure;
+    Assert.Equal(Errors.Code(failure), "AllocationFailed");
+    Assert.Equal(Errors.Path(failure), "");
+    Assert.Equal(Errors.Start(failure), -1_i64);
+    Assert.Equal(Errors.End(failure), -1_i64);
+    Assert.True(!Errors.HasRelated(failure), "reserved allocation failure has no borrowed diagnostic");
+    SerializationError first = Errors.Diagnostic("DuplicateField", "root.field", 20_i64, 30_i64, true, 0_i64, 10_i64);
+    SerializationError second = Errors.NumericError("Range");
+    Assert.Equal(Errors.Code(first), "DuplicateField");
+    Assert.Equal(Errors.Code(second), "Range");
+    Assert.Equal(Errors.RelatedStart(first), 0_i64);
+    Assert.Equal(Errors.RelatedEnd(first), 10_i64);
+    Assert.True(Errors.HasRelated(first), "ordinary immutable diagnostics retain related source");
+    Assert.Equal(Errors.Code(failure), "AllocationFailed");
+}
+
+test wire_encoder_prepares_fallible_work_before_nonallocating_commit {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId shape = Register(table, "publication-i64", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+    Serialization.WireEncoder encoder = Serialization.CreateEncoder(shape, table);
+    Assert.True(Results.IsError(encoder.Commit()), "unopened transaction cannot publish");
+    encoder.Abort();
+    Assert.True(Results.IsOk(encoder.Begin(Limits.DefaultLimits())), "begin after unopened rollback");
+    Assert.True(Results.IsOk(encoder.WriteSigned(42_i64, 64_u8)), "fallible root completion validates unpublished bytes");
+    Assert.True(Results.IsError(Serialization.EncodedText(encoder)), "prepared bytes remain unpublished");
+    Assert.True(Results.IsOk(encoder.Commit()), "commit transfers already prepared result");
+    Assert.True(Results.IsOk(Serialization.EncodedText(encoder)), "published bytes become visible");
+    Assert.True(Results.IsError(encoder.Commit()), "second commit rejected without replacing publication");
+    encoder.Abort();
+    Assert.True(Results.IsError(Serialization.EncodedText(encoder)), "rollback revokes output visibility");
+    Assert.True(Results.IsOk(encoder.Begin(Limits.DefaultLimits())), "reusable encoder starts a fresh transaction");
+    Assert.True(Results.IsOk(encoder.WriteSigned(43_i64, 64_u8)), "fresh payload prepared");
+    Assert.True(Results.IsOk(encoder.Commit()), "fresh transaction committed");
+}

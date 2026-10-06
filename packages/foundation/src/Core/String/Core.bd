@@ -1,5 +1,5 @@
 /// Core string helpers backed by runtime builtins (`__str_len`, `__str_slice`).
-use Core.Bytes.Slice;
+use Core.Collections.Array;
 
 /// Returns the number of UTF-8 code units in text.
 pub i64 Len(string text) {
@@ -56,7 +56,7 @@ pub string Trim(string text) {
     mut i64 start = 0;
     while start < len {
         u8 b = ByteAt(text, start);
-        if b != 32 && b != 9 && b != 13 {
+        if b != 32_u8 && b != 9_u8 && b != 13_u8 {
             break;
         }
         start = start + 1;
@@ -64,7 +64,7 @@ pub string Trim(string text) {
     mut i64 end = len;
     while end > start {
         u8 b = ByteAt(text, end - 1);
-        if b != 32 && b != 9 && b != 13 {
+        if b != 32_u8 && b != 9_u8 && b != 13_u8 {
             break;
         }
         end = end - 1;
@@ -73,6 +73,65 @@ pub string Trim(string text) {
         return "";
     }
     return SubSlice(text, start, end - start);
+}
+
+/// Compares two strings by their UTF-8 code units (ordinal order).
+/// Byte-wise UTF-8 order equals Unicode code point order (RFC 3629, section 1).
+/// Returns -1, 0 or 1. A proper prefix orders before the longer string.
+pub i64 CompareOrdinal(string left, string right) {
+    i64 leftLen = Len(left);
+    i64 rightLen = Len(right);
+    mut i64 shared = leftLen;
+    if rightLen < shared {
+        shared = rightLen;
+    }
+    mut i64 i = 0;
+    while i < shared {
+        u8 leftByte = ByteAt(left, i);
+        u8 rightByte = ByteAt(right, i);
+        if leftByte < rightByte {
+            return -1;
+        }
+        if leftByte > rightByte {
+            return 1;
+        }
+        i = i + 1;
+    }
+    if leftLen < rightLen {
+        return -1;
+    }
+    if leftLen > rightLen {
+        return 1;
+    }
+    return 0;
+}
+
+/// Returns a new array with `values` in ascending ordinal order (`CompareOrdinal`).
+/// Stable insertion sort over a copy; the input array is not modified.
+pub string[] SortOrdinal(string[] values) {
+    i64 length = Array.Len<string>(values);
+    mut string[] sorted = Array.Empty<string>();
+    mut i64 index = 0;
+    while index < length {
+        Array.Append<string>(sorted, Array.Get<string>(values, index));
+        index = index + 1;
+    }
+    mut i64 next = 1;
+    while next < length {
+        string current = Array.Get<string>(sorted, next);
+        mut i64 slot = next;
+        while slot > 0 {
+            string previous = Array.Get<string>(sorted, slot - 1);
+            if CompareOrdinal(previous, current) <= 0 {
+                break;
+            }
+            Array.Set<string>(sorted, slot, previous);
+            slot = slot - 1;
+        }
+        Array.Set<string>(sorted, slot, current);
+        next = next + 1;
+    }
+    return sorted;
 }
 
 /// Returns the byte at the given zero-based index in the UTF-8 representation.

@@ -13,15 +13,37 @@ pub type Deadline {
 /// Constructs a checked monotonic deadline from a relative duration.
 pub Core.Results.Result<Deadline, TimerError> After(Duration duration) {
     if duration.nanos < 0_i64 {
-        return Result::Error(TimerError::InvalidDuration());
+        return Result::Error(TimerError::InvalidDuration);
     }
     Instant sample = Time.MonotonicNow();
     i64 now = sample.nanos;
     if now < 0_i64 {
-        return Result::Error(TimerError::Unavailable());
+        return Result::Error(TimerError::Unavailable);
     }
     if duration.nanos > 9223372036854775807_i64 - now {
-        return Result::Error(TimerError::DeadlineOverflow());
+        return Result::Error(TimerError::DeadlineOverflow);
     }
     return Result::Ok(Deadline { monotonicNanos: now + duration.nanos });
+}
+
+/// Selects the earlier of two issued deadlines in the same monotonic domain.
+pub Deadline Earlier(Deadline left, Deadline right) {
+    if left.monotonicNanos <= right.monotonicNanos { return left; }
+    return right;
+}
+
+/// Reserves an interval before an issued deadline without sampling a new clock.
+pub Result<Deadline, TimerError> Reserve(Deadline deadline, Duration duration) {
+    if duration.nanos < 0_i64 { return Result::Error(TimerError::InvalidDuration); }
+    if duration.nanos >= deadline.monotonicNanos {
+        return Result::Ok(Deadline { monotonicNanos: 0_i64 });
+    }
+    return Result::Ok(Deadline { monotonicNanos: deadline.monotonicNanos - duration.nanos });
+}
+
+/// Checks an issued deadline against the canonical monotonic clock.
+pub Result<bool, TimerError> IsExpired(Deadline deadline) {
+    Instant sample = Time.MonotonicNow();
+    if sample.nanos < 0_i64 { return Result::Error(TimerError::Unavailable); }
+    return Result::Ok(sample.nanos >= deadline.monotonicNanos);
 }

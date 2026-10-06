@@ -1,0 +1,211 @@
+use Core.Bsol.ImportGraph;
+use Core.Bsol.Imports;
+use Core.Bsol.Limits;
+use Core.Bsol.Schema;
+use Core.Bsol.Parser;
+use Core.Bsol.Typed;
+use Core.Bsol.Syntax;
+use Core.Serialization.Limits as SerializationPolicy;
+use Core.Hash.Sha256;
+use Core.Results;
+use Core.Collections.Array;
+use Testing.Assert;
+
+Imports.MaterializedSource Materialize(string source, string identity) {
+    match Sha256.HashUtf8(source, 8388608_i64) {
+        Result::Error(_) => { Assert.Fail("fixture source hashes"); return Materialize(source, identity); },
+        Result::Ok(digest) => { return Imports.MaterializedSource { source: source, canonicalIdentity: identity, sourceSha256: digest }; },
+    };
+}
+
+type GraphHost : Imports.Resolver {
+    bool cycle,
+    pub Result<Imports.MaterializedSource, Imports.ImportFailure> Resolve(Imports.ImportRequest request) {
+        match request {
+            Imports.ImportRequest::File(path) => {
+                if (path == "base.bsol") {
+                    return Result::Ok(Materialize("profile \"base.v2\" { version = 2 }", "file:base.bsol"));
+                }
+                if (path == "branch.bsol") {
+                    return Result::Ok(Materialize("profile \"branch.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" alias = shared } }", "file:branch.bsol"));
+                }
+                if (path == "root.bsol" && this.cycle) {
+                    return Result::Ok(Materialize("profile \"root.v2\" { version = 2 import_schema \"root.v2\" { from = file path = \"root.bsol\" } }", "file:root.bsol"));
+                }
+                return Result::Error(Imports.ImportFailure { code: "MissingCache", message: "fixture has no materialized path" });
+            },
+            _ => { return Result::Error(Imports.ImportFailure { code: "MissingCache", message: "fixture only materializes File requests" }); },
+        };
+    }
+}
+
+type WriteAdmissionProbe : Typed.BsolBinding<i32> {
+    bool invoked,
+    pub Result<i32, Schema.Diagnostic[]> ReadDocument(Schema.ValidatedDocument document, SerializationPolicy.SerializationLimits limits) {
+        return Result::Ok(0_i32);
+    }
+    pub Result<Syntax.Document, Schema.Diagnostic[]> WriteDocument(i32 value, Schema.Profile profile, SerializationPolicy.SerializationLimits limits) {
+        this.invoked = true;
+        return Result::Ok(Syntax.Document { source: "", nodes: Array.Empty<Syntax.Node>(), roots: Array.Empty<i64>(), trivia: Array.Empty<Syntax.Trivia>() });
+    }
+}
+
+test bsol_typed_write_reowns_profile_before_invoking_binding {
+    WriteAdmissionProbe probe = WriteAdmissionProbe { invoked: false };
+    match Schema.ParseProfile("profile \"plain.v2\" { version = 2 }", Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("valid source profile"),
+        Result::Ok(original) => {
+            mut Schema.Profile profile = original;
+            profile.source = "invalid profile source";
+            Assert.True(Results.IsError(Typed.Write<i32, WriteAdmissionProbe>(1_i32, profile, probe, SerializationPolicy.DefaultLimits())), "invalid owned source rejects before binding code");
+            Assert.False(probe.invoked, "unadmitted profile never reaches typed writer");
+        },
+    };
+}
+
+type CompositionHost : Imports.Resolver {
+    pub Result<Imports.MaterializedSource, Imports.ImportFailure> Resolve(Imports.ImportRequest request) {
+        match request {
+            Imports.ImportRequest::File(path) => {
+                if (path == "defaults.bsol") {
+                    return Result::Ok(Materialize("profile \"defaults.v2\" { version = 2 rule \"base\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extras = false field \"count\" { type = u32 required = false default = 7 } } }", "file:defaults.bsol"));
+                }
+                if (path == "nodes.bsol") {
+                    return Result::Ok(Materialize("profile \"nodes.v2\" { version = 2 rule \"node\" { scope = any match = keyword keyword = node label = required cardinality = many extras = false } }", "file:nodes.bsol"));
+                }
+                return Result::Error(Imports.ImportFailure { code: "MissingCache", message: "unknown composition fixture" });
+            },
+            _ => { return Result::Error(Imports.ImportFailure { code: "MissingCache", message: "composition fixture requires File" }); },
+        };
+    }
+}
+
+test bsol_imported_alias_composes_defaults_and_revalidates_owned_closure {
+    CompositionHost fixtureResolver = CompositionHost {};
+    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"defaults.v2\" { from = file path = \"defaults.bsol\" alias = shared } rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extends = \"shared.base\" } }", "file:root.bsol");
+    match Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("imported inherited defaults compose"),
+        Result::Ok(profile) => {
+            Assert.Equal(Array.Len<i64>(profile.roots), 1_i64, "only declaring root rules become document roots");
+            mut Schema.Rule rule = profile.rules[profile.roots[0_i64]];
+            Assert.Equal(Array.Len<Schema.Field>(rule.fields), 1_i64, "imported field inherited");
+            Assert.Equal(profile.document.nodes[rule.fields[0_i64].defaultNode].text, "7", "default refers to rebased imported arena");
+            // A caller can mutate public tables, but validation must rebuild
+            // them from the private verified source closure.
+            rule.fields[0_i64].typeIndex = -1_i64;
+            match Parser.Parse("config { count = 9 }", Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("document parses"),
+                Result::Ok(document) => Assert.True(Results.IsOk(Schema.Validate(document, profile, Limits.DefaultLimits())), "validation retains source closure without resolving again"),
+            };
+            mut Limits.BsolLimits narrow = Limits.DefaultLimits();
+            narrow.maxImportDepth = 0_i64;
+            Assert.True(Results.IsError(Schema.ReownProfile(profile, narrow)), "reownership reapplies caller depth policy");
+            narrow = Limits.DefaultLimits();
+            narrow.maxImports = 0_i64;
+            Assert.True(Results.IsError(Schema.ReownProfile(profile, narrow)), "reownership reapplies import policy");
+        },
+    };
+}
+
+test bsol_imported_private_keys_do_not_shadow_quoted_local_rule_names {
+    CompositionHost fixtureResolver = CompositionHost {};
+    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"defaults.v2\" { from = file path = \"defaults.bsol\" alias = shared } rule \"#1:0:defaults.v2:base\" { scope = top match = keyword keyword = local } rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extends = \"shared.base\" } }", "file:collision-root.bsol");
+    match Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("valid quoted local name cannot collide with imported private identity"),
+        Result::Ok(profile) => {
+            Assert.Equal(Array.Len<i64>(profile.roots), 2_i64, "both local roots retained");
+            Schema.Rule local = profile.rules[profile.roots[0_i64]];
+            Schema.Rule derived = profile.rules[profile.roots[1_i64]];
+            Assert.Equal(local.name, "#1:0:defaults.v2:base", "local identity remains unchanged");
+            Assert.Equal(Array.Len<Schema.Field>(local.fields), 0_i64, "local declaration remains independent");
+            Assert.Equal(Array.Len<Schema.Field>(derived.fields), 1_i64, "alias inheritance selects imported source declaration");
+            Assert.True(derived.extends != local.name, "rebased target has disjoint owned identity");
+        },
+    };
+}
+
+test bsol_imported_reference_aliases_share_one_owned_target {
+    CompositionHost fixtureResolver = CompositionHost {};
+    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"nodes.v2\" { from = file path = \"nodes.bsol\" alias = shared } import_schema \"nodes.v2\" { from = file path = \"nodes.bsol\" alias = other } rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"target\" { type = inline(shared.node) required = true } field \"first\" { type = ref(shared.node) required = true } field \"second\" { type = ref(shared.node) required = true } } }", "file:reference-root.bsol");
+    match Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("qualified imported type profile loads"),
+        Result::Ok(profile) => {
+            match Parser.Parse("config { target = node \"alpha\" {} first = @shared.node/alpha second = @other.node/alpha }", Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("qualified reference document parses"),
+                Result::Ok(document) => {
+                    match Schema.Validate(document, profile, Limits.DefaultLimits()) {
+                        Result::Error(_) => Assert.Fail("both aliases accept the declared imported type"),
+                        Result::Ok(checked) => {
+                            match Schema.ResolveReferences(checked, Limits.DefaultLimits()) {
+                                Result::Error(_) => Assert.Fail("diamond aliases resolve without target ambiguity"),
+                                Result::Ok(resolved) => {
+                                    Assert.Equal(Array.Len<Schema.ReferenceBinding>(resolved.references), 2_i64, "both reference origins bound");
+                                    Assert.Equal(resolved.references[0_i64].target, resolved.references[1_i64].target, "same actual input node");
+                                    Assert.Equal(resolved.references[0_i64].targetRule, resolved.references[1_i64].targetRule, "same owned imported declaration");
+                                },
+                            };
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+test bsol_imported_qualifier_parser_rejects_empty_segments {
+    string[] malformed = ["@shared./alpha", "@shared..node/alpha", "@.node/alpha", "ref(shared..node)", "inline(shared.)"];
+    for value in malformed {
+        Assert.True(Results.IsError(Parser.Parse("config { value = " + value + " }", Limits.DefaultLimits())), "malformed dotted qualifier rejects");
+    }
+}
+
+test bsol_import_graph_diamond_deduplicates_owned_source_and_keeps_namespaces {
+    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" alias = direct } import_schema \"branch.v2\" { from = file path = \"branch.bsol\" alias = branch } }", "file:root.bsol");
+    GraphHost fixtureResolver = GraphHost { cycle: false };
+    match ImportGraph.Resolve<GraphHost>(root, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("locked diamond must resolve"),
+        Result::Ok(graph) => {
+            Assert.Equal(Array.Len<ImportGraph.Source>(graph.sources), 3_i64, "shared source stored once");
+            Assert.Equal(Array.Len<ImportGraph.Binding>(graph.bindings), 3_i64, "three namespace edges retained");
+            Assert.Equal(graph.root, 0_i64, "owned root index");
+            for source in graph.sources { Assert.False(source.active, "all recursive visits complete before publication"); }
+        },
+    };
+}
+
+test bsol_import_graph_cycles_and_missing_cache_never_publish_partial_graph {
+    GraphHost fixtureResolver = GraphHost { cycle: true };
+    Imports.MaterializedSource cyclic = Materialize("profile \"root.v2\" { version = 2 import_schema \"root.v2\" { from = file path = \"root.bsol\" } }", "file:root.bsol");
+    match ImportGraph.Resolve<GraphHost>(cyclic, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Ok(_) => Assert.Fail("cycle rejected"),
+        Result::Error(error) => { Assert.Equal(error.failure.code, "ImportCycle", "canonical source cycle"); Assert.True(error.span.end > error.span.start, "import declaration span"); },
+    };
+    Imports.MaterializedSource missing = Materialize("profile \"root.v2\" { version = 2 import_schema \"absent.v2\" { from = file path = \"missing.bsol\" } }", "file:missing-root.bsol");
+    match ImportGraph.Resolve<GraphHost>(missing, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Ok(_) => Assert.Fail("missing cache rejected"),
+        Result::Error(error) => Assert.Equal(error.failure.code, "MissingCache", "host failure retained"),
+    };
+}
+
+test bsol_import_graph_limits_cover_the_whole_closure {
+    GraphHost fixtureResolver = GraphHost { cycle: false };
+    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" } }", "file:root.bsol");
+    mut Limits.BsolLimits limits = Limits.DefaultLimits();
+    limits.maxImports = 0_i64;
+    Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "import count checked before resolution");
+    limits = Limits.DefaultLimits();
+    limits.maxImportDepth = 0_i64;
+    Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "child depth checked");
+    limits = Limits.DefaultLimits();
+    limits.maxResolvedSchemaBytes = 1_i64;
+    Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "aggregate source budget");
+}
+
+test bsol_import_graph_preserves_supported_schema_version_in_owned_cache {
+    GraphHost fixtureResolver = GraphHost { cycle: false };
+    Imports.MaterializedSource root = Materialize("profile \"legacy.v1\" { version = 1 }", "file:legacy.bsol");
+    match ImportGraph.Resolve<GraphHost>(root, fixtureResolver, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("existing version one profile remains supported"),
+        Result::Ok(graph) => Assert.Equal(graph.sources[graph.root].version, 1_i64, "version retained with canonical source identity and digest"),
+    };
+}

@@ -1,0 +1,28 @@
+use Core.Results;
+use Core.Numeric.UnicodeScalar;
+use Testing.Assert;
+
+test unicode_scalar_public_roundtrip_includes_supplementary_plane
+{
+    u32[] values = [0_u32, 65_u32, 55295_u32, 57344_u32, 128512_u32, 1114111_u32];
+    for value in values {
+        match UnicodeScalar.FromCodePoint(value) {
+            Result::Error(_) => Assert.Fail("valid Unicode scalar rejected"),
+            Result::Ok(character) => Assert.Equal(UnicodeScalar.ToCodePoint(character), value, "exact scalar roundtrip"),
+        };
+    }
+}
+
+test unicode_scalar_public_errors_preserve_invalid_code_point
+{
+    match UnicodeScalar.FromCodePoint(55296_u32) {
+        Result::Error(UnicodeScalarError::Surrogate(value)) => Assert.Equal(value, 55296_u32, "surrogate payload"),
+        _ => Assert.Fail("surrogate must return its typed error"),
+    };
+    match UnicodeScalar.FromCodePoint(1114112_u32) {
+        Result::Error(UnicodeScalarError::OutOfRange(value)) => Assert.Equal(value, 1114112_u32, "range payload"),
+        _ => Assert.Fail("out of range must return its typed error"),
+    };
+    Assert.True(Results.IsError(UnicodeScalar.FromCodePoint(57343_u32)), "last surrogate rejected");
+    Assert.True(Results.IsError(UnicodeScalar.FromCodePoint(4294967295_u32)), "maximum u32 rejected");
+}

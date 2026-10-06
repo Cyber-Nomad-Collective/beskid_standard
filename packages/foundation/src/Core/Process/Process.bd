@@ -1,18 +1,242 @@
-/// Process metadata and control helpers backed by canonical Corelib services.
+/// Typed child sessions. Native capabilities are issued only by this canonical source.
+use Core.Results;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.String.Utf8;
+use Core.IO.Reader;
+use Core.IO.Writer;
+use Core.IO.Closer;
+use Core.IO.IoError;
+use Core.IO.TransferFailure;
+use Core.Time.Deadline;
+use Core.Time;
+use Core.Optional.Option;
+use Core.Disposable;
 
-pub i32 Id() {
-    return __process_getpid();
+pub i32 Id() { return __process_getpid(); }
+pub unit Exit(i32 code) { __process_exit(code); return; }
+pub i32 CurrentId() { return Id(); }
+pub bool IsCurrentProcess(i32 pid) { return pid == Id(); }
+
+pub type EnvironmentEntry { pub string key, pub string value, }
+pub enum EnvironmentPolicy { Inherit(), Replace(EnvironmentEntry[] entries), Extend(EnvironmentEntry[] entries), }
+pub type ProcessStartInfo { pub string executable, pub string[] arguments, pub EnvironmentPolicy environment, pub string cwd, }
+pub enum ProcessError {
+    NotFound(string executable), PermissionDenied(string executable), ExitCode(i64 code, string stderr), IOError(string message),
+    InvalidInput(), Cancelled(), TimedOut(), Closed(), Busy(), CleanupFailed(), Unsupported(),
+}
+pub type ProcessExit { pub i64 exitCode, }
+pub type ProcessOutput { pub i64 exitCode, pub string stdout, pub string stderr, }
+
+ProcessError StatusError(i64 status) {
+    if status == -3_i64 { return ProcessError::Cancelled; }
+    if status == -4_i64 { return ProcessError::TimedOut; }
+    if status == -5_i64 { return ProcessError::Unsupported; }
+    if status == -6_i64 { return ProcessError::Busy; }
+    if status == -11_i64 { return ProcessError::Closed; }
+    return ProcessError::IOError("child process operation failed");
+}
+TransferFailure TransferCause(i64 status) {
+    if status == -3_i64 { return TransferFailure::Cancelled; }
+    if status == -4_i64 { return TransferFailure::TimedOut; }
+    if status == -6_i64 { return TransferFailure::Busy; }
+    if status == -11_i64 { return TransferFailure::Closed; }
+    return TransferFailure::Unspecified;
 }
 
-pub unit Exit(i32 code) {
-    __process_exit(code);
-    return;
+pub type ProcessReader: Reader, Closer, Disposable {
+    u64 token, i32 stream, i64 deadline,
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(destination), offset, count) { return Result::Error(IoError::InvalidRange()); }
+        if count == 0_i64 { return Result::Ok(0_i64); }
+        i64 result = __child_read(this.token, this.stream, destination, offset, count, this.deadline);
+        if result < 0_i64 { return Result::Error(IoError::ReadFailed(TransferCause(result))); }
+        return Result::Ok(result);
+    }
+    /// None is native readiness pending; the caller owns cooperative retry/cancellation.
+    pub Result<Option<i64>, IoError> TryRead(u8[] destination, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(destination), offset, count) { return Result::Error(IoError::InvalidRange()); }
+        if count == 0_i64 { return Result::Ok(Option::Some(0_i64)); }
+        i64 result = __child_try_read(this.token, this.stream, destination, offset, count);
+        if result == -2_i64 { return Result::Ok(Option::None); }
+        if result < 0_i64 { return Result::Error(IoError::ReadFailed(TransferCause(result))); }
+        return Result::Ok(Option::Some(result));
+    }
+    pub Result<unit, DisposeError> Dispose() {
+        return match Close() { Result::Ok(value) => Result::Ok(()), Result::Error(error) => Result::Error(DisposeError::Failed()), };
+    }
+    pub Result<unit, IoError> Close() {
+        if __child_close_pipe(this.token, this.stream) != 0_i32 { return Result::Error(IoError::CloseFailed()); }
+        return Result::Ok(());
+    }
+}
+pub type ProcessWriter: Writer, Closer, Disposable {
+    u64 token, i64 deadline,
+    pub Result<i64, IoError> Write(u8[] source, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange()); }
+        if count == 0_i64 { return Result::Ok(0_i64); }
+        i64 result = __child_write(this.token, source, offset, count, this.deadline);
+        if result < 0_i64 { return Result::Error(IoError::WriteFailed(TransferCause(result))); }
+        return Result::Ok(result);
+    }
+    /// A pending write must be retried with the same source prefix; Busy cannot mutate it.
+    pub Result<Option<i64>, IoError> TryWrite(u8[] source, i64 offset, i64 count) {
+        if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange()); }
+        if count == 0_i64 { return Result::Ok(Option::Some(0_i64)); }
+        i64 result = __child_try_write(this.token, source, offset, count);
+        if result == -2_i64 { return Result::Ok(Option::None); }
+        if result < 0_i64 { return Result::Error(IoError::WriteFailed(TransferCause(result))); }
+        return Result::Ok(Option::Some(result));
+    }
+    pub Result<unit, DisposeError> Dispose() {
+        return match Close() { Result::Ok(value) => Result::Ok(()), Result::Error(error) => Result::Error(DisposeError::Failed()), };
+    }
+    pub Result<unit, IoError> Close() {
+        if __child_close_pipe(this.token, 0_i32) != 0_i32 { return Result::Error(IoError::CloseFailed()); }
+        return Result::Ok(());
+    }
+}
+pub type ChildProcess: Disposable {
+    u64 token,
+    pub ProcessWriter Stdin() { return ProcessWriter { token: this.token, deadline: -1_i64 }; }
+    pub ProcessReader Stdout() { return ProcessReader { token: this.token, stream: 1_i32, deadline: -1_i64 }; }
+    pub ProcessReader Stderr() { return ProcessReader { token: this.token, stream: 2_i32, deadline: -1_i64 }; }
+    pub ProcessWriter StdinUntil(Deadline limit) { return ProcessWriter { token: this.token, deadline: limit.monotonicNanos }; }
+    pub ProcessReader StdoutUntil(Deadline limit) { return ProcessReader { token: this.token, stream: 1_i32, deadline: limit.monotonicNanos }; }
+    pub ProcessReader StderrUntil(Deadline limit) { return ProcessReader { token: this.token, stream: 2_i32, deadline: limit.monotonicNanos }; }
+    pub Result<ProcessExit, ProcessError> Wait(Deadline limit) {
+        i64 result = __child_wait(this.token, limit.monotonicNanos);
+        if result < 0_i64 { return Result::Error(StatusError(result)); }
+        return Result::Ok(ProcessExit { exitCode: result });
+    }
+    pub Result<unit, ProcessError> Terminate() {
+        if __child_terminate(this.token) != 0_i32 { return Result::Error(ProcessError::CleanupFailed()); }
+        return Result::Ok(());
+    }
+    pub Result<unit, DisposeError> Dispose() {
+        return match Close() { Result::Ok(value) => Result::Ok(()), Result::Error(error) => Result::Error(DisposeError::Failed()), };
+    }
+    /// Uses one issued deadline for termination and reap, capped at five seconds.
+    pub Result<unit, ProcessError> CloseUntil(Deadline deadline) {
+        if __child_close_until(this.token, deadline.monotonicNanos) != 0_i32 {
+            return Result::Error(ProcessError::CleanupFailed());
+        }
+        return Result::Ok(());
+    }
+    /// Invalidates pipes, terminates the contained process tree and reaps within five seconds.
+    pub Result<unit, ProcessError> Close() {
+        if __child_close(this.token) != 0_i32 { return Result::Error(ProcessError::CleanupFailed()); }
+        return Result::Ok(());
+    }
 }
 
-pub i32 CurrentId() {
-    return Id();
+/// Convenience setup settlement uses a checked five-second deadline.
+pub Result<ChildProcess, ProcessError> Spawn(ProcessStartInfo info) {
+    return match Deadline.After(Time.FromSeconds(5_i64)) {
+        Result::Ok(deadline) => SpawnUntil(info, deadline),
+        Result::Error(error) => Result::Error(ProcessError::Unsupported),
+    };
 }
 
-pub bool IsCurrentProcess(i32 pid) {
-    return pid == Id();
+pub Result<ChildProcess, ProcessError> SpawnUntil(ProcessStartInfo info, Deadline deadline) {
+    i32 inherit = match info.environment { EnvironmentPolicy::Replace(entries) => 0_i32, _ => 1_i32, };
+    u64 token = __child_begin(info.executable, info.cwd, inherit);
+    if token == 0_u64 { return Result::Error(ProcessError::InvalidInput); }
+    mut i64 index = 0_i64;
+    while index < Array.Len<string>(info.arguments) {
+        if __child_argument(token, info.arguments[index]) != 0_i32 { __child_close(token); return Result::Error(ProcessError::InvalidInput); }
+        index = index + 1_i64;
+    }
+    EnvironmentEntry[] entries = match info.environment {
+        EnvironmentPolicy::Inherit => Array.Empty<EnvironmentEntry>(),
+        EnvironmentPolicy::Replace(values) => values,
+        EnvironmentPolicy::Extend(values) => values,
+    };
+    index = 0_i64;
+    while index < Array.Len<EnvironmentEntry>(entries) {
+        EnvironmentEntry entry = entries[index];
+        if __child_environment(token, entry.key, entry.value) != 0_i32 { __child_close(token); return Result::Error(ProcessError::InvalidInput); }
+        index = index + 1_i64;
+    }
+    i32 started = __child_spawn(token, deadline.monotonicNanos);
+    if started != 0_i32 {
+        if __child_close(token) != 0_i32 { return Result::Error(ProcessError::CleanupFailed); }
+        if started == -7_i32 { return Result::Error(ProcessError::NotFound(info.executable)); }
+        if started == -8_i32 { return Result::Error(ProcessError::PermissionDenied(info.executable)); }
+        return Result::Error(StatusError(i64(started)));
+    }
+    return Result::Ok(ChildProcess { token: token });
 }
+
+/// Capture both streams concurrently through nonblocking probes; never drain one to EOF first.
+pub Result<ProcessOutput, ProcessError> Run(string command, string[] args) {
+    Result<ChildProcess, ProcessError> started = Spawn(ProcessStartInfo { executable: command, arguments: args, environment: EnvironmentPolicy::Inherit, cwd: "" });
+    return match started {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(child) => Capture(child),
+    };
+}
+Result<ProcessOutput, ProcessError> Capture(ChildProcess child) {
+    if __child_close_pipe(child.token, 0_i32) != 0_i32 { child.Close(); return Result::Error(ProcessError::CleanupFailed); }
+    mut u8[] output = Array.Empty<u8>(); mut u8[] errors = Array.Empty<u8>();
+    u8[] buffer = Slice.New(4096_i64);
+    mut bool outputEof = false; mut bool errorsEof = false; mut i64 exit = -2_i64;
+    while !outputEof || !errorsEof || exit == -2_i64 {
+        mut i32 stream = 1_i32;
+        while stream <= 2_i32 {
+            i64 count = __child_try_read(child.token, stream, buffer, 0_i64, 4096_i64);
+            if count == 0_i64 { if stream == 1_i32 { outputEof = true; } else { errorsEof = true; } }
+            if count < -2_i64 || count == -1_i64 { child.Close(); return Result::Error(StatusError(count)); }
+            mut i64 index = 0_i64;
+            while index < count {
+                if Array.Len<u8>(output) + Array.Len<u8>(errors) >= 16777216_i64 { child.Close(); return Result::Error(ProcessError::IOError("captured child output exceeded 16 MiB")); }
+                if stream == 1_i32 { Array.Append<u8>(output, buffer[index]); } else { Array.Append<u8>(errors, buffer[index]); }
+                index = index + 1_i64;
+            }
+            stream = stream + 1_i32;
+        }
+        exit = __child_poll(child.token);
+        if exit < 0_i64 && exit != -2_i64 { child.Close(); return Result::Error(StatusError(exit)); }
+        if !outputEof || !errorsEof || exit == -2_i64 {
+            i64 pause = __child_pause(-1_i64);
+            if pause < 0_i64 { child.Close(); return Result::Error(StatusError(pause)); }
+        }
+    }
+    Result<unit, ProcessError> closed = child.Close();
+    return match closed {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(value) => CapturedOutput(output, errors, exit),
+    };
+}
+Result<ProcessOutput, ProcessError> CapturedOutput(u8[] output, u8[] errors, i64 exit) {
+    if !ValidOutput(output) || !ValidOutput(errors) { return Result::Error(ProcessError::IOError("captured output is not UTF-8")); }
+    string stderr = Utf8.FromUtf8CodeUnits(errors);
+    if exit != 0_i64 { return Result::Error(ProcessError::ExitCode(exit, stderr)); }
+    return Result::Ok(ProcessOutput { exitCode: exit, stdout: Utf8.FromUtf8CodeUnits(output), stderr: stderr });
+}
+bool ValidOutput(u8[] bytes) {
+    mut i64 index = 0_i64;
+    while index < Slice.Len(bytes) {
+        u8 first = bytes[index]; index = index + 1_i64;
+        if first >= 128_u8 {
+            mut i64 more = 0_i64; mut u32 scalar = 0_u32; mut u32 minimum = 0_u32;
+            if first >= 194_u8 && first <= 223_u8 { more = 1_i64; scalar = u32(first & 31_u8); minimum = 128_u32; }
+            else if first >= 224_u8 && first <= 239_u8 { more = 2_i64; scalar = u32(first & 15_u8); minimum = 2048_u32; }
+            else if first >= 240_u8 && first <= 244_u8 { more = 3_i64; scalar = u32(first & 7_u8); minimum = 65536_u32; }
+            else { return false; }
+            if more > Slice.Len(bytes) - index { return false; }
+            while more > 0_i64 { u8 next = bytes[index]; if (next & 192_u8) != 128_u8 { return false; } scalar = scalar * 64_u32 + u32(next & 63_u8); index = index + 1_i64; more = more - 1_i64; }
+            if scalar < minimum || scalar > 1114111_u32 || (scalar >= 55296_u32 && scalar <= 57343_u32) { return false; }
+        }
+    }
+    return true;
+}
+
+/// Pump readiness uses the same absolute deadline and cancellation winner as stream waits.
+pub Result<unit, ProcessError> WaitReady(Deadline deadline) {
+    i64 result = __child_pause(deadline.monotonicNanos);
+    if result < 0_i64 { return Result::Error(StatusError(result)); }
+    return Result::Ok(());
+}
+[CleanupConversion]
+pub ProcessError FromDisposeError(DisposeError error) { return ProcessError::CleanupFailed; }

@@ -1,0 +1,246 @@
+/// Native SHA-256 (FIPS180-4), shared by source integrity and structural identities.
+use Core.Collections.Array;
+
+use Core.String;
+
+use Core.Results;
+
+pub enum HashError
+{
+    InvalidLimit,
+
+    InvalidLength,
+
+    LengthOverflow,
+
+    InputLimit,
+}
+
+pub i64 DefaultMaxInputBytes()
+{
+    return 8388608_i64;
+}
+
+/// Validate before allocation, input reads or bit-length arithmetic.
+pub Result<unit, HashError> ValidateLength(i64 byteLength, i64 maxInputBytes)
+{
+    if (maxInputBytes < 0_i64)
+    {
+        return Result::Error(HashError::InvalidLimit);
+    }
+    if (byteLength < 0_i64)
+    {
+        return Result::Error(HashError::InvalidLength);
+    }
+    if (byteLength >= 2305843009213693952_i64)
+    {
+        return Result::Error(HashError::LengthOverflow);
+    }
+    if (byteLength > maxInputBytes)
+    {
+        return Result::Error(HashError::InputLimit);
+    }
+    return Result<unit, HashError>::Ok(());
+}
+
+u32 Xor(u32 left, u32 right)
+{
+    return (left | right) - (left & right);
+}
+
+u32 Rotate(u32 value, u32 count)
+{
+    return (value >> count) | (value << (32_u32 - count));
+}
+
+u32 SmallZero(u32 value)
+{
+    return Xor(Xor(Rotate(value, 7_u32), Rotate(value, 18_u32)), value >> 3_u32);
+}
+
+u32 SmallOne(u32 value)
+{
+    return Xor(Xor(Rotate(value, 17_u32), Rotate(value, 19_u32)), value >> 10_u32);
+}
+
+u32 LargeZero(u32 value)
+{
+    return Xor(Xor(Rotate(value, 2_u32), Rotate(value, 13_u32)), Rotate(value, 22_u32));
+}
+
+u32 LargeOne(u32 value)
+{
+    return Xor(Xor(Rotate(value, 6_u32), Rotate(value, 11_u32)), Rotate(value, 25_u32));
+}
+
+u32 ChooseBits(u32 x, u32 y, u32 z)
+{
+    return Xor(x & y, (4294967295_u32 - x) & z);
+}
+
+u32 Majority(u32 x, u32 y, u32 z)
+{
+    return Xor(Xor(x & y, x & z), y & z);
+}
+
+u32 Word(u8[] input, i64 offset)
+{
+    return (u32(input[offset]) << 24_u32) | (u32(input[offset + 1_i64]) << 16_u32) | (u32(input[offset + 2_i64]) << 8_u32) | u32(input[offset + 3_i64]);
+}
+
+unit FillWords(u8[] input, i64 offset, u32[] words)
+{
+    mut i64 i = 0_i64;
+    while (i < 16_i64)
+    {
+        Array.Set<u32>(words, i, Word(input, offset + i * 4_i64));
+        i = i + 1_i64;
+    }
+}
+
+unit StoreWord(u8[] bytes, i64 offset, u32 value)
+{
+    Array.Set<u8>(bytes, offset, u8(value >> 24_u32));
+    Array.Set<u8>(bytes, offset + 1_i64, u8((value >> 16_u32) & 255_u32));
+    Array.Set<u8>(bytes, offset + 2_i64, u8((value >> 8_u32) & 255_u32));
+    Array.Set<u8>(bytes, offset + 3_i64, u8(value & 255_u32));
+}
+
+unit Compress(u32[] hash, u32[] words, u32[] constants)
+{
+    mut i64 i = 16_i64;
+    while (i < 64_i64)
+    {
+        u32 value = SmallOne(words[i - 2_i64]) + words[i - 7_i64] + SmallZero(words[i - 15_i64]) + words[i - 16_i64];
+        Array.Set<u32>(words, i, value);
+        i = i + 1_i64;
+    }
+
+    mut u32 a = hash[0];
+    mut u32 b = hash[1];
+    mut u32 c = hash[2];
+    mut u32 d = hash[3];
+    mut u32 e = hash[4];
+    mut u32 f = hash[5];
+    mut u32 g = hash[6];
+    mut u32 h = hash[7];
+    i = 0_i64;
+    while (i < 64_i64)
+    {
+        u32 first = h + LargeOne(e) + ChooseBits(e, f, g) + constants[i] + words[i];
+        u32 second = LargeZero(a) + Majority(a, b, c);
+        h = g;
+        g = f;
+        f = e;
+        e = d + first;
+        d = c;
+        c = b;
+        b = a;
+        a = first + second;
+        i = i + 1_i64;
+    }
+    Array.Set<u32>(hash, 0_i64, hash[0] + a);
+    Array.Set<u32>(hash, 1_i64, hash[1] + b);
+    Array.Set<u32>(hash, 2_i64, hash[2] + c);
+    Array.Set<u32>(hash, 3_i64, hash[3] + d);
+    Array.Set<u32>(hash, 4_i64, hash[4] + e);
+    Array.Set<u32>(hash, 5_i64, hash[5] + f);
+    Array.Set<u32>(hash, 6_i64, hash[6] + g);
+    Array.Set<u32>(hash, 7_i64, hash[7] + h);
+}
+
+/// Streams full input blocks and at most two owned padding blocks.
+pub Result<u8[], HashError> HashBytes(u8[] input, i64 maxInputBytes)
+{
+    i64 length = Array.Len<u8>(input);
+    match ValidateLength(length, maxInputBytes)
+    {
+        Result::Error(error) => {
+            return Result::Error(error);
+        },
+
+        Result::Ok(_) => { },
+    };
+    u32[] hash = [1779033703_u32, 3144134277_u32, 1013904242_u32, 2773480762_u32, 1359893119_u32, 2600822924_u32, 528734635_u32, 1541459225_u32];
+    u32[] constants = [1116352408_u32, 1899447441_u32, 3049323471_u32, 3921009573_u32, 961987163_u32, 1508970993_u32, 2453635748_u32, 2870763221_u32, 3624381080_u32, 310598401_u32, 607225278_u32, 1426881987_u32, 1925078388_u32, 2162078206_u32, 2614888103_u32, 3248222580_u32, 3835390401_u32, 4022224774_u32, 264347078_u32, 604807628_u32, 770255983_u32, 1249150122_u32, 1555081692_u32, 1996064986_u32, 2554220882_u32, 2821834349_u32, 2952996808_u32, 3210313671_u32, 3336571891_u32, 3584528711_u32, 113926993_u32, 338241895_u32, 666307205_u32, 773529912_u32, 1294757372_u32, 1396182291_u32, 1695183700_u32, 1986661051_u32, 2177026350_u32, 2456956037_u32, 2730485921_u32, 2820302411_u32, 3259730800_u32, 3345764771_u32, 3516065817_u32, 3600352804_u32, 4094571909_u32, 275423344_u32, 430227734_u32, 506948616_u32, 659060556_u32, 883997877_u32, 958139571_u32, 1322822218_u32, 1537002063_u32, 1747873779_u32, 1955562222_u32, 2024104815_u32, 2227730452_u32, 2361852424_u32, 2428436474_u32, 2756734187_u32, 3204031479_u32, 3329325298_u32];
+    mut u32[] words = Array.Empty<u32>();
+    mut u8[] tail = Array.Empty<u8>();
+    mut i64 i = 0_i64;
+    while (i < 64_i64)
+    {
+        Array.Append<u32>(words, 0_u32);
+        Array.Append<u8>(tail, 0_u8);
+        i = i + 1_i64;
+    }
+
+    mut i64 offset = 0_i64;
+    while (length - offset >= 64_i64)
+    {
+        FillWords(input, offset, words);
+        Compress(hash, words, constants);
+        offset = offset + 64_i64;
+    }
+
+    i64 remainder = length - offset;
+    i = 0_i64;
+    while (i < remainder)
+    {
+        Array.Set<u8>(tail, i, input[offset + i]);
+        i = i + 1_i64;
+    }
+    Array.Set<u8>(tail, remainder, 128_u8);
+    if (remainder >= 56_i64)
+    {
+        FillWords(tail, 0_i64, words);
+        Compress(hash, words, constants);
+        i = 0_i64;
+        while (i < 64_i64)
+        {
+            Array.Set<u8>(tail, i, 0_u8);
+            i = i + 1_i64;
+        }
+    }
+
+    u32 highLength = u32(length >> 29_i64);
+    u32 lowLength = u32(length & 536870911_i64) << 3_u32;
+    StoreWord(tail, 56_i64, highLength);
+    StoreWord(tail, 60_i64, lowLength);
+    FillWords(tail, 0_i64, words);
+    Compress(hash, words, constants);
+    mut u8[] digest = Array.Empty<u8>();
+    i = 0_i64;
+    while (i < 32_i64)
+    {
+        Array.Append<u8>(digest, 0_u8);
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < 8_i64)
+    {
+        StoreWord(digest, i * 4_i64, hash[i]);
+        i = i + 1_i64;
+    }
+    return Result::Ok(digest);
+}
+
+/// Bounds UTF8 code-unit count before copying; no scalar-count or normalization coercion.
+pub Result<u8[], HashError> HashUtf8(string input, i64 maxInputBytes)
+{
+    i64 length = String.Len(input);
+    match ValidateLength(length, maxInputBytes)
+    {
+        Result::Error(error) => {
+            return Result::Error(error);
+        },
+
+        Result::Ok(_) => { },
+    };
+    mut u8[] bytes = Array.Empty<u8>();
+    mut i64 i = 0_i64;
+    while (i < length)
+    {
+        Array.Append<u8>(bytes, String.ByteAt(input, i));
+        i = i + 1_i64;
+    }
+    return HashBytes(bytes, maxInputBytes);
+}

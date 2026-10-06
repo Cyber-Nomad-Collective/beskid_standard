@@ -1,0 +1,395 @@
+use Core.Bsol.Schema;
+
+use Core.Output;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Limits;
+
+use Core.Environment;
+
+use Core.FS;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Testing.Assert;
+
+string ReadComposition(string name)
+{
+    match Environment.Get("BESKID_BSOL_CORPUS")
+    {
+        Result::Error(_) => {
+            Assert.Fail("shared corpus required");
+            return "";
+        },
+
+        Result::Ok(directory) => match FS.ReadAllText(directory + "/cases/schema-composition-references/" + name + ".bsol")
+        {
+            Result::Error(_) => {
+                Assert.Fail("shared composition fixture readable");
+                return "";
+            },
+
+            Result::Ok(source) => {
+                return source;
+            },
+        },
+    };
+}
+
+unit RejectComposition(string name, string code, bool related)
+{
+    match Schema.ParseProfile(ReadComposition(name), Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("invalid composition must reject before publication"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                Schema.Diagnostic error = errors[i];
+                Output.WriteLine("composition error " + error.code + " field " + error.field + " rule " + error.rule);
+                if (error.code == code)
+                {
+                    found = true;
+                    Assert.True(error.span.end > error.span.start, "definition span retained");
+                    if (related)
+                    {
+                        Assert.True(error.hasRelated, "conflict retains previous definition");
+                        Assert.True(error.relatedSpan.end > error.relatedSpan.start, "related definition span retained");
+                    }
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "exact composition rejection");
+        },
+    };
+}
+
+Result<Schema.ValidatedDocument, Schema.Diagnostic[]> CheckReferenceWith(string name, string profileName)
+{
+    match Schema.ParseProfile(ReadComposition(profileName), Limits.DefaultLimits())
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(profile) => match Parser.Parse(ReadComposition(name), Limits.DefaultLimits())
+        {
+            Result::Error(_) => {
+                Assert.Fail("reference fixture valid syntax");
+                return Result::Error(Array.Empty<Schema.Diagnostic>());
+            },
+
+            Result::Ok(document) => match Schema.Validate(document, profile, Limits.DefaultLimits())
+            {
+                Result::Error(errors) => {
+                    return Result::Error(errors);
+                },
+
+                Result::Ok(validated) => {
+                    return Schema.ResolveReferences(validated, Limits.DefaultLimits());
+                },
+            },
+        },
+    };
+}
+
+Result<Schema.ValidatedDocument, Schema.Diagnostic[]> CheckReference(string name)
+{
+    return CheckReferenceWith(name, "reference-profile");
+}
+
+unit RejectReference(string name, string code, bool related)
+{
+    match CheckReference(name)
+    {
+        Result::Ok(_) => Assert.Fail("invalid document link rejects"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                Schema.Diagnostic error = errors[i];
+                Output.WriteLine("composition error " + error.code + " field " + error.field + " rule " + error.rule);
+                if (error.code == code)
+                {
+                    found = true;
+                    Assert.True(error.span.end > error.span.start, "offending reference definition span");
+                    if (related)
+                    {
+                        Assert.True(error.hasRelated, "reference conflict carries definition span");
+                    }
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "exact reference diagnostic");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_identical_diamond_composes_once
+{
+    match Schema.ParseProfile(ReadComposition("diamond-profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("identical diamond composes"),
+
+        Result::Ok(profile) => match Schema.Compose(profile, Limits.DefaultLimits())
+        {
+            Result::Error(_) => Assert.Fail("composition is checked and idempotent"),
+
+            Result::Ok(composed) => {
+                Schema.Rule leaf = composed.rules[3];
+                Assert.Equal(Array.Len<Schema.Field>(leaf.fields), 2_i64, "diamond base field occurs once");
+                Assert.Equal(leaf.fields[0].name, "name", "base ordering precedes local fields");
+                Assert.Equal(leaf.fields[1].name, "count", "local field order retained");
+                Assert.True(leaf.fields[0].span.end > leaf.fields[0].span.start, "inherited field retains origin span");
+            },
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_composition_cycle_and_unknown_base_reject
+{
+    RejectComposition("cycle-profile", "CompositionCycle", false);
+
+    RejectComposition("unknown-base-profile", "UnknownBaseRule", false);
+}
+
+/// @native-only
+test bsol_schema_incompatible_overlay_retains_both_definitions
+{
+    RejectComposition("conflict-profile", "CompositionConflict", true);
+
+    RejectComposition("label-conflict-profile", "CompositionConflict", true);
+}
+
+/// @native-only
+test bsol_schema_reference_resolves_to_document_owned_index
+{
+    match CheckReference("reference-valid")
+    {
+        Result::Error(_) => Assert.Fail("qualified reference resolves"),
+
+        Result::Ok(document) => {
+            Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "one checked reference link");
+            Schema.ReferenceBinding link = document.references[0];
+            match link.origin
+            {
+                Schema.ReferenceOrigin::DocumentNode(index) => Assert.True(index >= 0_i64 && index < Array.Len<Syntax.Node>(document.document.nodes), "reference origin is document-owned"),
+
+                _ => Assert.Fail("supplied reference cannot claim default owner"),
+            };
+            Assert.Equal(document.document.nodes[link.target].label, "one", "target index addresses exact node");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_syntax_reference_cycles_do_not_expand_owned_values
+{
+    match CheckReference("reference-cycle")
+    {
+        Result::Error(_) => Assert.Fail("syntax links may cycle"),
+
+        Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 2_i64, "two finite syntax links"),
+    };
+}
+
+/// @native-only
+test bsol_schema_reference_missing_duplicate_and_ambiguity_reject
+{
+    RejectReference("reference-missing", "UnresolvedReference", false);
+
+    RejectReference("reference-duplicate", "DuplicateReferenceTarget", true);
+
+    RejectReference("reference-ambiguous", "AmbiguousReference", true);
+}
+
+/// @native-only
+test bsol_schema_overlay_refines_but_cannot_loosen_constraints
+{
+    RejectComposition("constraint-conflict-profile", "CompositionConflict", true);
+
+    match Schema.ParseProfile(ReadComposition("refinement-profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("compatible constraint refinement allowed"),
+
+        Result::Ok(profile) => {
+            Schema.Field count = profile.rules[1].fields[0];
+            Assert.Equal(count.minimum, 2_i64, "overlay narrows minimum");
+            Assert.Equal(count.maximum, 8_i64, "overlay narrows maximum");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_references_traverse_lists_maps_and_inline_blocks
+{
+    match CheckReferenceWith("reference-nested-valid", "reference-nested-profile")
+    {
+        Result::Error(_) => Assert.Fail("nested reference shapes resolve"),
+
+        Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 4_i64, "each nested reference resolves exactly once"),
+    };
+
+    match CheckReferenceWith("reference-nested-missing", "reference-nested-profile")
+    {
+        Result::Ok(_) => Assert.Fail("missing list reference rejected"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                if (errors[i].code == "UnresolvedReference")
+                {
+                    found = true;
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "nested missing target diagnosed");
+        },
+    };
+
+    RejectReference("reference-wrong-kind", "TypeMismatch", false);
+}
+
+/// @native-only
+test bsol_schema_default_reference_retains_checked_field_owner
+{
+    match CheckReferenceWith("default-reference-valid", "default-reference-profile")
+    {
+        Result::Error(_) => Assert.Fail("typed default reference resolves"),
+
+        Result::Ok(document) => {
+            Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "one default reference");
+            Schema.ReferenceBinding link = document.references[0];
+            match link.origin
+            {
+                Schema.ReferenceOrigin::DefaultNode(owner, index) => {
+                    Schema.FieldBinding field = document.fields[owner];
+                    Assert.True(field.fromDefault, "origin names actual missing-only default binding");
+                    Assert.True(index >= 0_i64 && index < Array.Len<Syntax.Node>(field.sourceDocument.nodes), "default index belongs to its owning source document");
+                    Assert.Equal(field.sourceDocument.nodes[index].text, "one", "default reference source retained");
+                },
+
+                _ => Assert.Fail("default cannot pretend to be an input node"),
+            };
+            Assert.Equal(document.document.nodes[link.target].label, "one", "target is always input document-owned");
+        },
+    };
+
+    match CheckReferenceWith("default-reference-missing", "default-reference-profile")
+    {
+        Result::Ok(_) => Assert.Fail("missing default target rejects"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                if (errors[i].code == "UnresolvedReference")
+                {
+                    found = true;
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "default reference checked with its owner");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_reference_kind_and_rule_alias_share_canonical_target
+{
+    match CheckReferenceWith("alias-reference-kind", "alias-reference-profile")
+    {
+        Result::Error(_) => Assert.Fail("actual block kind resolves typed rule"),
+
+        Result::Ok(document) => {
+            Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "kind alias counts one target");
+            Assert.Equal(document.schema.rules[document.references[0].targetRule].name, "item_rule", "resolved rule binding is authority");
+        },
+    };
+
+    match CheckReferenceWith("alias-reference-rule", "alias-reference-profile")
+    {
+        Result::Error(_) => Assert.Fail("rule alias resolves same typed rule"),
+
+        Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "rule alias does not duplicate target identity"),
+    };
+}
+
+test bsol_native_composition_values_can_narrow_but_never_widen
+{
+    match Schema.ParseProfile(ReadComposition("values-narrow-profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("enum values may narrow"),
+
+        Result::Ok(profile) => {
+            Assert.Equal(Array.Len<string>(profile.rules[1_i64].fields[0_i64].values), 1_i64, "narrow values retained");
+        },
+    };
+
+    RejectComposition("values-widen-profile", "CompositionConflict", true);
+}
+
+test bsol_native_composition_incompatible_nested_same_name_rejects
+{
+    RejectComposition("nested-conflict-profile", "CompositionConflict", true);
+}
+
+test bsol_native_composition_identical_nested_definitions_coalesce
+{
+    match Schema.ParseProfile(ReadComposition("nested-identical-profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("identical nested definitions coalesce"),
+
+        Result::Ok(profile) => {
+            Assert.Equal(Array.Len<i64>(profile.rules[4_i64].nested), 1_i64, "one nested definition");
+        },
+    };
+}
+
+test bsol_native_composition_aggregate_search_work_is_bounded
+{
+    mut string source = "profile \"work.v2\" { version = 2 rule \"wide\" { keyword = wide ";
+
+    mut i64 index = 0_i64;
+
+    while (index < 500_i64)
+    {
+        source = source + "field \"field" + index + "\" { type = quoted } ";
+        index = index + 1_i64;
+    }
+
+    source = source + "} }";
+
+    match Schema.ParseProfile(source, Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("aggregate composition search budget must reject"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                if (errors[i].code == "SchemaWorkLimit")
+                {
+                    found = true;
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "checked composition work exhaustion diagnostic");
+        },
+    };
+}

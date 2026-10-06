@@ -1,0 +1,182 @@
+use Core.Bsol.Errors;
+
+use Core.Bsol.Imports;
+
+use Core.Bsol.Limits;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Schema;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Writer;
+
+
+use Core.Serialization.Limits as SerializationLimitsModule;
+
+/// A generated binding declares exact profile paths and specialized field /
+/// enum constructors. Implementations never infer a dictionary shape.
+pub contract BsolBinding<T>
+{
+    Result<T, Schema.Diagnostic[]> ReadDocument(Schema.ValidatedDocument document, SerializationLimitsModule.SerializationLimits limits);
+
+    Result<Syntax.Document, Schema.Diagnostic[]> WriteDocument(T value, Schema.Profile profile, SerializationLimitsModule.SerializationLimits limits);
+}
+
+Schema.Diagnostic ParseDiagnostic(Errors.BsolError error, string profile)
+{
+    return Schema.Diagnostic
+    {
+        code: "InvalidSyntax",
+
+        stage: Schema.DiagnosticStage::Syntax,
+
+        span: error.span,
+
+        field: "",
+
+        rule: "",
+
+        profile: profile,
+
+        hasRelated: false,
+
+        relatedSpan: Syntax.Span
+        {
+            start: -1_i64,
+
+            end: -1_i64,
+        },
+
+        message: error.message,
+    };
+}
+
+pub Limits.BsolLimits FormatLimits(SerializationLimitsModule.SerializationLimits limits)
+{
+    return Limits.BsolLimits
+    {
+        maxInputBytes: limits.maxInputBytes,
+
+        maxOutputBytes: limits.maxOutputBytes,
+
+        maxDepth: limits.maxDepth,
+
+        maxNodes: limits.maxNodes,
+
+        maxScalarBytes: limits.maxScalarBytes,
+
+        maxImports: 256_i64,
+
+        maxImportDepth: 32_i64,
+
+        maxResolvedSchemaBytes: 8388608_i64,
+    };
+}
+
+/// Resolve only through the caller's explicit materialized host adapter before
+/// entering the checked typed binding. No parser operation fetches a source.
+pub Result<T, Schema.Diagnostic[]> Read<T, B, R>(string text, Imports.MaterializedSource root, R resolver, B binding, SerializationLimitsModule.SerializationLimits limits) where B: BsolBinding<T>, R: Imports.Resolver
+{
+    match Schema.LoadProfile<R>(root, resolver, FormatLimits(limits)) {
+        Result::Error(errors) => { return Result::Error(errors); },
+        Result::Ok(profile) => { return ReadResolved<T, B>(text, profile, binding, limits); },
+    };
+}
+
+/// The profile is already resolved through the explicit host adapter. Syntax,
+/// profile constraints and references finish before a fresh typed T is exposed.
+pub Result<T, Schema.Diagnostic[]> ReadResolved<T, B>(string text, Schema.Profile profile, B binding, SerializationLimitsModule.SerializationLimits limits) where B: BsolBinding<T>
+{
+    Limits.BsolLimits policy = FormatLimits(limits);
+    match Parser.Parse(text, policy)
+    {
+        Result::Error(error) => {
+            return Result::Error([ParseDiagnostic(error, profile.name)]);
+        },
+
+        Result::Ok(document) => {
+            match Schema.Validate(document, profile, policy)
+            {
+                Result::Error(errors) => {
+                    return Result::Error(errors);
+                },
+
+                Result::Ok(checked) => {
+                    match Schema.ResolveReferences(checked, policy)
+                    {
+                        Result::Error(errors) => {
+                            return Result::Error(errors);
+                        },
+
+                        Result::Ok(resolved) => {
+                            return binding.ReadDocument(resolved, limits);
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+/// Generated syntax remains private until profile/reference validation and the
+/// bounded canonical writer finish. An error never returns partial text.
+pub Result<string, Schema.Diagnostic[]> Write<T, B>(T value, Schema.Profile profile, B binding, SerializationLimitsModule.SerializationLimits limits) where B: BsolBinding<T>
+{
+    match Schema.ReownProfile(profile, FormatLimits(limits)) {
+        Result::Error(errors) => { return Result::Error(errors); },
+        Result::Ok(owned) => { return WriteOwned<T, B>(value, owned, binding, limits); },
+    };
+}
+
+Result<string, Schema.Diagnostic[]> WriteOwned<T, B>(T value, Schema.Profile profile, B binding, SerializationLimitsModule.SerializationLimits limits) where B: BsolBinding<T>
+{
+    Limits.BsolLimits policy = FormatLimits(limits);
+    match binding.WriteDocument(value, profile, limits)
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(document) => {
+            match Writer.Write(document, policy)
+            {
+                Result::Error(error) => {
+                    return Result::Error([ParseDiagnostic(error, profile.name)]);
+                },
+
+                Result::Ok(privateText) => {
+                    match Parser.Parse(privateText, policy)
+                    {
+                        Result::Error(error) => {
+                            return Result::Error([ParseDiagnostic(error, profile.name)]);
+                        },
+
+                        Result::Ok(owned) => {
+                            match Schema.Validate(owned, profile, policy)
+                            {
+                                Result::Error(errors) => {
+                                    return Result::Error(errors);
+                                },
+
+                                Result::Ok(checked) => {
+                                    match Schema.ResolveReferences(checked, policy)
+                                    {
+                                        Result::Error(errors) => {
+                                            return Result::Error(errors);
+                                        },
+
+                                        Result::Ok(_) => {
+                                            return Result::Ok(privateText);
+                                        },
+                                    };
+                                },
+                            };
+                        },
+                    };
+                },
+            };
+        },
+    };
+}

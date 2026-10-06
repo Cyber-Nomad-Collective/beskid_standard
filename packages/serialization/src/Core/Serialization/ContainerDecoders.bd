@@ -1,0 +1,95 @@
+use Core.Collections.Array;
+use Core.Collections.List;
+use Core.Collections.Map;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Serialization.Errors;
+use Core.Serialization.Limits;
+use Core.Serialization.Reader;
+
+Result<unit, SerializationError> Count<R>(R reader, i64 count, SerializationLimits limits) where R: Reader {
+    if (count < 0_i64 || count > limits.maxNodes) {
+        SourceLocation location = reader.Location();
+        return Result::Error(Errors.Diagnostic("CollectionLimit", location.path, location.start, location.end, false, -1_i64, -1_i64));
+    }
+    return Result::Ok(());
+}
+
+pub type ArrayBinding<T, R, B> { B element, }
+impl<T, R, B> ArrayBinding<T, R, B> : FieldDecoder<T[], R> where R: Reader, B: FieldDecoder<T, R> {
+    pub Result<T[], SerializationError> Read(R reader, SerializationLimits limits) {
+        i64 count = reader.BeginSequence()?;
+        Count<R>(reader, count, limits)?;
+        mut T[] values = [];
+        mut i64 index = 0_i64;
+        while (index < count) {
+            T value = this.element.Read(reader, limits)?;
+            values = Array.Append<T>(values, value);
+            index = index + 1_i64;
+        }
+        reader.EndSequence()?;
+        return Result::Ok(values);
+    }
+}
+pub ArrayBinding<T, R, B> CreateArray<T, R, B>(B element) where R: Reader, B: FieldDecoder<T, R> {
+    return ArrayBinding<T, R, B> { element: element };
+}
+
+pub type ListBinding<T, R, B> { B element, }
+impl<T, R, B> ListBinding<T, R, B> : FieldDecoder<List<T>, R> where R: Reader, B: FieldDecoder<T, R> {
+    pub Result<List<T>, SerializationError> Read(R reader, SerializationLimits limits) {
+        i64 count = reader.BeginSequence()?;
+        Count<R>(reader, count, limits)?;
+        mut List<T> values = List.New<T>();
+        mut i64 index = 0_i64;
+        while (index < count) {
+            values = values.Push(this.element.Read(reader, limits)?);
+            index = index + 1_i64;
+        }
+        reader.EndSequence()?;
+        return Result::Ok(values);
+    }
+}
+pub ListBinding<T, R, B> CreateList<T, R, B>(B element) where R: Reader, B: FieldDecoder<T, R> {
+    return ListBinding<T, R, B> { element: element };
+}
+
+pub type MapBinding<T, R, B> { B element, }
+impl<T, R, B> MapBinding<T, R, B> : FieldDecoder<Map<string, T>, R> where R: Reader, B: FieldDecoder<T, R> {
+    pub Result<Map<string, T>, SerializationError> Read(R reader, SerializationLimits limits) {
+        i64 count = reader.BeginMap()?;
+        Count<R>(reader, count, limits)?;
+        mut Map<string, T> values = Map.New<string, T>();
+        mut i64 index = 0_i64;
+        while (index < count) {
+            string key = reader.BeginMapEntry()?;
+            if (values.ContainsKey(key)) {
+                SourceLocation location = reader.Location();
+                return Result::Error(Errors.Diagnostic("DuplicateKey", location.path, location.start, location.end, false, -1_i64, -1_i64));
+            }
+            T value = this.element.Read(reader, limits)?;
+            reader.EndMapEntry()?;
+            values = values.Insert(key, value);
+            index = index + 1_i64;
+        }
+        reader.EndMap()?;
+        return Result::Ok(values);
+    }
+}
+pub MapBinding<T, R, B> CreateMap<T, R, B>(B element) where R: Reader, B: FieldDecoder<T, R> {
+    return MapBinding<T, R, B> { element: element };
+}
+
+pub type OptionalBinding<T, R, B> { B element, }
+impl<T, R, B> OptionalBinding<T, R, B> : FieldDecoder<Option<T>, R> where R: Reader, B: FieldDecoder<T, R> {
+    pub Result<Option<T>, SerializationError> Read(R reader, SerializationLimits limits) {
+        bool present = reader.BeginOptional()?;
+        mut Option<T> value = Option::None;
+        if (present) { value = Option::Some(this.element.Read(reader, limits)?); }
+        reader.EndOptional()?;
+        return Result::Ok(value);
+    }
+}
+pub OptionalBinding<T, R, B> CreateOptional<T, R, B>(B element) where R: Reader, B: FieldDecoder<T, R> {
+    return OptionalBinding<T, R, B> { element: element };
+}

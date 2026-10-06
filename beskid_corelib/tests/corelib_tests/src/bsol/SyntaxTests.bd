@@ -1,0 +1,389 @@
+use Core.Bsol.Parser;
+
+use Core.Bsol.Lexer;
+
+use Core.Output;
+
+use Core.String;
+
+use Core.Bsol.Writer;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Limits;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Testing.Assert;
+
+test bsol_ordered_blocks_assignments_and_byte_spans
+{
+    match Parser.Parse("config \"root\" { name = \"ż\" count = -12 }", Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("native parser accepts ordered block"),
+
+        Result::Ok(document) => {
+            Assert.Equal(Array.Len<i64>(document.roots), 1_i64, "one root block");
+            Syntax.Node root = document.nodes[document.roots[0]];
+            Assert.Equal(root.name, "config", "block kind retained");
+            Assert.Equal(root.label, "root", "decoded label retained");
+            Assert.Equal(root.span.start, 0_i64, "root byte span starts at zero");
+            Assert.Equal(Array.Len<i64>(root.children), 2_i64, "ordered assignments");
+            Syntax.Node name = document.nodes[root.children[0]];
+            Assert.Equal(name.name, "name", "first assignment retains order");
+            Syntax.Node value = document.nodes[name.children[0]];
+            Assert.True(match value.kind
+            {
+                Syntax.NodeKind::String => true,
+
+                _ => false,
+            }, "quoted value distinguished");
+            Assert.Equal(value.text, "ż", "UTF8 value retained");
+            Assert.Equal(value.span.end - value.span.start, 4_i64, "span counts UTF8 bytes and quotes");
+            Syntax.Node count = document.nodes[root.children[1]];
+            Assert.Equal(document.nodes[count.children[0]].raw, "-12", "signed raw precision retained");
+        },
+    };
+}
+
+test bsol_strict_escaped_unicode_and_invalid_surrogates
+{
+    mut Lexer.State plainState = Lexer.Start("\"A\"", Limits.DefaultLimits());
+
+    string plainText = Lexer.Quoted(plainState);
+
+    i64 plainLength = String.Len(plainText);
+
+    Output.WriteLine("BSOL plain quoted length " + plainLength);
+
+    mut Lexer.State unicodeState = Lexer.Start("\"\\u0041\"", Limits.DefaultLimits());
+
+    string unicodeText = Lexer.Quoted(unicodeState);
+
+    i64 unicodeLength = String.Len(unicodeText);
+
+    bool unicodeFailed = unicodeState.failed;
+
+    Output.WriteLine("BSOL ASCII unicode quoted length " + unicodeLength);
+
+    Output.WriteLine("BSOL ASCII unicode failed " + unicodeFailed);
+
+    mut Lexer.State newlineState = Lexer.Start("\"\\n\"", Limits.DefaultLimits());
+
+    string newlineText = Lexer.Quoted(newlineState);
+
+    i64 newlineLength = String.Len(newlineText);
+
+    bool newlineFailed = newlineState.failed;
+
+    Output.WriteLine("BSOL newline quoted length " + newlineLength);
+
+    Output.WriteLine("BSOL newline failed " + newlineFailed);
+
+    mut Lexer.State quoteState = Lexer.Start("\"\\\"\"", Limits.DefaultLimits());
+
+    string quoteText = Lexer.Quoted(quoteState);
+
+    i64 quoteLength = String.Len(quoteText);
+
+    Output.WriteLine("BSOL escaped quote length " + quoteLength);
+
+    string scalarForConcat = Lexer.Scalar(65_i64);
+
+    mut string concatText = "";
+
+    concatText = concatText + scalarForConcat;
+
+    i64 concatLength = String.Len(concatText);
+
+    Output.WriteLine("BSOL assigned empty concat length " + concatLength);
+
+    string directConcat = "" + Lexer.Scalar(65_i64);
+
+    i64 directConcatLength = String.Len(directConcat);
+
+    Output.WriteLine("BSOL direct empty concat length " + directConcatLength);
+
+    string scalarAscii = Lexer.Scalar(65_i64);
+
+    string scalarEmoji = Lexer.Scalar(128512_i64);
+
+    i64 scalarAsciiLength = String.Len(scalarAscii);
+
+    i64 scalarEmojiLength = String.Len(scalarEmoji);
+
+    Output.WriteLine("BSOL Scalar ASCII length " + scalarAsciiLength);
+
+    Output.WriteLine("BSOL Scalar emoji length " + scalarEmojiLength);
+
+    u8[] literalBytes = [65_u8];
+
+    string literalText = String.FromUtf8CodeUnits(literalBytes);
+
+    i64 literalBytesLength = Array.Len<u8>(literalBytes);
+
+    i64 literalTextLength = String.Len(literalText);
+
+    Output.WriteLine("BSOL literal bytes length " + literalBytesLength);
+
+    Output.WriteLine("BSOL literal text length " + literalTextLength);
+
+    mut u8[] appendedBytes = [];
+
+    Array.Append<u8>(appendedBytes, 65_u8);
+
+    i64 appendedBytesLength = Array.Len<u8>(appendedBytes);
+
+    string appendedText = String.FromUtf8CodeUnits(appendedBytes);
+
+    i64 appendedTextLength = String.Len(appendedText);
+
+    Output.WriteLine("BSOL appended bytes length " + appendedBytesLength);
+
+    Output.WriteLine("BSOL appended text length " + appendedTextLength);
+
+    mut Lexer.State directState = Lexer.Start("\"\\uD83D\\uDE00\\n\\\"\\\\\"", Limits.DefaultLimits());
+
+    string directText = Lexer.Quoted(directState);
+
+    i64 directLength = String.Len(directText);
+
+    i64 directPosition = directState.pos;
+
+    Output.WriteLine("BSOL direct quoted length " + directLength);
+
+    Output.WriteLine("BSOL direct cursor position " + directPosition);
+
+    mut i64 directByteIndex = 0_i64;
+
+    while (directByteIndex < directLength)
+    {
+        u8 directByte = String.ByteAt(directText, directByteIndex);
+        Output.WriteLine("BSOL direct byte " + directByte);
+        directByteIndex = directByteIndex + 1_i64;
+    }
+
+    match Parser.Parse("config { value = \"\\uD83D\\uDE00\\n\\\"\\\\\" }", Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("valid surrogate pair and escapes decode"),
+
+        Result::Ok(document) => {
+            Syntax.Node root = document.nodes[document.roots[0]];
+            Syntax.Node assignment = document.nodes[root.children[0]];
+            i64 nodeCount = Array.Len<Syntax.Node>(document.nodes);
+            i64 rootCount = Array.Len<i64>(document.roots);
+            i64 childCount = Array.Len<i64>(assignment.children);
+            Output.WriteLine("BSOL arena node count " + nodeCount);
+            Output.WriteLine("BSOL arena root count " + rootCount);
+            Output.WriteLine("BSOL assignment child count " + childCount);
+            Syntax.Node published = document.nodes[assignment.children[0]];
+            Output.WriteLine("BSOL published raw: " + published.raw);
+            bool stringKind = match published.kind
+            {
+                Syntax.NodeKind::String => true,
+
+                _ => false,
+            };
+            Output.WriteLine("BSOL published string kind " + stringKind);
+            string decoded = published.text;
+            i64 decodedLength = String.Len(decoded);
+            Output.WriteLine("BSOL decoded byte length " + decodedLength);
+            mut i64 byteIndex = 0_i64;
+            while (byteIndex < decodedLength)
+            {
+                u8 decodedByte = String.ByteAt(decoded, byteIndex);
+                Output.WriteLine("BSOL decoded byte " + decodedByte);
+                byteIndex = byteIndex + 1_i64;
+            }
+            Assert.Equal(document.nodes[assignment.children[0]].text, "😀
+\"\\", "strict decoded scalar sequence");
+        },
+    };
+
+    Assert.True(Results.IsError(Parser.Parse("config { value = \"\\uD800\" }", Limits.DefaultLimits())), "unpaired surrogate rejects");
+
+    Assert.True(Results.IsError(Parser.Parse("config { value = \"\\q\" }", Limits.DefaultLimits())), "unknown escape rejects");
+
+    Assert.True(Results.IsError(Parser.Parse("config { value = 1e9999 }", Limits.DefaultLimits())), "nonfinite decimal rejects");
+}
+
+test bsol_attributes_references_empty_map_inline_blocks_and_numbers
+{
+    string source = "@Version(since = \"0.6\") config \"x\" @schemaless { @Secret name = \"ok\" empty = {} numbers = [-12, 18446744073709551615, -0.0, 1.25e+2] ref = @config/x wrapped = value \"record\" { fields = [field \"nested\" { value = \"ok\" }] } }";
+
+    match Parser.Parse(source, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("full native grammar accepts canonical constructs"),
+
+        Result::Ok(document) => {
+            Assert.True(document.nodes[document.roots[0]].schemaless, "schemaless retained");
+            match Writer.Write(document, Limits.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("writer accepts ordered syntax"),
+
+                Result::Ok(canonical) => Assert.True(Results.IsOk(Parser.Parse(canonical, Limits.DefaultLimits())), "canonical writer reparses"),
+            };
+        },
+    };
+
+    Assert.True(Results.IsError(Parser.Parse("config { map = { key = 1, key = 2 } }", Limits.DefaultLimits())), "duplicate map keys reject");
+
+    Assert.True(Results.IsError(Parser.Parse("config { values = [1,", Limits.DefaultLimits())), "truncated list rejects");
+
+    Assert.True(Results.IsError(Parser.Parse("config {} trailing", Limits.DefaultLimits())), "complete body consumption");
+}
+
+test bsol_limits_fail_before_unbounded_work
+{
+    Limits.BsolLimits limits = Limits.BsolLimits
+    {
+        maxInputBytes: 8_i64,
+
+        maxDepth: 2_i64,
+
+        maxNodes: 4_i64,
+
+        maxOutputBytes: 8388608_i64,
+
+        maxScalarBytes: 1048576_i64,
+
+        maxImports: 256_i64,
+
+        maxImportDepth: 32_i64,
+
+        maxResolvedSchemaBytes: 8388608_i64,
+    };
+
+    Assert.True(Results.IsError(Parser.Parse("config { value = 1 }", limits)), "input byte limit enforced");
+
+    Limits.BsolLimits depth = Limits.BsolLimits
+    {
+        maxInputBytes: 1024_i64,
+
+        maxDepth: 2_i64,
+
+        maxNodes: 100_i64,
+
+        maxOutputBytes: 8388608_i64,
+
+        maxScalarBytes: 1048576_i64,
+
+        maxImports: 256_i64,
+
+        maxImportDepth: 32_i64,
+
+        maxResolvedSchemaBytes: 8388608_i64,
+    };
+
+    Assert.True(Results.IsError(Parser.Parse("a { b { c {} } }", depth)), "depth limit enforced");
+
+    Limits.BsolLimits nodes = Limits.BsolLimits
+    {
+        maxInputBytes: 1024_i64,
+
+        maxDepth: 64_i64,
+
+        maxNodes: 2_i64,
+
+        maxOutputBytes: 8388608_i64,
+
+        maxScalarBytes: 1048576_i64,
+
+        maxImports: 256_i64,
+
+        maxImportDepth: 32_i64,
+
+        maxResolvedSchemaBytes: 8388608_i64,
+    };
+
+    Assert.True(Results.IsError(Parser.Parse("a { x = 1 y = 2 }", nodes)), "syntax node allocation limit enforced");
+}
+
+test bsol_normative_limits_defaults_are_explicit
+{
+    Limits.BsolLimits limits = Limits.DefaultLimits();
+
+    Assert.Equal(limits.maxInputBytes, 8388608_i64, "8 MiB input");
+
+    Assert.Equal(limits.maxOutputBytes, 8388608_i64, "8 MiB output");
+
+    Assert.Equal(limits.maxDepth, 128_i64, "128 syntax nesting");
+
+    Assert.Equal(limits.maxNodes, 100000_i64, "aggregate node budget");
+
+    Assert.Equal(limits.maxScalarBytes, 1048576_i64, "1 MiB scalar");
+
+    Assert.Equal(limits.maxImports, 256_i64, "bounded import count");
+
+    Assert.Equal(limits.maxImportDepth, 32_i64, "bounded import depth");
+
+    Assert.Equal(limits.maxResolvedSchemaBytes, 8388608_i64, "aggregate schema bytes");
+}
+
+test bsol_scalar_limit_uses_decoded_utf8_bytes
+{
+    mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+    limits.maxScalarBytes = 4_i64;
+
+    Assert.True(Results.IsOk(Parser.Parse("a { x = \"😀\" }", limits)), "astral scalar exact byte boundary");
+
+    limits.maxScalarBytes = 3_i64;
+
+    Assert.True(Results.IsError(Parser.Parse("a { x = \"😀\" }", limits)), "astral scalar boundary plus one rejects");
+
+    limits.maxScalarBytes = 1_i64;
+
+    Assert.True(Results.IsOk(Parser.Parse("a { x = \"\\u0041\" }", limits)), "escaped ASCII counts decoded bytes");
+}
+
+test bsol_output_limit_is_independent_of_input_limit
+{
+    mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+    limits.maxOutputBytes = 3_i64;
+
+    match Parser.Parse("a {}", limits)
+    {
+        Result::Error(_) => Assert.Fail("input admitted independently"),
+
+        Result::Ok(document) => {
+            Assert.True(Results.IsError(Writer.Write(document, limits)), "canonical output over limit rejects");
+        },
+    };
+}
+
+test bsol_aggregate_nodes_include_comment_entries
+{
+    mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+    limits.maxNodes = 2_i64;
+
+    Assert.True(Results.IsOk(Parser.Parse("# comment
+a {}", limits)), "one comment and one node exact aggregate boundary");
+
+    limits.maxNodes = 1_i64;
+
+    Assert.True(Results.IsError(Parser.Parse("# comment
+a {}", limits)), "comment plus node exceeds aggregate budget");
+}
+
+test bsol_writer_output_may_exceed_original_input_cap
+{
+    mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+    limits.maxInputBytes = 4_i64;
+
+    match Parser.Parse("a {}", limits)
+    {
+        Result::Error(_) => Assert.Fail("input exact four byte boundary"),
+
+        Result::Ok(document) => {
+            Assert.True(Results.IsOk(Writer.Write(document, limits)), "independent generated-output budget admits canonical expansion");
+        },
+    };
+
+    Assert.True(Results.IsError(Parser.Parse("a {} ", limits)), "input boundary plus one rejects");
+}

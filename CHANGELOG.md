@@ -8,6 +8,33 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Add explicit offline BSOL import resolver requests and materialized-source
+  digest verification with portable root-relative path and immutable Git checks.
+
+- Add resolved BSOL profile composition with alias-aware rule/type rebasing,
+  owned imported default and condition arenas, and source-closure reownership
+  during validation and migration.
+
+- Preserve imported rule origins during qualified reference resolution and
+  parse dot-separated import qualifiers in reference and type syntax.
+
+- Add explicit resolver-backed typed BSOL reads and reconstruct profile source
+  ownership before invoking typed writer bindings.
+
+- Add Core.Numeric.FloatBits exact bit projections for f32 and f64 values.
+
+- Provide typed compiler SDK factories for compilation, workspace members,
+  registrations, package catalogs and contract requests for native adapter preparation.
+
+### Added
+
+- Add typed format-independent serialization DataValue representations and
+  canonical 256-bit ShapeId parsing and formatting.
+
+- Add the format-independent serialization package foundation with documented
+  resource limits and exact checked signed/unsigned decimal parsing. Cover
+  integer-width overflow, the full u64 range, and precision beyond 2^53.
+
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent
@@ -59,6 +86,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Channel and Mutex wrappers with the canonical Optional/Results modules.
 
 ### Fixed
+
+- Parse exact decimal magnitudes with leading zeroes without treating total
+  text length as numeric overflow; preserve checked per-digit wire-width ranges.
 
 - Validate a request's `Host` field as soon as its header completes, before
   waiting for or interpreting the body framing.

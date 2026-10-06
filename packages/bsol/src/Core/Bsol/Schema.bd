@@ -1,0 +1,4044 @@
+/// Native checked profile loading and ordered validation bindings.
+use Core.Bsol.Syntax;
+use Core.Bsol.ImportGraph;
+use Core.Bsol.Imports;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Limits;
+
+use Core.Collections.Array;
+
+use Core.String;
+
+use Core.Results;
+
+use Core.Text.Regex.Bounded;
+
+pub enum DiagnosticStage
+{
+    Syntax,
+
+    Profile,
+
+    Validation,
+
+    Reference,
+
+    Import,
+
+    Migration,
+}
+
+pub type Diagnostic
+{
+    pub string code,
+
+    pub DiagnosticStage stage,
+
+    pub Syntax.Span span,
+
+    pub string field,
+
+    pub string rule,
+
+    pub string profile,
+
+    pub bool hasRelated,
+
+    pub Syntax.Span relatedSpan,
+
+    pub string message,
+}
+
+pub enum TypeKind
+{
+    Quoted,
+
+    Ident,
+
+    U32,
+
+    I64,
+
+    F64,
+
+    Bool,
+
+    Path,
+
+    Loose,
+
+    FlatList,
+
+    List,
+
+    Map,
+
+    Reference,
+
+    Inline,
+
+    Enum,
+}
+
+pub type TypeExpression
+{
+    pub TypeKind kind,
+
+    pub i64[] children,
+
+    pub string targetRule,
+
+    pub string[] values,
+
+    pub Syntax.Span span,
+}
+
+pub type Condition
+{
+    pub string name,
+
+    pub Syntax.Node value,
+
+    pub Syntax.Span span,
+}
+
+pub type Variant
+{
+    pub string name,
+
+    pub string[] require,
+
+    pub string[] forbid,
+
+    pub Syntax.Span span,
+}
+
+pub type Field
+{
+    pub string name,
+
+    pub string declaredTypeText,
+
+    pub string pattern,
+
+    pub i64 typeIndex,
+
+    pub string[] allowedAttributes,
+
+    pub bool required,
+
+    pub Syntax.Span span,
+
+    pub i64 syntaxNode,
+
+    pub string[] values,
+
+    pub i64 defaultNode,
+
+    pub bool hasMinimum,
+
+    pub i64 minimum,
+
+    pub bool hasMaximum,
+
+    pub i64 maximum,
+
+    pub Condition[] requiredIf,
+
+    pub Condition[] forbidIf,
+}
+
+pub type Rule
+{
+    pub string name,
+
+    pub string scopeKind,
+
+    pub string matcher,
+
+    pub string keyword,
+
+    pub string[] keywords,
+
+    pub string[] except,
+
+    pub string label,
+
+    pub string cardinality,
+
+    pub bool extras,
+
+    pub bool nestedExtras,
+
+    pub bool schemaless,
+
+    pub Syntax.Span span,
+
+    pub Field[] fields,
+
+    pub i64[] nested,
+
+    pub Variant[] variants,
+
+    pub string[] allowedAttributes,
+
+    pub i64 syntaxNode,
+
+    pub string extends,
+
+    pub string[] mixes,
+}
+
+type ImportedRuleOrigin {
+    i64 source,
+    string declaredName,
+}
+
+pub type Profile
+{
+    pub string name,
+
+    pub i64 version,
+
+    pub string source,
+
+    pub Syntax.Document document,
+
+    pub Rule[] rules,
+
+    pub i64[] roots,
+
+    pub TypeExpression[] types,
+
+    pub i64[] migrationNodes,
+
+    // Only this module can attach a resolved source closure. Public rule-table
+    // mutations never substitute for reparsing owned verified source bytes.
+    ImportGraph.Graph resolvedClosure,
+
+    ImportedRuleOrigin[] importedOrigins,
+}
+
+pub type RuleBinding
+{
+    pub i64 node,
+
+    pub i64 rule,
+}
+
+/// Construct a fresh stage inside the profile-owning module. Keeping this
+/// factory here allows private resolved-source state to survive staged routing
+/// without sharing a mutable Profile instance or exposing its construction.
+pub Result<Profile, Diagnostic[]> MigrationStage(Profile owner, i64 definition) {
+    mut bool declared = false;
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(owner.migrationNodes)) {
+        if (owner.migrationNodes[index] == definition) { declared = true; }
+        index = index + 1_i64;
+    }
+    if (!declared || definition < 0_i64 || definition >= Array.Len<Syntax.Node>(owner.document.nodes)) {
+        return Result::Error([Issue("InvalidMigrationDefinition", DiagnosticStage::Profile, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", owner.name)]);
+    }
+    return Result::Ok(Profile {
+        name: owner.name, version: owner.version, source: owner.source,
+        document: owner.document, rules: owner.rules, roots: owner.roots,
+        types: owner.types, migrationNodes: [definition], resolvedClosure: owner.resolvedClosure,
+        importedOrigins: owner.importedOrigins,
+    });
+}
+
+type ImportedRuleAddress {
+    i64 source,
+    i64 rule,
+}
+
+type ImportedRuleSearch {
+    i64 remaining,
+}
+
+// Copy, rather than mutate, source nodes when composing owned arenas. Every
+// child and attribute index must remain within its original source arena before
+// it is translated into the merged arena.
+Result<Syntax.Node, Diagnostic[]> RebaseImportedNode(Syntax.Node node, i64 sourceCount, i64 nodeOffset, string profileName, mut ImportedRuleSearch work) {
+    if (sourceCount < 0_i64 || nodeOffset < 0_i64 || nodeOffset > 9223372036854775807_i64 - sourceCount) {
+        return Result::Error([Issue("InvalidImportedArena", DiagnosticStage::Import, node.span, "", "", profileName)]);
+    }
+    mut i64[] children = Array.Empty<i64>();
+    mut i64[] attributes = Array.Empty<i64>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(node.children)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, node.span, "", "", profileName)]); }
+        work.remaining = work.remaining - 1_i64;
+        i64 child = node.children[index];
+        if (child < 0_i64 || child >= sourceCount) {
+            return Result::Error([Issue("InvalidImportedArena", DiagnosticStage::Import, node.span, "", "", profileName)]);
+        }
+        Array.Append<i64>(children, nodeOffset + child);
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<i64>(node.attributes)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, node.span, "", "", profileName)]); }
+        work.remaining = work.remaining - 1_i64;
+        i64 attributeIndex = node.attributes[index];
+        if (attributeIndex < 0_i64 || attributeIndex >= sourceCount) {
+            return Result::Error([Issue("InvalidImportedArena", DiagnosticStage::Import, node.span, "", "", profileName)]);
+        }
+        Array.Append<i64>(attributes, nodeOffset + attributeIndex);
+        index = index + 1_i64;
+    }
+    return Result::Ok(Syntax.Node {
+        kind: node.kind, span: node.span, raw: node.raw, text: node.text,
+        name: node.name, label: node.label, hasLabel: node.hasLabel,
+        schemaless: node.schemaless, children: children, attributes: attributes,
+    });
+}
+
+Result<Condition[], Diagnostic[]> RebaseImportedConditions(Condition[] conditions, i64 sourceCount, i64 nodeOffset, string profileName, mut ImportedRuleSearch work) {
+    mut Condition[] owned = Array.Empty<Condition>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<Condition>(conditions)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, conditions[index].span, "", "", profileName)]); }
+        work.remaining = work.remaining - 1_i64;
+        Condition condition = conditions[index];
+        match RebaseImportedNode(condition.value, sourceCount, nodeOffset, profileName, work) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(value) => {
+                Array.Append<Condition>(owned, Condition { name: condition.name, value: value, span: condition.span });
+            },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(owned);
+}
+
+Result<Field, Diagnostic[]> RebaseImportedField(Profile owner, Field field, i64 nodeOffset, i64 typeOffset, mut ImportedRuleSearch work) {
+    i64 nodeCount = Array.Len<Syntax.Node>(owner.document.nodes);
+    i64 typeCount = Array.Len<TypeExpression>(owner.types);
+    if (nodeOffset < 0_i64 || typeOffset < 0_i64 || nodeOffset > 9223372036854775807_i64 - nodeCount || typeOffset > 9223372036854775807_i64 - typeCount || field.syntaxNode < 0_i64 || field.syntaxNode >= nodeCount || field.defaultNode < -1_i64 || field.defaultNode >= nodeCount || field.typeIndex < 0_i64 || field.typeIndex >= typeCount) {
+        return Result::Error([Issue("InvalidImportedFieldArena", DiagnosticStage::Import, field.span, field.name, "", owner.name)]);
+    }
+    mut Condition[] required = Array.Empty<Condition>();
+    mut Condition[] forbidden = Array.Empty<Condition>();
+    match RebaseImportedConditions(field.requiredIf, nodeCount, nodeOffset, owner.name, work) {
+        Result::Error(errors) => { return Result::Error(errors); },
+        Result::Ok(owned) => { required = owned; },
+    };
+    match RebaseImportedConditions(field.forbidIf, nodeCount, nodeOffset, owner.name, work) {
+        Result::Error(errors) => { return Result::Error(errors); },
+        Result::Ok(owned) => { forbidden = owned; },
+    };
+    mut i64 defaultNode = -1_i64;
+    if (field.defaultNode >= 0_i64) { defaultNode = nodeOffset + field.defaultNode; }
+    return Result::Ok(Field {
+        name: field.name, declaredTypeText: field.declaredTypeText,
+        pattern: field.pattern, typeIndex: typeOffset + field.typeIndex,
+        allowedAttributes: field.allowedAttributes, required: field.required,
+        span: field.span, syntaxNode: nodeOffset + field.syntaxNode,
+        values: field.values, defaultNode: defaultNode,
+        hasMinimum: field.hasMinimum, minimum: field.minimum,
+        hasMaximum: field.hasMaximum, maximum: field.maximum,
+        requiredIf: required, forbidIf: forbidden,
+    });
+}
+
+Result<string, Diagnostic[]> RebaseImportedRuleName(ImportGraph.Graph graph, Profile[] profiles, i64 sourceIndex, string name, Syntax.Span span, i64[] ruleOffsets, string[] mergedRuleNames, mut ImportedRuleSearch work, Limits.BsolLimits limits) {
+    if (Array.Len<i64>(ruleOffsets) != Array.Len<Profile>(profiles)) {
+        return Result::Error([Issue("InvalidImportedRuleArena", DiagnosticStage::Import, span, "", name, "")]);
+    }
+    match ResolveImportedRule(graph, profiles, sourceIndex, name, span, work, 0_i64, limits.maxImportDepth) {
+        Result::Error(errors) => { return Result::Error(errors); },
+        Result::Ok(address) => {
+            i64 offset = ruleOffsets[address.source];
+            if (offset < 0_i64 || address.rule < 0_i64 || address.rule > 9223372036854775807_i64 - offset || offset + address.rule >= Array.Len<string>(mergedRuleNames)) {
+                return Result::Error([Issue("InvalidImportedRuleArena", DiagnosticStage::Import, span, "", name, profiles[sourceIndex].name)]);
+            }
+            return Result::Ok(mergedRuleNames[offset + address.rule]);
+        },
+    };
+}
+
+Result<Rule, Diagnostic[]> RebaseImportedRule(ImportGraph.Graph graph, Profile[] profiles, i64 sourceIndex, Rule rule, string mergedName, i64 nodeOffset, i64 typeOffset, i64[] ruleOffsets, string[] mergedRuleNames, mut ImportedRuleSearch work, Limits.BsolLimits limits) {
+    if (sourceIndex < 0_i64 || sourceIndex >= Array.Len<Profile>(profiles) || Array.Len<i64>(ruleOffsets) != Array.Len<Profile>(profiles)) {
+        return Result::Error([Issue("InvalidImportedRuleArena", DiagnosticStage::Import, rule.span, "", rule.name, "")]);
+    }
+    Profile owner = profiles[sourceIndex];
+    i64 nodeCount = Array.Len<Syntax.Node>(owner.document.nodes);
+    i64 ruleCount = Array.Len<Rule>(owner.rules);
+    i64 ruleOffset = ruleOffsets[sourceIndex];
+    if (nodeOffset < 0_i64 || nodeOffset > 9223372036854775807_i64 - nodeCount || rule.syntaxNode < 0_i64 || rule.syntaxNode >= nodeCount || ruleOffset < 0_i64 || ruleOffset > 9223372036854775807_i64 - ruleCount) {
+        return Result::Error([Issue("InvalidImportedRuleArena", DiagnosticStage::Import, rule.span, "", rule.name, owner.name)]);
+    }
+    mut Field[] fields = Array.Empty<Field>();
+    mut i64[] nested = Array.Empty<i64>();
+    mut string[] mixes = Array.Empty<string>();
+    mut string baseName = "";
+    mut i64 index = 0_i64;
+    while (index < Array.Len<Field>(rule.fields)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, rule.span, "", rule.name, owner.name)]); }
+        work.remaining = work.remaining - 1_i64;
+        match RebaseImportedField(owner, rule.fields[index], nodeOffset, typeOffset, work) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(field) => { Array.Append<Field>(fields, field); },
+        };
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<i64>(rule.nested)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, rule.span, "", rule.name, owner.name)]); }
+        work.remaining = work.remaining - 1_i64;
+        i64 child = rule.nested[index];
+        if (child < 0_i64 || child >= ruleCount) { return Result::Error([Issue("InvalidImportedRuleArena", DiagnosticStage::Import, rule.span, "", rule.name, owner.name)]); }
+        Array.Append<i64>(nested, ruleOffset + child);
+        index = index + 1_i64;
+    }
+    if (rule.extends != "") {
+        match RebaseImportedRuleName(graph, profiles, sourceIndex, rule.extends, rule.span, ruleOffsets, mergedRuleNames, work, limits) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(name) => { baseName = name; },
+        };
+    }
+    index = 0_i64;
+    while (index < Array.Len<string>(rule.mixes)) {
+        match RebaseImportedRuleName(graph, profiles, sourceIndex, rule.mixes[index], rule.span, ruleOffsets, mergedRuleNames, work, limits) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(name) => { Array.Append<string>(mixes, name); },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(Rule {
+        name: mergedName, scopeKind: rule.scopeKind, matcher: rule.matcher,
+        keyword: rule.keyword, keywords: rule.keywords, except: rule.except,
+        label: rule.label, cardinality: rule.cardinality, extras: rule.extras,
+        nestedExtras: rule.nestedExtras, schemaless: rule.schemaless,
+        span: rule.span, fields: fields, nested: nested, variants: rule.variants,
+        allowedAttributes: rule.allowedAttributes, syntaxNode: nodeOffset + rule.syntaxNode,
+        extends: baseName, mixes: mixes,
+    });
+}
+
+// Resolve reference names in their declaring source before publishing the
+// merged type table. Numeric child indices are translated only after checking
+// their original arena; aliases never resolve against unrelated leaf names.
+Result<TypeExpression, Diagnostic[]> RebaseImportedType(ImportGraph.Graph graph, Profile[] profiles, i64 sourceIndex, TypeExpression expression, i64 typeOffset, i64[] ruleOffsets, string[] mergedRuleNames, mut ImportedRuleSearch work, Limits.BsolLimits limits) {
+    if (sourceIndex < 0_i64 || sourceIndex >= Array.Len<Profile>(profiles) || Array.Len<i64>(ruleOffsets) != Array.Len<Profile>(profiles)) {
+        return Result::Error([Issue("InvalidImportedTypeScope", DiagnosticStage::Import, expression.span, "", "", "")]);
+    }
+    Profile owner = profiles[sourceIndex];
+    i64 count = Array.Len<TypeExpression>(owner.types);
+    if (typeOffset < 0_i64 || typeOffset > 9223372036854775807_i64 - count) {
+        return Result::Error([Issue("InvalidImportedTypeArena", DiagnosticStage::Import, expression.span, "", "", owner.name)]);
+    }
+    mut i64[] children = Array.Empty<i64>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(expression.children)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, expression.span, "", "", owner.name)]); }
+        work.remaining = work.remaining - 1_i64;
+        i64 child = expression.children[index];
+        if (child < 0_i64 || child >= count) {
+            return Result::Error([Issue("InvalidImportedTypeArena", DiagnosticStage::Import, expression.span, "", "", owner.name)]);
+        }
+        Array.Append<i64>(children, typeOffset + child);
+        index = index + 1_i64;
+    }
+    mut string target = "";
+    if (expression.targetRule != "") {
+        match RebaseImportedRuleName(graph, profiles, sourceIndex, expression.targetRule, expression.span, ruleOffsets, mergedRuleNames, work, limits) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(ownedName) => { target = ownedName; },
+        };
+    }
+    return Result::Ok(TypeExpression {
+        kind: expression.kind, children: children, targetRule: target,
+        values: expression.values, span: expression.span,
+    });
+}
+
+// Resolve aliases to exact owned source/rule addresses before rebasing tables.
+// Repeated diamond aliases may identify the same declaration; conflicting
+// declarations never coalesce just because their leaf names match.
+Result<ImportedRuleAddress, Diagnostic[]> ResolveImportedRule(ImportGraph.Graph graph, Profile[] profiles, i64 sourceIndex, string name, Syntax.Span span, mut ImportedRuleSearch work, i64 depth, i64 maxDepth) {
+    if (sourceIndex < 0_i64 || sourceIndex >= Array.Len<Profile>(profiles) || sourceIndex >= Array.Len<ImportGraph.Source>(graph.sources) || depth > maxDepth) {
+        return Result::Error([Issue("InvalidImportedRuleScope", DiagnosticStage::Import, span, "", name, "")]);
+    }
+    Profile owner = profiles[sourceIndex];
+    mut i64 selectedSource = -1_i64;
+    mut i64 selectedRule = -1_i64;
+    mut i64 index = 0_i64;
+    while (index < Array.Len<Rule>(owner.rules)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, span, "", name, owner.name)]); }
+        work.remaining = work.remaining - 1_i64;
+        if (owner.rules[index].name == name) {
+            if (selectedRule >= 0_i64) { return Result::Error([Issue("AmbiguousImportedRule", DiagnosticStage::Import, span, "", name, owner.name)]); }
+            selectedSource = sourceIndex;
+            selectedRule = index;
+        }
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<ImportGraph.Binding>(graph.bindings)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, span, "", name, owner.name)]); }
+        work.remaining = work.remaining - 1_i64;
+        ImportGraph.Binding binding = graph.bindings[index];
+        if (binding.owner == sourceIndex) {
+            string prefix = binding.name + ".";
+            i64 prefixBytes = String.Len(prefix);
+            if (String.Len(name) > prefixBytes && String.SubSlice(name, 0_i64, prefixBytes) == prefix) {
+                string remainingName = String.SubSlice(name, prefixBytes, String.Len(name) - prefixBytes);
+                match ResolveImportedRule(graph, profiles, binding.target, remainingName, span, work, depth + 1_i64, maxDepth) {
+                    Result::Error(errors) => { return Result::Error(errors); },
+                    Result::Ok(address) => {
+                        if (selectedRule >= 0_i64 && (selectedSource != address.source || selectedRule != address.rule)) {
+                            mut Diagnostic error = Issue("AmbiguousImportedRule", DiagnosticStage::Import, span, "", name, owner.name);
+                            error.hasRelated = true;
+                            error.relatedSpan = profiles[address.source].rules[address.rule].span;
+                            return Result::Error([error]);
+                        }
+                        selectedSource = address.source;
+                        selectedRule = address.rule;
+                    },
+                };
+            }
+        }
+        index = index + 1_i64;
+    }
+    if (selectedRule < 0_i64) { return Result::Error([Issue("UnknownImportedRule", DiagnosticStage::Import, span, "", name, owner.name)]); }
+    return Result::Ok(ImportedRuleAddress { source: selectedSource, rule: selectedRule });
+}
+
+pub type FieldBinding
+{
+    pub i64 assignment,
+
+    pub i64 rule,
+
+    pub i64 field,
+
+    pub i64 block,
+
+    pub bool fromDefault,
+
+    pub Syntax.Node value,
+
+    pub Syntax.Document sourceDocument,
+}
+
+pub enum ReferenceOrigin
+{
+    DocumentNode(i64 index),
+
+    DefaultNode(i64 fieldBinding, i64 index),
+}
+
+pub type ReferenceBinding
+{
+    pub ReferenceOrigin origin,
+
+    pub i64 target,
+
+    pub i64 targetRule,
+}
+
+pub type ValidatedDocument
+{
+    pub string profile,
+
+    pub Syntax.Document document,
+
+    pub Profile schema,
+
+    pub RuleBinding[] rules,
+
+    pub FieldBinding[] fields,
+
+    pub ReferenceBinding[] references,
+}
+
+type Loader
+{
+    Syntax.Document document,
+
+    Profile profile,
+
+    Diagnostic[] diagnostics,
+
+    Limits.BsolLimits limits,
+}
+
+pub type PatternLimits
+{
+    pub i64 maxSubjectBytes,
+
+    pub i64 maxWork,
+
+    pub i64 maxDepth,
+}
+
+type Validation
+{
+    Bounded.Budget patternBudget,
+
+    Syntax.Document document,
+
+    Profile profile,
+
+    Diagnostic[] diagnostics,
+
+    RuleBinding[] rules,
+
+    FieldBinding[] fields,
+
+    Limits.BsolLimits limits,
+}
+
+Diagnostic Issue(string code, DiagnosticStage stage, Syntax.Span span, string field, string rule, string profile)
+{
+    return Diagnostic
+    {
+        code: code,
+
+        stage: stage,
+
+        span: span,
+
+        field: field,
+
+        rule: rule,
+
+        profile: profile,
+
+        hasRelated: false,
+
+        relatedSpan: Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        },
+
+        message: code,
+    };
+}
+
+bool Block(Syntax.Node node)
+{
+    return match node.kind
+    {
+        Syntax.NodeKind::Block => true,
+
+        _ => false,
+    };
+}
+
+bool Assignment(Syntax.Node node)
+{
+    return match node.kind
+    {
+        Syntax.NodeKind::Assignment => true,
+
+        _ => false,
+    };
+}
+
+bool Quoted(Syntax.Node node)
+{
+    return match node.kind
+    {
+        Syntax.NodeKind::String => true,
+
+        _ => false,
+    };
+}
+
+bool Identifier(Syntax.Node node)
+{
+    return match node.kind
+    {
+        Syntax.NodeKind::Identifier => true,
+
+        _ => false,
+    };
+}
+
+bool Numeric(Syntax.Node node)
+{
+    return match node.kind
+    {
+        Syntax.NodeKind::Number => true,
+
+        _ => false,
+    };
+}
+
+bool Boolean(Syntax.Node node)
+{
+    return match node.kind
+    {
+        Syntax.NodeKind::Boolean => true,
+
+        _ => false,
+    };
+}
+
+bool Contains(string[] values, string value)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(values))
+    {
+        if (values[i] == value)
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+i64 Property(Syntax.Document document, Syntax.Node node, string name)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        i64 index = node.children[i];
+        Syntax.Node child = document.nodes[index];
+        if (Assignment(child) && child.name == name)
+        {
+            return index;
+        }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+string TextProperty(Syntax.Document document, Syntax.Node node, string name, string fallback)
+{
+    i64 index = Property(document, node, name);
+    if (index < 0_i64)
+    {
+        return fallback;
+    }
+
+    Syntax.Node assignment = document.nodes[index];
+    if (Array.Len<i64>(assignment.children) != 1_i64)
+    {
+        return fallback;
+    }
+    return document.nodes[assignment.children[0]].text;
+}
+
+bool BoolProperty(Syntax.Document document, Syntax.Node node, string name)
+{
+    return TextProperty(document, node, name, "false") == "true";
+}
+
+string[] ListProperty(Syntax.Document document, Syntax.Node node, string name)
+{
+    mut string[] values = [];
+    i64 index = Property(document, node, name);
+    if (index < 0_i64)
+    {
+        return values;
+    }
+
+    Syntax.Node assignment = document.nodes[index];
+    if (Array.Len<i64>(assignment.children) != 1_i64)
+    {
+        return values;
+    }
+
+    Syntax.Node list = document.nodes[assignment.children[0]];
+    bool isList = match list.kind
+    {
+        Syntax.NodeKind::List => true,
+
+        _ => false,
+    };
+    if (!isList)
+    {
+        return values;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(list.children))
+    {
+        Array.Append<string>(values, document.nodes[list.children[i]].text);
+        i = i + 1_i64;
+    }
+    return values;
+}
+
+unit LoadError(mut Loader loader, string code, Syntax.Span span, string field, string rule)
+{
+    if (Array.Len<Diagnostic>(loader.diagnostics) < loader.limits.maxNodes)
+    {
+        Array.Append<Diagnostic>(loader.diagnostics, Issue(code, DiagnosticStage::Profile, span, field, rule, loader.profile.name));
+    }
+}
+
+unit UniqueProperties(mut Loader loader, Syntax.Node node)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        Syntax.Node child = loader.document.nodes[node.children[i]];
+        if (Assignment(child))
+        {
+            mut i64 previous = 0_i64;
+            while (previous < i)
+            {
+                Syntax.Node first = loader.document.nodes[node.children[previous]];
+                if (Assignment(first) && first.name == child.name)
+                {
+                    mut Diagnostic diagnostic = Issue("DuplicateProfileProperty", DiagnosticStage::Profile, child.span, child.name, node.label, loader.profile.name);
+                    diagnostic.hasRelated = true;
+                    diagnostic.relatedSpan = first.span;
+                    Array.Append<Diagnostic>(loader.diagnostics, diagnostic);
+                }
+                previous = previous + 1_i64;
+            }
+        }
+        i = i + 1_i64;
+    }
+}
+
+i64 PropertyValue(Syntax.Document document, Syntax.Node node, string name)
+{
+    i64 assignment = Property(document, node, name);
+    if (assignment < 0_i64)
+    {
+        return -1_i64;
+    }
+
+    Syntax.Node property = document.nodes[assignment];
+    if (Array.Len<i64>(property.children) != 1_i64)
+    {
+        return -1_i64;
+    }
+    return property.children[0];
+}
+
+i64 Integer(string raw)
+{
+    mut i64 i = 0_i64;
+    mut bool negative = false;
+    mut i64 value = 0_i64;
+    if (String.ByteAt(raw, 0_i64) == 45_u8)
+    {
+        negative = true;
+        i = 1_i64;
+    }
+    while (i < String.Len(raw))
+    {
+        value = value * 10_i64 - i64(String.ByteAt(raw, i) - 48_u8);
+        i = i + 1_i64;
+    }
+    if (negative)
+    {
+        return value;
+    }
+    return -value;
+}
+
+Condition[] LoadConditions(mut Loader loader, Syntax.Node node, string property, string field, string rule)
+{
+    mut Condition[] conditions = [];
+    i64 valueIndex = PropertyValue(loader.document, node, property);
+    if (valueIndex < 0_i64)
+    {
+        return conditions;
+    }
+
+    Syntax.Node map = loader.document.nodes[valueIndex];
+    bool isMap = match map.kind
+    {
+        Syntax.NodeKind::Map => true,
+
+        _ => false,
+    };
+    if (!isMap)
+    {
+        LoadError(loader, "InvalidCondition", map.span, field, rule);
+        return conditions;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(map.children))
+    {
+        Syntax.Node entry = loader.document.nodes[map.children[i]];
+        if (!Assignment(entry) || Array.Len<i64>(entry.children) != 1_i64)
+        {
+            LoadError(loader, "InvalidCondition", entry.span, field, rule);
+        }
+        else
+        {
+            Syntax.Node value = loader.document.nodes[entry.children[0]];
+            if (!Quoted(value) && !Identifier(value) && !Numeric(value) && !Boolean(value))
+            {
+                LoadError(loader, "InvalidCondition", entry.span, field, rule);
+            }
+            else
+            {
+                Array.Append<Condition>(conditions, Condition
+                {
+                    name: entry.name,
+
+                    value: value,
+
+                    span: entry.span,
+                });
+            }
+        }
+        i = i + 1_i64;
+    }
+    return conditions;
+}
+
+bool NumericBounds(Field field, Syntax.Node value)
+{
+    if (!field.hasMinimum && !field.hasMaximum)
+    {
+        return true;
+    }
+    if (!Numeric(value) || !DecimalWithin(value.raw, "9223372036854775807", true))
+    {
+        return false;
+    }
+
+    i64 integer = Integer(value.raw);
+    return (!field.hasMinimum || integer >= field.minimum) && (!field.hasMaximum || integer <= field.maximum);
+}
+
+bool Starts(string text, string prefix)
+{
+    return String.Len(text) >= String.Len(prefix) && String.SubSlice(text, 0_i64, String.Len(prefix)) == prefix;
+}
+
+bool TypeName(string name)
+{
+    if (String.Len(name) == 0_i64)
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < String.Len(name))
+    {
+        u8 b = String.ByteAt(name, i);
+        if (!(b >= 65_u8 && b <= 90_u8) && !(b >= 97_u8 && b <= 122_u8) && b != 95_u8 && !(i > 0_i64 && b >= 48_u8 && b <= 57_u8))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+bool QualifiedRuleName(string name) {
+    if (String.Len(name) == 0_i64) { return false; }
+    mut bool first = true;
+    mut i64 index = 0_i64;
+    while (index < String.Len(name)) {
+        u8 byte = String.ByteAt(name, index);
+        if (byte == 46_u8) {
+            if (first) { return false; }
+            first = true;
+        } else {
+            if (!(byte >= 65_u8 && byte <= 90_u8) && !(byte >= 97_u8 && byte <= 122_u8) && byte != 95_u8 && !(!first && byte >= 48_u8 && byte <= 57_u8)) { return false; }
+            first = false;
+        }
+        index = index + 1_i64;
+    }
+    return !first;
+}
+
+i64 LoadType(mut Loader loader, string declared, string[] values, Syntax.Span span, string field, string rule, i64 depth)
+{
+    if (depth > loader.limits.maxDepth || Array.Len<TypeExpression>(loader.profile.types) >= loader.limits.maxNodes)
+    {
+        LoadError(loader, "TypeLimit", span, field, rule);
+        return -1_i64;
+    }
+
+    string text = String.Trim(declared);
+    mut TypeExpression expression = TypeExpression
+    {
+        kind: TypeKind::Quoted,
+
+        children: Array.Empty<i64>(),
+
+        targetRule: "",
+
+        values: values,
+
+        span: span,
+    };
+    if (text == "quoted")
+    {
+        expression.kind = TypeKind::Quoted;
+    }
+    else if (text == "ident")
+    {
+        expression.kind = TypeKind::Ident;
+    }
+    else if (text == "u32")
+    {
+        expression.kind = TypeKind::U32;
+    }
+    else if (text == "i64")
+    {
+        expression.kind = TypeKind::I64;
+    }
+    else if (text == "f64")
+    {
+        expression.kind = TypeKind::F64;
+    }
+    else if (text == "bool")
+    {
+        expression.kind = TypeKind::Bool;
+    }
+    else if (text == "path")
+    {
+        expression.kind = TypeKind::Path;
+    }
+    else if (text == "loose")
+    {
+        expression.kind = TypeKind::Loose;
+    }
+    else if (text == "list")
+    {
+        expression.kind = TypeKind::FlatList;
+    }
+    else if (text == "enum_or_quoted")
+    {
+        expression.kind = TypeKind::Enum;
+    }
+    else if (Starts(text, "ref(") || Starts(text, "inline("))
+    {
+        mut i64 offset = 4_i64;
+        expression.kind = TypeKind::Reference;
+        if (Starts(text, "inline("))
+        {
+            offset = 7_i64;
+            expression.kind = TypeKind::Inline;
+        }
+        if (String.Len(text) <= offset || String.ByteAt(text, String.Len(text) - 1_i64) != 41_u8)
+        {
+            LoadError(loader, "UnknownFieldType", span, field, rule);
+            return -1_i64;
+        }
+        expression.targetRule = String.Trim(String.SubSlice(text, offset, String.Len(text) - offset - 1_i64));
+        if (!QualifiedRuleName(expression.targetRule))
+        {
+            LoadError(loader, "UnknownFieldType", span, field, rule);
+            return -1_i64;
+        }
+    }
+    else if (Starts(text, "list[") || Starts(text, "map["))
+    {
+        mut i64 offset = 5_i64;
+        mut u8 separator = 124_u8;
+        expression.kind = TypeKind::List;
+        if (Starts(text, "map["))
+        {
+            offset = 4_i64;
+            separator = 44_u8;
+            expression.kind = TypeKind::Map;
+        }
+        if (String.Len(text) <= offset || String.ByteAt(text, String.Len(text) - 1_i64) != 93_u8)
+        {
+            LoadError(loader, "UnknownFieldType", span, field, rule);
+            return -1_i64;
+        }
+
+        i64 end = String.Len(text) - 1_i64;
+        mut i64 start = offset;
+        mut i64 i = offset;
+        mut i64 brackets = 0_i64;
+        mut i64 parentheses = 0_i64;
+        while (i <= end)
+        {
+            mut bool split = i == end;
+            if (i < end)
+            {
+                u8 b = String.ByteAt(text, i);
+                if (b == separator && brackets == 0_i64 && parentheses == 0_i64)
+                {
+                    split = true;
+                }
+                else if (b == 91_u8)
+                {
+                    brackets = brackets + 1_i64;
+                }
+                else if (b == 93_u8)
+                {
+                    brackets = brackets - 1_i64;
+                }
+                else if (b == 40_u8)
+                {
+                    parentheses = parentheses + 1_i64;
+                }
+                else if (b == 41_u8)
+                {
+                    parentheses = parentheses - 1_i64;
+                }
+            }
+            if (brackets < 0_i64 || parentheses < 0_i64)
+            {
+                LoadError(loader, "UnknownFieldType", span, field, rule);
+                return -1_i64;
+            }
+            if (split)
+            {
+                i64 child = LoadType(loader, String.SubSlice(text, start, i - start), values, span, field, rule, depth + 1_i64);
+                if (child < 0_i64)
+                {
+                    return -1_i64;
+                }
+                Array.Append<i64>(expression.children, child);
+                start = i + 1_i64;
+            }
+            i = i + 1_i64;
+        }
+        if (brackets != 0_i64 || parentheses != 0_i64 || Array.Len<i64>(expression.children) == 0_i64 || (separator == 44_u8 && Array.Len<i64>(expression.children) != 2_i64))
+        {
+            LoadError(loader, "UnknownFieldType", span, field, rule);
+            return -1_i64;
+        }
+    }
+    else
+    {
+        LoadError(loader, "UnknownFieldType", span, field, rule);
+        return -1_i64;
+    }
+
+    i64 result = Array.Len<TypeExpression>(loader.profile.types);
+    Array.Append<TypeExpression>(loader.profile.types, expression);
+    return result;
+}
+
+unit CheckAttributesProperty(mut Loader loader, Syntax.Node owner, string field, string rule)
+{
+    i64 index = Property(loader.document, owner, "allowed_attrs");
+    if (index < 0_i64)
+    {
+        return;
+    }
+
+    Syntax.Node assignment = loader.document.nodes[index];
+    if (Array.Len<i64>(assignment.children) != 1_i64)
+    {
+        LoadError(loader, "InvalidAllowedAttributes", assignment.span, field, rule);
+        return;
+    }
+
+    Syntax.Node list = loader.document.nodes[assignment.children[0]];
+    if (!(match list.kind
+    {
+        Syntax.NodeKind::List => true,
+
+        _ => false,
+    }))
+    {
+        LoadError(loader, "InvalidAllowedAttributes", list.span, field, rule);
+        return;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(list.children))
+    {
+        Syntax.Node item = loader.document.nodes[list.children[i]];
+        if (!Identifier(item) || !TypeName(item.text))
+        {
+            LoadError(loader, "InvalidAllowedAttributes", item.span, field, rule);
+        }
+
+        mut i64 previous = 0_i64;
+        while (previous < i)
+        {
+            if (loader.document.nodes[list.children[previous]].text == item.text)
+            {
+                LoadError(loader, "DuplicateAllowedAttribute", item.span, field, rule);
+            }
+            previous = previous + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+}
+
+unit CheckProfileTypes(mut Loader loader)
+{
+    mut i64 r = 0_i64;
+    while (r < Array.Len<Rule>(loader.profile.rules))
+    {
+        Rule rule = loader.profile.rules[r];
+        mut i64 f = 0_i64;
+        while (f < Array.Len<Field>(rule.fields))
+        {
+            Field field = rule.fields[f];
+            CheckConditionFields(loader, rule, field.requiredIf, field.name);
+            CheckConditionFields(loader, rule, field.forbidIf, field.name);
+            if (field.defaultNode >= 0_i64)
+            {
+                mut Validation validation = Validation
+                {
+                    patternBudget: Bounded.NewBudget(Bounded.DefaultLimits()),
+
+                    document: loader.profile.document,
+
+                    profile: loader.profile,
+
+                    diagnostics: Array.Empty<Diagnostic>(),
+
+                    rules: Array.Empty<RuleBinding>(),
+
+                    fields: Array.Empty<FieldBinding>(),
+
+                    limits: loader.limits,
+                };
+                bool shape = ShapeAccepts(loader.profile, field.typeIndex, loader.profile.document, field.defaultNode, 1_i64, loader.limits);
+                if (shape)
+                {
+                    ValidateNestedValue(validation, field.typeIndex, field.defaultNode, 1_i64);
+                }
+                if (!shape || !NumericBounds(field, loader.profile.document.nodes[field.defaultNode]) || Array.Len<Diagnostic>(validation.diagnostics) > 0_i64)
+                {
+                    LoadError(loader, "InvalidDefault", loader.profile.document.nodes[field.defaultNode].span, field.name, rule.name);
+                }
+            }
+            f = f + 1_i64;
+        }
+        r = r + 1_i64;
+    }
+
+    mut i64 t = 0_i64;
+    while (t < Array.Len<TypeExpression>(loader.profile.types))
+    {
+        TypeExpression expression = loader.profile.types[t];
+        if (expression.targetRule != "" && NamedRule(loader.profile, expression.targetRule) < 0_i64)
+        {
+            LoadError(loader, "UnknownTypeRule", expression.span, "", expression.targetRule);
+        }
+        t = t + 1_i64;
+    }
+}
+
+Field LoadField(mut Loader loader, i64 index, string rule)
+{
+    Syntax.Node node = loader.document.nodes[index];
+    CheckAttributesProperty(loader, node, node.label, rule);
+    UniqueProperties(loader, node);
+    mut string name = node.label;
+    if (!node.hasLabel)
+    {
+        name = TextProperty(loader.document, node, "name", "");
+    }
+
+    string valueType = TextProperty(loader.document, node, "type", "");
+    if (name == "")
+    {
+        LoadError(loader, "MissingFieldName", node.span, "", rule);
+    }
+
+    string[] values = ListProperty(loader.document, node, "values");
+    if (valueType == "enum_or_quoted" && Array.Len<string>(values) == 0_i64)
+    {
+        LoadError(loader, "MissingEnumValues", node.span, name, rule);
+    }
+
+    mut Field field = Field
+    {
+        name: name,
+
+        declaredTypeText: valueType,
+
+        pattern: TextProperty(loader.document, node, "pattern", ""),
+
+        typeIndex: LoadType(loader, valueType, values, node.span, name, rule, 1_i64),
+
+        allowedAttributes: ListProperty(loader.document, node, "allowed_attrs"),
+
+        required: BoolProperty(loader.document, node, "required"),
+
+        span: node.span,
+
+        syntaxNode: index,
+
+        values: values,
+
+        defaultNode: PropertyValue(loader.document, node, "default"),
+
+        hasMinimum: false,
+
+        minimum: 0_i64,
+
+        hasMaximum: false,
+
+        maximum: 0_i64,
+
+        requiredIf: LoadConditions(loader, node, "required_if", name, rule),
+
+        forbidIf: LoadConditions(loader, node, "forbid_if", name, rule),
+    };
+    i64 minimumNode = PropertyValue(loader.document, node, "min");
+    if (minimumNode >= 0_i64)
+    {
+        Syntax.Node minimum = loader.document.nodes[minimumNode];
+        if ((valueType != "u32" && valueType != "i64") || !Numeric(minimum) || !DecimalWithin(minimum.raw, "9223372036854775807", true))
+        {
+            LoadError(loader, "InvalidMinimum", minimum.span, name, rule);
+        }
+        else
+        {
+            field.hasMinimum = true;
+            field.minimum = Integer(minimum.raw);
+        }
+    }
+
+    i64 maximumNode = PropertyValue(loader.document, node, "max");
+    if (maximumNode >= 0_i64)
+    {
+        Syntax.Node maximum = loader.document.nodes[maximumNode];
+        if ((valueType != "u32" && valueType != "i64") || !Numeric(maximum) || !DecimalWithin(maximum.raw, "9223372036854775807", true))
+        {
+            LoadError(loader, "InvalidMaximum", maximum.span, name, rule);
+        }
+        else
+        {
+            field.hasMaximum = true;
+            field.maximum = Integer(maximum.raw);
+        }
+    }
+    if (field.hasMinimum && field.hasMaximum && field.minimum > field.maximum)
+    {
+        LoadError(loader, "InvalidNumericBounds", node.span, name, rule);
+    }
+
+    i64 patternIndex = PropertyValue(loader.document, node, "pattern");
+    if (patternIndex >= 0_i64)
+    {
+        Syntax.Node patternNode = loader.document.nodes[patternIndex];
+        if (!Quoted(patternNode))
+        {
+            LoadError(loader, "InvalidPattern", patternNode.span, name, rule);
+        }
+        else
+        {
+            match Bounded.ValidatePattern(field.pattern)
+            {
+                Result::Error(_) => {
+                    LoadError(loader, "InvalidPattern", patternNode.span, name, rule);
+                },
+
+                Result::Ok(_) => { },
+            };
+        }
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        Syntax.Node child = loader.document.nodes[node.children[i]];
+        if (!Assignment(child) || (child.name != "name" && child.name != "type" && child.name != "required" && child.name != "values" && child.name != "default" && child.name != "min" && child.name != "max" && child.name != "required_if" && child.name != "forbid_if" && child.name != "allowed_attrs" && child.name != "pattern"))
+        {
+            LoadError(loader, "UnsupportedFieldConstraint", child.span, name, rule);
+        }
+        i = i + 1_i64;
+    }
+    return field;
+}
+
+Variant LoadVariant(mut Loader loader, Syntax.Node node, string rule)
+{
+    UniqueProperties(loader, node);
+    mut string name = node.label;
+    if (!node.hasLabel)
+    {
+        name = TextProperty(loader.document, node, "name", "");
+    }
+    if (name == "")
+    {
+        LoadError(loader, "MissingVariantName", node.span, "", rule);
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        Syntax.Node child = loader.document.nodes[node.children[i]];
+        if (!Assignment(child) || (child.name != "name" && child.name != "require" && child.name != "forbid"))
+        {
+            LoadError(loader, "InvalidVariant", child.span, "", rule);
+        }
+        i = i + 1_i64;
+    }
+    return Variant
+    {
+        name: name,
+
+        require: ListProperty(loader.document, node, "require"),
+
+        forbid: ListProperty(loader.document, node, "forbid"),
+
+        span: node.span,
+    };
+}
+
+unit CheckConditionFields(mut Loader loader, Rule rule, Condition[] conditions, string field)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Condition>(conditions))
+    {
+        Condition condition = conditions[i];
+        i64 dependency = FieldIndex(rule, condition.name);
+        if (dependency < 0_i64)
+        {
+            LoadError(loader, "UnknownConditionalField", condition.span, field, rule.name);
+        }
+        else if (!LeafAccepts(loader.profile, rule.fields[dependency].typeIndex, condition.value, loader.limits))
+        {
+            LoadError(loader, "InvalidConditionValue", condition.span, field, rule.name);
+        }
+        i = i + 1_i64;
+    }
+}
+
+i64 LoadRule(mut Loader loader, i64 index, string defaultScope, i64 depth)
+{
+    Syntax.Node node = loader.document.nodes[index];
+    CheckAttributesProperty(loader, node, "", node.label);
+    if (depth > loader.limits.maxDepth)
+    {
+        LoadError(loader, "DepthLimit", node.span, "", node.label);
+        return -1_i64;
+    }
+    UniqueProperties(loader, node);
+    mut string name = node.label;
+    if (!node.hasLabel)
+    {
+        name = TextProperty(loader.document, node, "id", node.name);
+    }
+
+    mut Rule rule = Rule
+    {
+        name: name,
+
+        scopeKind: TextProperty(loader.document, node, "scope", defaultScope),
+
+        matcher: TextProperty(loader.document, node, "match", "keyword"),
+
+        keyword: TextProperty(loader.document, node, "keyword", node.label),
+
+        keywords: ListProperty(loader.document, node, "keywords"),
+
+        except: ListProperty(loader.document, node, "except"),
+
+        label: TextProperty(loader.document, node, "label", "optional"),
+
+        cardinality: TextProperty(loader.document, node, "cardinality", "many"),
+
+        extras: BoolProperty(loader.document, node, "extras"),
+
+        nestedExtras: BoolProperty(loader.document, node, "nested_extras"),
+
+        schemaless: BoolProperty(loader.document, node, "schemaless"),
+
+        span: node.span,
+
+        fields: Array.Empty<Field>(),
+
+        nested: Array.Empty<i64>(),
+
+        variants: Array.Empty<Variant>(),
+
+        allowedAttributes: ListProperty(loader.document, node, "allowed_attrs"),
+
+        syntaxNode: index,
+
+        extends: TextProperty(loader.document, node, "extends", ""),
+
+        mixes: ListProperty(loader.document, node, "mixes"),
+    };
+    if (rule.scopeKind != "top" && rule.scopeKind != "nested" && rule.scopeKind != "any")
+    {
+        LoadError(loader, "InvalidScope", node.span, "scope", name);
+    }
+    if (rule.matcher != "keyword" && rule.matcher != "keywords" && rule.matcher != "free_ident")
+    {
+        LoadError(loader, "InvalidMatcher", node.span, "match", name);
+    }
+    if (rule.label != "required" && rule.label != "forbidden" && rule.label != "optional")
+    {
+        LoadError(loader, "InvalidLabelPolicy", node.span, "label", name);
+    }
+    if (rule.cardinality != "one" && rule.cardinality != "many" && rule.cardinality != "zero_or_one")
+    {
+        LoadError(loader, "InvalidCardinality", node.span, "cardinality", name);
+    }
+    if (Array.Len<Rule>(loader.profile.rules) >= loader.limits.maxNodes)
+    {
+        LoadError(loader, "NodeLimit", node.span, "", name);
+        return -1_i64;
+    }
+
+    i64 result = Array.Len<Rule>(loader.profile.rules);
+    Array.Append<Rule>(loader.profile.rules, rule);
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        i64 childIndex = node.children[i];
+        Syntax.Node child = loader.document.nodes[childIndex];
+        if (Block(child) && child.name == "field")
+        {
+            Field field = LoadField(loader, childIndex, name);
+            mut i64 previous = 0_i64;
+            while (previous < Array.Len<Field>(rule.fields))
+            {
+                if (rule.fields[previous].name == field.name)
+                {
+                    LoadError(loader, "DuplicateFieldRule", field.span, field.name, name);
+                }
+                previous = previous + 1_i64;
+            }
+            Array.Append<Field>(rule.fields, field);
+        }
+        else if (Block(child) && child.name == "variant")
+        {
+            Variant variant = LoadVariant(loader, child, name);
+            mut i64 previous = 0_i64;
+            while (previous < Array.Len<Variant>(rule.variants))
+            {
+                if (rule.variants[previous].name == variant.name)
+                {
+                    LoadError(loader, "DuplicateVariant", child.span, "", name);
+                }
+                previous = previous + 1_i64;
+            }
+            Array.Append<Variant>(rule.variants, variant);
+        }
+        else if (Block(child) && child.name == "nested")
+        {
+            i64 nested = LoadRule(loader, childIndex, "nested", depth + 1_i64);
+            if (nested >= 0_i64)
+            {
+                Array.Append<i64>(rule.nested, nested);
+            }
+        }
+        else if (Assignment(child))
+        {
+            string property = child.name;
+            if (property != "id" && property != "scope" && property != "match" && property != "keyword" && property != "keywords" && property != "except" && property != "label" && property != "cardinality" && property != "extras" && property != "nested_extras" && property != "schemaless" && property != "allowed_attrs" && property != "extends" && property != "mixes")
+            {
+                LoadError(loader, "UnsupportedRuleProperty", child.span, property, name);
+            }
+        }
+        else
+        {
+            LoadError(loader, "UnsupportedRuleConstruct", child.span, "", name);
+        }
+        i = i + 1_i64;
+    }
+
+    mut i64 variantPosition = 0_i64;
+    while (variantPosition < Array.Len<Variant>(rule.variants))
+    {
+        Variant variant = rule.variants[variantPosition];
+        mut i64 payload = 0_i64;
+        while (payload < Array.Len<string>(variant.require))
+        {
+            if (FieldIndex(rule, variant.require[payload]) < 0_i64)
+            {
+                LoadError(loader, "UnknownVariantField", variant.span, variant.require[payload], rule.name);
+            }
+            payload = payload + 1_i64;
+        }
+        payload = 0_i64;
+        while (payload < Array.Len<string>(variant.forbid))
+        {
+            if (FieldIndex(rule, variant.forbid[payload]) < 0_i64)
+            {
+                LoadError(loader, "UnknownVariantField", variant.span, variant.forbid[payload], rule.name);
+            }
+            payload = payload + 1_i64;
+        }
+        variantPosition = variantPosition + 1_i64;
+    }
+    Array.Set<Rule>(loader.profile.rules, result, rule);
+    return result;
+}
+
+unit CheckMigrationDefinition(mut Loader loader, i64 index)
+{
+    Syntax.Node migration = loader.document.nodes[index];
+    UniqueProperties(loader, migration);
+    i64 from = PropertyValue(loader.document, migration, "from");
+    if (from < 0_i64 || TextProperty(loader.document, migration, "from", "") == "")
+    {
+        LoadError(loader, "MigrationFromRequired", migration.span, "from", "");
+    }
+    else if (!Quoted(loader.document.nodes[from]) && loader.document.nodes[from].kind != Syntax.NodeKind::Identifier)
+    {
+        LoadError(loader, "MigrationFromRequired", loader.document.nodes[from].span, "from", "");
+    }
+
+    mut i64 operations = 0_i64;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(migration.children))
+    {
+        Syntax.Node item = loader.document.nodes[migration.children[i]];
+        if (Assignment(item))
+        {
+            if (item.name != "from")
+            {
+                LoadError(loader, "UnknownMigrationProperty", item.span, item.name, "");
+            }
+        }
+        else if (Block(item) && (item.name == "detect" || item.name == "when" || item.name == "rewrite"))
+        {
+            UniqueProperties(loader, item);
+            if (item.name == "when" && Array.Len<i64>(item.children) == 0_i64)
+            {
+                LoadError(loader, "EmptyMigrationWhen", item.span, "", "");
+            }
+
+            mut i64 j = 0_i64;
+            while (j < Array.Len<i64>(item.children))
+            {
+                Syntax.Node property = loader.document.nodes[item.children[j]];
+                mut bool allowed = false;
+                if (item.name == "detect")
+                {
+                    allowed = Assignment(property) && property.name == "profile_version_missing";
+                    i64 value = PropertyValue(loader.document, item, property.name);
+                    if (value < 0_i64 || loader.document.nodes[value].kind != Syntax.NodeKind::Boolean)
+                    {
+                        LoadError(loader, "MigrationBooleanRequired", property.span, property.name, "");
+                    }
+                }
+                else if (item.name == "when")
+                {
+                    allowed = Assignment(property) && (property.name == "block" || property.name == "block_kind" || property.name == "field" || property.name == "field_value" || property.name == "missing_field");
+                    i64 value = PropertyValue(loader.document, item, property.name);
+                    if (value < 0_i64)
+                    {
+                        LoadError(loader, "InvalidMigrationWhen", property.span, property.name, "");
+                    }
+                    else if (property.name != "field_value" && !Quoted(loader.document.nodes[value]) && loader.document.nodes[value].kind != Syntax.NodeKind::Identifier)
+                    {
+                        LoadError(loader, "MigrationNameRequired", property.span, property.name, "");
+                    }
+                    else if (property.name == "field_value" && !Quoted(loader.document.nodes[value]) && !Numeric(loader.document.nodes[value]) && loader.document.nodes[value].kind != Syntax.NodeKind::Identifier && loader.document.nodes[value].kind != Syntax.NodeKind::Boolean)
+                    {
+                        LoadError(loader, "MigrationScalarRequired", property.span, property.name, "");
+                    }
+                }
+                else
+                {
+                    allowed = (Assignment(property) && (property.name == "add_field" || property.name == "rename_field" || property.name == "replace_value" || property.name == "from" || property.name == "to")) || (Block(property) && property.name == "replace_value");
+                    if (property.name == "add_field" || property.name == "rename_field")
+                    {
+                        i64 value = PropertyValue(loader.document, item, property.name);
+                        if (value < 0_i64 || loader.document.nodes[value].kind != Syntax.NodeKind::Map)
+                        {
+                            LoadError(loader, "MigrationRewriteMapRequired", property.span, property.name, "");
+                        }
+                        else
+                        {
+                            Syntax.Node map = loader.document.nodes[value];
+                            operations = operations + Array.Len<i64>(map.children);
+                            if (property.name == "rename_field")
+                            {
+                                mut i64 entry = 0_i64;
+                                while (entry < Array.Len<i64>(map.children))
+                                {
+                                    Syntax.Node pair = loader.document.nodes[map.children[entry]];
+                                    i64 destination = pair.children[0_i64];
+                                    if (!Quoted(loader.document.nodes[destination]) && loader.document.nodes[destination].kind != Syntax.NodeKind::Identifier)
+                                    {
+                                        LoadError(loader, "MigrationNameRequired", pair.span, pair.name, "");
+                                    }
+                                    entry = entry + 1_i64;
+                                }
+                            }
+                        }
+                    }
+                    else if (property.name == "replace_value")
+                    {
+                        mut Syntax.Node owner = property;
+                        if (Assignment(property))
+                        {
+                            owner = item;
+                        }
+                        UniqueProperties(loader, owner);
+                        i64 left = PropertyValue(loader.document, owner, "from");
+                        i64 right = PropertyValue(loader.document, owner, "to");
+                        if (left < 0_i64 || right < 0_i64)
+                        {
+                            LoadError(loader, "MigrationScalarRequired", property.span, "", "");
+                        }
+                        else
+                        {
+                            Syntax.Node l = loader.document.nodes[left];
+                            Syntax.Node r = loader.document.nodes[right];
+                            if ((!Quoted(l) && !Numeric(l) && l.kind != Syntax.NodeKind::Identifier && l.kind != Syntax.NodeKind::Boolean) || (!Quoted(r) && !Numeric(r) && r.kind != Syntax.NodeKind::Identifier && r.kind != Syntax.NodeKind::Boolean))
+                            {
+                                LoadError(loader, "MigrationScalarRequired", property.span, "", "");
+                            }
+                            else
+                            {
+                                operations = operations + 1_i64;
+                            }
+                        }
+                        if (Block(property))
+                        {
+                            mut i64 entry = 0_i64;
+                            while (entry < Array.Len<i64>(owner.children))
+                            {
+                                Syntax.Node pair = loader.document.nodes[owner.children[entry]];
+                                if (!Assignment(pair) || (pair.name != "from" && pair.name != "to"))
+                                {
+                                    LoadError(loader, "UnknownMigrationDirective", pair.span, pair.name, "");
+                                }
+                                entry = entry + 1_i64;
+                            }
+                        }
+                    }
+                    else if ((property.name == "from" || property.name == "to") && Property(loader.document, item, "replace_value") < 0_i64)
+                    {
+                        allowed = false;
+                    }
+                }
+                if (!allowed)
+                {
+                    LoadError(loader, "UnknownMigrationDirective", property.span, property.name, "");
+                }
+                j = j + 1_i64;
+            }
+            if (item.name == "when" && Property(loader.document, item, "field_value") >= 0_i64 && Property(loader.document, item, "field") < 0_i64)
+            {
+                LoadError(loader, "MigrationFieldRequired", item.span, "field", "");
+            }
+        }
+        else
+        {
+            LoadError(loader, "UnknownMigrationDirective", item.span, item.name, "");
+        }
+        i = i + 1_i64;
+    }
+    if (operations == 0_i64)
+    {
+        LoadError(loader, "MigrationRewriteRequired", migration.span, "", "");
+    }
+}
+
+Result<Profile, Diagnostic[]> ParseUncomposed(string source, Limits.BsolLimits limits)
+{
+    return ParseUncomposedMode(source, limits, false);
+}
+
+// Imports are admitted only after the explicit resolver constructed a verified
+// private closure. Ordinary ParseProfile remains a source-only operation.
+Result<Profile, Diagnostic[]> ParseUncomposedMode(string source, Limits.BsolLimits limits, bool resolvedImports)
+{
+    match Parser.Parse(source, limits)
+    {
+        Result::Error(error) => {
+            mut Diagnostic[] errors = [];
+            Array.Append<Diagnostic>(errors, Issue("SyntaxError", DiagnosticStage::Syntax, error.span, "", "", ""));
+            return Result::Error(errors);
+        },
+
+        Result::Ok(document) => {
+            mut Loader loader = Loader
+            {
+                document: document,
+
+                profile: Profile
+                {
+                    name: "",
+
+                    version: 0_i64,
+
+                    source: source,
+
+                    document: document,
+
+                    rules: Array.Empty<Rule>(),
+
+                    roots: Array.Empty<i64>(),
+
+                    types: Array.Empty<TypeExpression>(),
+
+                    migrationNodes: Array.Empty<i64>(),
+
+                    importedOrigins: Array.Empty<ImportedRuleOrigin>(),
+                    resolvedClosure: ImportGraph.Graph {
+                        sources: Array.Empty<ImportGraph.Source>(),
+                        bindings: Array.Empty<ImportGraph.Binding>(),
+                        root: 0_i64,
+                    },
+                },
+
+                diagnostics: Array.Empty<Diagnostic>(),
+
+                limits: limits,
+            };
+            if (Array.Len<i64>(document.roots) != 1_i64)
+            {
+                LoadError(loader, "ProfileRootRequired", Syntax.Span
+                {
+                    start: 0_i64,
+
+                    end: String.Len(source),
+                }, "", "");
+                return Result::Error(loader.diagnostics);
+            }
+
+            Syntax.Node root = document.nodes[document.roots[0]];
+            loader.profile.name = root.label;
+            if (root.name != "profile" || !root.hasLabel || root.label == "")
+            {
+                LoadError(loader, "ProfileRootRequired", root.span, "", "");
+            }
+
+            string version = TextProperty(document, root, "version", "");
+            if (version == "1")
+            {
+                loader.profile.version = 1_i64;
+            }
+            else if (version == "2")
+            {
+                loader.profile.version = 2_i64;
+            }
+            else
+            {
+                LoadError(loader, "InvalidProfileVersion", root.span, "version", "");
+            }
+            UniqueProperties(loader, root);
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(root.children))
+            {
+                i64 childIndex = root.children[i];
+                Syntax.Node child = document.nodes[childIndex];
+                if (Block(child) && child.name == "rule")
+                {
+                    i64 rule = LoadRule(loader, childIndex, "top", 1_i64);
+                    if (rule >= 0_i64)
+                    {
+                        mut i64 previous = 0_i64;
+                        while (previous < Array.Len<i64>(loader.profile.roots))
+                        {
+                            if (loader.profile.rules[loader.profile.roots[previous]].name == loader.profile.rules[rule].name)
+                            {
+                                LoadError(loader, "DuplicateRule", child.span, "", child.label);
+                            }
+                            previous = previous + 1_i64;
+                        }
+                        Array.Append<i64>(loader.profile.roots, rule);
+                    }
+                }
+                else if (Block(child) && child.name == "migration")
+                {
+                    CheckMigrationDefinition(loader, childIndex);
+                    Array.Append<i64>(loader.profile.migrationNodes, childIndex);
+                }
+                else if (resolvedImports && Block(child) && child.name == "import_schema")
+                {
+                    match Imports.ParseDeclaration(document, childIndex) {
+                        Result::Error(error) => {
+                            mut Diagnostic diagnostic = Issue(error.code, DiagnosticStage::Import, child.span, "", "", loader.profile.name);
+                            diagnostic.message = error.message;
+                            Array.Append<Diagnostic>(loader.diagnostics, diagnostic);
+                        },
+                        Result::Ok(_) => {},
+                    };
+                }
+                else if (!Assignment(child) || child.name != "version")
+                {
+                    LoadError(loader, "UnsupportedProfileConstruct", child.span, child.name, "");
+                }
+                i = i + 1_i64;
+            }
+            if (Array.Len<Diagnostic>(loader.diagnostics) > 0_i64)
+            {
+                return Result::Error(loader.diagnostics);
+            }
+            return Result::Ok(loader.profile);
+        },
+    };
+}
+
+bool DecimalWithin(string raw, string maximum, bool signed)
+{
+    mut i64 start = 0_i64;
+    mut string bound = maximum;
+    if (String.Len(raw) == 0_i64)
+    {
+        return false;
+    }
+    if (String.ByteAt(raw, 0_i64) == 45_u8)
+    {
+        if (!signed)
+        {
+            return false;
+        }
+        start = 1_i64;
+        bound = "9223372036854775808";
+    }
+
+    i64 count = String.Len(raw) - start;
+    if (count < 1_i64 || count > String.Len(bound))
+    {
+        return false;
+    }
+
+    mut i64 i = start;
+    while (i < String.Len(raw))
+    {
+        u8 b = String.ByteAt(raw, i);
+        if (b < 48_u8 || b > 57_u8)
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    if (count < String.Len(bound))
+    {
+        return true;
+    }
+    i = 0_i64;
+    while (i < count)
+    {
+        u8 actual = String.ByteAt(raw, start + i);
+        u8 limit = String.ByteAt(bound, i);
+        if (actual < limit)
+        {
+            return true;
+        }
+        if (actual > limit)
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+bool Matches(Rule rule, string kind)
+{
+    if (rule.matcher == "keyword")
+    {
+        return kind == rule.keyword;
+    }
+    if (rule.matcher == "keywords")
+    {
+        return Contains(rule.keywords, kind);
+    }
+    return !Contains(rule.except, kind);
+}
+
+i64 NamedRule(Profile profile, string name)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Rule>(profile.rules))
+    {
+        if (profile.rules[i].name == name)
+        {
+            return i;
+        }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+bool LeafAccepts(Profile profile, i64 typeIndex, Syntax.Node value, Limits.BsolLimits limits)
+{
+    if (typeIndex < 0_i64 || typeIndex >= Array.Len<TypeExpression>(profile.types))
+    {
+        return false;
+    }
+
+    TypeExpression expression = profile.types[typeIndex];
+    return match expression.kind
+    {
+        TypeKind::Quoted => Quoted(value),
+
+        TypeKind::Path => Quoted(value),
+
+        TypeKind::Ident => Identifier(value) || Quoted(value),
+
+        TypeKind::Loose => Identifier(value) || Quoted(value) || Boolean(value),
+
+        TypeKind::Bool => Boolean(value),
+
+        TypeKind::U32 => Numeric(value) && DecimalWithin(value.raw, "4294967295", false),
+
+        TypeKind::I64 => Numeric(value) && DecimalWithin(value.raw, "9223372036854775807", true),
+
+        TypeKind::F64 => Numeric(value),
+
+        TypeKind::Enum => (Identifier(value) || Quoted(value) || Boolean(value)) && Contains(expression.values, value.text),
+
+        TypeKind::Reference => match value.kind
+        {
+            Syntax.NodeKind::Reference => ReferenceQualifier(profile, expression.targetRule, value.name, limits),
+
+            _ => false,
+        },
+
+        _ => false,
+    };
+}
+
+bool ShapeAccepts(Profile profile, i64 typeIndex, Syntax.Document document, i64 index, i64 depth, Limits.BsolLimits limits)
+{
+    if (depth > limits.maxDepth || index < 0_i64 || index >= Array.Len<Syntax.Node>(document.nodes) || typeIndex < 0_i64 || typeIndex >= Array.Len<TypeExpression>(profile.types))
+    {
+        return false;
+    }
+
+    TypeExpression expression = profile.types[typeIndex];
+    Syntax.Node value = document.nodes[index];
+    match expression.kind
+    {
+        TypeKind::List => {
+            if (!(match value.kind
+            {
+                Syntax.NodeKind::List => true,
+
+                _ => false,
+            }))
+            {
+                return false;
+            }
+
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(value.children))
+            {
+                mut bool accepted = false;
+                mut i64 c = 0_i64;
+                while (c < Array.Len<i64>(expression.children))
+                {
+                    if (ShapeAccepts(profile, expression.children[c], document, value.children[i], depth + 1_i64, limits))
+                    {
+                        accepted = true;
+                    }
+                    c = c + 1_i64;
+                }
+                if (!accepted)
+                {
+                    return false;
+                }
+                i = i + 1_i64;
+            }
+            return true;
+        },
+
+        TypeKind::FlatList => {
+            if (!(match value.kind
+            {
+                Syntax.NodeKind::List => true,
+
+                _ => false,
+            }))
+            {
+                return false;
+            }
+
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(value.children))
+            {
+                Syntax.Node child = document.nodes[value.children[i]];
+                if (!Identifier(child) && !Quoted(child) && !Numeric(child) && !Boolean(child) && !(match child.kind
+                {
+                    Syntax.NodeKind::Reference => true,
+
+                    _ => false,
+                }))
+                {
+                    return false;
+                }
+                i = i + 1_i64;
+            }
+            return true;
+        },
+
+        TypeKind::Map => {
+            if (!(match value.kind
+            {
+                Syntax.NodeKind::Map => true,
+
+                _ => false,
+            }) || Array.Len<i64>(expression.children) != 2_i64)
+            {
+                return false;
+            }
+
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(value.children))
+            {
+                Syntax.Node entry = document.nodes[value.children[i]];
+                mut Syntax.Node key = entry;
+                key.kind = Syntax.NodeKind::Identifier;
+                key.text = entry.name;
+                key.raw = entry.name;
+                if (!LeafAccepts(profile, expression.children[0], key, limits) || Array.Len<i64>(entry.children) != 1_i64 || !ShapeAccepts(profile, expression.children[1], document, entry.children[0], depth + 1_i64, limits))
+                {
+                    return false;
+                }
+                i = i + 1_i64;
+            }
+            return true;
+        },
+
+        TypeKind::Inline => {
+            i64 target = NamedRule(profile, expression.targetRule);
+            if (target < 0_i64 || !Block(value))
+            {
+                return false;
+            }
+
+            Rule rule = profile.rules[target];
+            return Matches(rule, value.name) && !(rule.label == "required" && !value.hasLabel) && !(rule.label == "forbidden" && value.hasLabel);
+        },
+
+        _ => {
+            return LeafAccepts(profile, typeIndex, value, limits);
+        },
+    };
+}
+
+unit ValidateNestedValue(mut Validation state, i64 typeIndex, i64 index, i64 depth)
+{
+    if (depth > state.limits.maxDepth || typeIndex < 0_i64 || typeIndex >= Array.Len<TypeExpression>(state.profile.types))
+    {
+        return;
+    }
+
+    TypeExpression expression = state.profile.types[typeIndex];
+    Syntax.Node value = state.document.nodes[index];
+    match expression.kind
+    {
+        TypeKind::Inline => {
+            i64 target = NamedRule(state.profile, expression.targetRule);
+            if (target >= 0_i64)
+            {
+                ValidateBlock(state, index, target, depth + 1_i64);
+            }
+        },
+
+        TypeKind::List => {
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(value.children))
+            {
+                mut i64 c = 0_i64;
+                mut bool selected = false;
+                while (c < Array.Len<i64>(expression.children))
+                {
+                    if (!selected && ShapeAccepts(state.profile, expression.children[c], state.document, value.children[i], depth + 1_i64, state.limits))
+                    {
+                        ValidateNestedValue(state, expression.children[c], value.children[i], depth + 1_i64);
+                        selected = true;
+                    }
+                    c = c + 1_i64;
+                }
+                i = i + 1_i64;
+            }
+        },
+
+        TypeKind::Map => {
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(value.children))
+            {
+                Syntax.Node entry = state.document.nodes[value.children[i]];
+                ValidateNestedValue(state, expression.children[1], entry.children[0], depth + 1_i64);
+                i = i + 1_i64;
+            }
+        },
+
+        _ => { },
+    };
+}
+
+unit ValidateAttributes(mut Validation state, Syntax.Node node, string[] allowed, string field, string rule)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.attributes))
+    {
+        Syntax.Node attrNode = state.document.nodes[node.attributes[i]];
+        if (!Contains(allowed, attrNode.name))
+        {
+            ValidationError(state, "UnknownAttribute", attrNode.span, field, rule);
+        }
+        i = i + 1_i64;
+    }
+}
+
+unit ValidationError(mut Validation state, string code, Syntax.Span span, string field, string rule)
+{
+    if (Array.Len<Diagnostic>(state.diagnostics) < state.limits.maxNodes)
+    {
+        Array.Append<Diagnostic>(state.diagnostics, Issue(code, DiagnosticStage::Validation, span, field, rule, state.profile.name));
+    }
+}
+
+unit ValidateNumericConstraints(mut Validation state, Field field, Syntax.Node value, Syntax.Span span, string rule)
+{
+    if (field.pattern != "")
+    {
+        match Bounded.Matches(field.pattern, value.text, state.patternBudget)
+        {
+            Result::Error(code) => {
+                ValidationError(state, code, span, field.name, rule);
+            },
+
+            Result::Ok(accepted) => {
+                if (!accepted)
+                {
+                    ValidationError(state, "PatternMismatch", span, field.name, rule);
+                }
+            },
+        };
+    }
+    if (!field.hasMinimum && !field.hasMaximum)
+    {
+        return;
+    }
+    if (!Numeric(value) || !DecimalWithin(value.raw, "9223372036854775807", true))
+    {
+        ValidationError(state, "TypeMismatch", span, field.name, rule);
+        return;
+    }
+
+    i64 integer = Integer(value.raw);
+    if (field.hasMinimum && integer < field.minimum)
+    {
+        ValidationError(state, "BelowMinimum", span, field.name, rule);
+    }
+    if (field.hasMaximum && integer > field.maximum)
+    {
+        ValidationError(state, "AboveMaximum", span, field.name, rule);
+    }
+}
+
+bool AnyCondition(Validation state, i64 block, i64 rule, Condition[] conditions)
+{
+    mut i64 c = 0_i64;
+    while (c < Array.Len<Condition>(conditions))
+    {
+        Condition condition = conditions[c];
+        mut i64 i = 0_i64;
+        while (i < Array.Len<FieldBinding>(state.fields))
+        {
+            FieldBinding binding = state.fields[i];
+            if (binding.block == block && binding.rule == rule && state.profile.rules[rule].fields[binding.field].name == condition.name)
+            {
+                if (Numeric(binding.value) && Numeric(condition.value) && DecimalWithin(binding.value.raw, "9223372036854775807", true) && DecimalWithin(condition.value.raw, "9223372036854775807", true))
+                {
+                    if (Integer(binding.value.raw) == Integer(condition.value.raw))
+                    {
+                        return true;
+                    }
+                }
+                else if (binding.value.text == condition.value.text)
+                {
+                    return true;
+                }
+            }
+            i = i + 1_i64;
+        }
+        c = c + 1_i64;
+    }
+    return false;
+}
+
+i64 FieldIndex(Rule rule, string name)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Field>(rule.fields))
+    {
+        if (rule.fields[i].name == name)
+        {
+            return i;
+        }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+unit ValidateVariants(mut Validation state, i64 block, i64 ruleIndex, bool[] seen)
+{
+    Rule rule = state.profile.rules[ruleIndex];
+    if (Array.Len<Variant>(rule.variants) == 0_i64)
+    {
+        return;
+    }
+
+    mut string discriminantField = "source";
+    mut i64 discriminantIndex = FieldIndex(rule, "source");
+    if (discriminantIndex < 0_i64 || !seen[discriminantIndex])
+    {
+        discriminantField = "kind";
+        discriminantIndex = FieldIndex(rule, "kind");
+    }
+
+    mut string discriminant = "";
+    mut i64 i = 0_i64;
+    while (i < Array.Len<FieldBinding>(state.fields))
+    {
+        FieldBinding binding = state.fields[i];
+        if (binding.block == block && binding.rule == ruleIndex && binding.field == discriminantIndex)
+        {
+            discriminant = binding.value.text;
+        }
+        i = i + 1_i64;
+    }
+
+    mut i64 selected = -1_i64;
+    i = 0_i64;
+    while (i < Array.Len<Variant>(rule.variants))
+    {
+        if (rule.variants[i].name == discriminant)
+        {
+            selected = i;
+        }
+        i = i + 1_i64;
+    }
+    if (selected < 0_i64)
+    {
+        ValidationError(state, "UnknownVariant", state.document.nodes[block].span, discriminantField, rule.name);
+        return;
+    }
+
+    Variant variant = rule.variants[selected];
+    i = 0_i64;
+    while (i < Array.Len<string>(variant.require))
+    {
+        i64 field = FieldIndex(rule, variant.require[i]);
+        if (field < 0_i64 || !seen[field])
+        {
+            ValidationError(state, "VariantRequiredField", state.document.nodes[block].span, variant.require[i], rule.name);
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<string>(variant.forbid))
+    {
+        i64 field = FieldIndex(rule, variant.forbid[i]);
+        if (field >= 0_i64 && seen[field])
+        {
+            ValidationError(state, "VariantForbiddenField", state.document.nodes[block].span, variant.forbid[i], rule.name);
+        }
+        i = i + 1_i64;
+    }
+}
+
+unit ValidateBlock(mut Validation state, i64 index, i64 ruleIndex, i64 depth)
+{
+    Syntax.Node node = state.document.nodes[index];
+    Rule rule = state.profile.rules[ruleIndex];
+    ValidateAttributes(state, node, rule.allowedAttributes, "", rule.name);
+    if (depth > state.limits.maxDepth)
+    {
+        ValidationError(state, "DepthLimit", node.span, "", rule.name);
+        return;
+    }
+    Array.Append<RuleBinding>(state.rules, RuleBinding
+    {
+        node: index,
+
+        rule: ruleIndex,
+    });
+    if ((rule.label == "required" && !node.hasLabel) || (rule.label == "forbidden" && node.hasLabel))
+    {
+        ValidationError(state, "InvalidLabel", node.span, "", rule.name);
+    }
+    if (node.schemaless && !rule.schemaless)
+    {
+        ValidationError(state, "SchemalessForbidden", node.span, "", rule.name);
+    }
+
+    mut bool[] seen = [];
+    mut i64 f = 0_i64;
+    while (f < Array.Len<Field>(rule.fields))
+    {
+        Array.Append<bool>(seen, false);
+        f = f + 1_i64;
+    }
+
+    mut i64[] nestedBlocks = [];
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        i64 childIndex = node.children[i];
+        Syntax.Node child = state.document.nodes[childIndex];
+        if (Assignment(child))
+        {
+            mut i64 previous = 0_i64;
+            while (previous < i)
+            {
+                Syntax.Node first = state.document.nodes[node.children[previous]];
+                if (Assignment(first) && first.name == child.name)
+                {
+                    mut Diagnostic diagnostic = Issue("DuplicateField", DiagnosticStage::Validation, child.span, child.name, rule.name, state.profile.name);
+                    diagnostic.hasRelated = true;
+                    diagnostic.relatedSpan = first.span;
+                    Array.Append<Diagnostic>(state.diagnostics, diagnostic);
+                }
+                previous = previous + 1_i64;
+            }
+
+            mut i64 fieldIndex = -1_i64;
+            f = 0_i64;
+            while (f < Array.Len<Field>(rule.fields))
+            {
+                if (rule.fields[f].name == child.name)
+                {
+                    fieldIndex = f;
+                }
+                f = f + 1_i64;
+            }
+            if (fieldIndex < 0_i64)
+            {
+                ValidateAttributes(state, child, Array.Empty<string>(), child.name, rule.name);
+                if (!rule.extras && !(node.schemaless && rule.schemaless))
+                {
+                    ValidationError(state, "UnknownField", child.span, child.name, rule.name);
+                }
+            }
+            else
+            {
+                Array.Set<bool>(seen, fieldIndex, true);
+                ValidateAttributes(state, child, rule.fields[fieldIndex].allowedAttributes, child.name, rule.name);
+                if (Array.Len<i64>(child.children) != 1_i64)
+                {
+                    ValidationError(state, "TypeMismatch", child.span, child.name, rule.name);
+                }
+                else if (!ShapeAccepts(state.profile, rule.fields[fieldIndex].typeIndex, state.document, child.children[0], depth + 1_i64, state.limits))
+                {
+                    ValidationError(state, "TypeMismatch", child.span, child.name, rule.name);
+                }
+                else
+                {
+                    Array.Append<FieldBinding>(state.fields, FieldBinding
+                    {
+                        assignment: childIndex,
+
+                        rule: ruleIndex,
+
+                        field: fieldIndex,
+
+                        block: index,
+
+                        fromDefault: false,
+
+                        value: state.document.nodes[child.children[0]],
+
+                        sourceDocument: state.document,
+                    });
+                    ValidateNumericConstraints(state, rule.fields[fieldIndex], state.document.nodes[child.children[0]], child.span, rule.name);
+                    ValidateNestedValue(state, rule.fields[fieldIndex].typeIndex, child.children[0], depth + 1_i64);
+                }
+            }
+        }
+        else if (Block(child))
+        {
+            Array.Append<i64>(nestedBlocks, childIndex);
+        }
+        else
+        {
+            ValidationError(state, "InvalidBlockItem", child.span, "", rule.name);
+        }
+        i = i + 1_i64;
+    }
+    f = 0_i64;
+    while (f < Array.Len<Field>(rule.fields))
+    {
+        Field field = rule.fields[f];
+        if (!seen[f] && field.defaultNode >= 0_i64)
+        {
+            Syntax.Node value = state.profile.document.nodes[field.defaultNode];
+            Array.Append<FieldBinding>(state.fields, FieldBinding
+            {
+                assignment: -1_i64,
+
+                rule: ruleIndex,
+
+                field: f,
+
+                block: index,
+
+                fromDefault: true,
+
+                value: value,
+
+                sourceDocument: state.profile.document,
+            });
+            Array.Set<bool>(seen, f, true);
+            ValidateNumericConstraints(state, field, value, node.span, rule.name);
+        }
+        if (field.required && !seen[f])
+        {
+            ValidationError(state, "MissingField", node.span, field.name, rule.name);
+        }
+        f = f + 1_i64;
+    }
+    f = 0_i64;
+    while (f < Array.Len<Field>(rule.fields))
+    {
+        Field field = rule.fields[f];
+        if (!seen[f] && AnyCondition(state, index, ruleIndex, field.requiredIf))
+        {
+            ValidationError(state, "RequiredIf", node.span, field.name, rule.name);
+        }
+        if (seen[f] && AnyCondition(state, index, ruleIndex, field.forbidIf))
+        {
+            ValidationError(state, "ForbiddenIf", node.span, field.name, rule.name);
+        }
+        f = f + 1_i64;
+    }
+    ValidateVariants(state, index, ruleIndex, seen);
+    ValidateScope(state, nestedBlocks, rule.nested, true, rule.nestedExtras || (node.schemaless && rule.schemaless), depth + 1_i64);
+}
+
+unit ValidateScope(mut Validation state, i64[] blocks, i64[] candidates, bool nested, bool allowExtras, i64 depth)
+{
+    mut i64[] counts = [];
+    mut i64 c = 0_i64;
+    while (c < Array.Len<i64>(candidates))
+    {
+        Array.Append<i64>(counts, 0_i64);
+        c = c + 1_i64;
+    }
+
+    mut i64 b = 0_i64;
+    while (b < Array.Len<i64>(blocks))
+    {
+        i64 index = blocks[b];
+        Syntax.Node node = state.document.nodes[index];
+        mut i64 selected = -1_i64;
+        mut i64 candidatePosition = -1_i64;
+        c = 0_i64;
+        while (c < Array.Len<i64>(candidates))
+        {
+            i64 candidate = candidates[c];
+            Rule rule = state.profile.rules[candidate];
+            bool scopeMatches = rule.scopeKind == "any" || (nested && rule.scopeKind == "nested") || (!nested && rule.scopeKind == "top");
+            if (scopeMatches && Matches(rule, node.name))
+            {
+                if (selected >= 0_i64)
+                {
+                    ValidationError(state, "AmbiguousRule", node.span, "", rule.name);
+                }
+                else
+                {
+                    selected = candidate;
+                    candidatePosition = c;
+                }
+            }
+            c = c + 1_i64;
+        }
+        if (selected < 0_i64)
+        {
+            if (!allowExtras)
+            {
+                ValidationError(state, "UnknownBlock", node.span, "", node.name);
+            }
+        }
+        else
+        {
+            Array.Set<i64>(counts, candidatePosition, counts[candidatePosition] + 1_i64);
+            ValidateBlock(state, index, selected, depth);
+        }
+        b = b + 1_i64;
+    }
+    c = 0_i64;
+    while (c < Array.Len<i64>(candidates))
+    {
+        Rule rule = state.profile.rules[candidates[c]];
+        if ((rule.cardinality == "one" && counts[c] != 1_i64) || (rule.cardinality == "zero_or_one" && counts[c] > 1_i64))
+        {
+            ValidationError(state, "Cardinality", rule.span, "", rule.name);
+        }
+        c = c + 1_i64;
+    }
+}
+
+pub Result<ValidatedDocument, Diagnostic[]> Validate(Syntax.Document document, Profile profile, Limits.BsolLimits limits)
+{
+    return ValidateWithPatternLimits(document, profile, limits, PatternLimits
+    {
+        maxSubjectBytes: 1048576_i64,
+
+        maxWork: 16777216_i64,
+
+        maxDepth: 64_i64,
+    });
+}
+
+pub Result<ValidatedDocument, Diagnostic[]> ValidateWithPatternLimits(Syntax.Document document, Profile profile, Limits.BsolLimits limits, PatternLimits policy)
+{
+    match ReownProfile(profile, limits)
+    {
+        Result::Error(diagnostics) => {
+            return Result::Error(diagnostics);
+        },
+
+        Result::Ok(checked) => {
+            mut Validation state = Validation
+            {
+                patternBudget: Bounded.NewBudget(Bounded.PatternLimits
+                {
+                    maxSubjectBytes: policy.maxSubjectBytes,
+
+                    maxWork: policy.maxWork,
+
+                    maxDepth: policy.maxDepth,
+                }),
+
+                document: document,
+
+                profile: checked,
+
+                diagnostics: Array.Empty<Diagnostic>(),
+
+                rules: Array.Empty<RuleBinding>(),
+
+                fields: Array.Empty<FieldBinding>(),
+
+                limits: limits,
+            };
+            if (!Bounded.ValidLimits(state.patternBudget.limits))
+            {
+                ValidationError(state, "InvalidPatternLimits", Syntax.Span
+                {
+                    start: 0_i64,
+
+                    end: String.Len(document.source),
+                }, "", "");
+                return Result::Error(state.diagnostics);
+            }
+            if (checked.name != profile.name || checked.version != profile.version)
+            {
+                ValidationError(state, "ProfileIdentityMismatch", Syntax.Span
+                {
+                    start: 0_i64,
+
+                    end: 0_i64,
+                }, "", "");
+                return Result::Error(state.diagnostics);
+            }
+            match Parser.Parse(document.source, limits)
+            {
+                Result::Error(error) => {
+                    Array.Append<Diagnostic>(state.diagnostics, Issue("SyntaxError", DiagnosticStage::Syntax, error.span, "", "", checked.name));
+                    return Result::Error(state.diagnostics);
+                },
+
+                Result::Ok(owned) => {
+                    state.document = owned;
+                },
+            };
+            ValidateScope(state, state.document.roots, checked.roots, false, false, 1_i64);
+            if (Array.Len<Diagnostic>(state.diagnostics) > 0_i64)
+            {
+                return Result::Error(state.diagnostics);
+            }
+            return Result::Ok(ValidatedDocument
+            {
+                profile: checked.name,
+
+                document: state.document,
+
+                schema: checked,
+
+                rules: state.rules,
+
+                fields: state.fields,
+
+                references: Array.Empty<ReferenceBinding>(),
+            });
+        },
+    };
+}
+
+/// Composition and resolution retain the existing checked Schema authority.
+type Composition
+{
+    Loader loader,
+
+    i64[] marks,
+
+    i64 remaining,
+}
+
+bool CompositionStep(mut Composition state, Syntax.Span span, string rule)
+{
+    if (state.remaining <= 0_i64)
+    {
+        if (state.remaining == 0_i64)
+        {
+            LoadError(state.loader, "SchemaWorkLimit", span, "", rule);
+            state.remaining = -1_i64;
+        }
+        return false;
+    }
+    state.remaining = state.remaining - 1_i64;
+    return true;
+}
+
+unit CompositionConflict(mut Composition state, Syntax.Span current, Syntax.Span previous, string field, string rule)
+{
+    mut Diagnostic error = Issue("CompositionConflict", DiagnosticStage::Profile, current, field, rule, state.loader.profile.name);
+    error.hasRelated = true;
+    error.relatedSpan = previous;
+    Array.Append<Diagnostic>(state.loader.diagnostics, error);
+}
+
+i64 TypeTag(TypeKind kind)
+{
+    return match kind
+    {
+        TypeKind::Quoted => 0_i64,
+
+        TypeKind::Ident => 1_i64,
+
+        TypeKind::U32 => 2_i64,
+
+        TypeKind::I64 => 3_i64,
+
+        TypeKind::F64 => 4_i64,
+
+        TypeKind::Bool => 5_i64,
+
+        TypeKind::Path => 6_i64,
+
+        TypeKind::Loose => 7_i64,
+
+        TypeKind::FlatList => 8_i64,
+
+        TypeKind::List => 9_i64,
+
+        TypeKind::Map => 10_i64,
+
+        TypeKind::Reference => 11_i64,
+
+        TypeKind::Inline => 12_i64,
+
+        TypeKind::Enum => 13_i64,
+    };
+}
+
+i64 NodeTag(Syntax.NodeKind kind)
+{
+    return match kind
+    {
+        Syntax.NodeKind::Block => 0_i64,
+
+        Syntax.NodeKind::Assignment => 1_i64,
+
+        Syntax.NodeKind::Identifier => 2_i64,
+
+        Syntax.NodeKind::String => 3_i64,
+
+        Syntax.NodeKind::Number => 4_i64,
+
+        Syntax.NodeKind::Boolean => 5_i64,
+
+        Syntax.NodeKind::Reference => 6_i64,
+
+        Syntax.NodeKind::List => 7_i64,
+
+        Syntax.NodeKind::Map => 8_i64,
+
+        Syntax.NodeKind::Attribute => 9_i64,
+    };
+}
+
+bool SameStrings(string[] left, string[] right)
+{
+    if (Array.Len<string>(left) != Array.Len<string>(right))
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(left))
+    {
+        if (left[i] != right[i])
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+bool SameType(mut Composition state, i64 left, i64 right, i64 depth)
+{
+    if (depth > state.loader.limits.maxDepth || left < 0_i64 || right < 0_i64)
+    {
+        return false;
+    }
+
+    TypeExpression first = state.loader.profile.types[left];
+    TypeExpression second = state.loader.profile.types[right];
+    if (!CompositionStep(state, first.span, ""))
+    {
+        return false;
+    }
+    if (TypeTag(first.kind) != TypeTag(second.kind) || first.targetRule != second.targetRule || !CompositionSameStrings(state, first.values, second.values, first.span) || Array.Len<i64>(first.children) != Array.Len<i64>(second.children))
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(first.children))
+    {
+        if (!SameType(state, first.children[i], second.children[i], depth + 1_i64))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+bool SameValue(mut Composition state, i64 left, i64 right, i64 depth)
+{
+    if (depth > state.loader.limits.maxDepth)
+    {
+        return false;
+    }
+
+    Syntax.Node first = state.loader.document.nodes[left];
+    Syntax.Node second = state.loader.document.nodes[right];
+    if (!CompositionStep(state, first.span, ""))
+    {
+        return false;
+    }
+    if (NodeTag(first.kind) != NodeTag(second.kind) || first.name != second.name || first.text != second.text || first.label != second.label || first.hasLabel != second.hasLabel || first.schemaless != second.schemaless || Array.Len<i64>(first.children) != Array.Len<i64>(second.children) || Array.Len<i64>(first.attributes) != Array.Len<i64>(second.attributes))
+    {
+        return false;
+    }
+    if (Numeric(first) && first.raw != second.raw)
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(first.children))
+    {
+        if (!SameValue(state, first.children[i], second.children[i], depth + 1_i64))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<i64>(first.attributes))
+    {
+        if (!SameValue(state, first.attributes[i], second.attributes[i], depth + 1_i64))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+Condition[] MergeConditions(mut Composition state, Condition[] base, Condition[] overlay, string rule)
+{
+    mut Condition[] result = Array.Empty<Condition>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Condition>(base))
+    {
+        if (!CompositionStep(state, base[i].span, rule))
+        {
+            return result;
+        }
+        Array.Append<Condition>(result, base[i]);
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<Condition>(overlay))
+    {
+        if (!CompositionStep(state, overlay[i].span, rule))
+        {
+            return result;
+        }
+
+        mut bool found = false;
+        mut i64 j = 0_i64;
+        while (j < Array.Len<Condition>(result))
+        {
+            if (!CompositionStep(state, overlay[i].span, rule))
+            {
+                return result;
+            }
+            if (result[j].name == overlay[i].name && NodeTag(result[j].value.kind) == NodeTag(overlay[i].value.kind) && result[j].value.text == overlay[i].value.text && result[j].value.raw == overlay[i].value.raw)
+            {
+                found = true;
+            }
+            j = j + 1_i64;
+        }
+        if (!found)
+        {
+            Array.Append<Condition>(result, overlay[i]);
+        }
+        i = i + 1_i64;
+    }
+    return result;
+}
+
+Field MergeField(mut Composition state, Field base, Field overlay, string rule, bool refinement)
+{
+    mut bool compatibleType = SameType(state, base.typeIndex, overlay.typeIndex, 1_i64);
+    if (refinement && base.declaredTypeText == "enum_or_quoted" && overlay.declaredTypeText == base.declaredTypeText)
+    {
+        compatibleType = true;
+        mut i64 valueIndex = 0_i64;
+        while (valueIndex < Array.Len<string>(overlay.values))
+        {
+            if (!CompositionStep(state, overlay.span, rule))
+            {
+                return base;
+            }
+            if (!CompositionContains(state, base.values, overlay.values[valueIndex], overlay.span, rule))
+            {
+                compatibleType = false;
+            }
+            valueIndex = valueIndex + 1_i64;
+        }
+    }
+    if (!compatibleType)
+    {
+        CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+        return base;
+    }
+
+    Syntax.Node declaration = state.loader.document.nodes[overlay.syntaxNode];
+    bool explicitRequired = Property(state.loader.document, declaration, "required") >= 0_i64;
+    if ((explicitRequired && base.required && !overlay.required) || (overlay.hasMinimum && base.hasMinimum && overlay.minimum < base.minimum) || (overlay.hasMaximum && base.hasMaximum && overlay.maximum > base.maximum))
+    {
+        CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+        return base;
+    }
+    if (!refinement && (base.required != overlay.required || base.hasMinimum != overlay.hasMinimum || base.minimum != overlay.minimum || base.hasMaximum != overlay.hasMaximum || base.maximum != overlay.maximum))
+    {
+        CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+        return base;
+    }
+    if (base.defaultNode >= 0_i64 && overlay.defaultNode >= 0_i64 && !SameValue(state, base.defaultNode, overlay.defaultNode, 1_i64))
+    {
+        CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+        return base;
+    }
+
+    mut Field result = Field
+    {
+        name: overlay.name,
+
+        declaredTypeText: overlay.declaredTypeText,
+
+        pattern: overlay.pattern,
+
+        typeIndex: overlay.typeIndex,
+
+        allowedAttributes: overlay.allowedAttributes,
+
+        required: overlay.required,
+
+        span: overlay.span,
+
+        syntaxNode: overlay.syntaxNode,
+
+        values: overlay.values,
+
+        defaultNode: overlay.defaultNode,
+
+        hasMinimum: overlay.hasMinimum,
+
+        minimum: overlay.minimum,
+
+        hasMaximum: overlay.hasMaximum,
+
+        maximum: overlay.maximum,
+
+        requiredIf: overlay.requiredIf,
+
+        forbidIf: overlay.forbidIf,
+    };
+    if (!explicitRequired)
+    {
+        result.required = base.required;
+    }
+    if (!overlay.hasMinimum)
+    {
+        result.hasMinimum = base.hasMinimum;
+        result.minimum = base.minimum;
+    }
+    if (!overlay.hasMaximum)
+    {
+        result.hasMaximum = base.hasMaximum;
+        result.maximum = base.maximum;
+    }
+    if (overlay.pattern == "")
+    {
+        result.pattern = base.pattern;
+    }
+    else if (base.pattern != "" && overlay.pattern != base.pattern)
+    {
+        CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+    }
+    if (overlay.defaultNode < 0_i64)
+    {
+        result.defaultNode = base.defaultNode;
+    }
+    if (Property(state.loader.document, declaration, "allowed_attrs") < 0_i64)
+    {
+        result.allowedAttributes = base.allowedAttributes;
+    }
+    else
+    {
+        mut i64 i = 0_i64;
+        while (i < Array.Len<string>(overlay.allowedAttributes))
+        {
+            if (!CompositionContains(state, base.allowedAttributes, overlay.allowedAttributes[i], overlay.span, rule))
+            {
+                CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+            }
+            i = i + 1_i64;
+        }
+    }
+    result.requiredIf = MergeConditions(state, base.requiredIf, overlay.requiredIf, rule);
+    result.forbidIf = MergeConditions(state, base.forbidIf, overlay.forbidIf, rule);
+    if (result.defaultNode >= 0_i64 && !NumericBounds(result, state.loader.document.nodes[result.defaultNode]))
+    {
+        CompositionConflict(state, overlay.span, base.span, overlay.name, rule);
+    }
+    return result;
+}
+
+unit MergeRulePayload(mut Composition state, mut Rule result, Rule base, bool refinement)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Field>(base.fields))
+    {
+        Field field = base.fields[i];
+        if (!CompositionStep(state, field.span, result.name))
+        {
+            return;
+        }
+
+        i64 previous = CompositionFieldIndex(state, result, field.name, field.span);
+        if (previous < 0_i64)
+        {
+            Array.Append<Field>(result.fields, field);
+        }
+        else
+        {
+            Field merged = MergeField(state, result.fields[previous], field, result.name, refinement);
+            Array.Set<Field>(result.fields, previous, merged);
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<i64>(base.nested))
+    {
+        if (!CompositionStep(state, base.span, result.name))
+        {
+            return;
+        }
+
+        i64 candidateIndex = base.nested[i];
+        Rule candidate = state.loader.profile.rules[candidateIndex];
+        mut bool present = false;
+        mut i64 nestedIndex = 0_i64;
+        while (nestedIndex < Array.Len<i64>(result.nested))
+        {
+            if (!CompositionStep(state, candidate.span, result.name))
+            {
+                return;
+            }
+
+            i64 priorIndex = result.nested[nestedIndex];
+            Rule prior = state.loader.profile.rules[priorIndex];
+            if (priorIndex == candidateIndex)
+            {
+                present = true;
+            }
+            else if (prior.name == candidate.name)
+            {
+                present = true;
+                if (!SameValue(state, candidate.syntaxNode, prior.syntaxNode, 1_i64))
+                {
+                    CompositionConflict(state, candidate.span, prior.span, candidate.name, result.name);
+                }
+            }
+            nestedIndex = nestedIndex + 1_i64;
+        }
+        if (!present)
+        {
+            Array.Append<i64>(result.nested, candidateIndex);
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<Variant>(base.variants))
+    {
+        if (!CompositionStep(state, base.variants[i].span, result.name))
+        {
+            return;
+        }
+
+        Variant variant = base.variants[i];
+        mut i64 previous = -1_i64;
+        mut i64 j = 0_i64;
+        while (j < Array.Len<Variant>(result.variants))
+        {
+            if (!CompositionStep(state, variant.span, result.name))
+            {
+                return;
+            }
+            if (result.variants[j].name == variant.name)
+            {
+                previous = j;
+            }
+            j = j + 1_i64;
+        }
+        if (previous < 0_i64)
+        {
+            Array.Append<Variant>(result.variants, variant);
+        }
+        else if (!CompositionSameStrings(state, result.variants[previous].require, variant.require, variant.span) || !CompositionSameStrings(state, result.variants[previous].forbid, variant.forbid, variant.span))
+        {
+            CompositionConflict(state, variant.span, result.variants[previous].span, "", result.name);
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<string>(base.allowedAttributes))
+    {
+        if (!CompositionStep(state, base.span, result.name))
+        {
+            return;
+        }
+        if (!CompositionContains(state, result.allowedAttributes, base.allowedAttributes[i], base.span, result.name))
+        {
+            Array.Append<string>(result.allowedAttributes, base.allowedAttributes[i]);
+        }
+        i = i + 1_i64;
+    }
+}
+
+bool ContainsIndex(i64[] values, i64 index)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(values))
+    {
+        if (values[i] == index)
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+unit ComposeRule(mut Composition state, i64 index, i64 depth, string path)
+{
+    Rule original = state.loader.profile.rules[index];
+    if (!CompositionStep(state, original.span, original.name))
+    {
+        return;
+    }
+    if (depth > state.loader.limits.maxDepth)
+    {
+        LoadError(state.loader, "DepthLimit", original.span, "", original.name);
+        return;
+    }
+    if (state.marks[index] == 2_i64)
+    {
+        return;
+    }
+    if (state.marks[index] == 1_i64)
+    {
+        mut Diagnostic error = Issue("CompositionCycle", DiagnosticStage::Profile, original.span, "", original.name, state.loader.profile.name);
+        error.message = path + " -> " + original.name;
+        Array.Append<Diagnostic>(state.loader.diagnostics, error);
+        return;
+    }
+    Array.Set<i64>(state.marks, index, 1_i64);
+    mut string[] dependencies = Array.Empty<string>();
+    if (original.extends != "")
+    {
+        Array.Append<string>(dependencies, original.extends);
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(original.mixes))
+    {
+        if (!CompositionContains(state, dependencies, original.mixes[i], original.span, original.name))
+        {
+            Array.Append<string>(dependencies, original.mixes[i]);
+        }
+        i = i + 1_i64;
+    }
+
+    mut Rule result = Rule
+    {
+        name: original.name,
+
+        scopeKind: original.scopeKind,
+
+        matcher: original.matcher,
+
+        keyword: original.keyword,
+
+        keywords: original.keywords,
+
+        except: original.except,
+
+        label: original.label,
+
+        cardinality: original.cardinality,
+
+        extras: original.extras,
+
+        nestedExtras: original.nestedExtras,
+
+        schemaless: original.schemaless,
+
+        span: original.span,
+
+        syntaxNode: original.syntaxNode,
+
+        extends: original.extends,
+
+        mixes: original.mixes,
+
+        fields: Array.Empty<Field>(),
+
+        nested: Array.Empty<i64>(),
+
+        variants: Array.Empty<Variant>(),
+
+        allowedAttributes: Array.Empty<string>(),
+    };
+    mut bool policy = false;
+    mut string inheritedLabel = "";
+    mut string inheritedCardinality = "";
+    mut Syntax.Span inheritedSpan = original.span;
+    i = 0_i64;
+    while (i < Array.Len<string>(dependencies))
+    {
+        if (!CompositionStep(state, original.span, original.name))
+        {
+            return;
+        }
+
+        i64 baseIndex = CompositionNamedRule(state, dependencies[i], original.span);
+        if (baseIndex < 0_i64)
+        {
+            LoadError(state.loader, "UnknownBaseRule", original.span, dependencies[i], original.name);
+        }
+        else
+        {
+            ComposeRule(state, baseIndex, depth + 1_i64, path + " -> " + original.name);
+            Rule base = state.loader.profile.rules[baseIndex];
+            if (policy && (inheritedLabel != base.label || inheritedCardinality != base.cardinality))
+            {
+                CompositionConflict(state, base.span, inheritedSpan, "", original.name);
+            }
+            else
+            {
+                inheritedLabel = base.label;
+                inheritedCardinality = base.cardinality;
+                inheritedSpan = base.span;
+                policy = true;
+            }
+            MergeRulePayload(state, result, base, false);
+            result.extras = result.extras || base.extras;
+            result.nestedExtras = result.nestedExtras || base.nestedExtras;
+            result.schemaless = result.schemaless || base.schemaless;
+        }
+        i = i + 1_i64;
+    }
+    if (policy)
+    {
+        Syntax.Node declaration = state.loader.document.nodes[original.syntaxNode];
+        if (Property(state.loader.document, declaration, "label") >= 0_i64 && original.label != inheritedLabel)
+        {
+            CompositionConflict(state, original.span, inheritedSpan, "label", original.name);
+        }
+        else
+        {
+            result.label = inheritedLabel;
+        }
+        if (Property(state.loader.document, declaration, "cardinality") >= 0_i64 && original.cardinality != inheritedCardinality)
+        {
+            CompositionConflict(state, original.span, inheritedSpan, "cardinality", original.name);
+        }
+        else
+        {
+            result.cardinality = inheritedCardinality;
+        }
+    }
+    MergeRulePayload(state, result, original, true);
+    Array.Set<Rule>(state.loader.profile.rules, index, result);
+    Array.Set<i64>(state.marks, index, 2_i64);
+}
+
+Result<Profile, Diagnostic[]> ComposeOwned(Profile profile, Limits.BsolLimits limits)
+{
+    mut Composition state = Composition
+    {
+        loader: Loader
+        {
+            document: profile.document,
+
+            profile: profile,
+
+            diagnostics: Array.Empty<Diagnostic>(),
+
+            limits: limits,
+        },
+
+        marks: Array.Empty<i64>(),
+
+        remaining: 100000_i64,
+    };
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Rule>(profile.rules))
+    {
+        Array.Append<i64>(state.marks, 0_i64);
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<Rule>(profile.rules))
+    {
+        ComposeRule(state, i, 1_i64, profile.name);
+        i = i + 1_i64;
+    }
+    CheckProfileTypes(state.loader);
+    if (Array.Len<Diagnostic>(state.loader.diagnostics) > 0_i64)
+    {
+        return Result::Error(state.loader.diagnostics);
+    }
+    return Result::Ok(state.loader.profile);
+}
+
+string ImportedOrdinal(i64 value) {
+    if (value == 0_i64) { return "0"; }
+    mut string text = "";
+    mut i64 remaining = value;
+    while (remaining > 0_i64) {
+        text = String.CodeUnitChar(u8(48_i64 + remaining % 10_i64)) + text;
+        remaining = remaining / 10_i64;
+    }
+    return text;
+}
+
+Result<unit, Diagnostic[]> CheckImportedClosurePath(ImportGraph.Graph graph, i64 sourceIndex, i64 depth, i64[] active, mut ImportedRuleSearch work, Limits.BsolLimits limits) {
+    if (sourceIndex < 0_i64 || sourceIndex >= Array.Len<ImportGraph.Source>(graph.sources) || sourceIndex >= Array.Len<i64>(active) || depth > limits.maxImportDepth) {
+        return Result::Error([Issue("ImportDepthLimit", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", "")]);
+    }
+    if (active[sourceIndex] != 0_i64) { return Result::Error([Issue("ImportCycle", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", graph.sources[sourceIndex].profile)]); }
+    Array.Set<i64>(active, sourceIndex, 1_i64);
+    mut i64 index = 0_i64;
+    while (index < Array.Len<ImportGraph.Binding>(graph.bindings)) {
+        if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, graph.bindings[index].span, "", "", "")]); }
+        work.remaining = work.remaining - 1_i64;
+        ImportGraph.Binding binding = graph.bindings[index];
+        if (binding.owner < 0_i64 || binding.owner >= Array.Len<ImportGraph.Source>(graph.sources) || binding.target < 0_i64 || binding.target >= Array.Len<ImportGraph.Source>(graph.sources)) {
+            return Result::Error([Issue("InvalidImportedClosure", DiagnosticStage::Import, binding.span, "", "", "")]);
+        }
+        if (binding.owner == sourceIndex) {
+            match CheckImportedClosurePath(graph, binding.target, depth + 1_i64, active, work, limits) {
+                Result::Error(errors) => { return Result::Error(errors); },
+                Result::Ok(_) => {},
+            };
+        }
+        index = index + 1_i64;
+    }
+    Array.Set<i64>(active, sourceIndex, 0_i64);
+    return Result::Ok(());
+}
+
+// The closure comes only from resolver traversal or private reownership. Public
+// mutable profile tables never provide the source authority for this operation.
+Result<Profile, Diagnostic[]> ComposeResolved(ImportGraph.Graph graph, Limits.BsolLimits limits) {
+    i64 sourceCount = Array.Len<ImportGraph.Source>(graph.sources);
+    if (!Limits.Valid(limits) || sourceCount < 1_i64 || graph.root < 0_i64 || graph.root >= sourceCount || sourceCount - 1_i64 > limits.maxImports || Array.Len<ImportGraph.Binding>(graph.bindings) > limits.maxImports) {
+        return Result::Error([Issue("InvalidImportedClosure", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", "")]);
+    }
+    mut Profile[] profiles = Array.Empty<Profile>();
+    mut i64[] nodeOffsets = Array.Empty<i64>();
+    mut i64[] typeOffsets = Array.Empty<i64>();
+    mut i64[] ruleOffsets = Array.Empty<i64>();
+    mut string[] names = Array.Empty<string>();
+    mut i64 nodes = 0_i64;
+    mut i64 types = 0_i64;
+    mut i64 rules = 0_i64;
+    mut i64 nameBytes = 0_i64;
+    mut i64 sourceBytes = 0_i64;
+    mut i64[] active = Array.Empty<i64>();
+    mut i64 activeIndex = 0_i64;
+    while (activeIndex < sourceCount) { Array.Append<i64>(active, 0_i64); activeIndex = activeIndex + 1_i64; }
+    mut ImportedRuleSearch closureWork = ImportedRuleSearch { remaining: 100000_i64 };
+    match CheckImportedClosurePath(graph, graph.root, 0_i64, active, closureWork, limits) {
+        Result::Error(errors) => { return Result::Error(errors); },
+        Result::Ok(_) => {},
+    };
+    mut i64 sourceIndex = 0_i64;
+    while (sourceIndex < sourceCount) {
+        ImportGraph.Source entry = graph.sources[sourceIndex];
+        if (entry.active) { return Result::Error([Issue("InvalidImportedClosure", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", entry.profile)]); }
+        match Imports.VerifyMaterialized(entry.materialized, limits.maxResolvedSchemaBytes - sourceBytes) {
+            Result::Error(error) => {
+                mut Diagnostic diagnostic = Issue(error.code, DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", entry.profile);
+                diagnostic.message = error.message;
+                return Result::Error([diagnostic]);
+            },
+            Result::Ok(_) => {},
+        };
+        sourceBytes = sourceBytes + String.Len(entry.materialized.source);
+        if (Array.Len<Syntax.Node>(entry.document.nodes) > limits.maxNodes - nodes) {
+            return Result::Error([Issue("ResolvedNodeLimit", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", entry.profile)]);
+        }
+        Limits.BsolLimits remainingLimits = Limits.BsolLimits {
+            maxInputBytes: limits.maxInputBytes, maxOutputBytes: limits.maxOutputBytes,
+            maxDepth: limits.maxDepth, maxNodes: limits.maxNodes - nodes,
+            maxScalarBytes: limits.maxScalarBytes, maxImports: limits.maxImports,
+            maxImportDepth: limits.maxImportDepth, maxResolvedSchemaBytes: limits.maxResolvedSchemaBytes,
+        };
+        match ParseUncomposedMode(entry.materialized.source, remainingLimits, true) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(profile) => {
+                if (profile.name != entry.profile || profile.version != entry.version) { return Result::Error([Issue("ImportProfileMismatch", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", profile.name)]); }
+                i64 nodeCount = Array.Len<Syntax.Node>(profile.document.nodes);
+                i64 typeCount = Array.Len<TypeExpression>(profile.types);
+                i64 ruleCount = Array.Len<Rule>(profile.rules);
+                if (nodeCount > limits.maxNodes - nodes || typeCount > limits.maxNodes - types || ruleCount > limits.maxNodes - rules) { return Result::Error([Issue("ResolvedNodeLimit", DiagnosticStage::Import, Syntax.Span { start: -1_i64, end: -1_i64 }, "", "", profile.name)]); }
+                Array.Append<i64>(nodeOffsets, nodes);
+                Array.Append<i64>(typeOffsets, types);
+                Array.Append<i64>(ruleOffsets, rules);
+                nodes = nodes + nodeCount;
+                types = types + typeCount;
+                rules = rules + ruleCount;
+                mut i64 ruleIndex = 0_i64;
+                while (ruleIndex < ruleCount) {
+                    // Source/rule ordinals keep imported keys distinct while
+                    // retaining their readable profile and declaration names.
+                    mut string name = profile.rules[ruleIndex].name;
+                    if (sourceIndex != graph.root) {
+                        string ordinal = ImportedOrdinal(sourceIndex) + ":" + ImportedOrdinal(ruleIndex);
+                        i64 available = limits.maxResolvedSchemaBytes - nameBytes;
+                        if (String.Len(name) > available || String.Len(profile.name) > available - String.Len(name) || String.Len(ordinal) + 2_i64 > available - String.Len(name) - String.Len(profile.name)) {
+                            return Result::Error([Issue("ResolvedSchemaLimit", DiagnosticStage::Import, profile.rules[ruleIndex].span, "", "", profile.name)]);
+                        }
+                        name = "#" + ordinal + ":" + profile.name + ":" + name;
+                    }
+                    if (String.Len(name) > limits.maxResolvedSchemaBytes - nameBytes) { return Result::Error([Issue("ResolvedSchemaLimit", DiagnosticStage::Import, profile.rules[ruleIndex].span, "", "", profile.name)]); }
+                    nameBytes = nameBytes + String.Len(name);
+                    Array.Append<string>(names, name);
+                    ruleIndex = ruleIndex + 1_i64;
+                }
+                Array.Append<Profile>(profiles, profile);
+            },
+        };
+        sourceIndex = sourceIndex + 1_i64;
+    }
+    Profile root = profiles[graph.root];
+    // Quoted local rule identifiers can contain the punctuation used in private
+    // imported keys. Choose a disjoint spelling before resolving any references;
+    // adding a prefix preserves the unique numeric source/rule pair.
+    mut ImportedRuleSearch keyWork = ImportedRuleSearch { remaining: 100000_i64 };
+    sourceIndex = 0_i64;
+    while (sourceIndex < sourceCount) {
+        if (sourceIndex != graph.root) {
+            mut i64 ruleIndex = 0_i64;
+            while (ruleIndex < Array.Len<Rule>(profiles[sourceIndex].rules)) {
+                i64 nameIndex = ruleOffsets[sourceIndex] + ruleIndex;
+                mut string candidate = names[nameIndex];
+                mut bool collision = true;
+                while (collision) {
+                    collision = false;
+                    mut i64 localIndex = 0_i64;
+                    while (localIndex < Array.Len<Rule>(root.rules)) {
+                        if (keyWork.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, profiles[sourceIndex].rules[ruleIndex].span, "", "", root.name)]); }
+                        keyWork.remaining = keyWork.remaining - 1_i64;
+                        if (root.rules[localIndex].name == candidate) { collision = true; }
+                        localIndex = localIndex + 1_i64;
+                    }
+                    if (collision) {
+                        if (nameBytes >= limits.maxResolvedSchemaBytes) { return Result::Error([Issue("ResolvedSchemaLimit", DiagnosticStage::Import, profiles[sourceIndex].rules[ruleIndex].span, "", "", root.name)]); }
+                        candidate = "#" + candidate;
+                        nameBytes = nameBytes + 1_i64;
+                    }
+                }
+                Array.Set<string>(names, nameIndex, candidate);
+                ruleIndex = ruleIndex + 1_i64;
+            }
+        }
+        sourceIndex = sourceIndex + 1_i64;
+    }
+    mut Profile merged = Profile {
+        name: root.name, version: root.version, source: root.source,
+        document: Syntax.Document { source: root.source, nodes: Array.Empty<Syntax.Node>(), roots: Array.Empty<i64>(), trivia: root.document.trivia },
+        rules: Array.Empty<Rule>(), roots: Array.Empty<i64>(),
+        types: Array.Empty<TypeExpression>(), migrationNodes: Array.Empty<i64>(), resolvedClosure: graph,
+        importedOrigins: Array.Empty<ImportedRuleOrigin>(),
+    };
+    mut ImportedRuleSearch work = ImportedRuleSearch { remaining: 100000_i64 };
+    sourceIndex = 0_i64;
+    while (sourceIndex < sourceCount) {
+        Profile owner = profiles[sourceIndex];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<Syntax.Node>(owner.document.nodes)) {
+            if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, owner.document.nodes[index].span, "", "", owner.name)]); }
+            work.remaining = work.remaining - 1_i64;
+            match RebaseImportedNode(owner.document.nodes[index], Array.Len<Syntax.Node>(owner.document.nodes), nodeOffsets[sourceIndex], owner.name, work) {
+                Result::Error(errors) => { return Result::Error(errors); },
+                Result::Ok(node) => { Array.Append<Syntax.Node>(merged.document.nodes, node); },
+            };
+            index = index + 1_i64;
+        }
+        index = 0_i64;
+        while (index < Array.Len<TypeExpression>(owner.types)) {
+            if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, owner.types[index].span, "", "", owner.name)]); }
+            work.remaining = work.remaining - 1_i64;
+            match RebaseImportedType(graph, profiles, sourceIndex, owner.types[index], typeOffsets[sourceIndex], ruleOffsets, names, work, limits) {
+                Result::Error(errors) => { return Result::Error(errors); },
+                Result::Ok(expression) => { Array.Append<TypeExpression>(merged.types, expression); },
+            };
+            index = index + 1_i64;
+        }
+        index = 0_i64;
+        while (index < Array.Len<Rule>(owner.rules)) {
+            if (work.remaining <= 0_i64) { return Result::Error([Issue("CompositionWorkLimit", DiagnosticStage::Import, owner.rules[index].span, "", "", owner.name)]); }
+            work.remaining = work.remaining - 1_i64;
+            match RebaseImportedRule(graph, profiles, sourceIndex, owner.rules[index], names[ruleOffsets[sourceIndex] + index], nodeOffsets[sourceIndex], typeOffsets[sourceIndex], ruleOffsets, names, work, limits) {
+                Result::Error(errors) => { return Result::Error(errors); },
+                Result::Ok(rule) => {
+                    Array.Append<Rule>(merged.rules, rule);
+                    Array.Append<ImportedRuleOrigin>(merged.importedOrigins, ImportedRuleOrigin { source: sourceIndex, declaredName: owner.rules[index].name });
+                },
+            };
+            index = index + 1_i64;
+        }
+        sourceIndex = sourceIndex + 1_i64;
+    }
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(root.document.roots)) { Array.Append<i64>(merged.document.roots, nodeOffsets[graph.root] + root.document.roots[index]); index = index + 1_i64; }
+    index = 0_i64;
+    while (index < Array.Len<i64>(root.roots)) { Array.Append<i64>(merged.roots, ruleOffsets[graph.root] + root.roots[index]); index = index + 1_i64; }
+    index = 0_i64;
+    while (index < Array.Len<i64>(root.migrationNodes)) { Array.Append<i64>(merged.migrationNodes, nodeOffsets[graph.root] + root.migrationNodes[index]); index = index + 1_i64; }
+    return ComposeOwned(merged, limits);
+}
+
+pub Result<Profile, Diagnostic[]> LoadProfile<R>(Imports.MaterializedSource root, R resolver, Limits.BsolLimits limits) where R: Imports.Resolver {
+    match ImportGraph.Resolve<R>(root, resolver, limits) {
+        Result::Error(error) => {
+            mut Diagnostic diagnostic = Issue(error.failure.code, DiagnosticStage::Import, error.span, "", "", error.profile);
+            diagnostic.message = error.failure.message;
+            return Result::Error([diagnostic]);
+        },
+        Result::Ok(graph) => { return ComposeResolved(graph, limits); },
+    };
+}
+
+/// Reconstruct from privately retained, hash-verified source ownership. Public
+/// rule/type/default table mutations are never the input to revalidation.
+pub Result<Profile, Diagnostic[]> ReownProfile(Profile profile, Limits.BsolLimits limits) {
+    if (Array.Len<ImportGraph.Source>(profile.resolvedClosure.sources) == 0_i64) {
+        return ParseProfile(profile.source, limits);
+    }
+    return ComposeResolved(profile.resolvedClosure, limits);
+}
+
+pub Result<Profile, Diagnostic[]> ParseProfile(string source, Limits.BsolLimits limits)
+{
+    match ParseUncomposed(source, limits)
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(profile) => {
+            return ComposeOwned(profile, limits);
+        },
+    };
+}
+
+pub Result<Profile, Diagnostic[]> Compose(Profile profile, Limits.BsolLimits limits)
+{
+    return ReownProfile(profile, limits);
+}
+
+i64 ImportedQualifierRule(Profile profile, i64 sourceIndex, string qualifier, i64 depth, mut ImportedRuleSearch work, Limits.BsolLimits limits) {
+    if (sourceIndex < 0_i64 || sourceIndex >= Array.Len<ImportGraph.Source>(profile.resolvedClosure.sources) || depth > limits.maxImportDepth) { return -2_i64; }
+    mut i64 selected = -1_i64;
+    mut i64 index = 0_i64;
+    while (index < Array.Len<ImportedRuleOrigin>(profile.importedOrigins)) {
+        if (work.remaining <= 0_i64) { return -2_i64; }
+        work.remaining = work.remaining - 1_i64;
+        ImportedRuleOrigin origin = profile.importedOrigins[index];
+        if (origin.source == sourceIndex && origin.declaredName == qualifier) {
+            if (selected >= 0_i64 && selected != index) { return -2_i64; }
+            selected = index;
+        }
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<ImportGraph.Binding>(profile.resolvedClosure.bindings)) {
+        if (work.remaining <= 0_i64) { return -2_i64; }
+        work.remaining = work.remaining - 1_i64;
+        ImportGraph.Binding binding = profile.resolvedClosure.bindings[index];
+        if (binding.owner == sourceIndex) {
+            string prefix = binding.name + ".";
+            i64 prefixBytes = String.Len(prefix);
+            if (String.Len(qualifier) > prefixBytes && String.SubSlice(qualifier, 0_i64, prefixBytes) == prefix) {
+                string tail = String.SubSlice(qualifier, prefixBytes, String.Len(qualifier) - prefixBytes);
+                i64 candidate = ImportedQualifierRule(profile, binding.target, tail, depth + 1_i64, work, limits);
+                if (candidate == -2_i64 || (candidate >= 0_i64 && selected >= 0_i64 && candidate != selected)) { return -2_i64; }
+                if (candidate >= 0_i64) { selected = candidate; }
+            }
+        }
+        index = index + 1_i64;
+    }
+    return selected;
+}
+
+bool ReferenceQualifier(Profile profile, string target, string qualifier, Limits.BsolLimits limits)
+{
+    if (qualifier == "" || qualifier == target)
+    {
+        return true;
+    }
+
+    i64 index = NamedRule(profile, target);
+    if (index < 0_i64)
+    {
+        return false;
+    }
+    if (Matches(profile.rules[index], qualifier)) { return true; }
+    if (Array.Len<ImportedRuleOrigin>(profile.importedOrigins) != Array.Len<Rule>(profile.rules)) { return false; }
+    mut ImportedRuleSearch work = ImportedRuleSearch { remaining: 100000_i64 };
+    return ImportedQualifierRule(profile, profile.resolvedClosure.root, qualifier, 0_i64, work, limits) == index;
+}
+
+type ReferenceState
+{
+    ValidatedDocument checked,
+
+    Diagnostic[] diagnostics,
+
+    i64 remaining,
+
+    Limits.BsolLimits limits,
+}
+
+bool ReferenceStep(mut ReferenceState state, Syntax.Span span)
+{
+    if (state.remaining <= 0_i64)
+    {
+        if (Array.Len<Diagnostic>(state.diagnostics) == 0_i64)
+        {
+            Array.Append<Diagnostic>(state.diagnostics, Issue("WorkLimit", DiagnosticStage::Reference, span, "", "", state.checked.profile));
+        }
+        return false;
+    }
+    state.remaining = state.remaining - 1_i64;
+    return true;
+}
+
+unit ReferenceError(mut ReferenceState state, string code, Syntax.Span span, Syntax.Span related, bool hasRelated)
+{
+    mut Diagnostic error = Issue(code, DiagnosticStage::Reference, span, "", "", state.checked.profile);
+    error.hasRelated = hasRelated;
+    error.relatedSpan = related;
+    Array.Append<Diagnostic>(state.diagnostics, error);
+}
+
+bool SameOrigin(ReferenceOrigin left, ReferenceOrigin right)
+{
+    match left
+    {
+        ReferenceOrigin::DocumentNode(a) => {
+            match right
+            {
+                ReferenceOrigin::DocumentNode(b) => {
+                    return a == b;
+                },
+
+                _ => {
+                    return false;
+                },
+            };
+        },
+
+        ReferenceOrigin::DefaultNode(a, b) => {
+            match right
+            {
+                ReferenceOrigin::DefaultNode(c, d) => {
+                    return a == c && b == d;
+                },
+
+                _ => {
+                    return false;
+                },
+            };
+        },
+    };
+}
+
+unit BindReference(mut ReferenceState state, Syntax.Document source, i64 index, ReferenceOrigin origin, string expected)
+{
+    Syntax.Node reference = source.nodes[index];
+    mut i64 i = 0_i64;
+    while (i < Array.Len<ReferenceBinding>(state.checked.references))
+    {
+        if (SameOrigin(state.checked.references[i].origin, origin))
+        {
+            return;
+        }
+        i = i + 1_i64;
+    }
+
+    mut i64 target = -1_i64;
+    mut i64 targetRule = -1_i64;
+    mut bool ambiguous = false;
+    i = 0_i64;
+    while (i < Array.Len<RuleBinding>(state.checked.rules))
+    {
+        RuleBinding binding = state.checked.rules[i];
+        Syntax.Node candidate = state.checked.document.nodes[binding.node];
+        if (!ReferenceStep(state, reference.span))
+        {
+            return;
+        }
+        mut bool qualified = reference.name == "" || reference.name == candidate.name || reference.name == state.checked.schema.rules[binding.rule].name;
+        if (!qualified && candidate.hasLabel && candidate.label == reference.text && Array.Len<ImportedRuleOrigin>(state.checked.schema.importedOrigins) == Array.Len<Rule>(state.checked.schema.rules)) {
+            mut ImportedRuleSearch work = ImportedRuleSearch { remaining: state.remaining };
+            i64 aliasRule = ImportedQualifierRule(state.checked.schema, state.checked.schema.resolvedClosure.root, reference.name, 0_i64, work, state.limits);
+            state.remaining = work.remaining;
+            if (aliasRule == -2_i64) {
+                if (state.remaining <= 0_i64) { ReferenceStep(state, reference.span); }
+                else { ReferenceError(state, "AmbiguousReference", reference.span, reference.span, false); }
+                return;
+            }
+            qualified = aliasRule == binding.rule;
+        }
+        if (candidate.hasLabel && candidate.label == reference.text && qualified)
+        {
+            if (target >= 0_i64 && target != binding.node)
+            {
+                ambiguous = true;
+            }
+            else
+            {
+                target = binding.node;
+                targetRule = binding.rule;
+            }
+        }
+        i = i + 1_i64;
+    }
+    if (target < 0_i64)
+    {
+        ReferenceError(state, "UnresolvedReference", reference.span, reference.span, false);
+        return;
+    }
+    if (ambiguous)
+    {
+        ReferenceError(state, "AmbiguousReference", reference.span, state.checked.document.nodes[target].span, true);
+        return;
+    }
+    if (expected != "" && NamedRule(state.checked.schema, expected) != targetRule)
+    {
+        ReferenceError(state, "TypeMismatch", reference.span, state.checked.schema.rules[targetRule].span, true);
+        return;
+    }
+    Array.Append<ReferenceBinding>(state.checked.references, ReferenceBinding
+    {
+        origin: origin,
+
+        target: target,
+
+        targetRule: targetRule,
+    });
+}
+
+unit WalkReferences(mut ReferenceState state, Syntax.Document source, i64 index, i64 typeIndex, i64 owner, i64 depth)
+{
+    if (index < 0_i64 || index >= Array.Len<Syntax.Node>(source.nodes) || depth > state.limits.maxDepth)
+    {
+        ReferenceError(state, "DepthLimit", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, false);
+        return;
+    }
+
+    Syntax.Node node = source.nodes[index];
+    if (!ReferenceStep(state, node.span))
+    {
+        return;
+    }
+
+    mut ReferenceOrigin origin = ReferenceOrigin::DocumentNode(index);
+    if (owner >= 0_i64)
+    {
+        origin = ReferenceOrigin::DefaultNode(owner, index);
+    }
+
+    mut string expected = "";
+    if (typeIndex >= 0_i64)
+    {
+        TypeExpression expression = state.checked.schema.types[typeIndex];
+        match expression.kind
+        {
+            TypeKind::Reference => {
+                expected = expression.targetRule;
+            },
+
+            _ => { },
+        };
+    }
+    if (match node.kind
+    {
+        Syntax.NodeKind::Reference => true,
+
+        _ => false,
+    })
+    {
+        BindReference(state, source, index, origin, expected);
+        return;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        i64 child = node.children[i];
+        mut i64 childType = -1_i64;
+        if (typeIndex >= 0_i64)
+        {
+            TypeExpression expression = state.checked.schema.types[typeIndex];
+            match expression.kind
+            {
+                TypeKind::List => {
+                    mut i64 j = 0_i64;
+                    while (j < Array.Len<i64>(expression.children))
+                    {
+                        i64 option = expression.children[j];
+                        if (ShapeAccepts(state.checked.schema, option, source, child, depth + 1_i64, state.limits))
+                        {
+                            childType = option;
+                            break;
+                        }
+                        j = j + 1_i64;
+                    }
+                },
+
+                TypeKind::Map => {
+                    if (Array.Len<i64>(expression.children) > 1_i64)
+                    {
+                        childType = expression.children[1_i64];
+                    }
+                },
+
+                _ => { },
+            };
+        }
+
+        Syntax.Node nested = source.nodes[child];
+        if (Assignment(nested))
+        {
+            if (Array.Len<i64>(nested.children) > 0_i64)
+            {
+                WalkReferences(state, source, nested.children[0_i64], childType, owner, depth + 1_i64);
+            }
+        }
+        else
+        {
+            WalkReferences(state, source, child, childType, owner, depth + 1_i64);
+        }
+        i = i + 1_i64;
+    }
+}
+
+pub Result<ValidatedDocument, Diagnostic[]> ResolveReferences(ValidatedDocument document, Limits.BsolLimits limits)
+{
+    match Validate(document.document, document.schema, limits)
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(checked) => {
+            mut ReferenceState state = ReferenceState
+            {
+                checked: checked,
+
+                diagnostics: Array.Empty<Diagnostic>(),
+
+                remaining: 100000_i64,
+
+                limits: limits,
+            };
+            mut i64 i = 0_i64;
+            while (i < Array.Len<RuleBinding>(checked.rules))
+            {
+                RuleBinding left = checked.rules[i];
+                Syntax.Node node = checked.document.nodes[left.node];
+                mut i64 j = 0_i64;
+                while (j < i)
+                {
+                    if (!ReferenceStep(state, node.span))
+                    {
+                        break;
+                    }
+
+                    RuleBinding right = checked.rules[j];
+                    Syntax.Node prior = checked.document.nodes[right.node];
+                    if (left.node != right.node && node.hasLabel && prior.hasLabel && node.name == prior.name && node.label == prior.label)
+                    {
+                        ReferenceError(state, "DuplicateReferenceTarget", node.span, prior.span, true);
+                    }
+                    j = j + 1_i64;
+                }
+                i = i + 1_i64;
+            }
+            i = 0_i64;
+            while (i < Array.Len<FieldBinding>(checked.fields))
+            {
+                FieldBinding binding = checked.fields[i];
+                Field field = checked.schema.rules[binding.rule].fields[binding.field];
+                if (binding.fromDefault)
+                {
+                    WalkReferences(state, binding.sourceDocument, field.defaultNode, field.typeIndex, i, 1_i64);
+                }
+                else
+                {
+                    Syntax.Node assignment = checked.document.nodes[binding.assignment];
+                    WalkReferences(state, checked.document, assignment.children[0_i64], field.typeIndex, -1_i64, 1_i64);
+                }
+                i = i + 1_i64;
+            }
+            i = 0_i64;
+            while (i < Array.Len<Syntax.Node>(checked.document.nodes))
+            {
+                Syntax.Node node = checked.document.nodes[i];
+                if (match node.kind
+                {
+                    Syntax.NodeKind::Reference => true,
+
+                    _ => false,
+                })
+                {
+                    BindReference(state, checked.document, i, ReferenceOrigin::DocumentNode(i), "");
+                }
+                i = i + 1_i64;
+            }
+            if (Array.Len<Diagnostic>(state.diagnostics) > 0_i64)
+            {
+                return Result::Error(state.diagnostics);
+            }
+            return Result::Ok(state.checked);
+        },
+    };
+}
+
+bool CompositionContains(mut Composition state, string[] values, string sought, Syntax.Span span, string rule)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(values))
+    {
+        if (!CompositionStep(state, span, rule))
+        {
+            return false;
+        }
+        if (values[i] == sought)
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+i64 CompositionFieldIndex(mut Composition state, Rule rule, string name, Syntax.Span span)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Field>(rule.fields))
+    {
+        if (!CompositionStep(state, span, rule.name))
+        {
+            return -1_i64;
+        }
+        if (rule.fields[i].name == name)
+        {
+            return i;
+        }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+bool CompositionSameStrings(mut Composition state, string[] left, string[] right, Syntax.Span span)
+{
+    if (Array.Len<string>(left) != Array.Len<string>(right))
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(left))
+    {
+        if (!CompositionStep(state, span, ""))
+        {
+            return false;
+        }
+        if (left[i] != right[i])
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+i64 CompositionNamedRule(mut Composition state, string name, Syntax.Span span)
+{
+    mut i64 i = 0_i64;
+    mut i64 found = -1_i64;
+    while (i < Array.Len<Rule>(state.loader.profile.rules))
+    {
+        if (!CompositionStep(state, span, name))
+        {
+            return -1_i64;
+        }
+
+        Rule rule = state.loader.profile.rules[i];
+        if (rule.name == name)
+        {
+            if (found >= 0_i64)
+            {
+                CompositionConflict(state, span, rule.span, name, name);
+                return -1_i64;
+            }
+            found = i;
+        }
+        i = i + 1_i64;
+    }
+    return found;
+}

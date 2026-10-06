@@ -1,0 +1,190 @@
+use Core.Bsol.Schema;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Limits;
+
+use Core.Environment;
+
+use Core.FS;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Testing.Assert;
+
+string ReadStructured(string name)
+{
+    match Environment.Get("BESKID_BSOL_CORPUS")
+    {
+        Result::Error(_) => {
+            Assert.Fail("shared corpus root required");
+            return "";
+        },
+
+        Result::Ok(directory) => match FS.ReadAllText(directory + "/cases/schema-structured/" + name + ".bsol")
+        {
+            Result::Error(_) => {
+                Assert.Fail("shared structured case must be readable");
+                return "";
+            },
+
+            Result::Ok(source) => {
+                return source;
+            },
+        },
+    };
+}
+
+Result<Schema.ValidatedDocument, Schema.Diagnostic[]> CheckStructured(string name)
+{
+    match Schema.ParseProfile(ReadStructured("profile"), Limits.DefaultLimits())
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(profile) => match Parser.Parse(ReadStructured(name), Limits.DefaultLimits())
+        {
+            Result::Error(_) => {
+                Assert.Fail("structured fixture syntax valid");
+                return Result::Error(Array.Empty<Schema.Diagnostic>());
+            },
+
+            Result::Ok(document) => {
+                return Schema.Validate(document, profile, Limits.DefaultLimits());
+            },
+        },
+    };
+}
+
+unit RejectStructured(string name, string code, string field)
+{
+    match CheckStructured(name)
+    {
+        Result::Ok(_) => Assert.Fail("invalid declared structural field rejects"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                Schema.Diagnostic error = errors[i];
+                if (error.code == code && error.field == field)
+                {
+                    found = true;
+                    Assert.True(match error.stage
+                    {
+                        Schema.DiagnosticStage::Validation => true,
+
+                        _ => false,
+                    }, "structural rejection owns validation stage");
+                    Assert.True(error.span.end > error.span.start, "offending structural syntax keeps nonempty span");
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "exact shared structural error code and field");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_compound_types_have_checked_structural_arena
+{
+    match Schema.ParseProfile(ReadStructured("profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("parameterized profile compiles"),
+
+        Result::Ok(profile) => {
+            Schema.Rule config = profile.rules[profile.roots[0]];
+            Schema.TypeExpression list = profile.types[config.fields[1].typeIndex];
+            Assert.True(match list.kind
+            {
+                Schema.TypeKind::List => true,
+
+                _ => false,
+            }, "list type has structural kind");
+            Assert.Equal(Array.Len<i64>(list.children), 2_i64, "list union has two checked type alternatives");
+            Schema.TypeExpression map = profile.types[config.fields[2].typeIndex];
+            Assert.True(match map.kind
+            {
+                Schema.TypeKind::Map => true,
+
+                _ => false,
+            }, "map type has structural kind");
+            Assert.Equal(Array.Len<i64>(map.children), 2_i64, "map key/value types bound separately");
+            Assert.Equal(profile.types[config.fields[3].typeIndex].targetRule, "item", "inline binds declared rule");
+            Assert.Equal(profile.types[config.fields[4].typeIndex].targetRule, "item", "reference binds declared rule");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_valid_union_map_inline_reference_and_local_attributes
+{
+    match CheckStructured("valid")
+    {
+        Result::Error(_) => Assert.Fail("full structured valid fixture validates natively"),
+
+        Result::Ok(document) => {
+            Assert.Equal(document.profile, "structured.v2", "profile identity retained");
+            Assert.True(Array.Len<Schema.RuleBinding>(document.rules) >= 3_i64, "inline block also receives checked rule binding");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_union_list_and_map_values_check_each_element
+{
+    RejectStructured("bad-list", "TypeMismatch", "items");
+
+    RejectStructured("bad-map", "TypeMismatch", "scores");
+}
+
+/// @native-only
+test bsol_schema_inline_fields_and_reference_qualifier_are_checked
+{
+    RejectStructured("bad-inline", "TypeMismatch", "name");
+
+    RejectStructured("bad-ref-kind", "TypeMismatch", "target");
+}
+
+/// @native-only
+test bsol_schema_block_and_field_attribute_allowlists_are_local
+{
+    RejectStructured("bad-block-attr", "UnknownAttribute", "");
+
+    RejectStructured("bad-field-attr", "UnknownAttribute", "title");
+}
+
+/// @native-only
+test bsol_schema_unknown_union_alternative_rejects_profile
+{
+    match Schema.ParseProfile(ReadStructured("bad-type"), Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("unknown nested type cannot publish checked profile"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                if (errors[i].code == "UnknownFieldType" && errors[i].field == "items")
+                {
+                    found = true;
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "unknown union type identified at profile boundary");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_absent_attribute_allowlists_reject_unlisted_attributes
+{
+    RejectStructured("bad-empty-block-attr", "UnknownAttribute", "");
+
+    RejectStructured("bad-empty-field-attr", "UnknownAttribute", "items");
+}

@@ -1,0 +1,59 @@
+use Core.Bsol.Parser;
+
+use Core.Bsol.Writer;
+
+use Core.Bsol.Limits;
+
+use Core.Environment;
+
+use Core.FS;
+
+use Core.Results;
+
+use Testing.Assert;
+
+/// Read the same checked-in corpus files as the Rust bootstrap harness.
+/// The runner supplies an absolute corpus root; no embedded alternate copies.
+unit CheckCorpusFile(string directory, string name)
+{
+    match FS.ReadAllText(directory + "/cases/" + name)
+    {
+        Result::Error(_) => Assert.Fail("shared UTF8 corpus input must be readable"),
+
+        Result::Ok(source) => match Parser.Parse(source, Limits.DefaultLimits())
+        {
+            Result::Error(_) => Assert.Fail("shared Rust/native valid case parses"),
+
+            Result::Ok(document) => match Writer.Write(document, Limits.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("shared case writes canonically"),
+
+                Result::Ok(first) => match Parser.Parse(first, Limits.DefaultLimits())
+                {
+                    Result::Error(_) => Assert.Fail("canonical native output reparses"),
+
+                    Result::Ok(secondDocument) => match Writer.Write(secondDocument, Limits.DefaultLimits())
+                    {
+                        Result::Error(_) => Assert.Fail("reparsed case writes"),
+
+                        Result::Ok(second) => Assert.Equal(first, second, "canonical structural roundtrip stable"),
+                    },
+                },
+            },
+        },
+    };
+}
+
+/// @native-only
+test bsol_shared_corpus_values_and_runtime_manifest
+{
+    match Environment.Get("BESKID_BSOL_CORPUS")
+    {
+        Result::Error(_) => Assert.Fail("BESKID_BSOL_CORPUS must name the shared checked-in corpus"),
+
+        Result::Ok(directory) => {
+            CheckCorpusFile(directory, "v06-values.bsol");
+            CheckCorpusFile(directory, "runtime-manifest-v5.bsol");
+        },
+    };
+}

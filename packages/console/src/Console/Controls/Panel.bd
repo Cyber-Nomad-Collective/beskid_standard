@@ -10,18 +10,60 @@ use Core.String;
 pub type Panel : Contracts.PaddingProvider, Contracts.MarginProvider, Contracts.FramedControl, Contracts.ConsoleControl {
     string title,
     TitleAlignment align,
-    Padding padding,
-    Margin margin,
+    Style.Padding padding,
+    Style.Margin margin,
     bool forceAscii,
     string body,
+
+    pub Style.Padding Padding() {
+        return this.padding;
+    }
+
+    pub Style.Margin Margin() {
+        return this.margin;
+    }
+
+    pub bool UseUnicodeFrame() {
+        if this.forceAscii {
+            return false;
+        }
+        return Frame.PreferUnicodeFrame();
+    }
+
+    pub Console.ConsoleSize Measure(Console.ConsoleSize available) {
+        i32 pad = Style.ResolvePadding(this.padding, available.columns);
+        i32 margin = Style.ResolveMargin(this.margin, available.columns);
+        i64 inner = ContentWidth(this) + i64(pad * 2);
+        i32 width = Style.ClampWidth(i32(inner + 2), 4, available.columns - margin);
+        mut i32 rows = 3;
+        if this.title != "" {
+            rows = rows + 1;
+        }
+        return Console.ConsoleSize { columns: width, rows: rows };
+    }
+
+    pub string Render(Console.ConsoleSize size) {
+        Frame.FrameChars frame = Frame.ForHost(UseUnicodeFrame());
+        mut i32 innerWidth = size.columns - 2;
+        if innerWidth < 1 {
+            innerWidth = 1;
+        }
+        string top = TopBorder(this, frame, innerWidth);
+        string mid = BodyLine(this, frame, innerWidth);
+        string bottomFill = Frame.Repeat(frame.bottom, i64(innerWidth));
+        string bottom = "${frame.bottomLeft}${bottomFill}${frame.bottomRight}";
+        return "${top}
+${mid}
+${bottom}";
+    }
 }
 
 pub Panel New(string body) {
     return Panel {
         title: "",
-        align: TitleAlignment::Left(),
-        padding: Padding::None(),
-        margin: Margin::None(),
+        align: TitleAlignment::Left,
+        padding: Style.Padding::None,
+        margin: Style.Margin::None,
         forceAscii: false,
         body: body,
     };
@@ -60,7 +102,7 @@ pub Panel WithAsciiFrame(Panel panel) {
     };
 }
 
-pub Panel WithPadding(Panel panel, Padding padding) {
+pub Panel WithPadding(Panel panel, Style.Padding padding) {
     return Panel {
         title: panel.title,
         align: panel.align,
@@ -71,19 +113,16 @@ pub Panel WithPadding(Panel panel, Padding padding) {
     };
 }
 
-pub Padding Padding(Panel panel) {
-    return panel.padding;
+pub Style.Padding Padding(Panel panel) {
+    return panel.Padding();
 }
 
-pub Margin Margin(Panel panel) {
-    return panel.margin;
+pub Style.Margin Margin(Panel panel) {
+    return panel.Margin();
 }
 
 pub bool UseUnicodeFrame(Panel panel) {
-    if panel.forceAscii {
-        return false;
-    }
-    return Frame.PreferUnicodeFrame();
+    return panel.UseUnicodeFrame();
 }
 
 pub i64 ContentWidth(Panel panel) {
@@ -91,15 +130,7 @@ pub i64 ContentWidth(Panel panel) {
 }
 
 pub Console.ConsoleSize Measure(Panel panel, Console.ConsoleSize available) {
-    i32 pad = Console.Style.ResolvePadding(panel.padding, available.columns);
-    i32 margin = Console.Style.ResolveMargin(panel.margin, available.columns);
-    i64 inner = ContentWidth(panel) + (pad * 2);
-    i32 width = Console.Style.ClampWidth(inner + 2, 4, available.columns - margin);
-    i32 rows = 3;
-    if panel.title != "" {
-        rows = rows + 1;
-    }
-    return Console.ConsoleSize { columns: width, rows: rows };
+    return panel.Measure(available);
 }
 
 pub string TopBorder(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
@@ -131,7 +162,7 @@ pub string TopBorder(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
 }
 
 pub string BodyLine(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
-    i32 pad = Console.Style.ResolvePadding(panel.padding, innerWidth + 2);
+    i32 pad = Style.ResolvePadding(panel.padding, innerWidth + 2);
     i32 bodyLen = i32(Core.String.Len(panel.body));
     mut i32 padRight = innerWidth - bodyLen - pad;
     if padRight < 0 {
@@ -141,18 +172,7 @@ pub string BodyLine(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
 }
 
 pub string Render(Panel panel, Console.ConsoleSize size) {
-    Frame.FrameChars frame = Frame.ForHost(UseUnicodeFrame(panel));
-    mut i32 innerWidth = size.columns - 2;
-    if innerWidth < 1 {
-        innerWidth = 1;
-    }
-    string top = TopBorder(panel, frame, innerWidth);
-    string mid = BodyLine(panel, frame, innerWidth);
-    string bottomFill = Frame.Repeat(frame.bottom, i64(innerWidth));
-    string bottom = "${frame.bottomLeft}${bottomFill}${frame.bottomRight}";
-    return "${top}
-${mid}
-${bottom}";
+    return panel.Render(size);
 }
 
 pub string RenderWithContext(Panel panel, Console.ConsoleSize size, RenderContext.RenderContext ctx) {

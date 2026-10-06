@@ -1,0 +1,141 @@
+use Core.Serialization.DataValue;
+use Core.Serialization.Metadata;
+use Core.Results;
+use Core.Collections.Array;
+use Testing.Assert;
+
+test serialization_value_retains_signed_width_and_unsigned_range {
+    DataValue signedValue = DataValue::Signed(-128_i64, 8_u8);
+    match signedValue {
+        DataValue::Signed(value, width) => {
+            Assert.Equal(value, -128_i64, "signed payload");
+            Assert.Equal(width, 8_u8, "declared wire width");
+        },
+        _ => Assert.Fail("signed value remains distinguished"),
+    };
+    DataValue unsignedValue = DataValue::Unsigned(18446744073709551615_u64, 64_u8);
+    match unsignedValue {
+        DataValue::Unsigned(value, width) => {
+            Assert.Equal(value, 18446744073709551615_u64, "full exact integer range");
+            Assert.Equal(width, 64_u8, "unsigned wire width");
+        },
+        _ => Assert.Fail("unsigned value remains distinguished"),
+    };
+}
+
+test serialization_value_retains_float_width_and_negative_zero_bits {
+    DataValue floatOne = DataValue::Float(2147483648_u64, 32_u8);
+    DataValue floatTwo = DataValue::Float(9223372036854775808_u64, 64_u8);
+    match floatOne {
+        DataValue::Float(bits, width) => {
+            Assert.Equal(bits, 2147483648_u64, "f32 negative zero bits");
+            Assert.Equal(width, 32_u8, "f32 is not promoted");
+        },
+        _ => Assert.Fail("float retains its own representation"),
+    };
+    match floatTwo {
+        DataValue::Float(bits, width) => {
+            Assert.Equal(bits, 9223372036854775808_u64, "f64 negative zero bits");
+            Assert.Equal(width, 64_u8, "f64 width");
+        },
+        _ => Assert.Fail("float does not become an integer"),
+    };
+}
+
+test serialization_value_distinguishes_bytes_strings_and_unicode_scalars {
+    DataValue bytes = DataValue::Bytes([0_u8, 255_u8]);
+    match bytes {
+        DataValue::Bytes(value) => {
+            Assert.Equal(Array.Len<u8>(value), 2_i64, "explicit bytes length");
+            Assert.Equal(value[1], 255_u8, "byte is not text decoding");
+        },
+        _ => Assert.Fail("bytes retain explicit format representation"),
+    };
+    DataValue text = DataValue::String("🙂");
+    match text {
+        DataValue::String(value) => Assert.Equal(value, "🙂", "text preserves Unicode without normalization"),
+        _ => Assert.Fail("string is distinguished from bytes"),
+    };
+    DataValue scalar = DataValue::Scalar('🙂');
+    match scalar {
+        DataValue::Scalar(value) => Assert.Equal(value, '🙂', "one non-BMP scalar remains char"),
+        _ => Assert.Fail("Unicode scalar is distinguished from string"),
+    };
+}
+
+test serialization_value_distinguishes_unit_optional_and_sequence {
+    DataValue unitValue = DataValue::Unit();
+    match unitValue { DataValue::Unit() => Assert.True(true, "unit has no fabricated payload"), _ => Assert.Fail("unit identity") };
+    DataValue none = DataValue::Optional(false, []);
+    DataValue some = DataValue::Optional(true, [unitValue]);
+    match none {
+        DataValue::Optional(present, payload) => {
+            Assert.False(present, "None presence");
+            Assert.Equal(Array.Len<DataValue>(payload), 0_i64, "None carries no value");
+        },
+        _ => Assert.Fail("None is not unit"),
+    };
+    match some {
+        DataValue::Optional(present, payload) => {
+            Assert.True(present, "Some presence");
+            Assert.Equal(Array.Len<DataValue>(payload), 1_i64, "Some unit carries a value");
+        },
+        _ => Assert.Fail("Some unit is not None"),
+    };
+    DataValue sequence = DataValue::Sequence(SequenceKind::Array, [some, none]);
+    match sequence {
+        DataValue::Sequence(kind, payload) => {
+            Assert.Equal(Array.Len<DataValue>(payload), 2_i64, "ordered sequence length");
+            Assert.True(kind == SequenceKind::Array, "array/list distinction retained");
+        },
+        _ => Assert.Fail("sequence retains ordered values"),
+    };
+}
+
+test serialization_shape_id_preserves_complete_digest_and_rejects_noncanonical_text {
+    string digest = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    match Metadata.ParseShapeId(digest) {
+        Result::Ok(shape) => Assert.Equal(Metadata.FormatShapeId(shape), digest, "all 256 identity bits retained"),
+        Result::Error(_) => Assert.Fail("canonical complete digest admitted"),
+    };
+    Assert.True(Results.IsError(Metadata.ParseShapeId("1")), "short numeric IDs cannot replace stable digests");
+    Assert.True(Results.IsError(Metadata.ParseShapeId("000102030405060708090A0b0c0d0e0f101112131415161718191a1b1c1d1e1f")), "wire identity is lowercase hex");
+    Assert.True(Results.IsError(Metadata.ParseShapeId("g00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")), "nonhex identity rejects");
+}
+
+test serialization_nested_record_payload_survives_forced_gc {
+    string digest = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    match Metadata.ParseShapeId(digest) {
+        Result::Error(_) => Assert.Fail("complete shape identity admitted"),
+        Result::Ok(shape) => {
+            DataValue record = DataValue::Record(shape, [
+                RecordField { name: "text", value: DataValue::String("rooted " + "payload") },
+                RecordField { name: "bytes", value: DataValue::Sequence(SequenceKind::List, [DataValue::Bytes([0_u8, 255_u8])]) },
+            ]);
+            Assert.CollectGarbage();
+            Assert.CollectGarbage();
+            match record {
+                DataValue::Record(identity, fields) => {
+                    Assert.Equal(Metadata.FormatShapeId(identity), digest, "shape metadata stays rooted");
+                    Assert.Equal(Array.Len<RecordField>(fields), 2_i64, "ordered record fields survive");
+                    Assert.Equal(fields[0].name, "text", "declared field order");
+                    match fields[0].value {
+                        DataValue::String(text) => Assert.Equal(text, "rooted payload", "managed enum payload survives collection"),
+                        _ => Assert.Fail("record string identity retained"),
+                    };
+                    match fields[1].value {
+                        DataValue::Sequence(kind, items) => {
+                            Assert.True(kind == SequenceKind::List, "list kind survives");
+                            match items[0] {
+                                DataValue::Bytes(bytes) => Assert.Equal(bytes[1], 255_u8, "nested byte buffer survives collection"),
+                                _ => Assert.Fail("nested bytes identity retained"),
+                            };
+                        },
+                        _ => Assert.Fail("nested sequence identity retained"),
+                    };
+                },
+                _ => Assert.Fail("record value survives collection"),
+            };
+        },
+    };
+}

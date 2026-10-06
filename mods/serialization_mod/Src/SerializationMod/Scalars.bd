@@ -1,0 +1,99 @@
+use Beskid.Syntax.Nodes;
+use Beskid.Compiler.Semantic;
+use Core.Results;
+use SerializationMod.Syntax;
+
+SpannedExpression Convert(Syntax.Builder builder, string name, SpannedExpression value) {
+    return Syntax.Call(builder, Syntax.Local(builder, name), [value]);
+}
+
+SpannedExpression Width(Syntax.Builder builder, string value) {
+    return Syntax.LiteralValue(builder, Literal::Integer(value));
+}
+
+SpannedExpression Invoke(Syntax.Builder builder, string method, SpannedExpression[] values) {
+    return Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, "encoder"), method), values);
+}
+
+/// A scalar is written with its declared width, never inferred from its value.
+/// Word requires an explicit source-checked policy width passed by generation.
+pub Result<SpannedStatement, SemanticError> Write(Syntax.Builder builder, PrimitiveType primitive, SpannedExpression value, u8 wordWidth) {
+    mut SpannedExpression call = Invoke(builder, "WriteUnit", []);
+    match primitive {
+        PrimitiveType::Bool => { call = Invoke(builder, "WriteBoolean", [value]); },
+        PrimitiveType::I8 => { call = Invoke(builder, "WriteSigned", [Convert(builder, "i64", value), Width(builder, "8_u8")]); },
+        PrimitiveType::I16 => { call = Invoke(builder, "WriteSigned", [Convert(builder, "i64", value), Width(builder, "16_u8")]); },
+        PrimitiveType::I32 => { call = Invoke(builder, "WriteSigned", [Convert(builder, "i64", value), Width(builder, "32_u8")]); },
+        PrimitiveType::I64 => { call = Invoke(builder, "WriteSigned", [value, Width(builder, "64_u8")]); },
+        PrimitiveType::U8 => { call = Invoke(builder, "WriteUnsigned", [Convert(builder, "u64", value), Width(builder, "8_u8")]); },
+        PrimitiveType::U16 => { call = Invoke(builder, "WriteUnsigned", [Convert(builder, "u64", value), Width(builder, "16_u8")]); },
+        PrimitiveType::U32 => { call = Invoke(builder, "WriteUnsigned", [Convert(builder, "u64", value), Width(builder, "32_u8")]); },
+        PrimitiveType::U64 => { call = Invoke(builder, "WriteUnsigned", [value, Width(builder, "64_u8")]); },
+        PrimitiveType::Word => {
+            if (wordWidth != 8_u8 && wordWidth != 16_u8 && wordWidth != 32_u8 && wordWidth != 64_u8) {
+                return Result::Error(SemanticError { code: "SerializationWordWidth", message: "word requires an explicit 8, 16, 32 or 64 bit wire width" });
+            }
+            mut string width = "64_u8";
+            if (wordWidth == 8_u8) { width = "8_u8"; }
+            if (wordWidth == 16_u8) { width = "16_u8"; }
+            if (wordWidth == 32_u8) { width = "32_u8"; }
+            call = Invoke(builder, "WriteUnsigned", [Convert(builder, "u64", value), Width(builder, width)]);
+        },
+        PrimitiveType::F32 => {
+            SpannedExpression bits = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Numeric", "FloatBits", "ToBits32"], [])), [value]);
+            call = Invoke(builder, "WriteFloat", [Convert(builder, "u64", bits), Width(builder, "32_u8")]);
+        },
+        PrimitiveType::F64 => {
+            SpannedExpression bits = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Numeric", "FloatBits", "ToBits64"], [])), [value]);
+            call = Invoke(builder, "WriteFloat", [bits, Width(builder, "64_u8")]);
+        },
+        PrimitiveType::Char => { call = Invoke(builder, "WriteScalar", [value]); },
+        PrimitiveType::String => { call = Invoke(builder, "WriteString", [value]); },
+        PrimitiveType::Unit => { },
+        PrimitiveType::Pointer => { return Result::Error(SemanticError { code: "SerializationPointer", message: "raw pointers are not serializable" }); },
+        PrimitiveType::Never => { return Result::Error(SemanticError { code: "SerializationNever", message: "never has no serializable value" }); },
+    };
+    return Result::Ok(Syntax.Evaluate(builder, Syntax.Propagate(builder, call)));
+}
+
+SpannedExpression ReadInvoke(Syntax.Builder builder, string method, SpannedExpression[] values) {
+    return Syntax.Propagate(builder, Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, "reader"), method), values));
+}
+
+/// The reader proves the declared range before narrowing. Floats retain exact bits.
+pub Result<SpannedExpression, SemanticError> Read(Syntax.Builder builder, PrimitiveType primitive, u8 wordWidth) {
+    match primitive {
+        PrimitiveType::Bool => { return Result::Ok(ReadInvoke(builder, "ReadBoolean", [])); },
+        PrimitiveType::I8 => { return Result::Ok(Convert(builder, "i8", ReadInvoke(builder, "ReadSigned", [Width(builder, "8_u8")]))); },
+        PrimitiveType::I16 => { return Result::Ok(Convert(builder, "i16", ReadInvoke(builder, "ReadSigned", [Width(builder, "16_u8")]))); },
+        PrimitiveType::I32 => { return Result::Ok(Convert(builder, "i32", ReadInvoke(builder, "ReadSigned", [Width(builder, "32_u8")]))); },
+        PrimitiveType::I64 => { return Result::Ok(ReadInvoke(builder, "ReadSigned", [Width(builder, "64_u8")])); },
+        PrimitiveType::U8 => { return Result::Ok(Convert(builder, "u8", ReadInvoke(builder, "ReadUnsigned", [Width(builder, "8_u8")]))); },
+        PrimitiveType::U16 => { return Result::Ok(Convert(builder, "u16", ReadInvoke(builder, "ReadUnsigned", [Width(builder, "16_u8")]))); },
+        PrimitiveType::U32 => { return Result::Ok(Convert(builder, "u32", ReadInvoke(builder, "ReadUnsigned", [Width(builder, "32_u8")]))); },
+        PrimitiveType::U64 => { return Result::Ok(ReadInvoke(builder, "ReadUnsigned", [Width(builder, "64_u8")])); },
+        PrimitiveType::Word => {
+            mut string width = "64_u8";
+            if (wordWidth == 8_u8) { width = "8_u8"; }
+            else if (wordWidth == 16_u8) { width = "16_u8"; }
+            else if (wordWidth == 32_u8) { width = "32_u8"; }
+            else if (wordWidth != 64_u8) {
+                return Result::Error(SemanticError { code: "SerializationWordWidth", message: "word requires an explicit wire width" });
+            }
+            return Result::Ok(Convert(builder, "word", ReadInvoke(builder, "ReadUnsigned", [Width(builder, width)])));
+        },
+        PrimitiveType::F32 => {
+            SpannedExpression bits = Convert(builder, "u32", ReadInvoke(builder, "ReadFloat", [Width(builder, "32_u8")]));
+            return Result::Ok(Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Numeric", "FloatBits", "FromBits32"], [])), [bits]));
+        },
+        PrimitiveType::F64 => {
+            SpannedExpression bits = ReadInvoke(builder, "ReadFloat", [Width(builder, "64_u8")]);
+            return Result::Ok(Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Numeric", "FloatBits", "FromBits64"], [])), [bits]));
+        },
+        PrimitiveType::Char => { return Result::Ok(ReadInvoke(builder, "ReadScalar", [])); },
+        PrimitiveType::String => { return Result::Ok(ReadInvoke(builder, "ReadString", [])); },
+        PrimitiveType::Unit => { return Result::Ok(ReadInvoke(builder, "ReadUnit", [])); },
+        PrimitiveType::Pointer => { return Result::Error(SemanticError { code: "SerializationPointer", message: "raw pointers are not deserializable" }); },
+        PrimitiveType::Never => { return Result::Error(SemanticError { code: "SerializationNever", message: "never has no deserializable value" }); },
+    };
+}

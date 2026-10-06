@@ -1,0 +1,289 @@
+use Core.Hash.Sha256;
+
+use Core.Collections.Array;
+
+use Core.Bytes.Slice;
+
+use Core.Bytes.Convert;
+
+use Core.Encoding.Hex;
+
+use Core.Results;
+
+use Testing.Assert;
+
+u8[] DecodeHex(string text)
+{
+    match Hex.DecodeBytes(Convert.StringToBytes(text))
+    {
+        Result::Error(_) => {
+            Assert.Fail("vector hex valid");
+            return Array.Empty<u8>();
+        },
+
+        Result::Ok(bytes) => {
+            return bytes;
+        },
+    };
+}
+
+string DigestHex(u8[] bytes)
+{
+    Assert.Equal(Array.Len<u8>(bytes), 32_i64, "SHA256 output exactly32 bytes");
+    match Hex.EncodeBytes(bytes)
+    {
+        Result::Error(_) => {
+            Assert.Fail("digest encoding succeeds");
+            return "";
+        },
+
+        Result::Ok(encoded) => match Convert.BytesToString(encoded)
+        {
+            Result::Error(_) => {
+                Assert.Fail("hex is valid UTF8");
+                return "";
+            },
+
+            Result::Ok(text) => {
+                return text;
+            },
+        },
+    };
+}
+
+unit CheckBytes(u8[] bytes, string expected)
+{
+    match Sha256.HashBytes(bytes, 8388608_i64)
+    {
+        Result::Error(_) => Assert.Fail("published vector hashes"),
+
+        Result::Ok(digest) => Assert.Equal(DigestHex(digest), expected, "exact full digest vector"),
+    };
+}
+
+/// @native-only
+test sha256_published_cavp_byte_vectors
+{
+    CheckBytes(DecodeHex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+
+    CheckBytes(DecodeHex("3ebfb06db8c38d5ba037f1363e118550aad94606e26835a01af05078533cc25f2f39573c04b632f62f68c294ab31f2a3e2a1a0d8c2be51"), "6595a2ef537a69ba8583dfbf7f5bec0ab1f93ce4c8ee1916eff44a93af5749c4");
+
+    CheckBytes(DecodeHex("2d52447d1244d2ebc28650e7b05654bad35b3a68eedc7f8515306b496d75f3e73385dd1b002625024b81a02f2fd6dffb6e6d561cb7d0bd7a"), "cfb88d6faf2de3a69d36195acec2e255e2af2b7d933997f348e09f6ce5758360");
+
+    CheckBytes(DecodeHex("e2f76e97606a872e317439f1a03fcd92e632e5bd4e7cbc4e97f1afc19a16fde92d77cbe546416b51640cddb92af996534dfd81edb17c4424cf1ac4d75aceeb"), "18041bd4665083001fba8c5411d2d748e8abbfdcdfd9218cb02b68a78e7d4c23");
+
+    CheckBytes(DecodeHex("5a86b737eaea8ee976a0a24da63e7ed7eefad18a101c1211e2b3650c5187c2a8a650547208251f6d4237e661c7bf4c77f335390394c37fa1a9f9be836ac28509"), "42e61e174fbb3897d6dd6cef3dd2802fe67b331953b06114a65c772859dfc1aa");
+
+    CheckBytes(DecodeHex("451101250ec6f26652249d59dc974b7361d571a8101cdfd36aba3b5854d3ae086b5fdd4597721b66e3c0dc5d8c606d9657d0e323283a5217d1f53f2f284f57b85c8a61ac8924711f895c5ed90ef17745ed2d728abd22a5f7a13479a462d71b56c19a74a40b655c58edfe0a188ad2cf46cbf30524f65d423c837dd1ff2bf462ac4198007345bb44dbb7b1c861298cdf61982a833afc728fae1eda2f87aa2c9480858bec"), "3c593aa539fdcdae516cdf2f15000f6634185c88f505b39775fb9ab137a10aa2");
+}
+
+/// @native-only
+test sha256_nist_abc_and_two_block_examples
+{
+    CheckBytes(Convert.StringToBytes("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+    CheckBytes(Convert.StringToBytes("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+/// @native-only
+test sha256_exact_padding_boundaries
+{
+    CheckBytes(Convert.StringToBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "9f4390f8d30c2dd92ec9f095b65e2b9ae9b0a925a5258e241c9f1e910f734318");
+
+    CheckBytes(Convert.StringToBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "b35439a4ac6f0948b6d6f9e3c6af0f5f590ce20f1bde7090ef7970686ec6738a");
+
+    CheckBytes(Convert.StringToBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "7d3e74a05d7db15bce4ad9ec0658ea98e3f06eeecf16b4c6fff2da457ddc2f34");
+
+    CheckBytes(Convert.StringToBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "ffe054fe7ae0cb6dc65c3af9b61d5209f439851db43d0ba5997337df154668eb");
+
+    CheckBytes(Convert.StringToBytes("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"), "635361c48bb9eab14198e76ea8ab7f1a41685d6ad62aa9146d301d4f17eb0ae0");
+}
+
+/// @native-only
+test sha256_utf8_hashes_exact_owned_code_units
+{
+    u8[] bytes = [240_u8, 159_u8, 152_u8, 128_u8, 195_u8, 169_u8];
+
+    CheckBytes(bytes, "71b897d47640bd5e39412fb2d81c5d04b1195fc5524663a7704b6bfe2ec0db63");
+
+    match Sha256.HashUtf8("😀é", 6_i64)
+    {
+        Result::Error(_) => Assert.Fail("six UTF8 bytes fit exact bound"),
+
+        Result::Ok(digest) => Assert.Equal(DigestHex(digest), "71b897d47640bd5e39412fb2d81c5d04b1195fc5524663a7704b6bfe2ec0db63", "string adapter hashes bytes, not scalar count"),
+    };
+
+    match Sha256.HashUtf8("😀é", 5_i64)
+    {
+        Result::Ok(_) => Assert.Fail("UTF8 byte limit rejects"),
+
+        Result::Error(error) => Assert.True(match error
+        {
+            Sha256.HashError::InputLimit => true,
+
+            _ => false,
+        }, "UTF8 input limit checked"),
+    };
+}
+
+/// @native-only
+test sha256_input_limit_at_maximum_and_plus_one
+{
+    mut u8[] bytes = Slice.New(8388608_i64);
+
+    CheckBytes(bytes, "2daeb1f36095b44b318410b3f4e8b5d989dcc7bb023d1426c492dab0a3053e74");
+
+    match Sha256.HashBytes(bytes, 8388607_i64)
+    {
+        Result::Ok(_) => Assert.Fail("caller limit plusone rejects"),
+
+        Result::Error(error) => Assert.True(match error
+        {
+            Sha256.HashError::InputLimit => true,
+
+            _ => false,
+        }, "actual owned input bounded"),
+    };
+
+    Array.Append<u8>(bytes, 0_u8);
+
+    match Sha256.HashBytes(bytes, 8388608_i64)
+    {
+        Result::Ok(_) => Assert.Fail("actual default limit plusone rejects"),
+
+        Result::Error(error) => Assert.True(match error
+        {
+            Sha256.HashError::InputLimit => true,
+
+            _ => false,
+        }, "actual maxplusone owned input"),
+    };
+
+    match Sha256.ValidateLength(8388609_i64, 8388608_i64)
+    {
+        Result::Ok(_) => Assert.Fail("default maxplusone rejected before allocation"),
+
+        Result::Error(error) => Assert.True(match error
+        {
+            Sha256.HashError::InputLimit => true,
+
+            _ => false,
+        }, "exact maxplusone"),
+    };
+}
+
+/// @native-only
+test sha256_bit_length_guard_without_huge_allocation
+{
+    match Sha256.ValidateLength(2305843009213693951_i64, 2305843009213693951_i64)
+    {
+        Result::Error(_) => Assert.Fail("maximum byte-aligned standard length representable"),
+
+        Result::Ok(_) => { },
+    };
+
+    match Sha256.ValidateLength(2305843009213693952_i64, 9223372036854775807_i64)
+    {
+        Result::Ok(_) => Assert.Fail("bit length overflow rejects"),
+
+        Result::Error(error) => Assert.True(match error
+        {
+            Sha256.HashError::LengthOverflow => true,
+
+            _ => false,
+        }, "no overflowing length multiplication"),
+    };
+
+    match Sha256.ValidateLength(-1_i64, 8_i64)
+    {
+        Result::Ok(_) => Assert.Fail("negative length rejects"),
+
+        Result::Error(_) => { },
+    };
+
+    match Sha256.ValidateLength(0_i64, -1_i64)
+    {
+        Result::Ok(_) => Assert.Fail("negative caller limit rejects"),
+
+        Result::Error(error) => Assert.True(match error
+        {
+            Sha256.HashError::InvalidLimit => true,
+
+            _ => false,
+        }, "invalid limit"),
+    };
+}
+
+/// @native-only
+test sha256_owned_digest_survives_input_mutation_and_gc
+{
+    u8[] input = [97_u8, 98_u8, 99_u8];
+
+    match Sha256.HashBytes(input, 3_i64)
+    {
+        Result::Error(_) => Assert.Fail("owned input hashes"),
+
+        Result::Ok(digest) => {
+            Array.Set<u8>(input, 0_i64, 120_u8);
+            Assert.CollectGarbage();
+            Assert.Equal(DigestHex(digest), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "digest owns distinct managed bytes after GC");
+        },
+    };
+}
+
+/// @native-only
+test sha256_u32_primitives_wrap_and_shift_logically
+{
+    u32 maximum = 4294967295_u32;
+
+    Assert.Equal(maximum + 1_u32, 0_u32, "u32 addition modulo2pow32");
+
+    Assert.Equal(2147483648_u32 >> 31_u32, 1_u32, "u32 logical rightshift");
+
+    Assert.Equal((240_u32 | 170_u32) - (240_u32 & 170_u32), 90_u32, "XOR expressed through existing bit operators");
+}
+
+u8[] RepeatedA(i64 count)
+{
+    return Slice.Fill(Slice.New(count), 0_i64, count, 97_u8);
+}
+
+/// @native-only
+test sha256_nist_896_bit_two_block_message
+{
+    CheckBytes(Convert.StringToBytes("abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"), "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1");
+}
+
+/// @native-only
+test sha256_nist_one_million_a
+{
+    CheckBytes(RepeatedA(1000000_i64), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+/// @native-only
+test sha256_second_block_padding_boundaries
+{
+    CheckBytes(RepeatedA(119_i64), "31eba51c313a5c08226adf18d4a359cfdfd8d2e816b13f4af952f7ea6584dcfb");
+
+    CheckBytes(RepeatedA(120_i64), "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c");
+
+    CheckBytes(RepeatedA(130_i64), "1e3c4f4750c8c29bbfa9ced317788176b156d342e57f7777f62fd7221a44312f");
+}
+
+/// @native-only
+test sha256_repeated_hashing_under_allocation_pressure
+{
+    mut i64 i = 0_i64;
+    while (i < 200_i64)
+    {
+        CheckBytes(Convert.StringToBytes("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+
+        CheckBytes(RepeatedA(120_i64), "2f3d335432c70b580af0e8e1b3674a7c020d683aa5f73aaaedfdc55af904c21c");
+
+        if (i % 50_i64 == 0_i64)
+        {
+            Assert.CollectGarbage();
+        }
+        i = i + 1_i64;
+    }
+}

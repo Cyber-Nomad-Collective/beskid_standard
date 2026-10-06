@@ -1,0 +1,53 @@
+use Core.Serialization.Limits;
+use Core.Serialization.Numeric;
+use Core.Results;
+use Testing.Assert;
+
+test serialization_default_limits_match_public_contract {
+    SerializationLimits limits = Limits.DefaultLimits();
+    Assert.Equal(limits.maxInputBytes, 8388608_i64, "input byte bound");
+    Assert.Equal(limits.maxOutputBytes, 8388608_i64, "output byte bound");
+    Assert.Equal(limits.maxDepth, 128_i64, "nesting bound");
+    Assert.Equal(limits.maxNodes, 100000_i64, "aggregate node and entry bound");
+    Assert.Equal(limits.maxScalarBytes, 1048576_i64, "scalar byte bound");
+}
+
+test serialization_unsigned_decimal_retains_all_u64_bits {
+    match Numeric.ParseUnsigned("18446744073709551615", 64_i64) {
+        Result::Ok(value) => Assert.Equal(value, 18446744073709551615_u64, "exact maximum without float conversion"),
+        Result::Error(_) => Assert.Fail("u64 maximum admitted"),
+    };
+    match Numeric.ParseUnsigned("9007199254740993", 64_i64) {
+        Result::Ok(value) => Assert.Equal(value, 9007199254740993_u64, "integer above 2^53 remains exact"),
+        Result::Error(_) => Assert.Fail("exact integer admitted"),
+    };
+}
+
+test serialization_unsigned_width_and_overflow_reject {
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("256", 8_i64)), "u8 overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("18446744073709551616", 64_i64)), "u64 overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("-1", 64_i64)), "negative unsigned rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("1", 7_i64)), "unsupported wire width rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("1.0", 64_i64)), "decimal float is not an integer");
+}
+
+test serialization_signed_minimum_and_width_are_exact {
+    match Numeric.ParseSigned("-9223372036854775808", 64_i64) {
+        Result::Ok(value) => Assert.Equal(value, -9223372036854775807_i64 - 1_i64, "signed minimum admitted without positive overflow"),
+        Result::Error(_) => Assert.Fail("i64 minimum admitted"),
+    };
+    Assert.True(Results.IsError(Numeric.ParseSigned("-129", 8_i64)), "i8 negative overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseSigned("128", 8_i64)), "i8 positive overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseSigned("9223372036854775808", 64_i64)), "i64 overflow rejects");
+}
+
+test serialization_leading_zeroes_preserve_exact_integer_value {
+    match Numeric.ParseUnsigned("000000000000000000000000000000000000000000000000001", 8_i64) {
+        Result::Ok(value) => Assert.Equal(value, 1_u64, "leading zeroes do not change range"),
+        Result::Error(_) => Assert.Fail("bounded exact decimal with leading zeroes admitted"),
+    };
+    match Numeric.ParseSigned("-000000000000000000000000000000000000000000000000128", 8_i64) {
+        Result::Ok(value) => Assert.Equal(value, -128_i64, "negative minimum with leading zeroes"),
+        Result::Error(_) => Assert.Fail("leading zeroes do not overflow signed magnitude"),
+    };
+}

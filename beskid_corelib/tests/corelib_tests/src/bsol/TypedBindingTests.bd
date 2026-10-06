@@ -1,0 +1,171 @@
+use Core.Bsol.Limits;
+
+use Core.Bsol.Schema;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Typed;
+
+use Core.Collections.Array;
+
+use Core.Results;
+use Core.Serialization.Errors;
+
+use Core.Serialization.Decimal;
+
+use Core.Serialization.Limits as SerializationPolicy;
+
+use Core.Serialization.Numeric;
+
+use Testing.Assert;
+
+pub type Counter
+{
+    pub i64 count,
+}
+
+Syntax.Node Node(Syntax.NodeKind kind, string name, string raw, i64[] children)
+{
+    return Syntax.Node
+    {
+        kind: kind,
+
+        span: Syntax.Span
+        {
+            start: -1_i64,
+
+            end: -1_i64,
+        },
+
+        raw: raw,
+
+        text: raw,
+
+        name: name,
+
+        label: "",
+
+        hasLabel: false,
+
+        schemaless: false,
+
+        children: children,
+
+        attributes: Array.Empty<i64>(),
+    };
+}
+
+/// Explicit native binding fixture; the real Serialization Mod must generate
+/// equivalent typed field/constructor calls with exact source authority.
+pub type CounterBinding : Typed.BsolBinding<Counter> {
+    pub Result<Counter, Schema.Diagnostic[]> ReadDocument(Schema.ValidatedDocument checked, SerializationPolicy.SerializationLimits limits) {
+        Syntax.Document document = checked.document;
+        mut i64 i = 0_i64;
+        while (i < Array.Len<Schema.FieldBinding>(checked.fields)) {
+            Schema.FieldBinding field = checked.fields[i];
+            Syntax.Node assignment = document.nodes[field.assignment];
+            if (assignment.name == "count" && Array.Len<i64>(assignment.children) == 1_i64) {
+                Syntax.Node number = document.nodes[assignment.children[0_i64]];
+                match Numeric.ParseSigned(number.raw, 64_i64) {
+                    Result::Ok(count) => { return Result::Ok(Counter { count: count }); },
+                    Result::Error(error) => { return Result::Error([BindingError(Errors.Code(error), number.span)]); },
+                };
+            }
+            i = i + 1_i64;
+        }
+        return Result::Error([BindingError("MissingTypedField", Syntax.Span { start: 0_i64, end: 0_i64 })]);
+    }
+    pub Result<Syntax.Document, Schema.Diagnostic[]> WriteDocument(Counter value, Schema.Profile profile, SerializationPolicy.SerializationLimits limits) {
+        Syntax.Node number = Node(Syntax.NodeKind::Number, "", Decimal.Signed(value.count), Array.Empty<i64>());
+        Syntax.Node assignment = Node(Syntax.NodeKind::Assignment, "count", "", [0_i64]);
+        Syntax.Node block = Node(Syntax.NodeKind::Block, "config", "", [1_i64]);
+        return Result::Ok(Syntax.Document { source: "", nodes: [number, assignment, block], roots: [2_i64], trivia: Array.Empty<Syntax.Trivia>() });
+    }
+}
+
+Schema.Diagnostic BindingError(string code, Syntax.Span span)
+{
+    return Schema.Diagnostic
+    {
+        code: code,
+
+        stage: Schema.DiagnosticStage::Validation,
+
+        span: span,
+
+        field: "count",
+
+        rule: "config",
+
+        profile: "counter.v2",
+
+        hasRelated: false,
+
+        relatedSpan: Syntax.Span
+        {
+            start: -1_i64,
+
+            end: -1_i64,
+        },
+
+        message: code,
+    };
+}
+
+Schema.Profile Profile()
+{
+    return match Schema.ParseProfile("profile \"counter.v2\" { version = 2 rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extras = false field \"count\" { type = i64 required = true } } }", Limits.DefaultLimits())
+    {
+        Result::Ok(profile) => profile,
+
+        Result::Error(_) => {
+            Assert.Fail("binding profile valid");
+            return Profile();
+        },
+    };
+}
+
+test bsol_explicit_typed_binding_reads_exact_integer_after_validation
+{
+    CounterBinding binding = CounterBinding { };
+
+    match Typed.ReadResolved<Counter, CounterBinding>("config { count = 9007199254740993 }", Profile(), binding, SerializationPolicy.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("validated typed binding"),
+
+        Result::Ok(value) => Assert.Equal(value.count, 9007199254740993_i64, "typed value beyond float precision"),
+    };
+}
+
+test bsol_explicit_typed_binding_write_roundtrip_is_profile_checked
+{
+    CounterBinding binding = CounterBinding { };
+
+    match Typed.Write<Counter, CounterBinding>(Counter
+    {
+        count: 9007199254740993_i64,
+    }, Profile(), binding, SerializationPolicy.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("bounded native typed writer"),
+
+        Result::Ok(text) => {
+            match Typed.ReadResolved<Counter, CounterBinding>(text, Profile(), binding, SerializationPolicy.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("typed canonical reread"),
+
+                Result::Ok(value) => Assert.Equal(value.count, 9007199254740993_i64, "same typed config"),
+            };
+        },
+    };
+}
+
+test bsol_typed_binding_missing_duplicate_and_wrong_kind_reject
+{
+    CounterBinding binding = CounterBinding { };
+
+    Assert.True(Results.IsError(Typed.ReadResolved<Counter, CounterBinding>("config { }", Profile(), binding, SerializationPolicy.DefaultLimits())), "required field rejects before construction");
+
+    Assert.True(Results.IsError(Typed.ReadResolved<Counter, CounterBinding>("config { count = 1 count = 2 }", Profile(), binding, SerializationPolicy.DefaultLimits())), "duplicates reject before typed decode");
+
+    Assert.True(Results.IsError(Typed.ReadResolved<Counter, CounterBinding>("config { count = \"bad\" }", Profile(), binding, SerializationPolicy.DefaultLimits())), "kind mismatch rejects");
+}

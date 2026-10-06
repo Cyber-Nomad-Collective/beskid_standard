@@ -1,0 +1,463 @@
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Errors;
+
+use Core.Bsol.Limits;
+
+use Core.Collections.Array;
+
+use Core.String;
+
+pub type State
+{
+    pub string source,
+
+    pub i64 pos,
+
+    pub Syntax.Node[] nodes,
+
+    pub Syntax.Trivia[] trivia,
+
+    pub Limits.BsolLimits limits,
+
+    pub bool failed,
+
+    pub Errors.BsolError error,
+}
+
+pub State Start(string source, Limits.BsolLimits limits)
+{
+    return State
+    {
+        source: source,
+
+        pos: 0_i64,
+
+        nodes: Array.Empty<Syntax.Node>(),
+
+        trivia: Array.Empty<Syntax.Trivia>(),
+
+        limits: limits,
+
+        failed: false,
+
+        error: Errors.BsolError
+        {
+            kind: Errors.ErrorKind::InvalidSyntax,
+
+            span: Syntax.Span
+            {
+                start: 0_i64,
+
+                end: 0_i64,
+            },
+
+            message: "",
+        },
+    };
+}
+
+pub u8 Peek(State state)
+{
+    if (state.pos >= String.Len(state.source))
+    {
+        return 0_u8;
+    }
+    return String.ByteAt(state.source, state.pos);
+}
+
+pub bool At(State state, u8 value)
+{
+    return state.pos < String.Len(state.source) && Peek(state) == value;
+}
+
+pub string Raw(State state, i64 start)
+{
+    return String.SubSlice(state.source, start, state.pos - start);
+}
+
+pub unit Fail(mut State state, Errors.ErrorKind kind, string message)
+{
+    if (!state.failed)
+    {
+        state.failed = true;
+        state.error = Errors.BsolError
+        {
+            kind: kind,
+
+            span: Syntax.Span
+            {
+                start: state.pos,
+
+                end: state.pos,
+            },
+
+            message: message,
+        };
+    }
+}
+
+pub bool Alpha(u8 b)
+{
+    return (b >= 65_u8 && b <= 90_u8) || (b >= 97_u8 && b <= 122_u8) || b == 95_u8;
+}
+
+pub bool Digit(u8 b)
+{
+    return b >= 48_u8 && b <= 57_u8;
+}
+
+pub bool IdByte(u8 b)
+{
+    return Alpha(b) || Digit(b);
+}
+
+pub unit Skip(mut State state)
+{
+    mut bool more = true;
+    while (more && !state.failed)
+    {
+        more = false;
+        while (At(state, 32_u8) || At(state, 9_u8) || At(state, 10_u8) || At(state, 13_u8))
+        {
+            state.pos = state.pos + 1_i64;
+        }
+        if (At(state, 35_u8) || (At(state, 47_u8) && state.pos + 1_i64 < String.Len(state.source) && String.ByteAt(state.source, state.pos + 1_i64) == 47_u8))
+        {
+            i64 start = state.pos;
+            while (state.pos < String.Len(state.source) && !At(state, 10_u8) && !At(state, 13_u8))
+            {
+                state.pos = state.pos + 1_i64;
+            }
+            if (Array.Len<Syntax.Trivia>(state.trivia) >= state.limits.maxNodes - Array.Len<Syntax.Node>(state.nodes))
+            {
+                Fail(state, Errors.ErrorKind::NodeLimit, "comment limit");
+            }
+            else
+            {
+                Array.Append<Syntax.Trivia>(state.trivia, Syntax.Trivia
+                {
+                    span: Syntax.Span
+                    {
+                        start: start,
+
+                        end: state.pos,
+                    },
+
+                    raw: Raw(state, start),
+                });
+            }
+            more = true;
+        }
+    }
+}
+
+pub bool Take(mut State state, u8 value)
+{
+    Skip(state);
+    if (At(state, value))
+    {
+        state.pos = state.pos + 1_i64;
+        return true;
+    }
+    return false;
+}
+
+pub unit Require(mut State state, u8 value)
+{
+    if (!Take(state, value))
+    {
+        Fail(state, Errors.ErrorKind::UnexpectedToken, "expected punctuation");
+    }
+}
+
+pub string Ident(mut State state)
+{
+    Skip(state);
+    i64 start = state.pos;
+    if (!Alpha(Peek(state)))
+    {
+        Fail(state, Errors.ErrorKind::UnexpectedToken, "expected identifier");
+        return "";
+    }
+    state.pos = state.pos + 1_i64;
+    while (state.pos < String.Len(state.source) && IdByte(Peek(state)))
+    {
+        state.pos = state.pos + 1_i64;
+    }
+    if (state.pos - start > state.limits.maxScalarBytes)
+    {
+        Fail(state, Errors.ErrorKind::ScalarLimit, "identifier byte limit");
+        return "";
+    }
+    return Raw(state, start);
+}
+
+pub Syntax.Node EmptyNode(Syntax.NodeKind kind, i64 start)
+{
+    return Syntax.Node
+    {
+        kind: kind,
+
+        span: Syntax.Span
+        {
+            start: start,
+
+            end: start,
+        },
+
+        raw: "",
+
+        text: "",
+
+        name: "",
+
+        label: "",
+
+        hasLabel: false,
+
+        schemaless: false,
+
+        children: Array.Empty<i64>(),
+
+        attributes: Array.Empty<i64>(),
+    };
+}
+
+pub i64 Add(mut State state, Syntax.Node node)
+{
+    if (Array.Len<Syntax.Node>(state.nodes) >= state.limits.maxNodes - Array.Len<Syntax.Trivia>(state.trivia))
+    {
+        Fail(state, Errors.ErrorKind::NodeLimit, "syntax node limit");
+        return -1_i64;
+    }
+
+    i64 index = Array.Len<Syntax.Node>(state.nodes);
+    Array.Append<Syntax.Node>(state.nodes, node);
+    return index;
+}
+
+pub unit Finish(mut State state, i64 index, mut Syntax.Node node)
+{
+    if (index < 0_i64 || state.failed)
+    {
+        return;
+    }
+
+    bool number = match node.kind
+    {
+        Syntax.NodeKind::Number => true,
+
+        _ => false,
+    };
+    if (number && state.pos - node.span.start > state.limits.maxScalarBytes)
+    {
+        Fail(state, Errors.ErrorKind::ScalarLimit, "number byte limit");
+        return;
+    }
+    node.span.end = state.pos;
+    node.raw = String.SubSlice(state.source, node.span.start, node.span.end - node.span.start);
+    Array.Set<Syntax.Node>(state.nodes, index, node);
+}
+
+i64 Hex(u8 b)
+{
+    if (Digit(b))
+    {
+        return i64(b - 48_u8);
+    }
+    if (b >= 65_u8 && b <= 70_u8)
+    {
+        return i64(b - 65_u8) + 10_i64;
+    }
+    if (b >= 97_u8 && b <= 102_u8)
+    {
+        return i64(b - 97_u8) + 10_i64;
+    }
+    return -1_i64;
+}
+
+i64 HexQuad(mut State state)
+{
+    mut i64 value = 0_i64;
+    mut i64 i = 0_i64;
+    while (i < 4_i64 && !state.failed)
+    {
+        i64 h = Hex(Peek(state));
+        if (state.pos >= String.Len(state.source) || h < 0_i64)
+        {
+            Fail(state, Errors.ErrorKind::InvalidUnicode, "expected four hexadecimal digits");
+        }
+        else
+        {
+            value = value * 16_i64 + h;
+            state.pos = state.pos + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    return value;
+}
+
+pub string Scalar(i64 value)
+{
+    mut u8[] bytes = [];
+    if (value < 128_i64)
+    {
+        Array.Append<u8>(bytes, u8(value));
+    }
+    else if (value < 2048_i64)
+    {
+        Array.Append<u8>(bytes, u8(192_i64 + value / 64_i64));
+        Array.Append<u8>(bytes, u8(128_i64 + value % 64_i64));
+    }
+    else if (value < 65536_i64)
+    {
+        Array.Append<u8>(bytes, u8(224_i64 + value / 4096_i64));
+        Array.Append<u8>(bytes, u8(128_i64 + (value / 64_i64) % 64_i64));
+        Array.Append<u8>(bytes, u8(128_i64 + value % 64_i64));
+    }
+    else
+    {
+        Array.Append<u8>(bytes, u8(240_i64 + value / 262144_i64));
+        Array.Append<u8>(bytes, u8(128_i64 + (value / 4096_i64) % 64_i64));
+        Array.Append<u8>(bytes, u8(128_i64 + (value / 64_i64) % 64_i64));
+        Array.Append<u8>(bytes, u8(128_i64 + value % 64_i64));
+    }
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+pub string Quoted(mut State state)
+{
+    Require(state, 34_u8);
+    mut string text = "";
+    mut i64 run = state.pos;
+    while (state.pos < String.Len(state.source) && !state.failed)
+    {
+        u8 b = Peek(state);
+        if (b == 34_u8)
+        {
+            if (state.pos - run > state.limits.maxScalarBytes - String.Len(text))
+            {
+                Fail(state, Errors.ErrorKind::ScalarLimit, "decoded string byte limit");
+                return text;
+            }
+            text = text + String.SubSlice(state.source, run, state.pos - run);
+            state.pos = state.pos + 1_i64;
+            return text;
+        }
+        if (b < 32_u8)
+        {
+            Fail(state, Errors.ErrorKind::InvalidEscape, "unescaped control in string");
+        }
+        else if (b == 92_u8)
+        {
+            if (state.pos - run > state.limits.maxScalarBytes - String.Len(text))
+            {
+                Fail(state, Errors.ErrorKind::ScalarLimit, "decoded string byte limit");
+                return text;
+            }
+            text = text + String.SubSlice(state.source, run, state.pos - run);
+            state.pos = state.pos + 1_i64;
+            u8 escaped = Peek(state);
+            state.pos = state.pos + 1_i64;
+            if (escaped == 34_u8 || escaped == 92_u8)
+            {
+                text = AppendScalar(state, text, i64(escaped));
+            }
+            else if (escaped == 110_u8)
+            {
+                text = AppendScalar(state, text, 10_i64);
+            }
+            else if (escaped == 114_u8)
+            {
+                text = AppendScalar(state, text, 13_i64);
+            }
+            else if (escaped == 116_u8)
+            {
+                text = AppendScalar(state, text, 9_i64);
+            }
+            else if (escaped == 98_u8)
+            {
+                text = AppendScalar(state, text, 8_i64);
+            }
+            else if (escaped == 102_u8)
+            {
+                text = AppendScalar(state, text, 12_i64);
+            }
+            else if (escaped == 117_u8)
+            {
+                mut i64 scalar = HexQuad(state);
+                if (scalar >= 55296_i64 && scalar <= 56319_i64)
+                {
+                    if (!At(state, 92_u8))
+                    {
+                        Fail(state, Errors.ErrorKind::InvalidUnicode, "missing low surrogate");
+                    }
+                    else
+                    {
+                        state.pos = state.pos + 1_i64;
+                        if (!At(state, 117_u8))
+                        {
+                            Fail(state, Errors.ErrorKind::InvalidUnicode, "missing low surrogate");
+                        }
+                        else
+                        {
+                            state.pos = state.pos + 1_i64;
+                            i64 low = HexQuad(state);
+                            if (low < 56320_i64 || low > 57343_i64)
+                            {
+                                Fail(state, Errors.ErrorKind::InvalidUnicode, "invalid low surrogate");
+                            }
+                            else
+                            {
+                                scalar = 65536_i64 + (scalar - 55296_i64) * 1024_i64 + low - 56320_i64;
+                            }
+                        }
+                    }
+                }
+                else if (scalar >= 56320_i64 && scalar <= 57343_i64)
+                {
+                    Fail(state, Errors.ErrorKind::InvalidUnicode, "unpaired low surrogate");
+                }
+                if (!state.failed)
+                {
+                    text = AppendScalar(state, text, scalar);
+                }
+            }
+            else
+            {
+                Fail(state, Errors.ErrorKind::InvalidEscape, "unknown string escape");
+            }
+            run = state.pos;
+        }
+        else
+        {
+            state.pos = state.pos + 1_i64;
+        }
+    }
+    Fail(state, Errors.ErrorKind::UnexpectedEnd, "unterminated string");
+    return text;
+}
+
+string AppendScalar(mut State state, string text, i64 scalar)
+{
+    mut i64 width = 1_i64;
+    if (scalar >= 128_i64)
+    {
+        width = 2_i64;
+    }
+    if (scalar >= 2048_i64)
+    {
+        width = 3_i64;
+    }
+    if (scalar >= 65536_i64)
+    {
+        width = 4_i64;
+    }
+    if (width > state.limits.maxScalarBytes - String.Len(text))
+    {
+        Fail(state, Errors.ErrorKind::ScalarLimit, "decoded scalar byte limit");
+        return text;
+    }
+    return text + Scalar(scalar);
+}

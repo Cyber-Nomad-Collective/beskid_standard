@@ -1,0 +1,742 @@
+/// Exact bounded regex grammar and Unicode-scalar Thompson matching.
+use Core.String;
+
+use Core.Collections.Array;
+
+use Core.Results;
+
+pub type PatternLimits
+{
+    pub i64 maxSubjectBytes,
+
+    pub i64 maxWork,
+
+    pub i64 maxDepth,
+}
+
+pub type Budget
+{
+    pub PatternLimits limits,
+
+    pub i64 remaining,
+
+    pub string error,
+}
+
+type Expression
+{
+    i64 kind,
+
+    i64 atom,
+
+    i64 scalar,
+
+    bool negated,
+
+    i64[] first,
+
+    i64[] last,
+
+    i64[] children,
+
+    i64 minimum,
+
+    i64 maximum,
+}
+
+type Reader
+{
+    string source,
+
+    i64 pos,
+
+    Expression[] nodes,
+
+    Budget budget,
+}
+
+type State
+{
+    i64 kind,
+
+    i64 atom,
+
+    i64 next,
+
+    i64 other,
+}
+
+type Machine
+{
+    Expression[] expressions,
+
+    State[] states,
+
+    Budget budget,
+}
+
+pub PatternLimits DefaultLimits()
+{
+    return PatternLimits
+    {
+        maxSubjectBytes: 1048576_i64,
+
+        maxWork: 16777216_i64,
+
+        maxDepth: 64_i64,
+    };
+}
+
+pub bool ValidLimits(PatternLimits limits)
+{
+    return limits.maxSubjectBytes >= 0_i64 && limits.maxWork >= 0_i64 && limits.maxDepth > 0_i64 && limits.maxDepth <= 64_i64;
+}
+
+pub Budget NewBudget(PatternLimits limits)
+{
+    return Budget
+    {
+        limits: limits,
+
+        remaining: limits.maxWork,
+
+        error: "",
+    };
+}
+
+bool Charge(mut Budget budget)
+{
+    if (budget.error != "")
+    {
+        return false;
+    }
+    if (budget.remaining <= 0_i64)
+    {
+        budget.error = "PatternWorkLimit";
+        return false;
+    }
+    budget.remaining = budget.remaining - 1_i64;
+    return true;
+}
+
+pub i64 ScalarWidth(string source, i64 pos)
+{
+    if (pos >= String.Len(source))
+    {
+        return 0_i64;
+    }
+
+    u8 byte = String.ByteAt(source, pos);
+    if (byte < 128_u8)
+    {
+        return 1_i64;
+    }
+    if (byte < 224_u8)
+    {
+        return 2_i64;
+    }
+    if (byte < 240_u8)
+    {
+        return 3_i64;
+    }
+    return 4_i64;
+}
+
+pub i64 ScalarValue(string source, i64 pos)
+{
+    i64 width = ScalarWidth(source, pos);
+    if (width == 0_i64)
+    {
+        return -1_i64;
+    }
+
+    mut i64 value = i64(String.ByteAt(source, pos));
+    if (width == 1_i64)
+    {
+        return value;
+    }
+    if (width == 2_i64)
+    {
+        value = value - 192_i64;
+    }
+    else if (width == 3_i64)
+    {
+        value = value - 224_i64;
+    }
+    else
+    {
+        value = value - 240_i64;
+    }
+
+    mut i64 i = 1_i64;
+    mut i64 decoded = value;
+    while (i < width)
+    {
+        decoded = decoded * 64_i64 + i64(String.ByteAt(source, pos + i)) - 128_i64;
+        i = i + 1_i64;
+    }
+    return decoded;
+}
+
+i64 Peek(Reader reader)
+{
+    return ScalarValue(reader.source, reader.pos);
+}
+
+i64 Take(mut Reader reader)
+{
+    i64 value = Peek(reader);
+    reader.pos = reader.pos + ScalarWidth(reader.source, reader.pos);
+    return value;
+}
+
+Expression EmptyExpression(i64 kind)
+{
+    return Expression
+    {
+        kind: kind,
+
+        atom: 0_i64,
+
+        scalar: 0_i64,
+
+        negated: false,
+
+        first: Array.Empty<i64>(),
+
+        last: Array.Empty<i64>(),
+
+        children: Array.Empty<i64>(),
+
+        minimum: 0_i64,
+
+        maximum: 0_i64,
+    };
+}
+
+i64 AddExpression(mut Reader reader, Expression expression)
+{
+    i64 index = Array.Len<Expression>(reader.nodes);
+    Array.Append<Expression>(reader.nodes, expression);
+    return index;
+}
+
+unit MarkInvalid(mut Reader reader)
+{
+    if (reader.budget.error == "")
+    {
+        reader.budget.error = "InvalidPattern";
+    }
+}
+
+bool IsPlainLiteral(i64 value)
+{
+    return (value >= 65_i64 && value <= 90_i64) || (value >= 97_i64 && value <= 122_i64) || (value >= 48_i64 && value <= 57_i64) || value == 33_i64 || value == 35_i64 || value == 37_i64 || value == 38_i64 || value == 44_i64 || value == 47_i64 || value == 58_i64 || value == 59_i64 || value == 61_i64 || value == 64_i64 || value == 95_i64 || value == 96_i64 || value == 126_i64;
+}
+
+bool EscapedLiteral(i64 value)
+{
+    return value == 46_i64 || value == 92_i64 || value == 47_i64 || value == 45_i64 || value == 43_i64 || value == 124_i64 || value == 40_i64 || value == 41_i64 || value == 91_i64 || value == 93_i64 || value == 123_i64 || value == 125_i64 || value == 58_i64 || value == 39_i64 || value == 34_i64;
+}
+
+i64 Piece(mut Reader reader, i64 depth)
+{
+    i64 value = Take(reader);
+    mut Expression expression = EmptyExpression(0_i64);
+    mut i64 index = -1_i64;
+    mut bool anchor = false;
+    if (value == 40_i64)
+    {
+        if (depth >= reader.budget.limits.maxDepth)
+        {
+            reader.budget.error = "PatternDepthLimit";
+            return -1_i64;
+        }
+        index = Pattern(reader, depth + 1_i64);
+        if (Peek(reader) != 41_i64)
+        {
+            MarkInvalid(reader);
+            return -1_i64;
+        }
+        Take(reader);
+    }
+    else if (value == 94_i64 || value == 36_i64)
+    {
+        anchor = true;
+        if (value == 94_i64)
+        {
+            expression.kind = 1_i64;
+        }
+        else
+        {
+            expression.kind = 2_i64;
+        }
+        index = AddExpression(reader, expression);
+    }
+    else if (value == 91_i64)
+    {
+        expression.atom = 5_i64;
+        if (Peek(reader) == 94_i64)
+        {
+            expression.negated = true;
+            Take(reader);
+        }
+
+        mut i64 count = 0_i64;
+        while (Peek(reader) != 93_i64 && Peek(reader) >= 0_i64 && reader.budget.error == "")
+        {
+            i64 first = Take(reader);
+            mut i64 last = first;
+            if (Peek(reader) == 45_i64 && reader.pos + 1_i64 < String.Len(reader.source) && ScalarValue(reader.source, reader.pos + 1_i64) != 93_i64)
+            {
+                Take(reader);
+                last = Take(reader);
+            }
+            Array.Append<i64>(expression.first, first);
+            Array.Append<i64>(expression.last, last);
+            count = count + 1_i64;
+        }
+        if (count == 0_i64 || Peek(reader) != 93_i64)
+        {
+            MarkInvalid(reader);
+            return -1_i64;
+        }
+        Take(reader);
+        index = AddExpression(reader, expression);
+    }
+    else if (value == 92_i64)
+    {
+        i64 escaped = Take(reader);
+        if (escaped == 100_i64 || escaped == 68_i64)
+        {
+            expression.atom = 2_i64;
+            expression.negated = escaped == 68_i64;
+        }
+        else if (escaped == 119_i64 || escaped == 87_i64)
+        {
+            expression.atom = 3_i64;
+            expression.negated = escaped == 87_i64;
+        }
+        else if (escaped == 115_i64 || escaped == 83_i64)
+        {
+            expression.atom = 4_i64;
+            expression.negated = escaped == 83_i64;
+        }
+        else if (EscapedLiteral(escaped))
+        {
+            expression.scalar = escaped;
+        }
+        else
+        {
+            MarkInvalid(reader);
+            return -1_i64;
+        }
+        index = AddExpression(reader, expression);
+    }
+    else if (value == 46_i64)
+    {
+        expression.atom = 1_i64;
+        index = AddExpression(reader, expression);
+    }
+    else if (IsPlainLiteral(value))
+    {
+        expression.scalar = value;
+        index = AddExpression(reader, expression);
+    }
+    else
+    {
+        MarkInvalid(reader);
+        return -1_i64;
+    }
+
+    i64 quantifier = Peek(reader);
+    if (!anchor && (quantifier == 42_i64 || quantifier == 43_i64 || quantifier == 63_i64))
+    {
+        Take(reader);
+        mut Expression repeat = EmptyExpression(5_i64);
+        Array.Append<i64>(repeat.children, index);
+        repeat.maximum = -1_i64;
+        if (quantifier == 43_i64)
+        {
+            repeat.minimum = 1_i64;
+        }
+        if (quantifier == 63_i64)
+        {
+            repeat.maximum = 1_i64;
+        }
+        index = AddExpression(reader, repeat);
+    }
+    return index;
+}
+
+i64 Branch(mut Reader reader, i64 depth)
+{
+    mut Expression sequence = EmptyExpression(3_i64);
+    while (Peek(reader) >= 0_i64 && Peek(reader) != 124_i64 && Peek(reader) != 41_i64 && reader.budget.error == "")
+    {
+        i64 piece = Piece(reader, depth);
+        if (piece < 0_i64)
+        {
+            return -1_i64;
+        }
+        Array.Append<i64>(sequence.children, piece);
+    }
+    if (Array.Len<i64>(sequence.children) == 0_i64)
+    {
+        MarkInvalid(reader);
+        return -1_i64;
+    }
+    return AddExpression(reader, sequence);
+}
+
+i64 Pattern(mut Reader reader, i64 depth)
+{
+    mut Expression alternatives = EmptyExpression(4_i64);
+    i64 first = Branch(reader, depth);
+    if (first < 0_i64)
+    {
+        return -1_i64;
+    }
+    Array.Append<i64>(alternatives.children, first);
+    while (Peek(reader) == 124_i64 && reader.budget.error == "")
+    {
+        Take(reader);
+        i64 branch = Branch(reader, depth);
+        if (branch < 0_i64)
+        {
+            return -1_i64;
+        }
+        Array.Append<i64>(alternatives.children, branch);
+    }
+    return AddExpression(reader, alternatives);
+}
+
+Reader Parse(string pattern, Budget budget)
+{
+    mut Reader reader = Reader
+    {
+        source: pattern,
+
+        pos: 0_i64,
+
+        nodes: Array.Empty<Expression>(),
+
+        budget: budget,
+    };
+    if (String.Len(pattern) > budget.remaining)
+    {
+        budget.error = "PatternWorkLimit";
+        return reader;
+    }
+    budget.remaining = budget.remaining - String.Len(pattern);
+    Pattern(reader, 0_i64);
+    if (reader.pos != String.Len(pattern))
+    {
+        MarkInvalid(reader);
+    }
+    return reader;
+}
+
+pub Result<unit, string> ValidatePattern(string pattern)
+{
+    Budget budget = NewBudget(DefaultLimits());
+    Reader reader = Parse(pattern, budget);
+    if (budget.error != "")
+    {
+        return Result::Error(budget.error);
+    }
+    return Result::Ok(());
+}
+
+i64 AddState(mut Machine machine, i64 kind, i64 atom, i64 next, i64 other)
+{
+    if (!Charge(machine.budget))
+    {
+        return -1_i64;
+    }
+
+    i64 index = Array.Len<State>(machine.states);
+    Array.Append<State>(machine.states, State
+    {
+        kind: kind,
+
+        atom: atom,
+
+        next: next,
+
+        other: other,
+    });
+    return index;
+}
+
+i64 Compile(mut Machine machine, i64 index, i64 next)
+{
+    Expression expression = machine.expressions[index];
+    if (expression.kind == 0_i64)
+    {
+        return AddState(machine, 1_i64, index, next, -1_i64);
+    }
+    if (expression.kind == 1_i64)
+    {
+        return AddState(machine, 2_i64, -1_i64, next, -1_i64);
+    }
+    if (expression.kind == 2_i64)
+    {
+        return AddState(machine, 3_i64, -1_i64, next, -1_i64);
+    }
+
+    mut i64 head = next;
+    mut i64 i = Array.Len<i64>(expression.children) - 1_i64;
+    if (expression.kind == 3_i64)
+    {
+        while (i >= 0_i64 && machine.budget.error == "")
+        {
+            head = Compile(machine, expression.children[i], head);
+            i = i - 1_i64;
+        }
+        return head;
+    }
+    if (expression.kind == 4_i64)
+    {
+        head = Compile(machine, expression.children[i], next);
+        i = i - 1_i64;
+        while (i >= 0_i64 && machine.budget.error == "")
+        {
+            i64 other = Compile(machine, expression.children[i], next);
+            head = AddState(machine, 4_i64, -1_i64, other, head);
+            i = i - 1_i64;
+        }
+        return head;
+    }
+    if (expression.maximum == 1_i64)
+    {
+        i64 inner = Compile(machine, expression.children[0_i64], next);
+        return AddState(machine, 4_i64, -1_i64, inner, next);
+    }
+
+    i64 loop = AddState(machine, 0_i64, -1_i64, -1_i64, -1_i64);
+    if (loop < 0_i64)
+    {
+        return -1_i64;
+    }
+
+    i64 inner = Compile(machine, expression.children[0_i64], loop);
+    Array.Set<State>(machine.states, loop, State
+    {
+        kind: 4_i64,
+
+        atom: -1_i64,
+
+        next: inner,
+
+        other: next,
+    });
+    if (expression.minimum == 0_i64)
+    {
+        return loop;
+    }
+    return inner;
+}
+
+bool AtomMatches(mut Machine machine, Expression atom, i64 scalar)
+{
+    if (atom.atom == 0_i64)
+    {
+        return scalar == atom.scalar;
+    }
+    if (atom.atom == 1_i64)
+    {
+        return true;
+    }
+
+    mut bool accepted = false;
+    if (atom.atom == 2_i64)
+    {
+        accepted = scalar >= 48_i64 && scalar <= 57_i64;
+    }
+    else if (atom.atom == 3_i64)
+    {
+        accepted = (scalar >= 48_i64 && scalar <= 57_i64) || (scalar >= 65_i64 && scalar <= 90_i64) || (scalar >= 97_i64 && scalar <= 122_i64) || scalar == 95_i64;
+    }
+    else if (atom.atom == 4_i64)
+    {
+        accepted = scalar == 32_i64;
+    }
+    else
+    {
+        mut i64 i = 0_i64;
+        while (i < Array.Len<i64>(atom.first))
+        {
+            if (!Charge(machine.budget))
+            {
+                return false;
+            }
+            if (atom.first[i] <= scalar && scalar <= atom.last[i])
+            {
+                accepted = true;
+                break;
+            }
+            i = i + 1_i64;
+        }
+    }
+    return accepted != atom.negated;
+}
+
+pub Result<bool, string> Matches(string pattern, string text, Budget budget)
+{
+    if (!ValidLimits(budget.limits))
+    {
+        return Result::Error("InvalidPatternLimits");
+    }
+    if (String.Len(text) > budget.limits.maxSubjectBytes)
+    {
+        return Result::Error("PatternSubjectLimit");
+    }
+
+    Reader reader = Parse(pattern, budget);
+    if (budget.error != "")
+    {
+        return Result::Error(budget.error);
+    }
+
+    mut Machine machine = Machine
+    {
+        expressions: reader.nodes,
+
+        states: Array.Empty<State>(),
+
+        budget: budget,
+    };
+    AddState(machine, 0_i64, -1_i64, -1_i64, -1_i64);
+    i64 head = Compile(machine, Array.Len<Expression>(reader.nodes) - 1_i64, 0_i64);
+    if (budget.error != "")
+    {
+        return Result::Error(budget.error);
+    }
+
+    mut i64[] active = Array.Empty<i64>();
+    Array.Append<i64>(active, head);
+    mut i64 pos = 0_i64;
+    mut i64[] seen = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<State>(machine.states))
+    {
+        Array.Append<i64>(seen, -1_i64);
+        i = i + 1_i64;
+    }
+    while (true)
+    {
+        mut ClosureStack stack = ClosureStack
+        {
+            values: active,
+
+            top: Array.Len<i64>(active),
+        };
+        mut i64[] atoms = Array.Empty<i64>();
+        while (stack.top > 0_i64 && budget.error == "")
+        {
+            if (!Charge(budget))
+            {
+                break;
+            }
+            stack.top = stack.top - 1_i64;
+            i64 index = stack.values[stack.top];
+            if (seen[index] != pos)
+            {
+                Array.Set<i64>(seen, index, pos);
+                State state = machine.states[index];
+                if (state.kind == 0_i64)
+                {
+                    if (pos > 0_i64)
+                    {
+                        return Result::Ok(true);
+                    }
+                }
+                else if (state.kind == 1_i64)
+                {
+                    Array.Append<i64>(atoms, index);
+                }
+                else if (state.kind == 2_i64)
+                {
+                    if (pos == 0_i64)
+                    {
+                        Push(stack, state.next);
+                    }
+                }
+                else if (state.kind == 3_i64)
+                {
+                    if (pos == String.Len(text))
+                    {
+                        Push(stack, state.next);
+                    }
+                }
+                else
+                {
+                    if (!Charge(budget))
+                    {
+                        break;
+                    }
+                    Push(stack, state.other);
+                    Push(stack, state.next);
+                }
+            }
+        }
+        if (budget.error != "")
+        {
+            return Result::Error(budget.error);
+        }
+        if (pos >= String.Len(text))
+        {
+            return Result::Ok(false);
+        }
+
+        i64 scalar = ScalarValue(text, pos);
+        mut i64[] next = Array.Empty<i64>();
+        i = 0_i64;
+        while (i < Array.Len<i64>(atoms) && budget.error == "")
+        {
+            if (!Charge(budget))
+            {
+                break;
+            }
+
+            State state = machine.states[atoms[i]];
+            if (AtomMatches(machine, machine.expressions[state.atom], scalar))
+            {
+                Array.Append<i64>(next, state.next);
+            }
+            i = i + 1_i64;
+        }
+        if (budget.error != "")
+        {
+            return Result::Error(budget.error);
+        }
+        if (Array.Len<i64>(next) == 0_i64)
+        {
+            return Result::Ok(false);
+        }
+        active = next;
+        pos = pos + ScalarWidth(text, pos);
+    }
+    return Result::Ok(false);
+}
+
+type ClosureStack
+{
+    i64[] values,
+
+    i64 top,
+}
+
+unit Push(mut ClosureStack stack, i64 value)
+{
+    if (stack.top < Array.Len<i64>(stack.values))
+    {
+        Array.Set<i64>(stack.values, stack.top, value);
+    }
+    else
+    {
+        Array.Append<i64>(stack.values, value);
+    }
+    stack.top = stack.top + 1_i64;
+}

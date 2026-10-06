@@ -1,0 +1,125 @@
+use Core.Optional;
+use Core.Collections.Array;
+
+use Core.Results;
+
+use Core.Serialization.Descriptors;
+
+use Core.Serialization.Metadata;
+
+use Core.Serialization.Registry;
+
+use Testing.Assert;
+
+ShapeDescriptor Descriptor()
+{
+    Metadata.ShapeId id = match Registry.SignatureId("abc", 8388608_i64)
+    {
+        Result::Ok(value) => value,
+
+        Result::Error(_) => {
+            Assert.Fail("SHA256 canonical signature");
+            return Descriptor();
+        },
+    };
+    return ShapeDescriptor
+    {
+        id: id,
+
+        signature: "abc",
+
+        packageIdentity: "package@1.0.0",
+
+        sourcePath: "Main.bd",
+
+        declarationPath: "Item",
+
+        schemaVersion: "1",
+
+        kind: ShapeKind::Record,
+
+        width: 0_u8,
+
+        arguments: Array.Empty<Metadata.ShapeId>(),
+
+        fields: Array.Empty<FieldDescriptor>(),
+
+        variants: Array.Empty<VariantDescriptor>(),
+
+        extras: Optional.Empty<ExtrasBinding>(),
+    };
+}
+
+test serialization_signature_sha256_exact
+{
+    ShapeDescriptor descriptor = Descriptor();
+
+    Assert.Equal(Metadata.FormatShapeId(descriptor.id), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "actual SHA256 identity");
+}
+
+test serialization_registration_conflict_is_atomic_and_owned
+{
+    ShapeRegistry shapeTable = Registry.Create();
+
+    mut ShapeDescriptor descriptor = Descriptor();
+
+    Assert.True(Results.IsOk(Registry.Register(shapeTable, descriptor, 8388608_i64, 100000_i64)), "initial registration");
+
+    mut ShapeDescriptor conflicting = Descriptor();
+
+    conflicting.schemaVersion = "incompatible";
+
+    Assert.True(Results.IsError(Registry.Register(shapeTable, conflicting, 8388608_i64, 100000_i64)), "incompatible descriptor rejects");
+
+    descriptor.sourcePath = "mutated";
+
+    match Registry.Lookup(shapeTable, descriptor.id)
+    {
+        Result::Error(_) => Assert.Fail("first registration preserved"),
+
+        Result::Ok(value) => Assert.Equal(value.sourcePath, "Main.bd", "registered descriptor copied independently"),
+    };
+}
+
+test serialization_signature_limit_returns_checked_error
+{
+    Assert.True(Results.IsError(Registry.SignatureId("abc", 2_i64)), "signature bytes bounded before hash allocation");
+}
+
+Metadata.ShapeId Identity(string signature) {
+    match Registry.SignatureId(signature, 8388608_i64) {
+        Result::Ok(value) => { return value; },
+        Result::Error(_) => { Assert.Fail("fixture identity"); return Identity(signature); },
+    };
+}
+
+test serialization_graph_missing_edge_keeps_existing_table {
+    ShapeRegistry table = Registry.Create();
+    ShapeDescriptor prior = Descriptor();
+    Assert.True(Results.IsOk(Registry.Register(table, prior, 1048576_i64, 16_i64)), "prior registration");
+    mut ShapeDescriptor root = Descriptor();
+    root.signature = "root-with-missing-child"; root.id = Identity(root.signature);
+    Array.Append<FieldDescriptor>(root.fields, FieldDescriptor { name: "child", shape: Identity("missing"), required: true, optional: false, defaultSignature: "" });
+    Assert.True(Results.IsError(Registry.RegisterGraph(table, [root], 1048576_i64, 8388608_i64, 16_i64)), "missing edge rejects complete closure");
+    Assert.True(Results.IsError(Registry.Lookup(table, root.id)), "failed root was never published");
+    match Registry.Lookup(table, prior.id) {
+        Result::Error(_) => { Assert.Fail("prior graph survives"); },
+        Result::Ok(value) => { Assert.Equal(value.sourcePath, "Main.bd", "prior metadata retained"); },
+    };
+}
+
+test serialization_graph_admits_complete_recursive_closure {
+    ShapeRegistry table = Registry.Create();
+    mut ShapeDescriptor root = Descriptor();
+    root.signature = "recursive-record"; root.id = Identity(root.signature);
+    Array.Append<FieldDescriptor>(root.fields, FieldDescriptor { name: "next", shape: root.id, required: false, optional: true, defaultSignature: "" });
+    Assert.True(Results.IsOk(Registry.RegisterGraph(table, [root], 1048576_i64, 8388608_i64, 16_i64)), "schema back-reference is resolved within full closure");
+    Assert.True(Results.IsOk(Registry.RegisterGraph(table, [root], 1048576_i64, 8388608_i64, 16_i64)), "identical complete closure can be registered repeatedly");
+}
+
+test serialization_graph_signature_budget_failure_does_not_publish {
+    ShapeRegistry table = Registry.Create();
+    ShapeDescriptor root = Descriptor();
+    Assert.True(Results.IsError(Registry.RegisterGraph(table, [root], 1048576_i64, 2_i64, 16_i64)), "aggregate signatures bounded");
+    Assert.True(Results.IsError(Registry.Lookup(table, root.id)), "budget failure leaves empty table");
+}

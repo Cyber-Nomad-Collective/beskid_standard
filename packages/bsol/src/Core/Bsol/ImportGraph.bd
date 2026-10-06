@@ -1,0 +1,175 @@
+use Core.Bsol.Imports;
+use Core.Bsol.Syntax;
+use Core.Bsol.Parser;
+use Core.Bsol.Limits;
+use Core.Collections.Array;
+use Core.String;
+
+pub type Source {
+    pub Imports.MaterializedSource materialized,
+    pub Syntax.Document document,
+    pub string profile,
+    pub i64 version,
+    pub bool active,
+}
+
+pub type Binding {
+    pub i64 owner,
+    pub i64 target,
+    pub string name,
+    pub Syntax.Span span,
+}
+
+/// Every document and namespace binding is owned by this resolved closure.
+pub type Graph {
+    pub Source[] sources,
+    pub Binding[] bindings,
+    pub i64 root,
+}
+
+pub type GraphFailure {
+    pub Imports.ImportFailure failure,
+    pub Syntax.Span span,
+    pub string profile,
+}
+
+type State {
+    Graph graph,
+    Limits.BsolLimits limits,
+    i64 bytes,
+    i64 nodes,
+    i64 imports,
+}
+
+GraphFailure Issue(string code, string message, Syntax.Span span, string profile) {
+    return GraphFailure { failure: Imports.ImportFailure { code: code, message: message }, span: span, profile: profile };
+}
+
+GraphFailure HostIssue(Imports.ImportFailure error, Syntax.Span span, string profile) {
+    return GraphFailure { failure: error, span: span, profile: profile };
+}
+
+bool SameDigest(u8[] left, u8[] right) {
+    if (Array.Len<u8>(left) != 32_i64 || Array.Len<u8>(right) != 32_i64) { return false; }
+    mut i64 index = 0_i64;
+    while (index < 32_i64) {
+        if (left[index] != right[index]) { return false; }
+        index = index + 1_i64;
+    }
+    return true;
+}
+
+Result<i64, GraphFailure> Visit<R>(Imports.MaterializedSource materialized, string expectedProfile, R resolver, mut State state, i64 depth, Syntax.Span span, string ownerProfile) where R: Imports.Resolver {
+    if (depth > state.limits.maxImportDepth) { return Result::Error(Issue("ImportDepthLimit", "resolved import depth exceeded", span, ownerProfile)); }
+    // An identity may be reused only with identical content. An active reuse is
+    // a cycle; a completed reuse is a diamond and does not debit source twice.
+    mut i64 existing = 0_i64;
+    while (existing < Array.Len<Source>(state.graph.sources)) {
+        Source previous = state.graph.sources[existing];
+        if (previous.materialized.canonicalIdentity == materialized.canonicalIdentity) {
+            if (!SameDigest(previous.materialized.sourceSha256, materialized.sourceSha256) || previous.materialized.source != materialized.source) {
+                return Result::Error(Issue("AmbiguousImportIdentity", "one canonical identity returned different bytes", span, ownerProfile));
+            }
+            if (previous.active) { return Result::Error(Issue("ImportCycle", "active canonical source imported recursively", span, ownerProfile)); }
+            if (String.Len(expectedProfile) != 0_i64 && previous.profile != expectedProfile) { return Result::Error(Issue("ImportProfileMismatch", "materialization contains another profile", span, ownerProfile)); }
+            return Result::Ok(existing);
+        }
+        existing = existing + 1_i64;
+    }
+    i64 sourceBytes = String.Len(materialized.source);
+    if (sourceBytes > state.limits.maxResolvedSchemaBytes - state.bytes) { return Result::Error(Issue("ResolvedSchemaLimit", "aggregate schema bytes exceeded", span, ownerProfile)); }
+    match Imports.VerifyMaterialized(materialized, state.limits.maxResolvedSchemaBytes - state.bytes) {
+        Result::Error(error) => { return Result::Error(HostIssue(error, span, ownerProfile)); },
+        Result::Ok(_) => {},
+    };
+    // Parsing itself uses the remaining aggregate node budget. It cannot
+    // allocate a whole oversized imported arena and only account afterward.
+    i64 remainingNodes = state.limits.maxNodes - state.nodes;
+    if (remainingNodes < 1_i64) { return Result::Error(Issue("ResolvedNodeLimit", "aggregate schema nodes exceeded", span, ownerProfile)); }
+    Limits.BsolLimits parseLimits = Limits.BsolLimits {
+        maxInputBytes: state.limits.maxInputBytes,
+        maxOutputBytes: state.limits.maxOutputBytes,
+        maxDepth: state.limits.maxDepth,
+        maxNodes: remainingNodes,
+        maxScalarBytes: state.limits.maxScalarBytes,
+        maxImports: state.limits.maxImports,
+        maxImportDepth: state.limits.maxImportDepth,
+        maxResolvedSchemaBytes: state.limits.maxResolvedSchemaBytes,
+    };
+    match Parser.Parse(materialized.source, parseLimits) {
+        Result::Error(error) => { return Result::Error(Issue("ImportSyntaxError", error.message, error.span, ownerProfile)); },
+        Result::Ok(document) => {
+            if (Array.Len<i64>(document.roots) != 1_i64) { return Result::Error(Issue("ProfileRootRequired", "one profile root required", span, ownerProfile)); }
+            Syntax.Node profile = document.nodes[document.roots[0_i64]];
+            if (profile.kind != Syntax.NodeKind::Block || profile.name != "profile" || !profile.hasLabel || String.Len(profile.label) == 0_i64) { return Result::Error(Issue("ProfileRootRequired", "labelled profile root required", profile.span, ownerProfile)); }
+            if (String.Len(expectedProfile) != 0_i64 && profile.label != expectedProfile) { return Result::Error(Issue("ImportProfileMismatch", "materialization contains another profile", profile.span, ownerProfile)); }
+            mut i64 versionCount = 0_i64;
+            mut i64 declaredVersion = 0_i64;
+            mut i64 child = 0_i64;
+            while (child < Array.Len<i64>(profile.children)) {
+                Syntax.Node property = document.nodes[profile.children[child]];
+                if (property.kind == Syntax.NodeKind::Assignment && property.name == "version") {
+                    versionCount = versionCount + 1_i64;
+                    if (Array.Len<i64>(property.children) != 1_i64) { return Result::Error(Issue("InvalidProfileVersion", "profile version required", property.span, profile.label)); }
+                    Syntax.Node value = document.nodes[property.children[0_i64]];
+                    if ((value.kind != Syntax.NodeKind::Number && value.kind != Syntax.NodeKind::String) || (value.text != "1" && value.text != "2")) { return Result::Error(Issue("InvalidProfileVersion", "supported schema version required", property.span, profile.label)); }
+                    if (value.text == "1") { declaredVersion = 1_i64; } else { declaredVersion = 2_i64; }
+                }
+                child = child + 1_i64;
+            }
+            if (versionCount != 1_i64) { return Result::Error(Issue("InvalidProfileVersion", "exactly one schema version required", profile.span, profile.label)); }
+            i64 current = Array.Len<Source>(state.graph.sources);
+            Array.Append<Source>(state.graph.sources, Source { materialized: materialized, document: document, profile: profile.label, version: declaredVersion, active: true });
+            state.bytes = state.bytes + sourceBytes;
+            state.nodes = state.nodes + Array.Len<Syntax.Node>(document.nodes);
+            child = 0_i64;
+            while (child < Array.Len<i64>(profile.children)) {
+                i64 declarationIndex = profile.children[child];
+                Syntax.Node declarationNode = document.nodes[declarationIndex];
+                if (declarationNode.kind == Syntax.NodeKind::Block && declarationNode.name == "import_schema") {
+                    if (state.imports >= state.limits.maxImports) { return Result::Error(Issue("ImportCountLimit", "aggregate import count exceeded", declarationNode.span, profile.label)); }
+                    state.imports = state.imports + 1_i64;
+                    match Imports.ParseDeclaration(document, declarationIndex) {
+                        Result::Error(error) => { return Result::Error(HostIssue(error, declarationNode.span, profile.label)); },
+                        Result::Ok(declaration) => {
+                            mut string bindingName = declaration.profile;
+                            if (declaration.hasAlias) { bindingName = declaration.alias; }
+                            mut i64 bindingIndex = 0_i64;
+                            while (bindingIndex < Array.Len<Binding>(state.graph.bindings)) {
+                                Binding binding = state.graph.bindings[bindingIndex];
+                                if (binding.owner == current && binding.name == bindingName) { return Result::Error(Issue("DuplicateImportAlias", "import namespace binding is repeated", declaration.span, profile.label)); }
+                                bindingIndex = bindingIndex + 1_i64;
+                            }
+                            match Imports.ResolveVerified<R>(declaration.request, resolver, state.limits.maxResolvedSchemaBytes) {
+                                Result::Error(error) => { return Result::Error(HostIssue(error, declaration.span, profile.label)); },
+                                Result::Ok(imported) => {
+                                    match Visit<R>(imported, declaration.profile, resolver, state, depth + 1_i64, declaration.span, profile.label) {
+                                        Result::Error(error) => { return Result::Error(error); },
+                                        Result::Ok(target) => { Array.Append<Binding>(state.graph.bindings, Binding { owner: current, target: target, name: bindingName, span: declaration.span }); },
+                                    };
+                                },
+                            };
+                        },
+                    };
+                }
+                child = child + 1_i64;
+            }
+            mut Source completed = state.graph.sources[current];
+            completed.active = false;
+            state.graph.sources[current] = completed;
+            return Result::Ok(current);
+        },
+    };
+}
+
+/// Publish the graph only when every import has resolved and verified. Failed
+/// recursion never returns any of the private partially populated arenas.
+pub Result<Graph, GraphFailure> Resolve<R>(Imports.MaterializedSource root, R resolver, Limits.BsolLimits limits) where R: Imports.Resolver {
+    Syntax.Span rootSpan = Syntax.Span { start: 0_i64, end: String.Len(root.source) };
+    if (!Limits.Valid(limits)) { return Result::Error(Issue("InvalidLimits", "invalid import closure limits", rootSpan, "")); }
+    mut State state = State { graph: Graph { sources: Array.Empty<Source>(), bindings: Array.Empty<Binding>(), root: 0_i64 }, limits: limits, bytes: 0_i64, nodes: 0_i64, imports: 0_i64 };
+    match Visit<R>(root, "", resolver, state, 0_i64, rootSpan, "") {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(rootIndex) => { state.graph.root = rootIndex; return Result::Ok(state.graph); },
+    };
+}

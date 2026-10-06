@@ -1,0 +1,58 @@
+use Core.Glue.BinaryCodec;
+use Core.Serialization.DataValue;
+use Core.Collections.Array;
+use Core.Results;
+use Testing.Assert;
+
+/// @native-only
+test glue_signed_value_uses_shared_exact_width_and_twos_complement {
+    match BinaryCodec.Encode(DataValue::Signed(-128_i64, 8_u8)) {
+        Result::Error(_) => Assert.Fail("signed minimum encodes"),
+        Result::Ok(bytes) => {
+            Assert.Equal(Array.Len<u8>(bytes), 10_i64, "tag plus width plus exact 64-bit payload");
+            Assert.Equal(bytes[0], 2_u8, "shared signed tag");
+            Assert.Equal(bytes[1], 8_u8, "declared signed width");
+            Assert.Equal(bytes[2], 128_u8, "little-endian low byte");
+            mut i64 i = 3_i64;
+            while (i < 10_i64) { Assert.Equal(bytes[i], 255_u8, "sign extension preserved"); i = i + 1_i64; }
+            match BinaryCodec.Decode(bytes) {
+                Result::Error(_) => Assert.Fail("encoded signed value decodes"),
+                Result::Ok(value) => match value {
+                    DataValue::Signed(number, width) => { Assert.Equal(number, -128_i64, "exact negative value"); Assert.Equal(width, 8_u8, "exact width"); },
+                    _ => Assert.Fail("signed logical tag retained"),
+                },
+            };
+        },
+    };
+}
+
+/// @native-only
+test glue_codec_rejects_out_of_range_values_before_output {
+    match BinaryCodec.Encode(DataValue::Signed(128_i64, 8_u8)) {
+        Result::Ok(_) => Assert.Fail("out of range signed value must reject"),
+        Result::Error(_) => {},
+    };
+    match BinaryCodec.Encode(DataValue::Unsigned(256_u64, 8_u8)) {
+        Result::Ok(_) => Assert.Fail("out of range unsigned value must reject"),
+        Result::Error(_) => {},
+    };
+}
+
+/// @native-only
+test glue_float_negative_zero_preserves_exact_ieee_bits {
+    match BinaryCodec.Encode(DataValue::Float(9223372036854775808_u64, 64_u8)) {
+        Result::Error(_) => Assert.Fail("negative zero encodes"),
+        Result::Ok(bytes) => {
+            Assert.Equal(bytes[0], 4_u8, "shared float tag");
+            Assert.Equal(bytes[1], 64_u8, "float width retained");
+            Assert.Equal(bytes[9], 128_u8, "sign bit retained");
+            match BinaryCodec.Decode(bytes) {
+                Result::Error(_) => Assert.Fail("negative zero decodes"),
+                Result::Ok(value) => match value {
+                    DataValue::Float(bits, width) => { Assert.Equal(bits, 9223372036854775808_u64, "exact IEEE bits"); Assert.Equal(width, 64_u8, "exact float width"); },
+                    _ => Assert.Fail("float logical tag retained"),
+                },
+            };
+        },
+    };
+}

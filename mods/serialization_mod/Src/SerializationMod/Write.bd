@@ -1,0 +1,323 @@
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Results;
+use SerializationMod.Syntax;
+use SerializationMod.Scalars;
+use SerializationMod.Collect;
+use SerializationMod.Read;
+
+SpannedStatement Operation(Syntax.Builder builder, string name, SpannedExpression[] arguments) {
+    return Syntax.Evaluate(builder, Syntax.Propagate(builder, Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, "encoder"), name), arguments)));
+}
+
+SpannedStatement[] Concat(SpannedStatement[] target, SpannedStatement[] source) {
+    return Read.Append(target, source);
+}
+
+SpannedExpression Bool(Syntax.Builder builder, bool value) {
+    return Syntax.LiteralValue(builder, Literal::Bool(value));
+}
+
+/// Recursion is over declared source type, not runtime boxed fields.
+/// Nominal calls remain specialized and must pass host conformance/eligibility.
+/// Foundation containers are written only at semantically proven ContainerSites.
+pub Result<SpannedStatement[], SemanticError> Value(Syntax.Builder builder, SpannedType ty, SpannedExpression value, u8 wordWidth, Read.TypePlan plan, i64 depth) {
+    if (depth > 128_i64) {
+        return Result::Error(SemanticError { code: "SerializationTypeDepth", message: "generated source type nesting exceeds 128" });
+    }
+    match ty.node {
+        Type::Primitive(primitive) => {
+            match Scalars.Write(builder, primitive.node, value, wordWidth) {
+                Result::Ok(statement) => { return Result::Ok([statement]); },
+                Result::Error(error) => { return Result::Error(error); },
+            };
+        },
+        Type::Array(element) => {
+            string counter = Syntax.FreshName(builder);
+            SpannedExpression length = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Collections", "Array", "Len"], [])), [value]);
+            SpannedExpression zero = Syntax.LiteralValue(builder, Literal::Integer("0_i64"));
+            SpannedExpression one = Syntax.LiteralValue(builder, Literal::Integer("1_i64"));
+            mut SpannedStatement[] inner = [];
+            match Value(builder, element, Syntax.Index(builder, value, Syntax.Local(builder, counter)), wordWidth, plan, depth + 1_i64) {
+                Result::Ok(statements) => { inner = statements; },
+                Result::Error(error) => { return Result::Error(error); },
+            };
+            inner = Array.Append<SpannedStatement>(inner, Syntax.Assign(builder, Syntax.Local(builder, counter), Syntax.Binary(builder, Syntax.Local(builder, counter), BinaryOp::Add, one)));
+            return Result::Ok([
+                Operation(builder, "BeginSequence", [length]),
+                Syntax.Let(builder, counter, Syntax.Primitive(builder, PrimitiveType::I64), true, zero),
+                Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, counter), BinaryOp::Lt, length), inner),
+                Operation(builder, "EndSequence", []),
+            ]);
+        },
+        Type::Complex(_) => {
+            i64 site = Read.ContainerIndex(plan.containers, ty);
+            if (site >= 0_i64) {
+                Read.ContainerSite container = plan.containers[site];
+                match container.kind {
+                    Read.ContainerKind::Sequence => { return ListValue(builder, container.element, value, wordWidth, plan, depth); },
+                    Read.ContainerKind::Optional => { return OptionalValue(builder, container.element, value, wordWidth, plan, depth); },
+                    Read.ContainerKind::Mapping => { return MapValue(builder, container.element, value, wordWidth, plan, depth); },
+                };
+            }
+            return Result::Ok([OperationForNominal(builder, value)]);
+        },
+        Type::Associated(_, _) => {
+            return Result::Error(SemanticError { code: "SerializationOpaqueReference", message: "associated types have no serializable identity" });
+        },
+        Type::_This => {
+            return Result::Error(SemanticError { code: "SerializationOpaqueReference", message: "This has no serializable identity outside its declaration" });
+        },
+        Type::Function(_, _) => {
+            return Result::Error(SemanticError { code: "SerializationClosure", message: "function values are not serializable" });
+        },
+    };
+}
+
+/// Sorted key snapshot of a Map<string,V> value. Foundation Map entry order is
+/// an edit history, so output order is fixed at encode time: keys are copied
+/// with `Keys()` and sorted ordinally (byte-wise UTF-8, Core.String.Core.SortOrdinal).
+type KeyPlan {
+    SpannedStatement[] statements,
+    string keys,
+    string count,
+}
+
+KeyPlan SortedKeys(Syntax.Builder builder, SpannedExpression value) {
+    string keys = Syntax.FreshName(builder);
+    string count = Syntax.FreshName(builder);
+    SpannedType stringType = Syntax.Primitive(builder, PrimitiveType::String);
+    SpannedExpression snapshot = Syntax.Call(builder, Syntax.Member(builder, value, "Keys"), []);
+    SpannedExpression sorted = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["String", "Core", "SortOrdinal"], [])), [snapshot]);
+    SpannedExpression length = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Collections", "Array", "Len"], [])), [Syntax.Local(builder, keys)]);
+    return KeyPlan {
+        statements: [
+            Syntax.Let(builder, keys, Syntax.ArrayType(builder, stringType), false, sorted),
+            Syntax.Let(builder, count, Syntax.Primitive(builder, PrimitiveType::I64), false, length),
+        ],
+        keys: keys,
+        count: count,
+    };
+}
+
+/// Writes every entry in sorted key order, each framed by `begin(key)`/`end`.
+/// A key equal to a `reserved` wire name fails the write with `CatchallCollision`.
+/// `Get` is total for a key taken from the same map; its error arm is a checked
+/// failure, not a fallback.
+Result<SpannedStatement[], SemanticError> Entries(Syntax.Builder builder, SpannedType element, SpannedExpression value, KeyPlan plan, string begin, string end, string[] reserved, u8 wordWidth, Read.TypePlan types, i64 depth) {
+    string counter = Syntax.FreshName(builder);
+    string key = Syntax.FreshName(builder);
+    string item = Syntax.FreshName(builder);
+    string failure = Syntax.FreshName(builder);
+    SpannedType stringType = Syntax.Primitive(builder, PrimitiveType::String);
+    mut SpannedStatement[] written = [];
+    match Value(builder, element, Syntax.Local(builder, item), wordWidth, types, depth + 1_i64) {
+        Result::Ok(statements) => { written = statements; },
+        Result::Error(error) => { return Result::Error(error); },
+    };
+    SpannedPath access = Syntax.CorePath(builder, ["Results", "Result"], [element, stringType]);
+    SpannedPath errors = Syntax.CorePath(builder, ["Serialization", "Errors", "NumericError"], []);
+    SpannedExpression keyError = Syntax.Call(builder, Syntax.Name(builder, errors), [Syntax.Text(builder, "MapKey")]);
+    SpannedExpression get = Syntax.Call(builder, Syntax.Member(builder, value, "Get"), [Syntax.Local(builder, key)]);
+    SpannedExpression selected = Syntax.MatchValue(builder, get, [
+        Syntax.Arm(builder, Syntax.VariantPattern(builder, access, "Ok", [Syntax.Binding(builder, item)]), Syntax.BlockValue(builder, written)),
+        Syntax.Arm(builder, Syntax.VariantPattern(builder, access, "Error", [Syntax.Binding(builder, failure)]), Syntax.BlockValue(builder, [Syntax.Return(builder, Syntax.ConstructVariant(builder, types.result, "Error", [keyError]))])),
+    ]);
+    mut SpannedStatement[] inner = [Syntax.Let(builder, key, stringType, false, Syntax.Index(builder, Syntax.Local(builder, plan.keys), Syntax.Local(builder, counter)))];
+    mut i64 name = 0_i64;
+    while (name < Array.Len(reserved)) {
+        SpannedExpression collision = Syntax.Call(builder, Syntax.Name(builder, errors), [Syntax.Text(builder, "CatchallCollision")]);
+        SpannedExpression collides = Syntax.Binary(builder, Syntax.Local(builder, key), BinaryOp::Eq, Syntax.Text(builder, reserved[name]));
+        inner = Array.Append<SpannedStatement>(inner, Syntax.If(builder, collides, [Syntax.Return(builder, Syntax.ConstructVariant(builder, types.result, "Error", [collision]))]));
+        name = name + 1_i64;
+    }
+    inner = Array.Append<SpannedStatement>(inner, Operation(builder, begin, [Syntax.Local(builder, key)]));
+    inner = Array.Append<SpannedStatement>(inner, Syntax.Evaluate(builder, selected));
+    inner = Array.Append<SpannedStatement>(inner, Operation(builder, end, []));
+    inner = Array.Append<SpannedStatement>(inner, Syntax.Assign(builder, Syntax.Local(builder, counter), Syntax.Binary(builder, Syntax.Local(builder, counter), BinaryOp::Add, Syntax.LiteralValue(builder, Literal::Integer("1_i64")))));
+    return Result::Ok([
+        Syntax.Let(builder, counter, Syntax.Primitive(builder, PrimitiveType::I64), true, Syntax.LiteralValue(builder, Literal::Integer("0_i64"))),
+        Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, counter), BinaryOp::Lt, Syntax.Local(builder, plan.count)), inner),
+    ]);
+}
+
+/// Writes Map<string,V> as a counted map whose entries follow ordinal key order.
+Result<SpannedStatement[], SemanticError> MapValue(Syntax.Builder builder, SpannedType element, SpannedExpression value, u8 wordWidth, Read.TypePlan plan, i64 depth) {
+    KeyPlan keys = SortedKeys(builder, value);
+    mut SpannedStatement[] statements = keys.statements;
+    statements = Array.Append<SpannedStatement>(statements, Operation(builder, "BeginMap", [Syntax.Local(builder, keys.count)]));
+    match Entries(builder, element, value, keys, "BeginMapEntry", "EndMapEntry", [], wordWidth, plan, depth) {
+        Result::Ok(body) => { statements = Concat(statements, body); },
+        Result::Error(error) => { return Result::Error(error); },
+    };
+    statements = Array.Append<SpannedStatement>(statements, Operation(builder, "EndMap", []));
+    return Result::Ok(statements);
+}
+
+SpannedStatement OperationForNominal(Syntax.Builder builder, SpannedExpression value) {
+    SpannedExpression call = Syntax.Call(builder, Syntax.Member(builder, value, "WriteTyped"), [Syntax.Local(builder, "encoder"), Syntax.Local(builder, "limits")]);
+    return Syntax.Evaluate(builder, Syntax.Propagate(builder, call));
+}
+
+/// Writes List<T> in index order through its public Count/Get surface. Get is
+/// total for 0 <= index < Count; its error arm is a checked failure, not a fallback.
+Result<SpannedStatement[], SemanticError> ListValue(Syntax.Builder builder, SpannedType element, SpannedExpression value, u8 wordWidth, Read.TypePlan plan, i64 depth) {
+    string count = Syntax.FreshName(builder);
+    string counter = Syntax.FreshName(builder);
+    string item = Syntax.FreshName(builder);
+    string failure = Syntax.FreshName(builder);
+    SpannedType countType = Syntax.Primitive(builder, PrimitiveType::I64);
+    mut SpannedStatement[] written = [];
+    match Value(builder, element, Syntax.Local(builder, item), wordWidth, plan, depth + 1_i64) {
+        Result::Ok(statements) => { written = statements; },
+        Result::Error(error) => { return Result::Error(error); },
+    };
+    SpannedPath access = Syntax.CorePath(builder, ["Results", "Result"], [element, Syntax.Primitive(builder, PrimitiveType::String)]);
+    SpannedExpression indexError = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Serialization", "Errors", "NumericError"], [])), [Syntax.Text(builder, "ListIndex")]);
+    SpannedExpression get = Syntax.Call(builder, Syntax.Member(builder, value, "Get"), [Syntax.Local(builder, counter)]);
+    SpannedExpression selected = Syntax.MatchValue(builder, get, [
+        Syntax.Arm(builder, Syntax.VariantPattern(builder, access, "Ok", [Syntax.Binding(builder, item)]), Syntax.BlockValue(builder, written)),
+        Syntax.Arm(builder, Syntax.VariantPattern(builder, access, "Error", [Syntax.Binding(builder, failure)]), Syntax.BlockValue(builder, [Syntax.Return(builder, Syntax.ConstructVariant(builder, plan.result, "Error", [indexError]))])),
+    ]);
+    SpannedStatement[] inner = [
+        Syntax.Evaluate(builder, selected),
+        Syntax.Assign(builder, Syntax.Local(builder, counter), Syntax.Binary(builder, Syntax.Local(builder, counter), BinaryOp::Add, Syntax.LiteralValue(builder, Literal::Integer("1_i64")))),
+    ];
+    return Result::Ok([
+        Syntax.Let(builder, count, countType, false, Syntax.Call(builder, Syntax.Member(builder, value, "Count"), [])),
+        Operation(builder, "BeginSequence", [Syntax.Local(builder, count)]),
+        Syntax.Let(builder, counter, Syntax.Primitive(builder, PrimitiveType::I64), true, Syntax.LiteralValue(builder, Literal::Integer("0_i64"))),
+        Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, counter), BinaryOp::Lt, Syntax.Local(builder, count)), inner),
+        Operation(builder, "EndSequence", []),
+    ]);
+}
+
+/// Presence is explicit on the wire; absence never becomes a missing field.
+Result<SpannedStatement[], SemanticError> OptionalValue(Syntax.Builder builder, SpannedType element, SpannedExpression value, u8 wordWidth, Read.TypePlan plan, i64 depth) {
+    string item = Syntax.FreshName(builder);
+    SpannedPath option = Syntax.CorePath(builder, ["Optional", "Option"], [element]);
+    mut SpannedStatement[] present = [Operation(builder, "BeginOptional", [Bool(builder, true)])];
+    match Value(builder, element, Syntax.Local(builder, item), wordWidth, plan, depth + 1_i64) {
+        Result::Ok(statements) => { present = Concat(present, statements); },
+        Result::Error(error) => { return Result::Error(error); },
+    };
+    present = Array.Append<SpannedStatement>(present, Operation(builder, "EndOptional", []));
+    SpannedStatement[] absent = [Operation(builder, "BeginOptional", [Bool(builder, false)]), Operation(builder, "EndOptional", [])];
+    SpannedExpression selected = Syntax.MatchValue(builder, value, [
+        Syntax.Arm(builder, Syntax.VariantPattern(builder, option, "Some", [Syntax.Binding(builder, item)]), Syntax.BlockValue(builder, present)),
+        Syntax.Arm(builder, Syntax.VariantPattern(builder, option, "None", []), Syntax.BlockValue(builder, absent)),
+    ]);
+    return Result::Ok([Syntax.Evaluate(builder, selected)]);
+}
+
+Result<SpannedStatement[], SemanticError> Field(Syntax.Builder builder, SpannedType ty, SpannedExpression value, Read.FieldPolicy policy, Read.TypePlan plan) {
+    if (policy.bytes) {
+        match ty.node { Type::Array(element) => { match element.node { Type::Primitive(primitive) => { match primitive.node { PrimitiveType::U8 => { return Result::Ok([Operation(builder, "WriteBytes", [value])]); }, _ => { }, }; }, _ => { }, }; }, _ => { }, };
+        return Result::Error(SemanticError { code: "SerializationBytesType", message: "bytes requires u8[]" });
+    }
+    return Value(builder, ty, value, policy.wordWidth, plan, 0_i64);
+}
+
+/// Build the original record's method, with direct source-declared field access.
+/// Receiver/encoder/conformance identities are revalidated by BindTarget admission.
+pub Result<SpannedMethodDefinition, SemanticError> Record(Syntax.Builder builder, SpannedType receiver, SpannedType encoder, SpannedType limits, SpannedType result, SpannedPath shapeGetter, SpannedPath resultPath, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers) {
+    SpannedExpression shape = Syntax.Call(builder, Syntax.Name(builder, shapeGetter), []);
+    if (Array.Len(fields) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "field policy cardinality differs" }); }
+    Read.TypePlan plan = Read.Plan([], containers, resultPath);
+    mut i64 written = 0_i64;
+    mut i64 catchall = -1_i64;
+    mut string[] reserved = [];
+    mut i64 scan = 0_i64;
+    while (scan < Array.Len(fields)) {
+        if (policies[scan].catchall) {
+            if (catchall >= 0_i64) { return Result::Error(SemanticError { code: "SerializationCatchall", message: "a record admits at most one catchall field" }); }
+            catchall = scan;
+        } else {
+            // Every declared wire name is reserved: on decode it binds to its
+            // field (or rejects as a collision), never to the catchall.
+            reserved = Array.Append<string>(reserved, policies[scan].wireName);
+            if (!policies[scan].skipWrite) { written = written + 1_i64; }
+        }
+        scan = scan + 1_i64;
+    }
+    mut SpannedStatement[] statements = [];
+    mut SpannedExpression count = Syntax.LiteralValue(builder, Literal::Integer(Collect.Decimal(u64(written)) + "_i64"));
+    mut SpannedStatement[] flattened = [];
+    if (catchall >= 0_i64 && !policies[catchall].skipWrite) {
+        // Catchall entries flatten into the record after the declared fields, in
+        // ordinal key order; the record field count includes them.
+        SpannedType extrasType = fields[catchall].node.ty;
+        i64 site = Read.ContainerIndex(containers, extrasType);
+        mut bool mapping = false;
+        if (site >= 0_i64) { match containers[site].kind { Read.ContainerKind::Mapping => { mapping = true; }, _ => { }, }; }
+        if (!mapping) { return Result::Error(SemanticError { code: "SerializationCatchallType", message: "catchall field must be the canonical Foundation Map<string,V>" }); }
+        SpannedExpression extras = Syntax.Member(builder, Syntax.Local(builder, "self"), fields[catchall].node.name.node.name);
+        KeyPlan keys = SortedKeys(builder, extras);
+        statements = keys.statements;
+        count = Syntax.Binary(builder, count, BinaryOp::Add, Syntax.Local(builder, keys.count));
+        match Entries(builder, containers[site].element, extras, keys, "BeginField", "EndField", reserved, 0_u8, plan, 0_i64) {
+            Result::Ok(body) => { flattened = body; },
+            Result::Error(error) => { return Result::Error(error); },
+        };
+    }
+    statements = Array.Append<SpannedStatement>(statements, Operation(builder, "BeginRecord", [Syntax.Member(builder, shape, "id"), count]));
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        Beskid.Syntax.Nodes.Field field = fields[index].node;
+        Read.FieldPolicy policy = policies[index];
+        if (!policy.skipWrite && !policy.catchall) {
+            statements = Array.Append<SpannedStatement>(statements, Operation(builder, "BeginField", [Syntax.Text(builder, policy.wireName)]));
+            match Field(builder, field.ty, Syntax.Member(builder, Syntax.Local(builder, "self"), field.name.node.name), policy, plan) {
+                Result::Ok(body) => { statements = Concat(statements, body); },
+                Result::Error(error) => { return Result::Error(error); },
+            };
+            statements = Array.Append<SpannedStatement>(statements, Operation(builder, "EndField", []));
+        }
+        index = index + 1_i64;
+    }
+    statements = Concat(statements, flattened);
+    statements = Array.Append<SpannedStatement>(statements, Operation(builder, "EndRecord", []));
+    statements = Array.Append<SpannedStatement>(statements, Syntax.Return(builder, Syntax.ConstructVariant(builder, resultPath, "Ok", [Syntax.LiteralValue(builder, Literal::Unit)])));
+    return Result::Ok(Syntax.Method(builder, receiver, "WriteTyped", [Syntax.ParameterValue(builder, "encoder", encoder), Syntax.ParameterValue(builder, "limits", limits)], result, statements));
+}
+
+/// Each payload is destructured into a typed local and written in declaration
+/// order with its own field policy. No ordinal-only enum conversion or universal
+/// boxed payload is emitted.
+pub Result<SpannedMethodDefinition, SemanticError> Enumeration(Syntax.Builder builder, SpannedType receiver, SpannedPath receiverPath, SpannedType encoder, SpannedType limits, SpannedType result, SpannedPath shapeGetter, SpannedPath resultPath, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers) {
+    if (Array.Len(variants) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant policy cardinality differs" }); }
+    Read.TypePlan plan = Read.Plan([], containers, resultPath);
+    mut SpannedMatchArm[] arms = [];
+    mut i64 variantIndex = 0_i64;
+    while (variantIndex < Array.Len(variants)) {
+        EnumVariant variant = variants[variantIndex].node;
+        Read.FieldPolicy[] fieldPolicies = policies[variantIndex].fields;
+        if (Array.Len(variant.fields.items) != Array.Len(fieldPolicies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant field policy cardinality differs" }); }
+        mut i64 wire = 0_i64;
+        mut i64 scan = 0_i64;
+        while (scan < Array.Len(fieldPolicies)) { if (!fieldPolicies[scan].skipWrite) { wire = wire + 1_i64; } scan = scan + 1_i64; }
+        SpannedExpression shape = Syntax.Call(builder, Syntax.Name(builder, shapeGetter), []);
+        SpannedExpression count = Syntax.LiteralValue(builder, Literal::Integer(Collect.Decimal(u64(wire)) + "_i64"));
+        mut SpannedStatement[] statements = [Operation(builder, "BeginVariant", [Syntax.Member(builder, shape, "id"), Syntax.Text(builder, variant.name.node.name), count])];
+        mut SpannedPattern[] bindings = [];
+        mut i64 fieldIndex = 0_i64;
+        while (fieldIndex < Array.Len(variant.fields.items)) {
+            string name = Syntax.FreshName(builder);
+            bindings = Array.Append<SpannedPattern>(bindings, Syntax.Binding(builder, name));
+            if (!fieldPolicies[fieldIndex].skipWrite) {
+                match Field(builder, variant.fields.items[fieldIndex].node.ty, Syntax.Local(builder, name), fieldPolicies[fieldIndex], plan) {
+                    Result::Ok(body) => { statements = Concat(statements, body); },
+                    Result::Error(error) => { return Result::Error(error); },
+                };
+            }
+            fieldIndex = fieldIndex + 1_i64;
+        }
+        statements = Array.Append<SpannedStatement>(statements, Operation(builder, "EndVariant", []));
+        statements = Array.Append<SpannedStatement>(statements, Syntax.Return(builder, Syntax.ConstructVariant(builder, resultPath, "Ok", [Syntax.LiteralValue(builder, Literal::Unit)])));
+        arms = Array.Append<SpannedMatchArm>(arms, Syntax.Arm(builder, Syntax.VariantPattern(builder, receiverPath, variant.name.node.name, bindings), Syntax.BlockValue(builder, statements)));
+        variantIndex = variantIndex + 1_i64;
+    }
+    SpannedStatement dispatch = Syntax.Evaluate(builder, Syntax.MatchValue(builder, Syntax.Local(builder, "self"), arms));
+    return Result::Ok(Syntax.Method(builder, receiver, "WriteTyped", [Syntax.ParameterValue(builder, "encoder", encoder), Syntax.ParameterValue(builder, "limits", limits)], result, [dispatch]));
+}

@@ -1,0 +1,490 @@
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Results;
+use SerializationMod.Syntax;
+use SerializationMod.Scalars;
+use SerializationMod.Collect;
+
+/// Structural call plans are not semantic witnesses. The host validates each
+/// contributed function and exact current nominal/default correspondence.
+pub type NominalBinding {
+    pub SpannedType ty,
+    pub OptionalSpannedPath factory,
+    pub OptionalSpannedExpression decoder,
+}
+
+pub type FieldPolicy {
+    pub string wireName,
+    pub bool skipRead,
+    pub bool skipWrite,
+    pub u8 wordWidth,
+    pub bool bytes,
+    pub OptionalSpannedPath defaultFactory,
+    /// Explicit catchall selection; eligibility still requires the host-issued proof.
+    pub bool catchall,
+}
+
+/// Policies of one payload-enum variant, in payload declaration order.
+pub type VariantPolicy {
+    pub FieldPolicy[] fields,
+}
+
+/// Canonical Foundation container kinds. A site is admitted only from the
+/// semantic shape of the declared field (prepared Corelib package provenance),
+/// never from the leaf spelling List/Map/Option.
+pub enum ContainerKind {
+    Sequence,
+    Mapping,
+    Optional,
+}
+
+/// One declared syntax type that the semantic pass proved to be a Foundation
+/// container. `element` is the declared element (List/Option) or value (Map) type.
+pub type ContainerSite {
+    pub u32 id,
+    pub u64 start,
+    pub u64 end,
+    pub ContainerKind kind,
+    pub SpannedType element,
+}
+
+/// Everything a generated value traversal needs besides the value type itself.
+/// `result` is the enclosing generated function's Result path for failures.
+pub type TypePlan {
+    pub NominalBinding[] bindings,
+    pub ContainerSite[] containers,
+    pub SpannedPath result,
+}
+
+pub TypePlan Plan(NominalBinding[] bindings, ContainerSite[] containers, SpannedPath result) {
+    return TypePlan { bindings: bindings, containers: containers, result: result };
+}
+
+pub type ValueBody {
+    pub SpannedStatement[] statements,
+    pub SpannedExpression value,
+}
+
+bool SameNode(SpannedType left, SpannedType right) {
+    return left.id == right.id && left.span.start == right.span.start && left.span.end == right.span.end;
+}
+
+/// Container sites are matched by exact declared node identity, like bindings.
+pub i64 ContainerIndex(ContainerSite[] containers, SpannedType ty) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len(containers)) {
+        if (containers[index].id == ty.id && containers[index].start == ty.span.start && containers[index].end == ty.span.end) { return index; }
+        index = index + 1_i64;
+    }
+    return -1_i64;
+}
+
+/// Declared types that need a typed FieldDecoder binding, in traversal order.
+/// Primitives, primitive and bytes arrays and container shells are generated directly.
+pub SpannedType[] BindingTypes(SpannedType ty, ContainerSite[] containers, bool bytes) {
+    mut SpannedType[] result = [];
+    match ty.node {
+        Type::Array(element) => {
+            if (bytes) { return result; }
+            return BindingTypes(element, containers, false);
+        },
+        Type::Complex(_) => {
+            i64 site = ContainerIndex(containers, ty);
+            if (site >= 0_i64) { return BindingTypes(containers[site].element, containers, false); }
+            result = Array.Append<SpannedType>(result, ty);
+            return result;
+        },
+        // Primitives are read directly; ineligible kinds are rejected by Value.
+        _ => { return result; },
+    };
+}
+
+SpannedExpression Invoke(Syntax.Builder builder, string name, SpannedExpression[] arguments) {
+    return Syntax.Propagate(builder, Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, "reader"), name), arguments));
+}
+
+SpannedStatement Operation(Syntax.Builder builder, string name, SpannedExpression[] arguments) {
+    return Syntax.Evaluate(builder, Invoke(builder, name, arguments));
+}
+
+pub SpannedStatement[] Append(SpannedStatement[] target, SpannedStatement[] source) {
+    mut SpannedStatement[] result = target;
+    mut i64 index = 0_i64;
+    while (index < Array.Len(source)) {
+        result = Array.Append<SpannedStatement>(result, source[index]);
+        index = index + 1_i64;
+    }
+    return result;
+}
+
+SpannedExpression Failure(Syntax.Builder builder, SpannedPath result, string code) {
+    SpannedExpression location = Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, "reader"), "Location"), []);
+    SpannedExpression error = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Serialization", "Errors", "Diagnostic"], [])), [
+        Syntax.Text(builder, code), Syntax.Member(builder, location, "path"), Syntax.Member(builder, location, "start"), Syntax.Member(builder, location, "end"),
+        Syntax.LiteralValue(builder, Literal::Bool(false)), Syntax.LiteralValue(builder, Literal::Integer("-1_i64")), Syntax.LiteralValue(builder, Literal::Integer("-1_i64")),
+    ]);
+    return Syntax.ConstructVariant(builder, result, "Error", [error]);
+}
+
+SpannedExpression Equals(Syntax.Builder builder, SpannedExpression left, SpannedExpression right) {
+    return Syntax.Binary(builder, left, BinaryOp::Eq, right);
+}
+
+SpannedExpression IsFalse(Syntax.Builder builder, string local) {
+    return Equals(builder, Syntax.Local(builder, local), Syntax.LiteralValue(builder, Literal::Bool(false)));
+}
+
+SpannedStatement Increment(Syntax.Builder builder, string local) {
+    return Syntax.Assign(builder, Syntax.Local(builder, local), Syntax.Binary(builder, Syntax.Local(builder, local), BinaryOp::Add, Syntax.LiteralValue(builder, Literal::Integer("1_i64"))));
+}
+
+/// A declared collection count is accounted against the caller limits before
+/// any element is allocated.
+SpannedStatement CountLimit(Syntax.Builder builder, string count, SpannedPath result) {
+    SpannedExpression negative = Syntax.Binary(builder, Syntax.Local(builder, count), BinaryOp::Lt, Syntax.LiteralValue(builder, Literal::Integer("0_i64")));
+    SpannedExpression excess = Syntax.Binary(builder, Syntax.Local(builder, count), BinaryOp::Gt, Syntax.Member(builder, Syntax.Local(builder, "limits"), "maxNodes"));
+    return Syntax.If(builder, Syntax.Binary(builder, negative, BinaryOp::Or, excess), [Syntax.Return(builder, Failure(builder, result, "CollectionLimit"))]);
+}
+
+/// A concrete read constructs typed scalars, typed arrays and the semantically
+/// proven Foundation containers. Other nominal reads use exact typed bindings.
+pub Result<ValueBody, SemanticError> Value(Syntax.Builder builder, SpannedType ty, u8 wordWidth, bool bytes, TypePlan plan, i64 depth) {
+    if (depth > 128_i64) { return Result::Error(SemanticError { code: "SerializationTypeDepth", message: "generated read type nesting exceeds 128" }); }
+    if (bytes) {
+        match ty.node {
+            Type::Array(element) => {
+                match element.node {
+                    Type::Primitive(primitive) => {
+                        match primitive.node {
+                            PrimitiveType::U8 => { return Result::Ok(ValueBody { statements: [], value: Invoke(builder, "ReadBytes", []) }); },
+                            _ => { },
+                        };
+                    },
+                    _ => { },
+                };
+            },
+            _ => { },
+        };
+        return Result::Error(SemanticError { code: "SerializationBytesType", message: "bytes policy requires exactly u8[]" });
+    }
+    match ty.node {
+        Type::Primitive(primitive) => {
+            match Scalars.Read(builder, primitive.node, wordWidth) {
+                Result::Ok(value) => { return Result::Ok(ValueBody { statements: [], value: value }); },
+                Result::Error(error) => { return Result::Error(error); },
+            };
+        },
+        Type::Array(element) => {
+            string count = Syntax.FreshName(builder);
+            string index = Syntax.FreshName(builder);
+            string array = Syntax.FreshName(builder);
+            mut ValueBody item = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+            match Value(builder, element, wordWidth, false, plan, depth + 1_i64) {
+                Result::Ok(body) => { item = body; },
+                Result::Error(error) => { return Result::Error(error); },
+            };
+            mut SpannedStatement[] inner = item.statements;
+            SpannedExpression append = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Collections", "Array", "Append"], [element])), [Syntax.Local(builder, array), item.value]);
+            inner = Array.Append<SpannedStatement>(inner, Syntax.Assign(builder, Syntax.Local(builder, array), append));
+            inner = Array.Append<SpannedStatement>(inner, Increment(builder, index));
+            return Result::Ok(ValueBody { statements: [
+                Syntax.Let(builder, count, Syntax.Primitive(builder, PrimitiveType::I64), false, Invoke(builder, "BeginSequence", [])),
+                CountLimit(builder, count, plan.result),
+                Syntax.Let(builder, array, ty, true, Syntax.ArrayValue(builder, [])),
+                Syntax.Let(builder, index, Syntax.Primitive(builder, PrimitiveType::I64), true, Syntax.LiteralValue(builder, Literal::Integer("0_i64"))),
+                Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, index), BinaryOp::Lt, Syntax.Local(builder, count)), inner),
+                Operation(builder, "EndSequence", []),
+            ], value: Syntax.Local(builder, array) });
+        },
+        Type::Function(_, _) => { return Result::Error(SemanticError { code: "SerializationClosure", message: "function values are not deserializable" }); },
+        Type::Associated(_, _) => { return Result::Error(SemanticError { code: "SerializationOpaqueReference", message: "associated types have no serializable identity" }); },
+        Type::_This => { return Result::Error(SemanticError { code: "SerializationOpaqueReference", message: "This has no serializable identity outside its declaration" }); },
+        Type::Complex(_) => {
+            i64 site = ContainerIndex(plan.containers, ty);
+            if (site >= 0_i64) {
+                ContainerSite container = plan.containers[site];
+                match container.kind {
+                    ContainerKind::Sequence => { return ListValue(builder, ty, container.element, wordWidth, plan, depth); },
+                    ContainerKind::Mapping => { return MapValue(builder, ty, container.element, wordWidth, plan, depth); },
+                    ContainerKind::Optional => { return OptionalValue(builder, ty, container.element, wordWidth, plan, depth); },
+                };
+            }
+            mut i64 index = 0_i64;
+            mut i64 selected = -1_i64;
+            while (index < Array.Len(plan.bindings)) {
+                if (SameNode(plan.bindings[index].ty, ty)) {
+                    if (selected >= 0_i64) { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "ambiguous nominal read factory" }); }
+                    selected = index;
+                }
+                index = index + 1_i64;
+            }
+            if (selected < 0_i64) { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "nominal read requires its exact admitted typed factory" }); }
+            match plan.bindings[selected].decoder {
+                OptionalSpannedExpression::Some(decoder) => {
+                    match plan.bindings[selected].factory { OptionalSpannedPath::Some(_) => { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "field binding has two competing factory paths" }); }, _ => { }, };
+                    SpannedExpression call = Syntax.Call(builder, Syntax.Member(builder, decoder, "Read"), [Syntax.Local(builder, "reader"), Syntax.Local(builder, "limits")]);
+                    return Result::Ok(ValueBody { statements: [], value: Syntax.Propagate(builder, call) });
+                },
+                OptionalSpannedExpression::None => { },
+            };
+            match plan.bindings[selected].factory {
+                OptionalSpannedPath::Some(factory) => {
+                    SpannedExpression call = Syntax.Call(builder, Syntax.Name(builder, factory), [Syntax.Local(builder, "reader"), Syntax.Local(builder, "limits")]);
+                    return Result::Ok(ValueBody { statements: [], value: Syntax.Propagate(builder, call) });
+                },
+                OptionalSpannedPath::None => { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "field binding has no typed factory" }); },
+            };
+        },
+    };
+}
+
+/// Option locals represent absence without manufacturing a field value. A
+/// factory is called only from the missing branch, after the full record read.
+/// Duplicate wire fields reject. Unknown fields reject unless the record has an
+/// issued Map<string,V> catchall; then each unknown field is read as V into it.
+pub Result<SpannedStatement[], SemanticError> RecordBody(Syntax.Builder builder, SpannedPath receiver, SpannedPath shapeGetter, SpannedPath result, SpannedField[] fields, FieldPolicy[] policies, NominalBinding[] bindings, ContainerSite[] containers) {
+    if (Array.Len(fields) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "field policy cardinality differs" }); }
+    TypePlan plan = Plan(bindings, containers, result);
+    string count = Syntax.FreshName(builder);
+    string index = Syntax.FreshName(builder);
+    string name = Syntax.FreshName(builder);
+    string found = Syntax.FreshName(builder);
+    string extras = Syntax.FreshName(builder);
+    mut string[] slots = [];
+    mut string[] seen = [];
+    mut i64 catchall = -1_i64;
+    mut SpannedType extrasValue = Syntax.Primitive(builder, PrimitiveType::Unit);
+    mut SpannedStatement[] statements = [];
+    mut i64 fieldIndex = 0_i64;
+    while (fieldIndex < Array.Len(fields)) {
+        FieldPolicy policy = policies[fieldIndex];
+        SpannedType ty = fields[fieldIndex].node.ty;
+        if (policy.skipRead) {
+            match policy.defaultFactory { OptionalSpannedPath::None => { return Result::Error(SemanticError { code: "SerializationSkippedDefault", message: "skipped read field requires an exact typed default factory" }); }, _ => { }, };
+        }
+        string slot = Syntax.FreshName(builder);
+        string marker = Syntax.FreshName(builder);
+        slots = Array.Append<string>(slots, slot);
+        seen = Array.Append<string>(seen, marker);
+        if (policy.catchall) {
+            if (catchall >= 0_i64) { return Result::Error(SemanticError { code: "SerializationCatchall", message: "a record admits at most one catchall field" }); }
+            i64 site = ContainerIndex(containers, ty);
+            mut bool mapping = false;
+            if (site >= 0_i64) { match containers[site].kind { ContainerKind::Mapping => { mapping = true; }, _ => { }, }; }
+            if (!mapping) { return Result::Error(SemanticError { code: "SerializationCatchallType", message: "catchall field must be the canonical Foundation Map<string,V>" }); }
+            catchall = fieldIndex;
+            extrasValue = containers[site].element;
+            SpannedExpression empty = Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Collections", "Map", "New"], [Syntax.Primitive(builder, PrimitiveType::String), extrasValue])), []);
+            statements = Array.Append<SpannedStatement>(statements, Syntax.Let(builder, extras, ty, true, empty));
+        } else {
+            SpannedPath option = Syntax.CorePath(builder, ["Optional", "Option"], [ty]);
+            statements = Array.Append<SpannedStatement>(statements, Syntax.Let(builder, slot, Syntax.CoreType(builder, ["Optional", "Option"], [ty]), true, Syntax.ConstructVariant(builder, option, "None", [])));
+            statements = Array.Append<SpannedStatement>(statements, Syntax.Let(builder, marker, Syntax.Primitive(builder, PrimitiveType::Bool), true, Syntax.LiteralValue(builder, Literal::Bool(false))));
+        }
+        fieldIndex = fieldIndex + 1_i64;
+    }
+    SpannedExpression shape = Syntax.Call(builder, Syntax.Name(builder, shapeGetter), []);
+    statements = Array.Append<SpannedStatement>(statements, Syntax.Let(builder, count, Syntax.Primitive(builder, PrimitiveType::I64), false, Invoke(builder, "BeginRecord", [Syntax.Member(builder, shape, "id")])));
+    statements = Array.Append<SpannedStatement>(statements, CountLimit(builder, count, result));
+    statements = Array.Append<SpannedStatement>(statements, Syntax.Let(builder, index, Syntax.Primitive(builder, PrimitiveType::I64), true, Syntax.LiteralValue(builder, Literal::Integer("0_i64"))));
+    mut SpannedStatement[] loop = [Syntax.Let(builder, name, Syntax.Primitive(builder, PrimitiveType::String), false, Invoke(builder, "BeginField", [])), Syntax.Let(builder, found, Syntax.Primitive(builder, PrimitiveType::Bool), true, Syntax.LiteralValue(builder, Literal::Bool(false)))];
+    fieldIndex = 0_i64;
+    while (fieldIndex < Array.Len(fields)) {
+        FieldPolicy policy = policies[fieldIndex];
+        // A skip-read field that the encoder still writes is recognised by wire
+        // name: its value is read with the ordinary typed traversal, discarded,
+        // and the field is then initialised from its default factory.
+        bool discarded = policy.skipRead && !policy.skipWrite;
+        if ((!policy.skipRead || discarded) && !policy.catchall) {
+            mut ValueBody body = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+            match Value(builder, fields[fieldIndex].node.ty, policy.wordWidth, policy.bytes, plan, 0_i64) {
+                Result::Ok(value) => { body = value; }, Result::Error(error) => { return Result::Error(error); },
+            };
+            SpannedPath option = Syntax.CorePath(builder, ["Optional", "Option"], [fields[fieldIndex].node.ty]);
+            mut SpannedStatement[] selected = [Syntax.If(builder, Equals(builder, Syntax.Local(builder, seen[fieldIndex]), Syntax.LiteralValue(builder, Literal::Bool(true))), [Syntax.Return(builder, Failure(builder, result, "DuplicateField"))])];
+            selected = Append(selected, body.statements);
+            if (discarded) {
+                selected = Array.Append<SpannedStatement>(selected, Syntax.Evaluate(builder, body.value));
+            } else {
+                selected = Array.Append<SpannedStatement>(selected, Syntax.Assign(builder, Syntax.Local(builder, slots[fieldIndex]), Syntax.ConstructVariant(builder, option, "Some", [body.value])));
+            }
+            selected = Array.Append<SpannedStatement>(selected, Syntax.Assign(builder, Syntax.Local(builder, seen[fieldIndex]), Syntax.LiteralValue(builder, Literal::Bool(true))));
+            selected = Array.Append<SpannedStatement>(selected, Syntax.Assign(builder, Syntax.Local(builder, found), Syntax.LiteralValue(builder, Literal::Bool(true))));
+            loop = Array.Append<SpannedStatement>(loop, Syntax.If(builder, Equals(builder, Syntax.Local(builder, name), Syntax.Text(builder, policy.wireName)), selected));
+        }
+        fieldIndex = fieldIndex + 1_i64;
+    }
+    if (catchall >= 0_i64) {
+        // A declared wire name never enters the catchall, even when that
+        // field is not read: encode would otherwise emit it twice.
+        fieldIndex = 0_i64;
+        while (fieldIndex < Array.Len(fields)) {
+            if (policies[fieldIndex].skipRead && !policies[fieldIndex].catchall) {
+                SpannedExpression collides = Syntax.Binary(builder, IsFalse(builder, found), BinaryOp::And, Equals(builder, Syntax.Local(builder, name), Syntax.Text(builder, policies[fieldIndex].wireName)));
+                loop = Array.Append<SpannedStatement>(loop, Syntax.If(builder, collides, [Syntax.Return(builder, Failure(builder, result, "CatchallCollision"))]));
+            }
+            fieldIndex = fieldIndex + 1_i64;
+        }
+        mut ValueBody captured = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+        match Value(builder, extrasValue, 0_u8, false, plan, 1_i64) {
+            Result::Ok(value) => { captured = value; }, Result::Error(error) => { return Result::Error(error); },
+        };
+        SpannedExpression duplicate = Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, extras), "ContainsKey"), [Syntax.Local(builder, name)]);
+        mut SpannedStatement[] capture = [Syntax.If(builder, duplicate, [Syntax.Return(builder, Failure(builder, result, "DuplicateField"))])];
+        capture = Append(capture, captured.statements);
+        capture = Array.Append<SpannedStatement>(capture, Syntax.Assign(builder, Syntax.Local(builder, extras), Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, extras), "Insert"), [Syntax.Local(builder, name), captured.value])));
+        capture = Array.Append<SpannedStatement>(capture, Syntax.Assign(builder, Syntax.Local(builder, found), Syntax.LiteralValue(builder, Literal::Bool(true))));
+        loop = Array.Append<SpannedStatement>(loop, Syntax.If(builder, IsFalse(builder, found), capture));
+    }
+    loop = Array.Append<SpannedStatement>(loop, Syntax.If(builder, IsFalse(builder, found), [Syntax.Return(builder, Failure(builder, result, "UnknownField"))]));
+    loop = Array.Append<SpannedStatement>(loop, Operation(builder, "EndField", []));
+    loop = Array.Append<SpannedStatement>(loop, Increment(builder, index));
+    statements = Array.Append<SpannedStatement>(statements, Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, index), BinaryOp::Lt, Syntax.Local(builder, count)), loop));
+    statements = Array.Append<SpannedStatement>(statements, Operation(builder, "EndRecord", []));
+    mut SpannedStructLiteralField[] values = [];
+    fieldIndex = 0_i64;
+    while (fieldIndex < Array.Len(fields)) {
+        SpannedType ty = fields[fieldIndex].node.ty;
+        string fieldName = fields[fieldIndex].node.name.node.name;
+        if (fieldIndex == catchall) {
+            values = Array.Append<SpannedStructLiteralField>(values, Syntax.FieldValue(builder, fieldName, Syntax.Local(builder, extras)));
+        } else {
+            string value = Syntax.FreshName(builder);
+            SpannedPath option = Syntax.CorePath(builder, ["Optional", "Option"], [ty]);
+            mut SpannedExpression absent = Syntax.BlockValue(builder, [Syntax.Return(builder, Failure(builder, result, "MissingField"))]);
+            i64 site = ContainerIndex(containers, ty);
+            if (site >= 0_i64) {
+                // A missing optional field is None; it never invents a payload.
+                match containers[site].kind {
+                    ContainerKind::Optional => { absent = Syntax.ConstructVariant(builder, Syntax.CorePath(builder, ["Optional", "Option"], [containers[site].element]), "None", []); },
+                    _ => { },
+                };
+            }
+            match policies[fieldIndex].defaultFactory {
+                OptionalSpannedPath::Some(factory) => { absent = Syntax.Call(builder, Syntax.Name(builder, factory), []); },
+                OptionalSpannedPath::None => { },
+            };
+            SpannedExpression selected = Syntax.MatchValue(builder, Syntax.Local(builder, slots[fieldIndex]), [
+                Syntax.Arm(builder, Syntax.VariantPattern(builder, option, "Some", [Syntax.Binding(builder, value)]), Syntax.Local(builder, value)),
+                Syntax.Arm(builder, Syntax.VariantPattern(builder, option, "None", []), absent),
+            ]);
+            values = Array.Append<SpannedStructLiteralField>(values, Syntax.FieldValue(builder, fieldName, selected));
+        }
+        fieldIndex = fieldIndex + 1_i64;
+    }
+    statements = Array.Append<SpannedStatement>(statements, Syntax.Return(builder, Syntax.ConstructVariant(builder, result, "Ok", [Syntax.ConstructRecord(builder, receiver, values)])));
+    return Result::Ok(statements);
+}
+
+/// Payloads are positional. A field skipped in both directions is constructed
+/// only from its exact default factory and is absent from the wire count.
+pub Result<SpannedStatement[], SemanticError> EnumBody(Syntax.Builder builder, SpannedPath receiver, SpannedPath shapeGetter, SpannedPath result, SpannedEnumVariant[] variants, VariantPolicy[] policies, NominalBinding[] bindings, ContainerSite[] containers) {
+    if (Array.Len(variants) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant policy cardinality differs" }); }
+    TypePlan plan = Plan(bindings, containers, result);
+    string name = Syntax.FreshName(builder);
+    string count = Syntax.FreshName(builder);
+    SpannedExpression shape = Syntax.Call(builder, Syntax.Name(builder, shapeGetter), []);
+    mut SpannedStatement[] statements = [Syntax.Let(builder, name, Syntax.Primitive(builder, PrimitiveType::String), false, Invoke(builder, "BeginVariant", [Syntax.Member(builder, shape, "id")])), Syntax.Let(builder, count, Syntax.Primitive(builder, PrimitiveType::I64), false, Invoke(builder, "VariantCount", []))];
+    mut i64 variantIndex = 0_i64;
+    while (variantIndex < Array.Len(variants)) {
+        EnumVariant variant = variants[variantIndex].node;
+        FieldPolicy[] fieldPolicies = policies[variantIndex].fields;
+        if (Array.Len(variant.fields.items) != Array.Len(fieldPolicies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant field policy cardinality differs" }); }
+        mut i64 wire = 0_i64;
+        mut i64 scan = 0_i64;
+        while (scan < Array.Len(fieldPolicies)) { if (!fieldPolicies[scan].skipRead) { wire = wire + 1_i64; } scan = scan + 1_i64; }
+        mut SpannedStatement[] selected = [Syntax.If(builder, Syntax.Binary(builder, Syntax.Local(builder, count), BinaryOp::NotEq, Syntax.LiteralValue(builder, Literal::Integer(Collect.Decimal(u64(wire)) + "_i64"))), [Syntax.Return(builder, Failure(builder, result, "VariantPayloadCount"))])];
+        mut SpannedExpression[] values = [];
+        mut i64 fieldIndex = 0_i64;
+        while (fieldIndex < Array.Len(variant.fields.items)) {
+            FieldPolicy policy = fieldPolicies[fieldIndex];
+            SpannedType ty = variant.fields.items[fieldIndex].node.ty;
+            string local = Syntax.FreshName(builder);
+            if (policy.skipRead) {
+                match policy.defaultFactory {
+                    OptionalSpannedPath::Some(factory) => { selected = Array.Append<SpannedStatement>(selected, Syntax.Let(builder, local, ty, false, Syntax.Call(builder, Syntax.Name(builder, factory), []))); },
+                    OptionalSpannedPath::None => { return Result::Error(SemanticError { code: "SerializationSkippedDefault", message: "skipped payload field requires an exact typed default factory" }); },
+                };
+            } else {
+                mut ValueBody body = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+                match Value(builder, ty, policy.wordWidth, policy.bytes, plan, 0_i64) {
+                    Result::Ok(value) => { body = value; }, Result::Error(error) => { return Result::Error(error); },
+                };
+                selected = Append(selected, body.statements);
+                selected = Array.Append<SpannedStatement>(selected, Syntax.Let(builder, local, ty, false, body.value));
+            }
+            values = Array.Append<SpannedExpression>(values, Syntax.Local(builder, local));
+            fieldIndex = fieldIndex + 1_i64;
+        }
+        selected = Array.Append<SpannedStatement>(selected, Operation(builder, "EndVariant", []));
+        selected = Array.Append<SpannedStatement>(selected, Syntax.Return(builder, Syntax.ConstructVariant(builder, result, "Ok", [Syntax.ConstructVariant(builder, receiver, variant.name.node.name, values)])));
+        statements = Array.Append<SpannedStatement>(statements, Syntax.If(builder, Equals(builder, Syntax.Local(builder, name), Syntax.Text(builder, variant.name.node.name)), selected));
+        variantIndex = variantIndex + 1_i64;
+    }
+    statements = Array.Append<SpannedStatement>(statements, Syntax.Return(builder, Failure(builder, result, "UnknownVariant")));
+    return Result::Ok(statements);
+}
+
+/// Container reads are selected only through semantically proven ContainerSites.
+Result<ValueBody, SemanticError> ListValue(Syntax.Builder builder, SpannedType ty, SpannedType element, u8 wordWidth, TypePlan plan, i64 depth) {
+    string count = Syntax.FreshName(builder);
+    string index = Syntax.FreshName(builder);
+    string list = Syntax.FreshName(builder);
+    mut ValueBody item = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+    match Value(builder, element, wordWidth, false, plan, depth + 1_i64) {
+        Result::Ok(body) => { item = body; }, Result::Error(error) => { return Result::Error(error); },
+    };
+    mut SpannedStatement[] inner = item.statements;
+    inner = Array.Append<SpannedStatement>(inner, Syntax.Assign(builder, Syntax.Local(builder, list), Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, list), "Push"), [item.value])));
+    inner = Array.Append<SpannedStatement>(inner, Increment(builder, index));
+    return Result::Ok(ValueBody { statements: [
+        Syntax.Let(builder, count, Syntax.Primitive(builder, PrimitiveType::I64), false, Invoke(builder, "BeginSequence", [])),
+        CountLimit(builder, count, plan.result),
+        Syntax.Let(builder, list, ty, true, Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Collections", "List", "New"], [element])), [])),
+        Syntax.Let(builder, index, Syntax.Primitive(builder, PrimitiveType::I64), true, Syntax.LiteralValue(builder, Literal::Integer("0_i64"))),
+        Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, index), BinaryOp::Lt, Syntax.Local(builder, count)), inner), Operation(builder, "EndSequence", []),
+    ], value: Syntax.Local(builder, list) });
+}
+
+Result<ValueBody, SemanticError> MapValue(Syntax.Builder builder, SpannedType ty, SpannedType element, u8 wordWidth, TypePlan plan, i64 depth) {
+    string count = Syntax.FreshName(builder);
+    string index = Syntax.FreshName(builder);
+    string map = Syntax.FreshName(builder);
+    string key = Syntax.FreshName(builder);
+    SpannedType stringType = Syntax.Primitive(builder, PrimitiveType::String);
+    mut ValueBody item = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+    match Value(builder, element, wordWidth, false, plan, depth + 1_i64) {
+        Result::Ok(body) => { item = body; }, Result::Error(error) => { return Result::Error(error); },
+    };
+    SpannedExpression duplicate = Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, map), "ContainsKey"), [Syntax.Local(builder, key)]);
+    mut SpannedStatement[] inner = [Syntax.Let(builder, key, stringType, false, Invoke(builder, "BeginMapEntry", [])), Syntax.If(builder, duplicate, [Syntax.Return(builder, Failure(builder, plan.result, "DuplicateKey"))])];
+    inner = Append(inner, item.statements);
+    inner = Array.Append<SpannedStatement>(inner, Syntax.Assign(builder, Syntax.Local(builder, map), Syntax.Call(builder, Syntax.Member(builder, Syntax.Local(builder, map), "Insert"), [Syntax.Local(builder, key), item.value])));
+    inner = Array.Append<SpannedStatement>(inner, Operation(builder, "EndMapEntry", []));
+    inner = Array.Append<SpannedStatement>(inner, Increment(builder, index));
+    return Result::Ok(ValueBody { statements: [
+        Syntax.Let(builder, count, Syntax.Primitive(builder, PrimitiveType::I64), false, Invoke(builder, "BeginMap", [])),
+        CountLimit(builder, count, plan.result),
+        Syntax.Let(builder, map, ty, true, Syntax.Call(builder, Syntax.Name(builder, Syntax.CorePath(builder, ["Collections", "Map", "New"], [stringType, element])), [])),
+        Syntax.Let(builder, index, Syntax.Primitive(builder, PrimitiveType::I64), true, Syntax.LiteralValue(builder, Literal::Integer("0_i64"))),
+        Syntax.While(builder, Syntax.Binary(builder, Syntax.Local(builder, index), BinaryOp::Lt, Syntax.Local(builder, count)), inner), Operation(builder, "EndMap", []),
+    ], value: Syntax.Local(builder, map) });
+}
+
+Result<ValueBody, SemanticError> OptionalValue(Syntax.Builder builder, SpannedType ty, SpannedType element, u8 wordWidth, TypePlan plan, i64 depth) {
+    string present = Syntax.FreshName(builder);
+    string value = Syntax.FreshName(builder);
+    SpannedPath option = Syntax.CorePath(builder, ["Optional", "Option"], [element]);
+    mut ValueBody item = ValueBody { statements: [], value: Syntax.LiteralValue(builder, Literal::Unit) };
+    match Value(builder, element, wordWidth, false, plan, depth + 1_i64) {
+        Result::Ok(body) => { item = body; }, Result::Error(error) => { return Result::Error(error); },
+    };
+    mut SpannedStatement[] selected = item.statements;
+    selected = Array.Append<SpannedStatement>(selected, Syntax.Assign(builder, Syntax.Local(builder, value), Syntax.ConstructVariant(builder, option, "Some", [item.value])));
+    return Result::Ok(ValueBody { statements: [
+        Syntax.Let(builder, present, Syntax.Primitive(builder, PrimitiveType::Bool), false, Invoke(builder, "BeginOptional", [])),
+        Syntax.Let(builder, value, ty, true, Syntax.ConstructVariant(builder, option, "None", [])),
+        Syntax.If(builder, Syntax.Local(builder, present), selected), Operation(builder, "EndOptional", []),
+    ], value: Syntax.Local(builder, value) });
+}

@@ -1,0 +1,93 @@
+use Core.Bsol.Imports;
+use Core.Bsol.Parser;
+use Core.Bsol.Limits;
+use Core.Collections.Array;
+use Core.Hash.Sha256;
+use Core.Results;
+use Testing.Assert;
+
+test bsol_import_path_cannot_escape_controlled_root_lexically {
+    Assert.True(Imports.RelativePath("schemas/base.bsol"), "root relative schema");
+    Assert.False(Imports.RelativePath("../base.bsol"), "parent escape");
+    Assert.False(Imports.RelativePath("schemas/../base.bsol"), "nested traversal");
+    Assert.False(Imports.RelativePath("/base.bsol"), "absolute path");
+    Assert.False(Imports.RelativePath("C:/base.bsol"), "drive path");
+    Assert.False(Imports.RelativePath("schemas\\base.bsol"), "alternate separator");
+    Assert.False(Imports.RelativePath("schemas//base.bsol"), "ambiguous empty segment");
+}
+
+test bsol_import_git_revision_must_be_immutable {
+    Assert.True(Imports.ImmutableRevision("0123456789abcdef0123456789abcdef01234567"), "full Git object");
+    Assert.False(Imports.ImmutableRevision("main"), "moving branch");
+    Assert.False(Imports.ImmutableRevision("v0.6.0"), "moving tag");
+    Assert.False(Imports.ImmutableRevision("0123456"), "abbreviated object");
+}
+
+test bsol_import_requests_reject_before_host_resolution {
+    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::File("../escape.bsol"))), "file traversal rejected before host");
+    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Git("https://example.invalid/repo", "main", "schema.bsol"))), "moving revision rejected before host");
+    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Registry("corelib", "", "schema.bsol"))), "missing exact lock version");
+    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Pckg("", "0.6.0", "schema.bsol"))), "missing package identity");
+}
+
+test bsol_package_shorthand_preserves_exact_locked_request {
+    match Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/schemas/base.bsol") {
+        Result::Ok(Imports.ImportRequest::Pckg(package, version, path)) => {
+            Assert.Equal(package, "corelib", "package identity");
+            Assert.Equal(version, "0.6.0", "exact version");
+            Assert.Equal(path, "schemas/base.bsol", "remaining path");
+        },
+        _ => Assert.Fail("valid shorthand must produce its locked package request"),
+    };
+    Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib//schema.bsol")), "missing version");
+    Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/../escape.bsol")), "shorthand traversal");
+    Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/")), "missing path");
+}
+
+test bsol_import_declaration_retains_alias_profile_and_source_span {
+    match Parser.Parse("import_schema \"base.v2\" { from = file path = \"schemas/base.bsol\" alias = base }", Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("import syntax"),
+        Result::Ok(document) => {
+            match Imports.ParseDeclaration(document, document.roots[0_i64]) {
+                Result::Error(_) => Assert.Fail("valid import declaration"),
+                Result::Ok(declaration) => {
+                    Assert.Equal(declaration.profile, "base.v2", "requested profile identity");
+                    Assert.Equal(declaration.alias, "base", "explicit alias");
+                    Assert.True(declaration.hasAlias, "alias presence retained");
+                    Assert.True(declaration.span.end > declaration.span.start, "owned source span");
+                },
+            };
+        },
+    };
+}
+
+test bsol_import_declaration_rejects_duplicate_and_inapplicable_properties {
+    string[] invalid = [
+        "import_schema \"base.v2\" { from = file path = \"a.bsol\" path = \"b.bsol\" }",
+        "import_schema \"base.v2\" { from = file path = \"a.bsol\" rev = \"ignored\" }",
+        "import_schema \"base.v2\" { from = file path = \"a.bsol\" alias = \"\" }",
+        "import_schema \"base.v2\" { from = file path = [\"a.bsol\"] }",
+    ];
+    for source in invalid {
+        match Parser.Parse(source, Limits.DefaultLimits()) {
+            Result::Error(_) => Assert.Fail("invalid property fixture must parse"),
+            Result::Ok(document) => Assert.True(Results.IsError(Imports.ParseDeclaration(document, document.roots[0_i64])), "invalid property rejected before host resolution"),
+        };
+    }
+}
+
+test bsol_import_content_digest_is_checked_before_admission {
+    string source = "profile \"base.v2\" { version = 2 }";
+    match Sha256.HashUtf8(source, 1024_i64) {
+        Result::Error(_) => Assert.Fail("bounded fixture hashes"),
+        Result::Ok(digest) => {
+            Imports.MaterializedSource verified = Imports.MaterializedSource { source: source, canonicalIdentity: "file:schemas/base.bsol", sourceSha256: digest };
+            Assert.True(Results.IsOk(Imports.VerifyMaterialized(verified, 1024_i64)), "exact materialized bytes");
+            Imports.MaterializedSource forged = Imports.MaterializedSource { source: "changed", canonicalIdentity: "file:schemas/base.bsol", sourceSha256: digest };
+            Assert.True(Results.IsError(Imports.VerifyMaterialized(forged, 1024_i64)), "digest mismatch rejects");
+            Assert.True(Results.IsError(Imports.VerifyMaterialized(verified, 1_i64)), "budget precedes admission");
+            Imports.MaterializedSource absent = Imports.MaterializedSource { source: source, canonicalIdentity: "", sourceSha256: Array.Empty<u8>() };
+            Assert.True(Results.IsError(Imports.VerifyMaterialized(absent, 1024_i64)), "missing identity and digest reject");
+        },
+    };
+}

@@ -1,0 +1,481 @@
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use SerializationMod.Read;
+
+/// A rejection retains the most specific source span the Mod knows: the field
+/// for field and type failures, the declaration for target failures.
+pub type Rejection {
+    pub string code,
+    pub string message,
+    pub NodeSpan span,
+}
+
+pub Rejection RejectionValue(SemanticError error, NodeSpan span) {
+    return Rejection { code: error.code, message: error.message, span: span };
+}
+
+Rejection Reject(string code, string message, NodeSpan span) {
+    return Rejection { code: code, message: message, span: span };
+}
+
+pub i64 PrimitiveCode(PrimitiveType primitive) {
+    match primitive {
+        PrimitiveType::Bool => { return 1_i64; },
+        PrimitiveType::I8 => { return 2_i64; },
+        PrimitiveType::I16 => { return 3_i64; },
+        PrimitiveType::I32 => { return 4_i64; },
+        PrimitiveType::I64 => { return 5_i64; },
+        PrimitiveType::U8 => { return 6_i64; },
+        PrimitiveType::U16 => { return 7_i64; },
+        PrimitiveType::U32 => { return 8_i64; },
+        PrimitiveType::U64 => { return 9_i64; },
+        PrimitiveType::F32 => { return 10_i64; },
+        PrimitiveType::F64 => { return 11_i64; },
+        PrimitiveType::Char => { return 12_i64; },
+        PrimitiveType::String => { return 13_i64; },
+        PrimitiveType::Unit => { return 14_i64; },
+        PrimitiveType::Word => { return 15_i64; },
+        PrimitiveType::Pointer => { return 16_i64; },
+        PrimitiveType::Never => { return 17_i64; },
+    };
+}
+
+// Declared-type eligibility. This pass needs no host and runs for concrete
+// targets and generic templates alike, before any adapter syntax is built.
+
+Result<unit, Rejection> ScalarEligible(PrimitiveType primitive, NodeSpan span) {
+    match primitive {
+        PrimitiveType::Pointer => { return Result::Error(Reject("SerializationPointer", "raw pointers are opaque references, not serializable data", span)); },
+        PrimitiveType::Never => { return Result::Error(Reject("SerializationNever", "never has no serializable value", span)); },
+        _ => { return Result::Ok(()); },
+    };
+}
+
+Result<unit, Rejection> DeclaredType(SpannedType ty, NodeSpan span, i64 depth) {
+    if (depth > 128_i64) { return Result::Error(Reject("SerializationTypeDepth", "declared type nesting exceeds 128", span)); }
+    match ty.node {
+        Type::Primitive(primitive) => { return ScalarEligible(primitive.node, span); },
+        Type::Array(element) => { return DeclaredType(element, span, depth + 1_i64); },
+        Type::Complex(path) => {
+            mut i64 segment = 0_i64;
+            while (segment < Array.Len(path.node.segments.items)) {
+                SpannedType[] arguments = path.node.segments.items[segment].node.typeArgs.items;
+                mut i64 argument = 0_i64;
+                while (argument < Array.Len(arguments)) {
+                    match DeclaredType(arguments[argument], span, depth + 1_i64) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                    argument = argument + 1_i64;
+                }
+                segment = segment + 1_i64;
+            }
+            return Result::Ok(());
+        },
+        Type::Associated(_, _) => { return Result::Error(Reject("SerializationOpaqueReference", "associated types have no serializable identity", span)); },
+        Type::_This => { return Result::Error(Reject("SerializationOpaqueReference", "This has no serializable identity outside its declaration", span)); },
+        Type::Function(_, _) => { return Result::Error(Reject("SerializationClosure", "function values are not serializable", span)); },
+    };
+}
+
+/// A field that is serialized in at least one direction must be an ordinary
+/// value field whose declared type contains no pointer, never, closure or
+/// opaque associated/This reference. A field skipped in both directions is
+/// constructed only by its default factory and is not serialized data.
+pub Result<unit, Rejection> Declared(SpannedField field, Read.FieldPolicy policy) {
+    match field.node.kind {
+        FieldKind::Value => { },
+        _ => { return Result::Error(Reject("SerializationFieldKind", "event and injected fields are not constructible serialized data", field.span)); },
+    };
+    if (policy.skipRead && policy.skipWrite) { return Result::Ok(()); }
+    return DeclaredType(field.node.ty, field.span, 0_i64);
+}
+
+bool IsPublic(SpannedVisibility visibility) {
+    match visibility.node { Visibility::Public => { return true; }, _ => { return false; }, };
+}
+
+/// Generated items are contributed at the compilation root and name the target
+/// through its enclosing inline modules. A nested target, and every enclosing
+/// module, must therefore be public; a private one has inaccessible construction.
+pub Result<unit, Rejection> Accessible(SpannedVisibility target, SpannedVisibility[] modules, NodeSpan span) {
+    if (Array.Len(modules) == 0_i64) { return Result::Ok(()); }
+    if (!IsPublic(target)) { return Result::Error(Reject("SerializationInaccessible", "a serialized type inside an inline module must be pub so generated adapters can construct it", span)); }
+    mut i64 index = 0_i64;
+    while (index < Array.Len(modules)) {
+        if (!IsPublic(modules[index])) { return Result::Error(Reject("SerializationInaccessible", "every inline module enclosing a serialized type must be pub", span)); }
+        index = index + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+// Semantic closure of a concrete target. Shapes come only from the
+// invocation-issued semantic authority; the source is a contract so the pass
+// runs unchanged against the host and against test tables.
+
+pub contract ShapeSource {
+    Result<Semantic.Shape, SemanticError> Describe(Semantic.SemanticHandle handle);
+    Result<unit, SemanticError> Serializable(Semantic.SemanticHandle handle);
+    Result<Semantic.FunctionSignature, SemanticError> Function(string[] path);
+}
+
+/// The production source: the current invocation's semantic queries. Function
+/// routes resolve from `caller`, the scope where generated adapters call them.
+pub type HostShapes : ShapeSource {
+    NodeRef caller,
+
+    pub Result<Semantic.Shape, SemanticError> Describe(Semantic.SemanticHandle handle) {
+        return Semantic.TypeShape(handle);
+    }
+
+    pub Result<unit, SemanticError> Serializable(Semantic.SemanticHandle handle) {
+        return Semantic.CheckSerializable(handle);
+    }
+
+    pub Result<Semantic.FunctionSignature, SemanticError> Function(string[] path) {
+        return Semantic.ResolveFunction(caller, path);
+    }
+}
+
+pub HostShapes Host(NodeRef caller) {
+    return HostShapes { caller: caller };
+}
+
+/// Result of a concrete closure: proven container sites of the declared
+/// syntax and the semantic record fields or enum variants in declaration order.
+pub type Closure {
+    pub Read.ContainerSite[] sites,
+    pub Semantic.Field[] fields,
+    pub Semantic.Variant[] variants,
+}
+
+type Walk {
+    i64 remaining,
+    u64[] visited,
+    Read.ContainerSite[] sites,
+}
+
+bool Contains(u64[] values, u64 value) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len(values)) {
+        if (values[index] == value) { return true; }
+        index = index + 1_i64;
+    }
+    return false;
+}
+
+u64[] Extend(u64[] path, u64 value) {
+    mut u64[] result = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(path)) { result = Array.Append<u64>(result, path[index]); index = index + 1_i64; }
+    result = Array.Append<u64>(result, value);
+    return result;
+}
+
+bool Corelib(Semantic.Shape shape) {
+    match shape.package {
+        Option::Some(package) => { match package.source { Semantic.PackageSource::Corelib => { return true; }, _ => { return false; }, }; },
+        Option::None => { return false; },
+    };
+}
+
+bool DeclaredAt(Semantic.Shape shape, string sourcePath, string name) {
+    if (!Corelib(shape)) { return false; }
+    match shape.packageDeclaration {
+        Option::Some(declaration) => {
+            return declaration.sourcePath == sourcePath && Array.Len(declaration.lexicalPath) == 1_i64 && declaration.lexicalPath[0_i64] == name;
+        },
+        Option::None => { return false; },
+    };
+}
+
+/// 0 = not a container, 1 = List, 2 = Map, 3 = Option. Identity is prepared
+/// Corelib package provenance plus package-relative declaration, not spelling.
+i64 ContainerCode(Semantic.Shape shape) {
+    if (DeclaredAt(shape, "Core/Collections/List.bd", "List")) { return 1_i64; }
+    if (DeclaredAt(shape, "Core/Collections/Map.bd", "Map")) { return 2_i64; }
+    if (DeclaredAt(shape, "Core/Optional/Option.bd", "Option")) { return 3_i64; }
+    return 0_i64;
+}
+
+/// Compiler semantic authority values are invocation resources, never data.
+bool CompilerResource(Semantic.Shape shape) {
+    string path = "Beskid/Compiler/Semantic.bd";
+    return DeclaredAt(shape, path, "SemanticHandle") || DeclaredAt(shape, path, "CatchallWitness") || DeclaredAt(shape, path, "TypeTemplate");
+}
+
+bool StringKey(Semantic.FieldType key) {
+    match key {
+        Semantic.FieldType::Scalar(primitive) => { return PrimitiveCode(primitive) == PrimitiveCode(PrimitiveType::String); },
+        _ => { return false; },
+    };
+}
+
+Result<unit, Rejection> Spend(Walk walk, NodeSpan span, i64 depth) {
+    if (depth > 128_i64) { return Result::Error(Reject("SerializationTypeDepth", "serialized shape nesting exceeds 128", span)); }
+    if (walk.remaining <= 0_i64) { return Result::Error(Reject("SerializationShapeLimit", "serialized shape closure exceeds 100000 nodes", span)); }
+    walk.remaining = walk.remaining - 1_i64;
+    return Result::Ok(());
+}
+
+Rejection Correspondence(NodeSpan span) {
+    return Reject("SerializationShapeCorrespondence", "declared field type differs from its semantic shape", span);
+}
+
+/// The host gate rejects process and runtime-managed opaque resources whose
+/// representation the Mod cannot observe through TypeShape.
+Result<unit, Rejection> Admitted<S>(S source, Semantic.SemanticHandle handle, NodeSpan span) where S: ShapeSource {
+    match source.Serializable(handle) {
+        Result::Error(error) => { return Result::Error(Reject("SerializationResource", error.message, span)); },
+        Result::Ok(_) => { return Result::Ok(()); },
+    };
+}
+
+/// Semantic-only eligibility of a nested type. `direct` holds the nominal
+/// identities reached through direct record fields only; arrays, containers
+/// and enum payloads are indirection and start a new direct path.
+Result<unit, Rejection> NestedType<S>(S source, Walk walk, Semantic.FieldType ty, NodeSpan span, u64[] direct, i64 depth) where S: ShapeSource {
+    match Spend(walk, span, depth) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    match ty {
+        Semantic.FieldType::Scalar(primitive) => { return ScalarEligible(primitive, span); },
+        Semantic.FieldType::Array(elements) => {
+            if (Array.Len(elements) != 1_i64) { return Result::Error(Correspondence(span)); }
+            return NestedType<S>(source, walk, elements[0_i64], span, [], depth + 1_i64);
+        },
+        Semantic.FieldType::Nominal(handle) => {
+            match source.Describe(handle) {
+                Result::Error(error) => { return Result::Error(RejectionValue(error, span)); },
+                Result::Ok(shape) => {
+                    i64 container = ContainerCode(shape);
+                    if (container > 0_i64) {
+                        if (container == 2_i64 && (Array.Len(shape.typeArguments) != 2_i64 || !StringKey(shape.typeArguments[0_i64]))) {
+                            return Result::Error(Reject("SerializationMapKey", "serialization supports Map with string keys only", span));
+                        }
+                        mut i64 argument = 0_i64;
+                        while (argument < Array.Len(shape.typeArguments)) {
+                            match NestedType<S>(source, walk, shape.typeArguments[argument], span, [], depth + 1_i64) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                            argument = argument + 1_i64;
+                        }
+                        return Result::Ok(());
+                    }
+                    return Nominal<S>(source, walk, handle, shape, span, direct, depth);
+                },
+            };
+        },
+    };
+}
+
+Result<unit, Rejection> Nominal<S>(S source, Walk walk, Semantic.SemanticHandle handle, Semantic.Shape shape, NodeSpan span, u64[] direct, i64 depth) where S: ShapeSource {
+    u64 token = Semantic.HandleToken(handle);
+    if (Contains(direct, token)) { return Result::Error(Reject("SerializationRecursiveCycle", "a record reaches itself through direct record fields; recursion requires an array, container or enum indirection", span)); }
+    if (Contains(walk.visited, token)) { return Result::Ok(()); }
+    walk.visited = Array.Append<u64>(walk.visited, token);
+    if (CompilerResource(shape)) { return Result::Error(Reject("SerializationResource", "compiler semantic authority values are resources, not serializable data", span)); }
+    match Admitted<S>(source, handle, span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    match shape.body {
+        Semantic.ShapeBody::Record(fields) => {
+            u64[] next = Extend(direct, token);
+            mut i64 index = 0_i64;
+            while (index < Array.Len(fields)) {
+                match NestedType<S>(source, walk, fields[index].ty, span, next, depth + 1_i64) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                index = index + 1_i64;
+            }
+        },
+        Semantic.ShapeBody::Enum(variants) => {
+            mut i64 variant = 0_i64;
+            while (variant < Array.Len(variants)) {
+                mut i64 index = 0_i64;
+                while (index < Array.Len(variants[variant].fields)) {
+                    match NestedType<S>(source, walk, variants[variant].fields[index].ty, span, [], depth + 1_i64) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                    index = index + 1_i64;
+                }
+                variant = variant + 1_i64;
+            }
+        },
+    };
+    return Result::Ok(());
+}
+
+/// Pair one declared field type with its semantic type. Foundation containers
+/// found here become ContainerSites on the declared syntax node.
+Result<unit, Rejection> Pair<S>(S source, Walk walk, SpannedType ty, Semantic.FieldType semantic, NodeSpan span, u64[] direct, i64 depth) where S: ShapeSource {
+    match Spend(walk, span, depth) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    match semantic {
+        Semantic.FieldType::Scalar(primitive) => {
+            match ty.node {
+                Type::Primitive(declared) => {
+                    if (PrimitiveCode(declared.node) != PrimitiveCode(primitive)) { return Result::Error(Correspondence(span)); }
+                    return ScalarEligible(primitive, span);
+                },
+                _ => { return Result::Error(Correspondence(span)); },
+            };
+        },
+        Semantic.FieldType::Array(elements) => {
+            if (Array.Len(elements) != 1_i64) { return Result::Error(Correspondence(span)); }
+            match ty.node {
+                Type::Array(element) => { return Pair<S>(source, walk, element, elements[0_i64], span, [], depth + 1_i64); },
+                _ => { return Result::Error(Correspondence(span)); },
+            };
+        },
+        Semantic.FieldType::Nominal(handle) => {
+            mut SpannedType[] arguments = [];
+            match ty.node {
+                Type::Complex(path) => {
+                    i64 segments = Array.Len(path.node.segments.items);
+                    if (segments == 0_i64) { return Result::Error(Correspondence(span)); }
+                    arguments = path.node.segments.items[segments - 1_i64].node.typeArgs.items;
+                },
+                _ => { return Result::Error(Correspondence(span)); },
+            };
+            match source.Describe(handle) {
+                Result::Error(error) => { return Result::Error(RejectionValue(error, span)); },
+                Result::Ok(shape) => {
+                    i64 container = ContainerCode(shape);
+                    if (container == 0_i64) { return Nominal<S>(source, walk, handle, shape, span, direct, depth); }
+                    mut i64 expected = 1_i64;
+                    if (container == 2_i64) { expected = 2_i64; }
+                    if (Array.Len(arguments) != expected || Array.Len(shape.typeArguments) != expected) { return Result::Error(Correspondence(span)); }
+                    if (container == 2_i64 && !StringKey(shape.typeArguments[0_i64])) {
+                        return Result::Error(Reject("SerializationMapKey", "serialization supports Map with string keys only", span));
+                    }
+                    mut Read.ContainerKind kind = Read.ContainerKind::Sequence;
+                    if (container == 2_i64) { kind = Read.ContainerKind::Mapping; }
+                    if (container == 3_i64) { kind = Read.ContainerKind::Optional; }
+                    SpannedType element = arguments[expected - 1_i64];
+                    walk.sites = Array.Append<Read.ContainerSite>(walk.sites, Read.ContainerSite { id: ty.id, start: ty.span.start, end: ty.span.end, kind: kind, element: element });
+                    return Pair<S>(source, walk, element, shape.typeArguments[expected - 1_i64], span, [], depth + 1_i64);
+                },
+            };
+        },
+    };
+}
+
+Result<unit, Rejection> PairField<S>(S source, Walk walk, SpannedField field, Semantic.Field semantic, Read.FieldPolicy policy, u64[] direct) where S: ShapeSource {
+    if (field.node.name.node.name != semantic.name) { return Result::Error(Correspondence(field.span)); }
+    if (policy.skipRead && policy.skipWrite) { return Result::Ok(()); }
+    return Pair<S>(source, walk, field.node.ty, semantic.ty, field.span, direct, 0_i64);
+}
+
+Walk Start(u64 target) {
+    return Walk { remaining: 100000_i64, visited: [target], sites: [] };
+}
+
+/// Concrete record closure: every serialized field type is paired with the
+/// issued semantic shape and its nested closure is proven eligible. A catchall
+/// field must be a proven Foundation Map<string,V>.
+pub Result<Closure, Rejection> RecordClosure<S>(S source, Semantic.SemanticHandle target, SpannedField[] fields, Read.FieldPolicy[] policies, NodeSpan span) where S: ShapeSource {
+    if (Array.Len(fields) != Array.Len(policies)) { return Result::Error(Reject("SerializationFieldPolicy", "field policy count differs", span)); }
+    match source.Describe(target) {
+        Result::Error(error) => { return Result::Error(RejectionValue(error, span)); },
+        Result::Ok(shape) => {
+            match shape.body {
+                Semantic.ShapeBody::Record(semanticFields) => {
+                    if (Array.Len(semanticFields) != Array.Len(fields)) { return Result::Error(Correspondence(span)); }
+                    u64 token = Semantic.HandleToken(target);
+                    Walk walk = Start(token);
+                    mut i64 index = 0_i64;
+                    while (index < Array.Len(fields)) {
+                        match PairField<S>(source, walk, fields[index], semanticFields[index], policies[index], [token]) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                        if (policies[index].catchall) {
+                            i64 site = Read.ContainerIndex(walk.sites, fields[index].node.ty);
+                            mut bool mapping = false;
+                            if (site >= 0_i64) { match walk.sites[site].kind { Read.ContainerKind::Mapping => { mapping = true; }, _ => { }, }; }
+                            if (!mapping) { return Result::Error(Reject("SerializationCatchallType", "catchall field must be the canonical Foundation Map<string,V>", fields[index].span)); }
+                        }
+                        index = index + 1_i64;
+                    }
+                    match Admitted<S>(source, target, span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                    return Result::Ok(Closure { sites: walk.sites, fields: semanticFields, variants: [] });
+                },
+                _ => { return Result::Error(Reject("SerializationShapeCorrespondence", "record target has a non-record semantic shape", span)); },
+            };
+        },
+    };
+}
+
+/// Concrete payload-enum closure. Variants and payload fields correspond by
+/// declaration order and name; payloads are indirection for cycle detection.
+pub Result<Closure, Rejection> EnumClosure<S>(S source, Semantic.SemanticHandle target, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, NodeSpan span) where S: ShapeSource {
+    if (Array.Len(variants) != Array.Len(policies)) { return Result::Error(Reject("SerializationFieldPolicy", "variant policy count differs", span)); }
+    match source.Describe(target) {
+        Result::Error(error) => { return Result::Error(RejectionValue(error, span)); },
+        Result::Ok(shape) => {
+            match shape.body {
+                Semantic.ShapeBody::Enum(semanticVariants) => {
+                    if (Array.Len(semanticVariants) != Array.Len(variants)) { return Result::Error(Correspondence(span)); }
+                    Walk walk = Start(Semantic.HandleToken(target));
+                    mut i64 variant = 0_i64;
+                    while (variant < Array.Len(variants)) {
+                        SpannedField[] fields = variants[variant].node.fields.items;
+                        Semantic.Field[] semanticFields = semanticVariants[variant].fields;
+                        if (variants[variant].node.name.node.name != semanticVariants[variant].name || Array.Len(fields) != Array.Len(semanticFields) || Array.Len(fields) != Array.Len(policies[variant].fields)) { return Result::Error(Correspondence(variants[variant].span)); }
+                        mut i64 index = 0_i64;
+                        while (index < Array.Len(fields)) {
+                            match PairField<S>(source, walk, fields[index], semanticFields[index], policies[variant].fields[index], []) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                            index = index + 1_i64;
+                        }
+                        variant = variant + 1_i64;
+                    }
+                    match Admitted<S>(source, target, span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                    return Result::Ok(Closure { sites: walk.sites, fields: [], variants: semanticVariants });
+                },
+                _ => { return Result::Error(Reject("SerializationShapeCorrespondence", "enum target has a non-enum semantic shape", span)); },
+            };
+        },
+    };
+}
+
+/// Catchall eligibility is issued only by the invocation's private semantic
+/// authority for the exact owner and field declaration; spelling grants nothing.
+pub Result<unit, Rejection> IssuedCatchall(Semantic.SemanticHandle owner, Semantic.Field field, NodeSpan span) {
+    match Semantic.CaptureCatchall(owner, field.declaration) {
+        Result::Error(error) => { return Result::Error(RejectionValue(error, span)); },
+        Result::Ok(witness) => {
+            match Semantic.ValidateCatchall(witness) {
+                Result::Error(error) => { return Result::Error(RejectionValue(error, span)); },
+                Result::Ok(_) => { return Result::Ok(()); },
+            };
+        },
+    };
+}
+
+// Default factory proof. The factory path resolves through the host's
+// canonical name resolution from the scope where the generated decoder calls
+// it, so imports, modules, packages and visibility follow ordinary calls. The
+// returned signature is compared with the field's semantic type by issued
+// handle identity, never by spelling.
+
+bool SameFieldType(Semantic.FieldType left, Semantic.FieldType right) {
+    match left {
+        Semantic.FieldType::Scalar(a) => { match right { Semantic.FieldType::Scalar(b) => { return PrimitiveCode(a) == PrimitiveCode(b); }, _ => { return false; }, }; },
+        Semantic.FieldType::Nominal(a) => { match right { Semantic.FieldType::Nominal(b) => { return Semantic.HandleToken(a) == Semantic.HandleToken(b); }, _ => { return false; }, }; },
+        Semantic.FieldType::Array(a) => {
+            match right {
+                Semantic.FieldType::Array(b) => { return Array.Len(a) == 1_i64 && Array.Len(b) == 1_i64 && SameFieldType(a[0_i64], b[0_i64]); },
+                _ => { return false; },
+            };
+        },
+    };
+}
+
+/// A default factory must resolve to one function visible from the source's
+/// caller scope, be non-generic, take no arguments and return exactly the
+/// field's semantic type. It is invoked only when the field is absent on input.
+pub Result<unit, Rejection> Factory<S>(S source, SpannedPath factory, Semantic.FieldType fieldType, NodeSpan span) where S: ShapeSource {
+    mut string[] names = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(factory.node.segments.items)) {
+        if (Array.Len(factory.node.segments.items[index].node.typeArgs.items) != 0_i64) { return Result::Error(Reject("SerializationDefaultFactory", "default factory path must not carry type arguments", span)); }
+        names = Array.Append<string>(names, factory.node.segments.items[index].node.name.node.name);
+        index = index + 1_i64;
+    }
+    match source.Function(names) {
+        Result::Error(error) => { return Result::Error(Reject("SerializationDefaultFactory", error.message, span)); },
+        Result::Ok(signature) => {
+            if (signature.genericCount != 0_u32) { return Result::Error(Reject("SerializationDefaultFactory", "default factory must not be generic", span)); }
+            if (Array.Len(signature.parameters) != 0_i64) { return Result::Error(Reject("SerializationDefaultFactory", "default factory must take no arguments", span)); }
+            if (!SameFieldType(signature.result, fieldType)) { return Result::Error(Reject("SerializationDefaultType", "default factory must return exactly the field's semantic type", span)); }
+            return Result::Ok(());
+        },
+    };
+}

@@ -1,0 +1,50 @@
+/// The exact version-one envelope shared with the reciprocal Rust peer.
+use Core.Results;
+use Core.Collections.Array;
+use Core.String;
+use Core.String.Utf8;
+use Core.Glue.BinaryCodec;
+
+pub enum WireError { Invalid(), Truncated(), Limit(), Trailing(), }
+pub type Envelope { pub u8 kind, pub u64 generation, pub u64 request, pub string library, pub u8[] binding, pub u8[] shapes, pub u8[] payload, }
+type Cursor { pub u8[] bytes, pub i64 offset, pub bool failed, }
+bool Zero(u8[] bytes) { mut i64 index=0;while index<Array.Len(bytes){if bytes[index]!=0_u8{return false;}index=index+1;}return true; }
+pub bool Valid(Envelope value) {
+    i64 libraryLength=String.Len(value.library);i64 shapes=Array.Len(value.shapes);
+    if value.generation==0_u64||libraryLength<1||libraryLength>4096||Array.Len(value.binding)!=32||shapes%32!=0||shapes>8192||value.kind>6_u8{return false;}
+    mut i64 index=0;while index<libraryLength{if String.ByteAt(value.library,index)==0_u8{return false;}index=index+1;}
+    if (value.kind==4_u8||value.kind==5_u8)&&Array.Len(value.payload)!=0{return false;}
+    if value.kind==0_u8||value.kind==5_u8 {return value.request==0_u64&&Zero(value.binding)&&shapes==0;}
+    if value.kind>=1_u8&&value.kind<=4_u8{return value.request!=0_u64&&!Zero(value.binding);}
+    if value.request==0_u64{return Zero(value.binding)&&shapes==0;}
+    return true;
+}
+unit Put(u8[] bytes,mut u64 value,i64 count){mut i64 index=0;while index<count{Array.Append(bytes,u8(value%256_u64));value=value/256_u64;index=index+1;}}
+unit Copy(u8[] target,u8[] source){mut i64 index=0;while index<Array.Len(source){Array.Append(target,source[index]);index=index+1;}}
+u64 Read(Cursor cursor,i64 count){if count>Array.Len(cursor.bytes)-cursor.offset{cursor.failed=true;return 0_u64;}mut u64 value=0_u64;mut u64 factor=1_u64;mut i64 index=0;while index<count{value=value+u64(cursor.bytes[cursor.offset])*factor;cursor.offset=cursor.offset+1;index=index+1;if index<count{factor=factor*256_u64;}}return value;}
+u8[] Take(Cursor cursor,i64 count){u8[] bytes=Array.Empty<u8>();if count<0||count>Array.Len(cursor.bytes)-cursor.offset{cursor.failed=true;return bytes;}mut i64 index=0;while index<count{Array.Append(bytes,cursor.bytes[cursor.offset]);cursor.offset=cursor.offset+1;index=index+1;}return bytes;}
+pub Result<u8[],WireError> Encode(Envelope value){
+    if !Valid(value){return Result::Error(WireError::Invalid);}
+    i64 length=64+String.Len(value.library)+Array.Len(value.shapes)+Array.Len(value.payload);
+    if length>16777216{return Result::Error(WireError::Limit);}
+    u8[] bytes=Array.Empty<u8>();Put(bytes,u64(length),4);Put(bytes,1_u64,2);Put(bytes,u64(value.kind),1);Put(bytes,0_u64,1);Put(bytes,value.generation,8);Put(bytes,value.request,8);
+    Put(bytes,u64(String.Len(value.library)),4);mut i64 index=0;while index<String.Len(value.library){Array.Append(bytes,String.ByteAt(value.library,index));index=index+1;}
+    Copy(bytes,value.binding);Put(bytes,u64(Array.Len(value.shapes)/32_i64),4);Copy(bytes,value.shapes);Put(bytes,u64(Array.Len(value.payload)),4);Copy(bytes,value.payload);
+    return Result::Ok(bytes);
+}
+pub Result<Envelope,WireError> Decode(u8[] bytes){
+    if Array.Len(bytes)<68{return Result::Error(WireError::Truncated);}
+    Cursor cursor=Cursor{bytes:bytes,offset:0,failed:false};u64 length=Read(cursor,4);
+    if length>16777216_u64{return Result::Error(WireError::Limit);}
+    if length!=u64(Array.Len(bytes)-4_i64){return Result::Error(WireError::Truncated);}
+    if Read(cursor,2)!=1_u64{return Result::Error(WireError::Invalid);}
+    u8 kind=u8(Read(cursor,1));if Read(cursor,1)!=0_u64{return Result::Error(WireError::Invalid);}
+    u64 generation=Read(cursor,8);u64 request=Read(cursor,8);u64 libraryLength=Read(cursor,4);
+    if libraryLength>4096_u64{return Result::Error(WireError::Limit);}
+    u8[] libraryBytes=Take(cursor,i64(libraryLength));if !BinaryCodec.ValidUtf8(libraryBytes){return Result::Error(WireError::Invalid);}
+    string library=Utf8.FromUtf8CodeUnits(libraryBytes);u8[] binding=Take(cursor,32);u64 shapesCount=Read(cursor,4);if shapesCount>256_u64{return Result::Error(WireError::Limit);}
+    u8[] shapes=Take(cursor,i64(shapesCount)*32);u64 payloadLength=Read(cursor,4);if payloadLength>16777216_u64{return Result::Error(WireError::Limit);}u8[] payload=Take(cursor,i64(payloadLength));
+    if cursor.failed{return Result::Error(WireError::Truncated);}if cursor.offset!=Array.Len(bytes){return Result::Error(WireError::Trailing);}
+    Envelope value=Envelope{kind:kind,generation:generation,request:request,library:library,binding:binding,shapes:shapes,payload:payload};
+    if !Valid(value){return Result::Error(WireError::Invalid);}return Result::Ok(value);
+}

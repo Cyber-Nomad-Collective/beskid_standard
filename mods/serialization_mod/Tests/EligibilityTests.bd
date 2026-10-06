@@ -1,0 +1,439 @@
+use SerializationMod.Syntax;
+use SerializationMod.Read;
+use SerializationMod.Eligibility;
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Results;
+use Testing.Assert;
+
+// Eligibility, closure and default-factory cases. The semantic shapes,
+// serialization gate and function signatures come from a fixture ShapeSource
+// table instead of the invocation authority; the production pass runs the same
+// code against Semantic.TypeShape, CheckSerializable and ResolveFunction.
+
+/// A function the fixture host resolves. Routes the host would not resolve
+/// (private, foreign or absent) are simply not listed.
+type FixtureFunction {
+    string route,
+    Semantic.FunctionSignature signature,
+}
+
+string Route(string[] path) {
+    mut string route = "";
+    mut i64 index = 0_i64;
+    while (index < Array.Len(path)) {
+        if (index > 0_i64) { route = route + "."; }
+        route = route + path[index];
+        index = index + 1_i64;
+    }
+    return route;
+}
+
+type Table : Eligibility.ShapeSource {
+    u64[] tokens,
+    Semantic.Shape[] shapes,
+    u64[] resources,
+    FixtureFunction[] functions,
+
+    pub Result<Semantic.Shape, SemanticError> Describe(Semantic.SemanticHandle handle) {
+        u64 token = Semantic.HandleToken(handle);
+        mut i64 index = 0_i64;
+        while (index < Array.Len(tokens)) {
+            if (tokens[index] == token) { return Result::Ok(shapes[index]); }
+            index = index + 1_i64;
+        }
+        return Result::Error(SemanticError { code: "FixtureUnknownHandle", message: "fixture has no shape for this handle" });
+    }
+
+    pub Result<unit, SemanticError> Serializable(Semantic.SemanticHandle handle) {
+        u64 token = Semantic.HandleToken(handle);
+        mut i64 index = 0_i64;
+        while (index < Array.Len(resources)) {
+            if (resources[index] == token) { return Result::Error(SemanticError { code: "ModSerializable", message: "canonical opaque runtime resource lacks serialization eligibility proof" }); }
+            index = index + 1_i64;
+        }
+        return Result::Ok(());
+    }
+
+    pub Result<Semantic.FunctionSignature, SemanticError> Function(string[] path) {
+        string route = Route(path);
+        mut i64 index = 0_i64;
+        while (index < Array.Len(functions)) {
+            if (functions[index].route == route) { return Result::Ok(functions[index].signature); }
+            index = index + 1_i64;
+        }
+        return Result::Error(SemanticError { code: "ModFunction", message: "function route does not resolve to one caller-visible declaration" });
+    }
+}
+
+Table NewTable() {
+    return Table { tokens: [], shapes: [], resources: [], functions: [] };
+}
+
+Table Add(Table table, u64 token, Semantic.Shape shape) {
+    table.tokens = Array.Append<u64>(table.tokens, token);
+    table.shapes = Array.Append<Semantic.Shape>(table.shapes, shape);
+    return table;
+}
+
+Table Resource(Table table, u64 token) {
+    table.resources = Array.Append<u64>(table.resources, token);
+    return table;
+}
+
+Table WithFunction(Table table, string route, u32 generics, Semantic.FieldType[] parameters, Semantic.FieldType result) {
+    Semantic.FunctionSignature signature = Semantic.FunctionSignatureValue(Decl(), generics, parameters, result);
+    table.functions = Array.Append<FixtureFunction>(table.functions, FixtureFunction { route: route, signature: signature });
+    return table;
+}
+
+NodeSpan Origin() {
+    return Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64);
+}
+
+Syntax.Builder NewBuilder() {
+    return Syntax.Create(Origin());
+}
+
+Semantic.Declaration Decl() {
+    return Semantic.DeclarationValue("fixture.bd", 1_u64, 1_u32, Origin());
+}
+
+Semantic.SemanticHandle H(u64 token) {
+    return Semantic.HandleValue(token);
+}
+
+Semantic.FieldType Scalar(PrimitiveType primitive) {
+    return Semantic.ScalarValue(primitive);
+}
+
+Semantic.FieldType Ref(u64 token) {
+    return Semantic.NominalValue(H(token));
+}
+
+Semantic.Field SField(string name, Semantic.FieldType ty) {
+    return Semantic.FieldValue(name, Decl(), ty, Semantic.NativeOwnershipValue());
+}
+
+Semantic.Shape UserRecord(string name, Semantic.Field[] fields) {
+    return Semantic.ShapeValue(name, "fixture::" + name, Semantic.NoPackageDeclaration(), Decl(), [], Semantic.RecordValue(fields), Semantic.NoPackage());
+}
+
+Semantic.Shape UserEnum(string name, Semantic.Variant[] variants) {
+    return Semantic.ShapeValue(name, "fixture::" + name, Semantic.NoPackageDeclaration(), Decl(), [], Semantic.EnumValue(variants), Semantic.NoPackage());
+}
+
+Semantic.Shape Corelib(string path, string name, Semantic.FieldType[] arguments) {
+    Semantic.PackageIdentity package = Semantic.PackageValue("corelib_foundation", "0.1.0", Semantic.CorelibValue(), "fixture-digest");
+    return Semantic.ShapeValue(name, "corelib::" + name, Semantic.SomePackageDeclaration(Semantic.PackageDeclarationValue(path, [name])), Decl(), arguments, Semantic.RecordValue([]), Semantic.SomePackage(package));
+}
+
+Semantic.Shape ListShape(Semantic.FieldType element) { return Corelib("Core/Collections/List.bd", "List", [element]); }
+Semantic.Shape MapShape(Semantic.FieldType key, Semantic.FieldType value) { return Corelib("Core/Collections/Map.bd", "Map", [key, value]); }
+Semantic.Shape OptionShape(Semantic.FieldType element) { return Corelib("Core/Optional/Option.bd", "Option", [element]); }
+
+Read.FieldPolicy Plain(string name) {
+    return Read.FieldPolicy { wireName: name, skipRead: false, skipWrite: false, wordWidth: 0_u8, bytes: false, defaultFactory: OptionalSpannedPath::None, catchall: false };
+}
+
+Read.FieldPolicy[] PlainAll(SpannedField[] fields) {
+    mut Read.FieldPolicy[] result = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) { result = Array.Append<Read.FieldPolicy>(result, Plain(fields[index].node.name.node.name)); index = index + 1_i64; }
+    return result;
+}
+
+SpannedType Prim(Syntax.Builder builder, PrimitiveType primitive) {
+    return Syntax.Primitive(builder, primitive);
+}
+
+SpannedField FieldAt(Syntax.Builder builder, string name, SpannedType ty, u64 start) {
+    mut SpannedField field = Syntax.DataField(builder, name, ty);
+    field.span = Semantic.SpanValue(start, start + 5_u64, 2_u64, 1_u64, 2_u64, 6_u64);
+    return field;
+}
+
+string DeclaredCode(SpannedField field, Read.FieldPolicy policy) {
+    match Eligibility.Declared(field, policy) {
+        Result::Ok(_) => { return ""; },
+        Result::Error(rejection) => {
+            Assert.Equal<u64>(rejection.span.start, field.span.start, "declared rejection carries the field span");
+            return rejection.code;
+        },
+    };
+}
+
+string RecordCode(Table table, u64 target, SpannedField[] fields, Read.FieldPolicy[] policies) {
+    match Eligibility.RecordClosure<Table>(table, H(target), fields, policies, Origin()) {
+        Result::Ok(_) => { return ""; },
+        Result::Error(rejection) => { return rejection.code; },
+    };
+}
+
+SpannedEnumVariant Variant(Syntax.Builder builder, string name, SpannedField[] fields) {
+    EnumVariant node = EnumVariant { name: Syntax.IdentifierValue(builder, name), fields: SpannedFieldList { items: fields }, fieldDocs: OptionalLeadingDocCommentList { items: [] } };
+    return SpannedEnumVariant { node: node, span: builder.origin, id: 70000_u32 };
+}
+
+// Gap 1: declared-type eligibility with field spans.
+test serialization_eligibility_rejects_ineligible_declared_types_with_field_spans {
+    Syntax.Builder builder = NewBuilder();
+    SpannedType function = SpannedType { node: Type::Function(Prim(builder, PrimitiveType::I32), SpannedTypeList { items: [] }), span: builder.origin, id: 90001_u32 };
+    SpannedType thisType = SpannedType { node: Type::_This, span: builder.origin, id: 90002_u32 };
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "raw", Prim(builder, PrimitiveType::Pointer), 20_u64), Plain("raw")), "SerializationPointer", "pointer rejects");
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "none", Syntax.ArrayType(builder, Prim(builder, PrimitiveType::Never)), 30_u64), Plain("none")), "SerializationNever", "never element rejects");
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "call", function, 40_u64), Plain("call")), "SerializationClosure", "closure rejects");
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "itself", thisType, 50_u64), Plain("itself")), "SerializationOpaqueReference", "This rejects");
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "boxed", Syntax.Named(builder, ["Box"], [Prim(builder, PrimitiveType::Pointer)]), 60_u64), Plain("boxed")), "SerializationPointer", "pointer type argument rejects");
+    mut SpannedField event = FieldAt(builder, "changed", Prim(builder, PrimitiveType::I32), 70_u64);
+    event.node.kind = FieldKind::Event;
+    Assert.Equal<string>(DeclaredCode(event, Plain("changed")), "SerializationFieldKind", "event field is not constructible data");
+}
+
+test serialization_eligibility_admits_data_types_and_fully_skipped_fields {
+    Syntax.Builder builder = NewBuilder();
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "count", Prim(builder, PrimitiveType::I32), 20_u64), Plain("count")), "", "scalar admitted");
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "table", Syntax.Named(builder, ["Map"], [Prim(builder, PrimitiveType::String), Syntax.Named(builder, ["Item"], [])]), 30_u64), Plain("table")), "", "nominal application admitted syntactically");
+    mut Read.FieldPolicy skipped = Plain("raw");
+    skipped.skipRead = true;
+    skipped.skipWrite = true;
+    Assert.Equal<string>(DeclaredCode(FieldAt(builder, "raw", Prim(builder, PrimitiveType::Pointer), 40_u64), skipped), "", "a field skipped both ways is not serialized");
+}
+
+test serialization_eligibility_requires_public_nested_targets {
+    Syntax.Builder builder = NewBuilder();
+    SpannedVisibility open = Syntax.Public(builder);
+    SpannedVisibility closed = SpannedVisibility { node: Visibility::Private, span: builder.origin, id: 90010_u32 };
+    Assert.True(Results.IsOk(Eligibility.Accessible(closed, [], Origin())), "a root-level private type is constructible from root contributions");
+    Assert.True(Results.IsOk(Eligibility.Accessible(open, [open], Origin())), "public nested type in public module");
+    match Eligibility.Accessible(closed, [open], Origin()) {
+        Result::Error(rejection) => { Assert.Equal<string>(rejection.code, "SerializationInaccessible", "private nested type rejects"); },
+        Result::Ok(_) => { Assert.Fail("private nested type must reject"); },
+    };
+    Assert.True(Results.IsError(Eligibility.Accessible(open, [open, closed], Origin())), "private enclosing module rejects");
+}
+
+// Gap 1 and 2: semantic closure proves containers and rejects nested shapes.
+test serialization_closure_proves_foundation_containers_by_package_identity {
+    Syntax.Builder builder = NewBuilder();
+    SpannedType items = Syntax.Named(builder, ["List"], [Prim(builder, PrimitiveType::I32)]);
+    SpannedType extra = Syntax.Named(builder, ["Map"], [Prim(builder, PrimitiveType::String), Prim(builder, PrimitiveType::I32)]);
+    SpannedType maybe = Syntax.Named(builder, ["Option"], [Prim(builder, PrimitiveType::String)]);
+    SpannedField[] fields = [FieldAt(builder, "count", Prim(builder, PrimitiveType::I32), 10_u64), FieldAt(builder, "items", items, 20_u64), FieldAt(builder, "extra", extra, 30_u64), FieldAt(builder, "maybe", maybe, 40_u64)];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserRecord("Bag", [SField("count", Scalar(PrimitiveType::I32)), SField("items", Ref(10_u64)), SField("extra", Ref(11_u64)), SField("maybe", Ref(12_u64))]));
+    table = Add(table, 10_u64, ListShape(Scalar(PrimitiveType::I32)));
+    table = Add(table, 11_u64, MapShape(Scalar(PrimitiveType::String), Scalar(PrimitiveType::I32)));
+    table = Add(table, 12_u64, OptionShape(Scalar(PrimitiveType::String)));
+    Read.FieldPolicy[] policies = PlainAll(fields);
+    match Eligibility.RecordClosure<Table>(table, H(1_u64), fields, policies, Origin()) {
+        Result::Error(rejection) => { Assert.Fail(rejection.code + ": " + rejection.message); },
+        Result::Ok(closure) => {
+            Assert.Equal<i64>(Array.Len(closure.sites), 3_i64, "three proven containers");
+            Assert.Equal<i64>(Array.Len(closure.fields), 4_i64, "semantic fields retained in order");
+            i64 list = Read.ContainerIndex(closure.sites, items);
+            Assert.True(list >= 0_i64, "list site recorded on the declared node");
+            match closure.sites[list].kind { Read.ContainerKind::Sequence => { }, _ => { Assert.Fail("List is a sequence"); }, };
+            Assert.True(Read.ContainerIndex(closure.sites, Prim(builder, PrimitiveType::I32)) < 0_i64, "an unrelated node is not a container");
+        },
+    };
+    mut Read.FieldPolicy extraPolicy = Plain("extra");
+    extraPolicy.catchall = true;
+    extraPolicy.skipWrite = true;
+    Assert.Equal<string>(RecordCode(table, 1_u64, fields, [Plain("count"), Plain("items"), extraPolicy, Plain("maybe")]), "", "catchall on a proven Map<string,V> is admitted");
+    mut Read.FieldPolicy countPolicy = Plain("count");
+    countPolicy.catchall = true;
+    Assert.Equal<string>(RecordCode(table, 1_u64, fields, [countPolicy, Plain("items"), Plain("extra"), Plain("maybe")]), "SerializationCatchallType", "catchall on a scalar rejects");
+}
+
+test serialization_closure_treats_user_list_spelling_as_nominal {
+    Syntax.Builder builder = NewBuilder();
+    SpannedField[] fields = [FieldAt(builder, "items", Syntax.Named(builder, ["List"], [Prim(builder, PrimitiveType::I32)]), 20_u64)];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserRecord("Holder", [SField("items", Ref(10_u64))]));
+    table = Add(table, 10_u64, UserRecord("List", [SField("first", Scalar(PrimitiveType::I32))]));
+    match Eligibility.RecordClosure<Table>(table, H(1_u64), fields, PlainAll(fields), Origin()) {
+        Result::Error(rejection) => { Assert.Fail(rejection.code); },
+        Result::Ok(closure) => { Assert.Equal<i64>(Array.Len(closure.sites), 0_i64, "a user List without Corelib provenance is not a container"); },
+    };
+}
+
+test serialization_closure_rejects_non_string_map_keys {
+    Syntax.Builder builder = NewBuilder();
+    SpannedField[] fields = [FieldAt(builder, "table", Syntax.Named(builder, ["Map"], [Prim(builder, PrimitiveType::I32), Prim(builder, PrimitiveType::I32)]), 20_u64)];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserRecord("Holder", [SField("table", Ref(11_u64))]));
+    table = Add(table, 11_u64, MapShape(Scalar(PrimitiveType::I32), Scalar(PrimitiveType::I32)));
+    match Eligibility.RecordClosure<Table>(table, H(1_u64), fields, PlainAll(fields), Origin()) {
+        Result::Error(rejection) => {
+            Assert.Equal<string>(rejection.code, "SerializationMapKey", "integer map key rejects");
+            Assert.Equal<u64>(rejection.span.start, 20_u64, "rejection points at the field");
+        },
+        Result::Ok(_) => { Assert.Fail("non-string map key must reject"); },
+    };
+}
+
+test serialization_closure_rejects_nested_opaque_references_and_resources {
+    Syntax.Builder builder = NewBuilder();
+    SpannedField[] fields = [FieldAt(builder, "handle", Syntax.Named(builder, ["Handle"], []), 20_u64)];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserRecord("Holder", [SField("handle", Ref(20_u64))]));
+    table = Add(table, 20_u64, UserRecord("Handle", [SField("raw", Scalar(PrimitiveType::Pointer))]));
+    Assert.Equal<string>(RecordCode(table, 1_u64, fields, PlainAll(fields)), "SerializationPointer", "type wrapping a pointer is an opaque reference");
+    mut Table authority = NewTable();
+    authority = Add(authority, 1_u64, UserRecord("Holder", [SField("handle", Ref(30_u64))]));
+    authority = Add(authority, 30_u64, Corelib("Beskid/Compiler/Semantic.bd", "SemanticHandle", []));
+    Assert.Equal<string>(RecordCode(authority, 1_u64, fields, PlainAll(fields)), "SerializationResource", "compiler semantic handle is a resource");
+    mut Table missing = NewTable();
+    missing = Add(missing, 1_u64, UserRecord("Holder", [SField("handle", Ref(99_u64))]));
+    Assert.Equal<string>(RecordCode(missing, 1_u64, fields, PlainAll(fields)), "FixtureUnknownHandle", "host shape rejection is reported with its code");
+}
+
+test serialization_closure_rejects_direct_record_cycles_but_admits_indirection {
+    Syntax.Builder builder = NewBuilder();
+    SpannedField[] direct = [FieldAt(builder, "next", Syntax.Named(builder, ["Node"], []), 20_u64)];
+    mut Table looped = NewTable();
+    looped = Add(looped, 1_u64, UserRecord("Node", [SField("next", Ref(1_u64))]));
+    Assert.Equal<string>(RecordCode(looped, 1_u64, direct, PlainAll(direct)), "SerializationRecursiveCycle", "record containing itself directly rejects");
+    SpannedField[] mutual = [FieldAt(builder, "other", Syntax.Named(builder, ["B"], []), 20_u64)];
+    mut Table pair = NewTable();
+    pair = Add(pair, 1_u64, UserRecord("A", [SField("other", Ref(2_u64))]));
+    pair = Add(pair, 2_u64, UserRecord("B", [SField("back", Ref(1_u64))]));
+    Assert.Equal<string>(RecordCode(pair, 1_u64, mutual, PlainAll(mutual)), "SerializationRecursiveCycle", "mutual direct records reject");
+    SpannedField[] children = [FieldAt(builder, "children", Syntax.ArrayType(builder, Syntax.Named(builder, ["Node"], [])), 20_u64)];
+    mut Table tree = NewTable();
+    tree = Add(tree, 1_u64, UserRecord("Node", [SField("children", Semantic.ArrayValue(Ref(1_u64)))]));
+    Assert.Equal<string>(RecordCode(tree, 1_u64, children, PlainAll(children)), "", "array indirection admits recursion");
+    SpannedField[] optional = [FieldAt(builder, "next", Syntax.Named(builder, ["Option"], [Syntax.Named(builder, ["Node"], [])]), 20_u64)];
+    mut Table chain = NewTable();
+    chain = Add(chain, 1_u64, UserRecord("Node", [SField("next", Ref(12_u64))]));
+    chain = Add(chain, 12_u64, OptionShape(Ref(1_u64)));
+    Assert.Equal<string>(RecordCode(chain, 1_u64, optional, PlainAll(optional)), "", "optional indirection admits recursion");
+}
+
+test serialization_closure_rejects_syntax_semantic_divergence {
+    Syntax.Builder builder = NewBuilder();
+    SpannedField[] fields = [FieldAt(builder, "count", Prim(builder, PrimitiveType::I32), 20_u64)];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserRecord("Holder", [SField("count", Scalar(PrimitiveType::String))]));
+    Assert.Equal<string>(RecordCode(table, 1_u64, fields, PlainAll(fields)), "SerializationShapeCorrespondence", "declared and semantic scalar differ");
+    mut Table renamed = NewTable();
+    renamed = Add(renamed, 1_u64, UserRecord("Holder", [SField("total", Scalar(PrimitiveType::I32))]));
+    Assert.Equal<string>(RecordCode(renamed, 1_u64, fields, PlainAll(fields)), "SerializationShapeCorrespondence", "field order and names must correspond");
+}
+
+test serialization_enum_closure_admits_recursive_payloads_and_rejects_opaque_ones {
+    Syntax.Builder builder = NewBuilder();
+    SpannedEnumVariant[] variants = [
+        Variant(builder, "Leaf", [FieldAt(builder, "value", Prim(builder, PrimitiveType::F64), 20_u64)]),
+        Variant(builder, "Node", [FieldAt(builder, "next", Syntax.Named(builder, ["Tree"], []), 30_u64)]),
+    ];
+    Read.VariantPolicy[] policies = [Read.VariantPolicy { fields: [Plain("value")] }, Read.VariantPolicy { fields: [Plain("next")] }];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserEnum("Tree", [Semantic.VariantValue("Leaf", 0_u32, Decl(), [SField("value", Scalar(PrimitiveType::F64))]), Semantic.VariantValue("Node", 1_u32, Decl(), [SField("next", Ref(1_u64))])]));
+    Assert.True(Results.IsOk(Eligibility.EnumClosure<Table>(table, H(1_u64), variants, policies, Origin())), "enum payload recursion is indirection");
+    mut Table opaque = NewTable();
+    opaque = Add(opaque, 1_u64, UserEnum("Tree", [Semantic.VariantValue("Leaf", 0_u32, Decl(), [SField("value", Scalar(PrimitiveType::F64))]), Semantic.VariantValue("Node", 1_u32, Decl(), [SField("next", Ref(20_u64))])]));
+    opaque = Add(opaque, 20_u64, UserRecord("Handle", [SField("raw", Scalar(PrimitiveType::Pointer))]));
+    match Eligibility.EnumClosure<Table>(opaque, H(1_u64), variants, policies, Origin()) {
+        Result::Error(rejection) => { Assert.Equal<string>(rejection.code, "SerializationPointer", "opaque payload rejects"); Assert.Equal<u64>(rejection.span.start, 30_u64, "payload field span"); },
+        Result::Ok(_) => { Assert.Fail("opaque payload must reject"); },
+    };
+}
+
+// Gap 5: default factory proof through host resolution and handle identity.
+string FactoryCode(Table table, SpannedPath factory, Semantic.FieldType field) {
+    match Eligibility.Factory<Table>(table, factory, field, Origin()) {
+        Result::Ok(_) => { return ""; },
+        Result::Error(rejection) => {
+            Assert.Equal<u64>(rejection.span.start, Origin().start, "factory rejection carries the field span");
+            return rejection.code;
+        },
+    };
+}
+
+test serialization_default_factory_resolves_across_modules_and_packages {
+    Syntax.Builder builder = NewBuilder();
+    mut Table table = NewTable();
+    table = WithFunction(table, "Defaults.MakeCount", 0_u32, [], Scalar(PrimitiveType::I32));
+    table = WithFunction(table, "Bounded.DefaultLimits", 0_u32, [], Ref(40_u64));
+    Assert.Equal<string>(FactoryCode(table, Syntax.PathValue(builder, ["Defaults", "MakeCount"], []), Scalar(PrimitiveType::I32)), "", "factory in another module resolves through the host");
+    Assert.Equal<string>(FactoryCode(table, Syntax.PathValue(builder, ["Bounded", "DefaultLimits"], []), Ref(40_u64)), "", "factory in another package returns the field's exact nominal handle");
+}
+
+test serialization_default_factory_denies_unresolvable_and_private_routes {
+    Syntax.Builder builder = NewBuilder();
+    mut Table table = NewTable();
+    table = WithFunction(table, "Defaults.MakeCount", 0_u32, [], Scalar(PrimitiveType::I32));
+    // The host never resolves a private function of another module or package,
+    // so the route is absent and the Mod reports the host's denial.
+    Assert.Equal<string>(FactoryCode(table, Syntax.PathValue(builder, ["Bounded", "HiddenLimits"], []), Ref(40_u64)), "SerializationDefaultFactory", "private factory in another package rejects");
+    Assert.Equal<string>(FactoryCode(table, Syntax.PathValue(builder, ["MakeCount"], []), Scalar(PrimitiveType::I32)), "SerializationDefaultFactory", "route is canonical, never a leaf-name search");
+    Assert.Equal<string>(FactoryCode(table, Syntax.PathValue(builder, ["Defaults", "MakeCount"], [Prim(builder, PrimitiveType::I32)]), Scalar(PrimitiveType::I32)), "SerializationDefaultFactory", "type arguments on a factory path reject");
+}
+
+test serialization_default_factory_requires_exact_zero_argument_return {
+    Syntax.Builder builder = NewBuilder();
+    SpannedPath path = Syntax.PathValue(builder, ["Defaults", "MakeCount"], []);
+    mut Table exact = NewTable();
+    exact = WithFunction(exact, "Defaults.MakeCount", 0_u32, [], Scalar(PrimitiveType::I32));
+    Assert.Equal<string>(FactoryCode(exact, path, Scalar(PrimitiveType::I32)), "", "exact zero-argument factory is admitted");
+    Assert.Equal<string>(FactoryCode(exact, path, Scalar(PrimitiveType::String)), "SerializationDefaultType", "wrong return primitive rejects");
+    mut Table parameterized = NewTable();
+    parameterized = WithFunction(parameterized, "Defaults.MakeCount", 0_u32, [Scalar(PrimitiveType::I32)], Scalar(PrimitiveType::I32));
+    Assert.Equal<string>(FactoryCode(parameterized, path, Scalar(PrimitiveType::I32)), "SerializationDefaultFactory", "factory with arguments rejects");
+    mut Table generic = NewTable();
+    generic = WithFunction(generic, "Defaults.MakeCount", 1_u32, [], Scalar(PrimitiveType::I32));
+    Assert.Equal<string>(FactoryCode(generic, path, Scalar(PrimitiveType::I32)), "SerializationDefaultFactory", "generic factory rejects");
+    mut Table empty = NewTable();
+    empty = WithFunction(empty, "Defaults.MakeCount", 0_u32, [], Scalar(PrimitiveType::Unit));
+    Assert.Equal<string>(FactoryCode(empty, path, Scalar(PrimitiveType::I32)), "SerializationDefaultType", "factory without a return value rejects");
+}
+
+test serialization_default_factory_compares_nominal_applications_by_handle {
+    Syntax.Builder builder = NewBuilder();
+    SpannedPath path = Syntax.PathValue(builder, ["MakeBox"], []);
+    // Box<i32> and Box<u32> are distinct issued applications with distinct handles.
+    mut Table same = NewTable();
+    same = WithFunction(same, "MakeBox", 0_u32, [], Ref(50_u64));
+    Assert.Equal<string>(FactoryCode(same, path, Ref(50_u64)), "", "same nominal application admitted");
+    mut Table other = NewTable();
+    other = WithFunction(other, "MakeBox", 0_u32, [], Ref(51_u64));
+    Assert.Equal<string>(FactoryCode(other, path, Ref(50_u64)), "SerializationDefaultType", "wrong nominal generic application rejects");
+    mut Table array = NewTable();
+    array = WithFunction(array, "MakeBox", 0_u32, [], Semantic.ArrayValue(Ref(50_u64)));
+    Assert.Equal<string>(FactoryCode(array, path, Semantic.ArrayValue(Ref(50_u64))), "", "array of the same application admitted");
+    Assert.Equal<string>(FactoryCode(array, path, Ref(50_u64)), "SerializationDefaultType", "array and element differ");
+}
+
+// Host serialization gate: resources the Mod cannot see through TypeShape.
+test serialization_closure_rejects_host_gated_resources {
+    Syntax.Builder builder = NewBuilder();
+    SpannedField[] fields = [FieldAt(builder, "child", Syntax.Named(builder, ["ChildProcess"], []), 20_u64)];
+    mut Table table = NewTable();
+    table = Add(table, 1_u64, UserRecord("Holder", [SField("child", Ref(60_u64))]));
+    table = Add(table, 60_u64, UserRecord("ChildProcess", [SField("pid", Scalar(PrimitiveType::I64))]));
+    table = Resource(table, 60_u64);
+    match Eligibility.RecordClosure<Table>(table, H(1_u64), fields, PlainAll(fields), Origin()) {
+        Result::Error(rejection) => {
+            Assert.Equal<string>(rejection.code, "SerializationResource", "host-gated resource rejects");
+            Assert.Equal<u64>(rejection.span.start, 20_u64, "nested resource rejection points at the field");
+        },
+        Result::Ok(_) => { Assert.Fail("process resource must reject"); },
+    };
+    mut Table root = NewTable();
+    root = Add(root, 1_u64, UserRecord("Holder", [SField("count", Scalar(PrimitiveType::I32))]));
+    root = Resource(root, 1_u64);
+    SpannedField[] plain = [FieldAt(builder, "count", Prim(builder, PrimitiveType::I32), 20_u64)];
+    Assert.Equal<string>(RecordCode(root, 1_u64, plain, PlainAll(plain)), "SerializationResource", "target rejected by the host gate");
+    SpannedEnumVariant[] variants = [Variant(builder, "Running", [FieldAt(builder, "child", Syntax.Named(builder, ["ChildProcess"], []), 30_u64)])];
+    mut Table enumeration = NewTable();
+    enumeration = Add(enumeration, 2_u64, UserEnum("State", [Semantic.VariantValue("Running", 0_u32, Decl(), [SField("child", Ref(60_u64))])]));
+    enumeration = Add(enumeration, 60_u64, UserRecord("ChildProcess", [SField("pid", Scalar(PrimitiveType::I64))]));
+    enumeration = Resource(enumeration, 60_u64);
+    match Eligibility.EnumClosure<Table>(enumeration, H(2_u64), variants, [Read.VariantPolicy { fields: [Plain("child")] }], Origin()) {
+        Result::Error(rejection) => { Assert.Equal<string>(rejection.code, "SerializationResource", "resource payload rejects"); },
+        Result::Ok(_) => { Assert.Fail("resource payload must reject"); },
+    };
+}

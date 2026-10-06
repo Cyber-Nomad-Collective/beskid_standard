@@ -1,0 +1,2090 @@
+/// Native serialization.v1 wire authority. Syntax remains distinct from the
+/// application-profile binding. Nominal shape eligibility is compiler-issued.
+use Core.Bsol.Limits as BsolPolicy;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Typed;
+
+use Core.Collections.Array;
+use Core.Memory.Managed;
+
+use Core.Bytes.Slice as ByteSlice;
+
+use Core.Encoding.Base64;
+
+use Core.Numeric.UnicodeScalar;
+
+
+use Core.Serialization.DataValue;
+use Core.Serialization.Contracts;
+use Core.Serialization.Decoding;
+use Core.Serialization.Reader as ReaderApi;
+
+use Core.Serialization.Decimal;
+
+use Core.Serialization.Descriptors;
+
+use Core.Serialization.Errors;
+
+use Core.Serialization.FloatDecimal;
+
+use Core.Serialization.Limits;
+
+use Core.Serialization.Metadata;
+
+use Core.Serialization.Numeric;
+
+use Core.Serialization.Registry;
+
+use Core.String;
+
+use Core.Bsol.Lexer;
+
+type Output
+{
+    u8[] bytes,
+
+    i64 used,
+
+    bool failed,
+
+    SerializationError error,
+
+    i64 nodes,
+    DataValue[] activeValues,
+
+    SerializationLimits limits,
+}
+
+SerializationError Error(string code, string path, Syntax.Span span)
+{
+    return Errors.Diagnostic(code, path, span.start, span.end, false, -1_i64, -1_i64);
+}
+
+SerializationError NoSource(string code)
+{
+    return Errors.NumericError(code);
+}
+
+unit Fail(mut Output output, string code)
+{
+    if (!output.failed)
+    {
+        output.failed = true;
+        // Immutable published diagnostics are never updated in place. The checked
+        // boundary must intercept allocation failure before constructing this value.
+        output.error = NoSource(code);
+    }
+}
+
+unit Put(mut Output output, string text)
+{
+    if (output.failed)
+    {
+        return;
+    }
+
+    i64 length = String.Len(text);
+    if (length > output.limits.maxOutputBytes - output.used)
+    {
+        Fail(output, "OutputLimit");
+        return;
+    }
+
+    i64 required = output.used + length;
+    if (required > Array.Len<u8>(output.bytes))
+    {
+        mut i64 capacity = Array.Len<u8>(output.bytes);
+        if (capacity == 0_i64)
+        {
+            capacity = 64_i64;
+            if (capacity > output.limits.maxOutputBytes)
+            {
+                capacity = output.limits.maxOutputBytes;
+            }
+        }
+        while (capacity < required)
+        {
+            if (capacity > output.limits.maxOutputBytes / 2_i64)
+            {
+                capacity = output.limits.maxOutputBytes;
+            }
+            else
+            {
+                capacity = capacity * 2_i64;
+            }
+        }
+
+        while (Array.Len<u8>(output.bytes) < capacity) {
+            if (!Array.TryAppend<u8>(output.bytes, 0_u8)) {
+                Fail(output, "AllocationFailed");
+                return;
+            }
+        }
+    }
+
+    mut i64 i = 0_i64;
+    while (i < length)
+    {
+        Array.Set<u8>(output.bytes, output.used + i, String.ByteAt(text, i));
+        i = i + 1_i64;
+    }
+    output.used = required;
+}
+
+unit Quote(mut Output output, string text)
+{
+    if (String.Len(text) > output.limits.maxScalarBytes)
+    {
+        Fail(output, "ScalarLimit");
+        return;
+    }
+    Put(output, "\"");
+    mut i64 run = 0_i64;
+    mut i64 i = 0_i64;
+    string hex = "0123456789abcdef";
+    while (i < String.Len(text))
+    {
+        u8 byte = String.ByteAt(text, i);
+        if (byte == 34_u8 || byte == 92_u8 || byte < 32_u8)
+        {
+            Put(output, String.SubSlice(text, run, i - run));
+            if (byte == 34_u8)
+            {
+                Put(output, "\\\"");
+            }
+            else if (byte == 92_u8)
+            {
+                Put(output, "\\\\");
+            }
+            else
+            {
+                Put(output, "\\u00" + String.SubSlice(hex, i64(byte >> 4_u8), 1_i64) + String.SubSlice(hex, i64(byte & 15_u8), 1_i64));
+            }
+            run = i + 1_i64;
+        }
+        i = i + 1_i64;
+    }
+    Put(output, String.SubSlice(text, run, String.Len(text) - run));
+    Put(output, "\"");
+}
+
+bool SameId(ShapeId left, ShapeId right)
+{
+    return Metadata.FormatShapeId(left) == Metadata.FormatShapeId(right);
+}
+
+unit Open(mut Output output, string tag)
+{
+    Put(output, "value ");
+    Quote(output, tag);
+    Put(output, " { ");
+}
+
+unit NumericText(mut Output output, Result<string, SerializationError> text)
+{
+    match text
+    {
+        Result::Error(error) => {
+            output.failed = true;
+            output.error = error;
+        },
+
+        Result::Ok(value) => Put(output, value),
+    };
+}
+
+bool Less(string left, string right)
+{
+    mut i64 i = 0_i64;
+    while (i < String.Len(left) && i < String.Len(right))
+    {
+        u8 a = String.ByteAt(left, i);
+        u8 b = String.ByteAt(right, i);
+        if (a != b)
+        {
+            return a < b;
+        }
+        i = i + 1_i64;
+    }
+    return String.Len(left) < String.Len(right);
+}
+
+unit Sift(MapEntry[] entries, i64[] order, i64 root, i64 length)
+{
+    mut i64 current = root;
+    while (current < length / 2_i64)
+    {
+        i64 left = current * 2_i64 + 1_i64;
+        if (left >= length)
+        {
+            return;
+        }
+
+        mut i64 greatest = left;
+        if (left + 1_i64 < length && Less(entries[order[left]].key, entries[order[left + 1_i64]].key))
+        {
+            greatest = left + 1_i64;
+        }
+        if (!Less(entries[order[current]].key, entries[order[greatest]].key))
+        {
+            return;
+        }
+
+        i64 temp = order[current];
+        Array.Set<i64>(order, current, order[greatest]);
+        Array.Set<i64>(order, greatest, temp);
+        current = greatest;
+    }
+}
+
+unit Emit(mut Output output, Registry.ShapeRegistry table, ShapeId expected, DataValue value, i64 depth) {
+    if (output.failed) { return; }
+    mut i64 i = 0_i64;
+    while (i < Array.Len<DataValue>(output.activeValues)) {
+        if (Managed.SameIdentity<DataValue>(output.activeValues[i], value)) {
+            Fail(output, "CycleDetected");
+            return;
+        }
+        i = i + 1_i64;
+    }
+    if (i >= output.limits.maxDepth) { Fail(output, "CollectionLimit"); return; }
+    if (!Array.TryAppend<DataValue>(output.activeValues, value)) { Fail(output, "AllocationFailed"); return; }
+    EmitBody(output, table, expected, value, depth);
+    // Always release this active edge, including checked errors. A repeated
+    // sibling alias is legal; only identity already on the current path cycles.
+    Array.RemoveLast<DataValue>(output.activeValues);
+}
+
+unit EmitBody(mut Output output, Registry.ShapeRegistry table, ShapeId expected, DataValue value, i64 depth)
+{
+    if (output.failed)
+    {
+        return;
+    }
+    output.nodes = output.nodes + 1_i64;
+    if (depth > output.limits.maxDepth || output.nodes > output.limits.maxNodes)
+    {
+        Fail(output, "CollectionLimit");
+        return;
+    }
+
+    ShapeDescriptor shape = match Registry.Lookup(table, expected)
+    {
+        Result::Error(error) => {
+            output.failed = true;
+            output.error = error;
+            return;
+        },
+
+        Result::Ok(descriptor) => descriptor,
+    };
+    match value
+    {
+        DataValue::Unit => {
+            if (shape.kind != ShapeKind::Unit)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "unit");
+        },
+
+        DataValue::Boolean(data) => {
+            if (shape.kind != ShapeKind::Boolean)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "bool");
+            Put(output, "data = ");
+            if (data)
+            {
+                Put(output, "true");
+            }
+            else
+            {
+                Put(output, "false");
+            }
+        },
+
+        DataValue::Signed(data, width) => {
+            if (shape.kind != ShapeKind::Signed || shape.width != width)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "i" + Decimal.Unsigned(u64(width)));
+            Put(output, "data = ");
+            NumericText(output, Decimal.FormatSigned(data, width));
+        },
+
+        DataValue::Unsigned(data, width) => {
+            if (shape.kind != ShapeKind::Unsigned || shape.width != width)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "u" + Decimal.Unsigned(u64(width)));
+            Put(output, "data = ");
+            NumericText(output, Decimal.FormatUnsigned(data, width));
+        },
+
+        DataValue::Float(bits, width) => {
+            if (shape.kind != ShapeKind::Float || shape.width != width)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "f" + Decimal.Unsigned(u64(width)));
+            Put(output, "data = ");
+            NumericText(output, FloatDecimal.Format(bits, width, output.limits));
+        },
+
+        DataValue::Scalar(data) => {
+            if (shape.kind != ShapeKind::Scalar)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "char");
+            Put(output, "data = ");
+            Quote(output, Lexer.Scalar(i64(UnicodeScalar.ToCodePoint(data))));
+        },
+
+        DataValue::String(data) => {
+            if (shape.kind != ShapeKind::String)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "string");
+            Put(output, "data = ");
+            Quote(output, data);
+        },
+
+        DataValue::Bytes(data) => {
+            if (shape.kind != ShapeKind::Bytes || Array.Len<u8>(data) > output.limits.maxScalarBytes)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            Open(output, "bytes");
+            Put(output, "encoding = base64 data = ");
+            match Base64.EncodeBytes(data)
+            {
+                Result::Error(_) => Fail(output, "InvalidBase64"),
+
+                Result::Ok(bytes) => Quote(output, String.FromUtf8CodeUnits(bytes)),
+            };
+        },
+
+        DataValue::Sequence(kind, values) => {
+            if ((shape.kind != ShapeKind::Array && shape.kind != ShapeKind::List) || Array.Len<ShapeId>(shape.arguments) != 1_i64)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+            match kind
+            {
+                SequenceKind::Array => {
+                    if (shape.kind != ShapeKind::Array)
+                    {
+                        Fail(output, "ShapeMismatch");
+                        return;
+                    }
+                    Open(output, "array");
+                },
+
+                SequenceKind::List => {
+                    if (shape.kind != ShapeKind::List)
+                    {
+                        Fail(output, "ShapeMismatch");
+                        return;
+                    }
+                    Open(output, "list");
+                },
+            };
+            Put(output, "items = [");
+            mut i64 i = 0_i64;
+            while (i < Array.Len<DataValue>(values) && !output.failed)
+            {
+                if (i > 0_i64)
+                {
+                    Put(output, ", ");
+                }
+                Emit(output, table, shape.arguments[0_i64], values[i], depth + 1_i64);
+                i = i + 1_i64;
+            }
+            Put(output, "]");
+        },
+
+        DataValue::Optional(present, payload) => {
+            if (shape.kind != ShapeKind::Optional || Array.Len<ShapeId>(shape.arguments) != 1_i64 || (present && Array.Len<DataValue>(payload) != 1_i64) || (!present && Array.Len<DataValue>(payload) != 0_i64))
+            {
+                Fail(output, "InvalidOptional");
+                return;
+            }
+            Open(output, "optional");
+            Put(output, "present = ");
+            if (present)
+            {
+                Put(output, "true value = ");
+                Emit(output, table, shape.arguments[0_i64], payload[0_i64], depth + 1_i64);
+            }
+            else
+            {
+                Put(output, "false");
+            }
+        },
+
+        DataValue::Map(entries) => {
+            if (Array.Len<MapEntry>(entries) > output.limits.maxNodes - output.nodes)
+            {
+                Fail(output, "CollectionLimit");
+                return;
+            }
+            if (shape.kind != ShapeKind::Map || Array.Len<ShapeId>(shape.arguments) != 1_i64)
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+
+            // A raw UTF-8 key byte is a lower bound on its quoted wire size.
+            // Debit the aggregate before allocating sort indices or comparing
+            // aliased long keys repeatedly.
+            mut i64 keyBytes = 0_i64;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<MapEntry>(entries)) {
+                i64 bytes = String.Len(entries[i].key);
+                if (bytes > output.limits.maxScalarBytes) { Fail(output, "ScalarLimit"); return; }
+                if (bytes > output.limits.maxOutputBytes - output.used - keyBytes) { Fail(output, "OutputLimit"); return; }
+                keyBytes = keyBytes + bytes;
+                i = i + 1_i64;
+            }
+            mut i64[] order = Array.Empty<i64>();
+            i = 0_i64;
+            while (i < Array.Len<MapEntry>(entries))
+            {
+                if (String.Len(entries[i].key) > output.limits.maxScalarBytes)
+                {
+                    Fail(output, "ScalarLimit");
+                    return;
+                }
+                if (!Array.TryAppend<i64>(order, i)) { Fail(output, "AllocationFailed"); return; }
+                i = i + 1_i64;
+            }
+
+            mut i64 parent = Array.Len<i64>(order) / 2_i64;
+            while (parent > 0_i64)
+            {
+                parent = parent - 1_i64;
+                Sift(entries, order, parent, Array.Len<i64>(order));
+            }
+
+            mut i64 end = Array.Len<i64>(order);
+            while (end > 1_i64)
+            {
+                end = end - 1_i64;
+                i64 temp = order[0_i64];
+                Array.Set<i64>(order, 0_i64, order[end]);
+                Array.Set<i64>(order, end, temp);
+                Sift(entries, order, 0_i64, end);
+            }
+            i = 1_i64;
+            while (i < Array.Len<i64>(order))
+            {
+                if (entries[order[i - 1_i64]].key == entries[order[i]].key)
+                {
+                    Fail(output, "DuplicateMapKey");
+                    return;
+                }
+                i = i + 1_i64;
+            }
+            Open(output, "map");
+            Put(output, "entries = [");
+            i = 0_i64;
+            while (i < Array.Len<i64>(order) && !output.failed)
+            {
+                if (i > 0_i64)
+                {
+                    Put(output, ", ");
+                }
+
+                MapEntry entry = entries[order[i]];
+                Put(output, "entry ");
+                Quote(output, entry.key);
+                Put(output, " { value = ");
+                Emit(output, table, shape.arguments[0_i64], entry.value, depth + 1_i64);
+                Put(output, " }");
+                i = i + 1_i64;
+            }
+            Put(output, "]");
+        },
+
+        DataValue::Record(identity, fields) => {
+            if (Array.Len<RecordField>(fields) > output.limits.maxNodes - output.nodes || Array.Len<FieldDescriptor>(shape.fields) > output.limits.maxNodes)
+            {
+                Fail(output, "CollectionLimit");
+                return;
+            }
+            if (shape.kind != ShapeKind::Record || !SameId(identity, expected))
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+
+            mut i64 i = 0_i64;
+            while (i < Array.Len<RecordField>(fields))
+            {
+                mut bool declared = false;
+                mut i64 j = 0_i64;
+                while (j < Array.Len<FieldDescriptor>(shape.fields))
+                {
+                    if (shape.fields[j].name == fields[i].name)
+                    {
+                        declared = true;
+                    }
+                    j = j + 1_i64;
+                }
+                if (!declared)
+                {
+                    match Registry.ExtraValue(table, shape) {
+                        Result::Error(_) => { Fail(output, "UnknownField"); return; },
+                        Result::Ok(_) => { },
+                    };
+                }
+                j = 0_i64;
+                while (j < i)
+                {
+                    if (fields[j].name == fields[i].name)
+                    {
+                        Fail(output, "DuplicateField");
+                        return;
+                    }
+                    j = j + 1_i64;
+                }
+                i = i + 1_i64;
+            }
+            Open(output, "record");
+            Put(output, "shape = ");
+            Quote(output, Metadata.FormatShapeId(identity));
+            Put(output, " fields = [");
+            i = 0_i64;
+            mut bool comma = false;
+            while (i < Array.Len<FieldDescriptor>(shape.fields) && !output.failed)
+            {
+                FieldDescriptor declared = shape.fields[i];
+                mut i64 found = -1_i64;
+                mut i64 j = 0_i64;
+                while (j < Array.Len<RecordField>(fields))
+                {
+                    if (fields[j].name == declared.name)
+                    {
+                        found = j;
+                    }
+                    j = j + 1_i64;
+                }
+                if (found < 0_i64)
+                {
+                    if (declared.required)
+                    {
+                        Fail(output, "MissingField");
+                        return;
+                    }
+                }
+                else
+                {
+                    if (comma)
+                    {
+                        Put(output, ", ");
+                    }
+                    comma = true;
+                    Put(output, "field ");
+                    Quote(output, declared.name);
+                    Put(output, " { value = ");
+                    Emit(output, table, declared.shape, fields[found].value, depth + 1_i64);
+                    Put(output, " }");
+                }
+                i = i + 1_i64;
+            }
+            mut MapEntry[] extras = Array.Empty<MapEntry>();
+            mut i64[] order = Array.Empty<i64>();
+            i = 0_i64;
+            while (i < Array.Len<RecordField>(fields)) {
+                mut bool declared = false; mut i64 j = 0_i64;
+                while (j < Array.Len<FieldDescriptor>(shape.fields)) { if (shape.fields[j].name == fields[i].name) { declared = true; } j = j + 1_i64; }
+                if (!declared) {
+                    Array.Append<i64>(order, Array.Len<MapEntry>(extras));
+                    Array.Append<MapEntry>(extras, MapEntry { key: fields[i].name, value: fields[i].value });
+                }
+                i = i + 1_i64;
+            }
+            if (Array.Len<MapEntry>(extras) > 0_i64) {
+                match Registry.ExtraValue(table, shape) {
+                    Result::Error(_) => { Fail(output, "UnknownField"); return; },
+                    Result::Ok(valueShape) => {
+                        mut i64 parent = Array.Len<i64>(order) / 2_i64;
+                        while (parent > 0_i64) { parent = parent - 1_i64; Sift(extras, order, parent, Array.Len<i64>(order)); }
+                        mut i64 end = Array.Len<i64>(order);
+                        while (end > 1_i64) { end = end - 1_i64; i64 temp = order[0_i64]; Array.Set<i64>(order, 0_i64, order[end]); Array.Set<i64>(order, end, temp); Sift(extras, order, 0_i64, end); }
+                        i = 0_i64;
+                        while (i < Array.Len<i64>(order) && !output.failed) {
+                            if (comma) { Put(output, ", "); } comma = true;
+                            MapEntry entry = extras[order[i]];
+                            Put(output, "field "); Quote(output, entry.key); Put(output, " { value = ");
+                            Emit(output, table, valueShape, entry.value, depth + 1_i64); Put(output, " }");
+                            i = i + 1_i64;
+                        }
+                    },
+                };
+            }
+            Put(output, "]");
+        },
+
+        DataValue::Variant(identity, name, payload) => {
+            if (shape.kind != ShapeKind::Variant || !SameId(identity, expected))
+            {
+                Fail(output, "ShapeMismatch");
+                return;
+            }
+
+            mut i64 found = -1_i64;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<VariantDescriptor>(shape.variants))
+            {
+                if (shape.variants[i].name == name)
+                {
+                    found = i;
+                }
+                i = i + 1_i64;
+            }
+            if (found < 0_i64 || Array.Len<FieldDescriptor>(shape.variants[found].fields) != Array.Len<DataValue>(payload))
+            {
+                Fail(output, "InvalidVariant");
+                return;
+            }
+            Open(output, "variant");
+            Put(output, "shape = ");
+            Quote(output, Metadata.FormatShapeId(identity));
+            Put(output, " name = ");
+            Quote(output, name);
+            Put(output, " payload = [");
+            i = 0_i64;
+            while (i < Array.Len<DataValue>(payload) && !output.failed)
+            {
+                if (i > 0_i64)
+                {
+                    Put(output, ", ");
+                }
+                Emit(output, table, shape.variants[found].fields[i].shape, payload[i], depth + 1_i64);
+                i = i + 1_i64;
+            }
+            Put(output, "]");
+        },
+    };
+    Put(output, " }");
+}
+
+pub Result<string, SerializationError> WriteValue(ShapeId shape, DataValue value, Registry.ShapeRegistry table, SerializationLimits limits)
+{
+    if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxScalarBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64)
+    {
+        return Result::Error(NoSource("InvalidLimits"));
+    }
+
+    mut Output output = Output
+    {
+        bytes: Array.Empty<u8>(),
+
+        used: 0_i64,
+
+        failed: false,
+
+        error: NoSource(""),
+
+        nodes: 0_i64,
+        activeValues: Array.Empty<DataValue>(),
+
+        limits: limits,
+    };
+    Put(output, "serialized ");
+    Quote(output, Metadata.FormatShapeId(shape));
+    Put(output, " { version = 1 value = ");
+    Emit(output, table, shape, value, 0_i64);
+    Put(output, " }");
+    if (output.failed)
+    {
+        return Result::Error(output.error);
+    }
+    string text = String.FromUtf8CodeUnits(ByteSlice.SubSlice(output.bytes, 0_i64, output.used));
+    match ReadValue(text, shape, table, limits) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => { return Result::Ok(text); },
+    };
+}
+
+type Input
+{
+    Syntax.Document document,
+
+    bool failed,
+
+    SerializationError error,
+
+    i64 nodes,
+
+    SerializationLimits limits,
+}
+
+unit Reject(mut Input input, string code, i64 index, string path)
+{
+    if (!input.failed)
+    {
+        input.failed = true;
+        input.error = Error(code, path, input.document.nodes[index].span);
+    }
+}
+
+unit RejectRelated(mut Input input, string code, i64 index, i64 related, string path) {
+    if (!input.failed) {
+        Reject(input, code, index, path);
+        input.error = Errors.Diagnostic(code, path, input.document.nodes[index].span.start, input.document.nodes[index].span.end, true, input.document.nodes[related].span.start, input.document.nodes[related].span.end);
+    }
+}
+
+bool Named(string[] names, string name)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(names))
+    {
+        if (names[i] == name)
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+unit Properties(mut Input input, i64 index, string[] allowed, string path)
+{
+    Syntax.Node block = input.document.nodes[index];
+    if (Array.Len<i64>(block.attributes) != 0_i64 || block.schemaless)
+    {
+        Reject(input, "UnknownAttribute", index, path);
+        return;
+    }
+
+    mut string[] seen = Array.Empty<string>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(block.children))
+    {
+        i64 child = block.children[i];
+        Syntax.Node assignment = input.document.nodes[child];
+        if (assignment.kind != Syntax.NodeKind::Assignment || Array.Len<i64>(assignment.children) != 1_i64 || Array.Len<i64>(assignment.attributes) != 0_i64 || !Named(allowed, assignment.name))
+        {
+            Reject(input, "UnknownField", child, path);
+            return;
+        }
+        if (Named(seen, assignment.name))
+        {
+            mut i64 previous = 0_i64;
+            while (previous < i) {
+                i64 related = block.children[previous];
+                if (input.document.nodes[related].name == assignment.name) {
+                    RejectRelated(input, "DuplicateField", child, related, path);
+                    return;
+                }
+                previous = previous + 1_i64;
+            }
+            return;
+        }
+        Array.Append<string>(seen, assignment.name);
+        i = i + 1_i64;
+    }
+}
+
+i64 Property(mut Input input, i64 index, string name, Syntax.NodeKind kind, string path)
+{
+    if (input.failed)
+    {
+        return index;
+    }
+
+    Syntax.Node block = input.document.nodes[index];
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(block.children))
+    {
+        Syntax.Node assignment = input.document.nodes[block.children[i]];
+        if (assignment.name == name)
+        {
+            if (assignment.kind != Syntax.NodeKind::Assignment || Array.Len<i64>(assignment.children) != 1_i64)
+            {
+                Reject(input, "InvalidField", block.children[i], path);
+                return index;
+            }
+
+            i64 value = assignment.children[0_i64];
+            if (input.document.nodes[value].kind != kind)
+            {
+                Reject(input, "KindMismatch", value, path);
+            }
+            return value;
+        }
+        i = i + 1_i64;
+    }
+    Reject(input, "MissingField", index, path);
+    return index;
+}
+
+string QuotedProperty(mut Input input, i64 index, string name, string path)
+{
+    return input.document.nodes[Property(input, index, name, Syntax.NodeKind::String, path)].text;
+}
+
+char Scalar(mut Input input, i64 index, string path)
+{
+    string text = input.document.nodes[index].text;
+    i64 length = String.Len(text);
+    mut u32 point = 0_u32;
+    if (length < 1_i64 || length > 4_i64)
+    {
+        Reject(input, "InvalidScalar", index, path);
+        return char(0_u32);
+    }
+
+    u8 lead = String.ByteAt(text, 0_i64);
+    i64 count = String.Utf8RuneByteLen(lead);
+    if (count != length)
+    {
+        Reject(input, "InvalidScalar", index, path);
+        return char(0_u32);
+    }
+    if (length == 1_i64)
+    {
+        point = u32(lead);
+    }
+    else
+    {
+        if (length == 2_i64)
+        {
+            point = u32(lead & 31_u8);
+        }
+        else if (length == 3_i64)
+        {
+            point = u32(lead & 15_u8);
+        }
+        else
+        {
+            point = u32(lead & 7_u8);
+        }
+
+        mut i64 i = 1_i64;
+        while (i < length)
+        {
+            u8 byte = String.ByteAt(text, i);
+            if (byte < 128_u8 || byte > 191_u8)
+            {
+                Reject(input, "InvalidScalar", index, path);
+                return char(0_u32);
+            }
+            point = (point << 6_u32) | u32(byte & 63_u8);
+            i = i + 1_i64;
+        }
+        if ((length == 2_i64 && point < 128_u32) || (length == 3_i64 && point < 2048_u32) || (length == 4_i64 && point < 65536_u32))
+        {
+            Reject(input, "InvalidScalar", index, path);
+            return char(0_u32);
+        }
+    }
+    match UnicodeScalar.FromCodePoint(point)
+    {
+        Result::Error(_) => {
+            Reject(input, "InvalidScalar", index, path);
+            return char(0_u32);
+        },
+
+        Result::Ok(value) => {
+            return value;
+        },
+    };
+}
+
+DataValue Take(mut Input input, Registry.ShapeRegistry table, ShapeId expected, i64 index, i64 depth, string path)
+{
+    if (input.failed)
+    {
+        return DataValue::Unit;
+    }
+    input.nodes = input.nodes + 1_i64;
+    if (depth > input.limits.maxDepth || input.nodes > input.limits.maxNodes)
+    {
+        Reject(input, "CollectionLimit", index, path);
+        return DataValue::Unit;
+    }
+
+    Syntax.Node node = input.document.nodes[index];
+    if (node.kind != Syntax.NodeKind::Block || node.name != "value" || !node.hasLabel)
+    {
+        Reject(input, "InvalidTag", index, path);
+        return DataValue::Unit;
+    }
+
+    ShapeDescriptor shape = match Registry.Lookup(table, expected)
+    {
+        Result::Error(error) => {
+            input.failed = true;
+            input.error = error;
+            return DataValue::Unit;
+        },
+
+        Result::Ok(descriptor) => descriptor,
+    };
+    string tag = node.label;
+    match shape.kind
+    {
+        ShapeKind::Unit => {
+            if (tag != "unit")
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, Array.Empty<string>(), path);
+            return DataValue::Unit;
+        },
+
+        ShapeKind::Boolean => {
+            if (tag != "bool")
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["data"], path);
+            return DataValue::Boolean(input.document.nodes[Property(input, index, "data", Syntax.NodeKind::Boolean, path)].text == "true");
+        },
+
+        ShapeKind::Signed => {
+            if (tag != "i" + Decimal.Unsigned(u64(shape.width)))
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["data"], path);
+            i64 number = Property(input, index, "data", Syntax.NodeKind::Number, path);
+            match Numeric.ParseSigned(input.document.nodes[number].raw, i64(shape.width))
+            {
+                Result::Error(error) => {
+                    Reject(input, Errors.Code(error), number, path);
+                    return DataValue::Unit;
+                },
+
+                Result::Ok(value) => {
+                    return DataValue::Signed(value, shape.width);
+                },
+            };
+        },
+
+        ShapeKind::Unsigned => {
+            if (tag != "u" + Decimal.Unsigned(u64(shape.width)))
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["data"], path);
+            i64 number = Property(input, index, "data", Syntax.NodeKind::Number, path);
+            match Numeric.ParseUnsigned(input.document.nodes[number].raw, i64(shape.width))
+            {
+                Result::Error(error) => {
+                    Reject(input, Errors.Code(error), number, path);
+                    return DataValue::Unit;
+                },
+
+                Result::Ok(value) => {
+                    return DataValue::Unsigned(value, shape.width);
+                },
+            };
+        },
+
+        ShapeKind::Float => {
+            if (tag != "f" + Decimal.Unsigned(u64(shape.width)))
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["data"], path);
+            i64 number = Property(input, index, "data", Syntax.NodeKind::Number, path);
+            match FloatDecimal.Parse(input.document.nodes[number].raw, shape.width, input.limits)
+            {
+                Result::Error(error) => {
+                    Reject(input, Errors.Code(error), number, path);
+                    return DataValue::Unit;
+                },
+
+                Result::Ok(bits) => {
+                    return DataValue::Float(bits, shape.width);
+                },
+            };
+        },
+
+        ShapeKind::Scalar => {
+            if (tag != "char")
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["data"], path);
+            i64 scalar = Property(input, index, "data", Syntax.NodeKind::String, path);
+            return DataValue::Scalar(Scalar(input, scalar, path));
+        },
+
+        ShapeKind::String => {
+            if (tag != "string")
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["data"], path);
+            return DataValue::String(QuotedProperty(input, index, "data", path));
+        },
+
+        ShapeKind::Bytes => {
+            if (tag != "bytes")
+            {
+                Reject(input, "ShapeMismatch", index, path);
+            }
+            Properties(input, index, ["encoding", "data"], path);
+            i64 encoding = Property(input, index, "encoding", Syntax.NodeKind::Identifier, path);
+            if (input.document.nodes[encoding].text != "base64")
+            {
+                Reject(input, "InvalidEncoding", encoding, path);
+            }
+
+            i64 data = Property(input, index, "data", Syntax.NodeKind::String, path);
+            string text = input.document.nodes[data].text;
+            u8[] bytes = ByteSlice.New(String.Len(text));
+            mut i64 i = 0_i64;
+            while (i < String.Len(text))
+            {
+                Array.Set<u8>(bytes, i, String.ByteAt(text, i));
+                i = i + 1_i64;
+            }
+            match Base64.DecodeBytes(bytes)
+            {
+                Result::Error(_) => {
+                    Reject(input, "InvalidBase64", data, path);
+                    return DataValue::Unit;
+                },
+
+                Result::Ok(value) => {
+                    return DataValue::Bytes(value);
+                },
+            };
+        },
+
+        ShapeKind::Array => {
+            return TakeSequence(input, table, shape, index, depth, path, true);
+        },
+
+        ShapeKind::List => {
+            return TakeSequence(input, table, shape, index, depth, path, false);
+        },
+
+        ShapeKind::Optional => {
+            if (tag != "optional" || Array.Len<ShapeId>(shape.arguments) != 1_i64)
+            {
+                Reject(input, "ShapeMismatch", index, path);
+                return DataValue::Unit;
+            }
+            Properties(input, index, ["present", "value"], path);
+            bool present = input.document.nodes[Property(input, index, "present", Syntax.NodeKind::Boolean, path)].text == "true";
+            mut DataValue[] payload = Array.Empty<DataValue>();
+            if (present)
+            {
+                Array.Append<DataValue>(payload, Take(input, table, shape.arguments[0_i64], Property(input, index, "value", Syntax.NodeKind::Block, path), depth + 1_i64, path + "/value"));
+            }
+            else if (Array.Len<i64>(node.children) != 1_i64)
+            {
+                Reject(input, "InvalidOptional", index, path);
+            }
+            return DataValue::Optional(present, payload);
+        },
+
+        ShapeKind::Map => {
+            if (tag != "map" || Array.Len<ShapeId>(shape.arguments) != 1_i64)
+            {
+                Reject(input, "ShapeMismatch", index, path);
+                return DataValue::Unit;
+            }
+            Properties(input, index, ["entries"], path);
+            i64 list = Property(input, index, "entries", Syntax.NodeKind::List, path);
+            mut MapEntry[] entries = Array.Empty<MapEntry>();
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(input.document.nodes[list].children) && !input.failed)
+            {
+                i64 entryIndex = input.document.nodes[list].children[i];
+                Syntax.Node entry = input.document.nodes[entryIndex];
+                if (entry.kind != Syntax.NodeKind::Block || entry.name != "entry" || !entry.hasLabel)
+                {
+                    Reject(input, "InvalidMapEntry", entryIndex, path);
+                    break;
+                }
+                if (i > 0_i64 && !Less(entries[i - 1_i64].key, entry.label))
+                {
+                    if (entries[i - 1_i64].key == entry.label) {
+                        RejectRelated(input, "DuplicateMapKey", entryIndex, input.document.nodes[list].children[i - 1_i64], path);
+                    } else { Reject(input, "MapOrder", entryIndex, path); }
+                    break;
+                }
+                Properties(input, entryIndex, ["value"], path);
+                DataValue value = Take(input, table, shape.arguments[0_i64], Property(input, entryIndex, "value", Syntax.NodeKind::Block, path), depth + 1_i64, path + "/" + entry.label);
+                Array.Append<MapEntry>(entries, MapEntry
+                {
+                    key: entry.label,
+
+                    value: value,
+                });
+                i = i + 1_i64;
+            }
+            return DataValue::Map(entries);
+        },
+
+        ShapeKind::Record => {
+            if (tag != "record" || QuotedProperty(input, index, "shape", path) != Metadata.FormatShapeId(expected))
+            {
+                Reject(input, "ShapeMismatch", index, path);
+                return DataValue::Unit;
+            }
+            Properties(input, index, ["shape", "fields"], path);
+            i64 list = Property(input, index, "fields", Syntax.NodeKind::List, path);
+            mut RecordField[] fields = Array.Empty<RecordField>();
+            mut i64 last = -1_i64;
+            mut bool extrasPhase = false;
+            mut string lastExtra = "";
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(input.document.nodes[list].children) && !input.failed)
+            {
+                i64 fieldIndex = input.document.nodes[list].children[i];
+                Syntax.Node field = input.document.nodes[fieldIndex];
+                if (field.kind != Syntax.NodeKind::Block || field.name != "field" || !field.hasLabel)
+                {
+                    Reject(input, "InvalidRecordField", fieldIndex, path);
+                    break;
+                }
+
+                mut i64 found = -1_i64;
+                mut i64 j = 0_i64;
+                while (j < Array.Len<FieldDescriptor>(shape.fields))
+                {
+                    if (shape.fields[j].name == field.label)
+                    {
+                        found = j;
+                    }
+                    j = j + 1_i64;
+                }
+                mut i64 previous = 0_i64;
+                while (previous < i && !input.failed) {
+                    i64 related = input.document.nodes[list].children[previous];
+                    if (input.document.nodes[related].label == field.label) { RejectRelated(input, "DuplicateField", fieldIndex, related, path); }
+                    previous = previous + 1_i64;
+                }
+                if (input.failed) { break; }
+                mut ShapeId fieldShape = expected;
+                if (found < 0_i64) {
+                    match Registry.ExtraValue(table, shape) {
+                        Result::Error(_) => { Reject(input, "UnknownField", fieldIndex, path); },
+                        Result::Ok(valueShape) => { fieldShape = valueShape; },
+                    };
+                    if (extrasPhase && !Less(lastExtra, field.label)) { Reject(input, "FieldOrder", fieldIndex, path); }
+                    extrasPhase = true; lastExtra = field.label;
+                } else {
+                    if (extrasPhase || found <= last) { Reject(input, "FieldOrder", fieldIndex, path); }
+                    last = found; fieldShape = shape.fields[found].shape;
+                }
+                if (input.failed) { break; }
+                Properties(input, fieldIndex, ["value"], path);
+                DataValue value = Take(input, table, fieldShape, Property(input, fieldIndex, "value", Syntax.NodeKind::Block, path), depth + 1_i64, path + "/" + field.label);
+                Array.Append<RecordField>(fields, RecordField
+                {
+                    name: field.label,
+
+                    value: value,
+                });
+                i = i + 1_i64;
+            }
+            i = 0_i64;
+            while (i < Array.Len<FieldDescriptor>(shape.fields))
+            {
+                if (shape.fields[i].required)
+                {
+                    mut bool present = false;
+                    mut i64 j = 0_i64;
+                    while (j < Array.Len<RecordField>(fields))
+                    {
+                        if (fields[j].name == shape.fields[i].name)
+                        {
+                            present = true;
+                        }
+                        j = j + 1_i64;
+                    }
+                    if (!present)
+                    {
+                        Reject(input, "MissingField", index, path + "/" + shape.fields[i].name);
+                    }
+                }
+                i = i + 1_i64;
+            }
+            return DataValue::Record(expected, fields);
+        },
+
+        ShapeKind::Variant => {
+            if (tag != "variant" || QuotedProperty(input, index, "shape", path) != Metadata.FormatShapeId(expected))
+            {
+                Reject(input, "ShapeMismatch", index, path);
+                return DataValue::Unit;
+            }
+            Properties(input, index, ["shape", "name", "payload"], path);
+            string name = QuotedProperty(input, index, "name", path);
+            mut i64 found = -1_i64;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<VariantDescriptor>(shape.variants))
+            {
+                if (shape.variants[i].name == name)
+                {
+                    found = i;
+                }
+                i = i + 1_i64;
+            }
+            if (found < 0_i64)
+            {
+                Reject(input, "InvalidVariant", index, path);
+                return DataValue::Unit;
+            }
+
+            i64 list = Property(input, index, "payload", Syntax.NodeKind::List, path);
+            if (Array.Len<i64>(input.document.nodes[list].children) != Array.Len<FieldDescriptor>(shape.variants[found].fields))
+            {
+                Reject(input, "InvalidVariant", list, path);
+                return DataValue::Unit;
+            }
+
+            mut DataValue[] payload = Array.Empty<DataValue>();
+            i = 0_i64;
+            while (i < Array.Len<i64>(input.document.nodes[list].children) && !input.failed)
+            {
+                Array.Append<DataValue>(payload, Take(input, table, shape.variants[found].fields[i].shape, input.document.nodes[list].children[i], depth + 1_i64, path + "/" + name + "/" + Decimal.Signed(i)));
+                i = i + 1_i64;
+            }
+            return DataValue::Variant(expected, name, payload);
+        },
+    };
+}
+
+pub Result<DataValue, SerializationError> ReadValue(string text, ShapeId expected, Registry.ShapeRegistry table, SerializationLimits limits)
+{
+    if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64 || limits.maxScalarBytes < 0_i64) { return Result::Error(NoSource("InvalidLimits")); }
+    BsolPolicy.BsolLimits syntaxLimits = Typed.FormatLimits(limits);
+    match Parser.Parse(text, syntaxLimits)
+    {
+        Result::Error(error) => {
+            return Result::Error(Error("InvalidSyntax", "", error.span));
+        },
+
+        Result::Ok(document) => {
+            if (Array.Len<i64>(document.roots) != 1_i64)
+            {
+                return Result::Error(NoSource("InvalidEnvelope"));
+            }
+
+            i64 root = document.roots[0_i64];
+            Syntax.Node envelope = document.nodes[root];
+            if (envelope.kind != Syntax.NodeKind::Block || envelope.name != "serialized" || !envelope.hasLabel || envelope.label != Metadata.FormatShapeId(expected))
+            {
+                return Result::Error(Error("ShapeMismatch", "", envelope.span));
+            }
+
+            mut Input input = Input
+            {
+                document: document,
+
+                failed: false,
+
+                error: NoSource(""),
+
+                nodes: 0_i64,
+
+                limits: limits,
+            };
+            Properties(input, root, ["version", "value"], "");
+            i64 version = Property(input, root, "version", Syntax.NodeKind::Number, "");
+            if (document.nodes[version].raw != "1")
+            {
+                Reject(input, "UnsupportedWireVersion", version, "");
+            }
+            if (input.failed)
+            {
+                return Result::Error(input.error);
+            }
+
+            DataValue value = Take(input, table, expected, Property(input, root, "value", Syntax.NodeKind::Block, ""), 0_i64, "");
+            if (input.failed)
+            {
+                return Result::Error(input.error);
+            }
+            return Result::Ok(value);
+        },
+    };
+}
+
+DataValue TakeSequence(mut Input input, Registry.ShapeRegistry table, ShapeDescriptor shape, i64 index, i64 depth, string path, bool array)
+{
+    string tag = input.document.nodes[index].label;
+    if ((array && tag != "array") || (!array && tag != "list") || Array.Len<ShapeId>(shape.arguments) != 1_i64)
+    {
+        Reject(input, "ShapeMismatch", index, path);
+        return DataValue::Unit;
+    }
+    Properties(input, index, ["items"], path);
+    i64 list = Property(input, index, "items", Syntax.NodeKind::List, path);
+    mut DataValue[] values = Array.Empty<DataValue>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(input.document.nodes[list].children) && !input.failed)
+    {
+        Array.Append<DataValue>(values, Take(input, table, shape.arguments[0_i64], input.document.nodes[list].children[i], depth + 1_i64, path + "/" + Decimal.Signed(i)));
+        i = i + 1_i64;
+    }
+    if (array)
+    {
+        return DataValue::Sequence(SequenceKind::Array, values);
+    }
+    return DataValue::Sequence(SequenceKind::List, values);
+}
+
+// Direct typed Encoder operations. Aggregate fields are never boxed into a
+// universal DataValue. The generated Serializable<E> body chooses real fields.
+type StreamFrame {
+    ShapeDescriptor shape,
+    i64 count,
+    i64 position,
+    bool entry,
+    bool pending,
+    i64 field,
+    string key,
+    string variant,
+}
+type StreamState {
+    Output output,
+    Registry.ShapeRegistry table,
+    ShapeId root,
+    StreamFrame[] frames,
+    bool rootPending,
+    bool active,
+    bool committed,
+    bool ready,
+    Result<unit, SerializationError> publicationStatus,
+    Result<unit, SerializationError> invalidState,
+}
+Result<unit, SerializationError> StreamError(mut StreamState state, SerializationError error) {
+    if (!state.output.failed) { state.output.failed = true; state.output.error = error; }
+    state.committed = false;
+    return Result::Error(state.output.error);
+}
+Result<unit, SerializationError> Status(mut StreamState state) {
+    if (state.output.failed) {
+        state.publicationStatus = Result<unit, SerializationError>::Error(state.output.error);
+        return state.publicationStatus;
+    }
+    // Complete formatting and validation while work remains fallible and unpublished.
+    // Commit itself only transfers readiness/ownership and returns an existing wrapper.
+    if (state.active && !state.rootPending && !state.ready && Array.Len<StreamFrame>(state.frames) == 0_i64) {
+        Put(state.output, " }");
+        if (state.output.failed) {
+            state.publicationStatus = Result<unit, SerializationError>::Error(state.output.error);
+            return state.publicationStatus;
+        }
+        string text = String.FromUtf8CodeUnits(ByteSlice.SubSlice(state.output.bytes, 0_i64, state.output.used));
+        match ReadValue(text, state.root, state.table, state.output.limits) {
+            Result::Error(error) => { state.output.failed = true; state.output.error = error; state.publicationStatus = Result<unit, SerializationError>::Error(error); },
+            Result::Ok(_) => { state.publicationStatus = Result<unit, SerializationError>::Ok(()); },
+        };
+        state.ready = true;
+        return state.publicationStatus;
+    }
+    return Result::Ok(());
+}
+Result<ShapeDescriptor, SerializationError> Next(mut StreamState state) {
+    if (state.output.failed) { return Result::Error(state.output.error); }
+    if (!state.active || state.committed) { return Result::Error(NoSource("EncoderState")); }
+    mut ShapeId expected = state.root;
+    i64 depth = Array.Len<StreamFrame>(state.frames);
+    if (depth == 0_i64) {
+        if (!state.rootPending) { return Result::Error(NoSource("DuplicateRoot")); }
+        state.rootPending = false;
+    } else {
+        mut StreamFrame frame = state.frames[depth - 1_i64];
+        if (frame.position >= frame.count) { return Result::Error(NoSource("CollectionCardinality")); }
+        if (frame.shape.kind == ShapeKind::Record) {
+            if (!frame.entry || !frame.pending) { return Result::Error(NoSource("MissingFieldBoundary")); }
+            if (frame.field >= Array.Len<FieldDescriptor>(frame.shape.fields)) {
+                match Registry.ExtraValue(state.table, frame.shape) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(valueShape) => { expected = valueShape; }, };
+            } else { expected = frame.shape.fields[frame.field].shape; }
+            frame.pending = false;
+        } else if (frame.shape.kind == ShapeKind::Map) {
+            if (!frame.entry || !frame.pending) { return Result::Error(NoSource("MissingMapEntry")); }
+            expected = frame.shape.arguments[0_i64]; frame.pending = false;
+        } else if (frame.shape.kind == ShapeKind::Variant) {
+            mut i64 i = 0_i64;
+            while (i < Array.Len<VariantDescriptor>(frame.shape.variants)) {
+                if (frame.shape.variants[i].name == frame.variant) { expected = frame.shape.variants[i].fields[frame.position].shape; }
+                i = i + 1_i64;
+            }
+            if (frame.position > 0_i64) { Put(state.output, ", "); }
+            frame.position = frame.position + 1_i64;
+        } else {
+            expected = frame.shape.arguments[0_i64];
+            if (frame.shape.kind != ShapeKind::Optional && frame.position > 0_i64) { Put(state.output, ", "); }
+            frame.position = frame.position + 1_i64;
+        }
+        Array.Set<StreamFrame>(state.frames, depth - 1_i64, frame);
+    }
+    state.output.nodes = state.output.nodes + 1_i64;
+    if (depth > state.output.limits.maxDepth || state.output.nodes > state.output.limits.maxNodes) { return Result::Error(NoSource("CollectionLimit")); }
+    return Registry.Lookup(state.table, expected);
+}
+Result<unit, SerializationError> Primitive(mut StreamState state, ShapeKind kind, u8 width, string tag, string text, bool quoted) {
+    match Next(state) {
+        Result::Error(error) => { state.output.failed = true; state.output.error = error; return Result::Error(error); },
+        Result::Ok(shape) => {
+            if (shape.kind != kind || shape.width != width) { Fail(state.output, "ShapeMismatch"); return Status(state); }
+            Open(state.output, tag);
+            if (kind != ShapeKind::Unit) { Put(state.output, "data = "); if (quoted) { Quote(state.output, text); } else { Put(state.output, text); } }
+            Put(state.output, " }"); return Status(state);
+        },
+    };
+}
+Result<unit, SerializationError> Push(mut StreamState state, ShapeDescriptor shape, i64 count, string variant) {
+    if (count < 0_i64 || count > state.output.limits.maxNodes - state.output.nodes) { Fail(state.output, "CollectionLimit"); return Status(state); }
+    Array.Append<StreamFrame>(state.frames, StreamFrame { shape: shape, count: count, position: 0_i64, entry: false, pending: false, field: -1_i64, key: "", variant: variant });
+    return Status(state);
+}
+Result<unit, SerializationError> EndAggregate(mut StreamState state, ShapeKind kind) {
+    i64 depth = Array.Len<StreamFrame>(state.frames);
+    if (depth == 0_i64) { Fail(state.output, "EncoderState"); return Status(state); }
+    StreamFrame frame = state.frames[depth - 1_i64];
+    if (frame.shape.kind != kind || frame.position != frame.count || frame.entry) { Fail(state.output, "CollectionCardinality"); return Status(state); }
+    if (kind == ShapeKind::Record) {
+        mut i64 i = frame.field + 1_i64;
+        while (i < Array.Len<FieldDescriptor>(frame.shape.fields)) { if (frame.shape.fields[i].required) { Fail(state.output, "MissingField"); return Status(state); } i = i + 1_i64; }
+    }
+    if (kind != ShapeKind::Optional) { Put(state.output, "]"); }
+    Put(state.output, " }");
+    mut StreamFrame[] remaining = Array.Empty<StreamFrame>(); mut i64 i = 0_i64;
+    while (i < depth - 1_i64) { Array.Append<StreamFrame>(remaining, state.frames[i]); i = i + 1_i64; }
+    state.frames = remaining; return Status(state);
+}
+
+pub type WireEncoder : Contracts.Encoder {
+    StreamState state,
+
+    pub Result<unit, SerializationError> Begin(SerializationLimits limits) {
+        if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64 || limits.maxScalarBytes < 0_i64) { return StreamError(this.state, NoSource("InvalidLimits")); }
+        this.state.output = Output { bytes: Array.Empty<u8>(), used: 0_i64, failed: false, error: NoSource(""), nodes: 0_i64, activeValues: Array.Empty<DataValue>(), limits: limits };
+        this.state.frames = Array.Empty<StreamFrame>(); this.state.rootPending = true; this.state.active = true; this.state.committed = false; this.state.ready = false;
+        Put(this.state.output, "serialized "); Quote(this.state.output, Metadata.FormatShapeId(this.state.root)); Put(this.state.output, " { version = 1 value = ");
+        return Status(this.state);
+    }
+    pub Result<unit, SerializationError> Commit() {
+        if (!this.state.active || this.state.committed || !this.state.ready) { return this.state.invalidState; }
+        if (this.state.output.failed) { return this.state.publicationStatus; }
+        this.state.committed = true; this.state.active = false;
+        return this.state.publicationStatus;
+    }
+    pub unit Abort() {
+        this.state.active = false; this.state.committed = false; this.state.ready = false;
+        this.state.output.used = 0_i64;
+        while (Array.Len<u8>(this.state.output.bytes) > 0_i64) { Array.RemoveLast<u8>(this.state.output.bytes); }
+        while (Array.Len<StreamFrame>(this.state.frames) > 0_i64) { Array.RemoveLast<StreamFrame>(this.state.frames); }
+    }
+    pub Result<unit, SerializationError> WriteUnit() { return Primitive(this.state, ShapeKind::Unit, 0_u8, "unit", "", false); }
+    pub Result<unit, SerializationError> WriteBoolean(bool value) { if (value) { return Primitive(this.state, ShapeKind::Boolean, 0_u8, "bool", "true", false); } return Primitive(this.state, ShapeKind::Boolean, 0_u8, "bool", "false", false); }
+    pub Result<unit, SerializationError> WriteSigned(i64 value, u8 width) {
+        match Decimal.FormatSigned(value, width) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(text) => { return Primitive(this.state, ShapeKind::Signed, width, "i" + Decimal.Unsigned(u64(width)), text, false); }, };
+    }
+    pub Result<unit, SerializationError> WriteUnsigned(u64 value, u8 width) {
+        match Decimal.FormatUnsigned(value, width) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(text) => { return Primitive(this.state, ShapeKind::Unsigned, width, "u" + Decimal.Unsigned(u64(width)), text, false); }, };
+    }
+    pub Result<unit, SerializationError> WriteFloat(u64 bits, u8 width) {
+        match FloatDecimal.Format(bits, width, this.state.output.limits) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(text) => { return Primitive(this.state, ShapeKind::Float, width, "f" + Decimal.Unsigned(u64(width)), text, false); }, };
+    }
+    pub Result<unit, SerializationError> WriteScalar(char value) { return Primitive(this.state, ShapeKind::Scalar, 0_u8, "char", Lexer.Scalar(i64(UnicodeScalar.ToCodePoint(value))), true); }
+    pub Result<unit, SerializationError> WriteString(string value) { return Primitive(this.state, ShapeKind::String, 0_u8, "string", value, true); }
+    pub Result<unit, SerializationError> WriteBytes(u8[] value) {
+        if (Array.Len<u8>(value) > this.state.output.limits.maxScalarBytes) { return StreamError(this.state, NoSource("ScalarLimit")); }
+        match Next(this.state) {
+            Result::Error(error) => { return StreamError(this.state, error); },
+            Result::Ok(shape) => {
+                if (shape.kind != ShapeKind::Bytes) { return StreamError(this.state, NoSource("ShapeMismatch")); }
+                Open(this.state.output, "bytes"); Put(this.state.output, "encoding = base64 data = ");
+                match Base64.EncodeBytes(value) { Result::Error(_) => { return StreamError(this.state, NoSource("InvalidBase64")); }, Result::Ok(bytes) => { Quote(this.state.output, String.FromUtf8CodeUnits(bytes)); }, };
+                Put(this.state.output, " }"); return Status(this.state);
+            },
+        };
+    }
+    pub Result<unit, SerializationError> BeginRecord(ShapeId identity, i64 count) {
+        match Next(this.state) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(shape) => {
+            if (shape.kind != ShapeKind::Record || !SameId(shape.id, identity)) { return StreamError(this.state, NoSource("ShapeMismatch")); }
+            Open(this.state.output, "record"); Put(this.state.output, "shape = "); Quote(this.state.output, Metadata.FormatShapeId(identity)); Put(this.state.output, " fields = ["); return Push(this.state, shape, count, "");
+        }, };
+    }
+    pub Result<unit, SerializationError> BeginField(string name) {
+        i64 depth = Array.Len<StreamFrame>(this.state.frames);
+        if (depth == 0_i64) { return StreamError(this.state, NoSource("EncoderState")); }
+        mut StreamFrame frame = this.state.frames[depth - 1_i64];
+        if (frame.shape.kind != ShapeKind::Record || frame.entry || frame.position >= frame.count) { return StreamError(this.state, NoSource("EncoderState")); }
+        mut i64 found = -1_i64; mut i64 i = 0_i64;
+        while (i < Array.Len<FieldDescriptor>(frame.shape.fields)) { if (frame.shape.fields[i].name == name) { found = i; } i = i + 1_i64; }
+        if (found < 0_i64) {
+            match Registry.ExtraValue(this.state.table, frame.shape) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(_) => { }, };
+            if (frame.field >= Array.Len<FieldDescriptor>(frame.shape.fields) && !Less(frame.key, name)) { return StreamError(this.state, NoSource("FieldOrderOrDuplicate")); }
+            i = frame.field + 1_i64;
+            while (i < Array.Len<FieldDescriptor>(frame.shape.fields)) { if (frame.shape.fields[i].required) { return StreamError(this.state, NoSource("MissingField")); } i = i + 1_i64; }
+            found = Array.Len<FieldDescriptor>(frame.shape.fields); frame.key = name;
+        } else {
+            if (found <= frame.field) { return StreamError(this.state, NoSource("FieldOrderOrDuplicate")); }
+            i = frame.field + 1_i64;
+            while (i < found) { if (frame.shape.fields[i].required) { return StreamError(this.state, NoSource("MissingField")); } i = i + 1_i64; }
+        }
+        if (frame.position > 0_i64) { Put(this.state.output, ", "); }
+        Put(this.state.output, "field "); Quote(this.state.output, name); Put(this.state.output, " { value = ");
+        frame.field = found; frame.entry = true; frame.pending = true; Array.Set<StreamFrame>(this.state.frames, depth - 1_i64, frame); return Status(this.state);
+    }
+    pub Result<unit, SerializationError> EndField() {
+        i64 depth = Array.Len<StreamFrame>(this.state.frames);
+        if (depth == 0_i64) { return StreamError(this.state, NoSource("EncoderState")); }
+        mut StreamFrame frame = this.state.frames[depth - 1_i64];
+        if (frame.shape.kind != ShapeKind::Record || !frame.entry || frame.pending) { return StreamError(this.state, NoSource("EncoderState")); }
+        Put(this.state.output, " }"); frame.entry = false; frame.position = frame.position + 1_i64; Array.Set<StreamFrame>(this.state.frames, depth - 1_i64, frame); return Status(this.state);
+    }
+    pub Result<unit, SerializationError> EndRecord() { return EndAggregate(this.state, ShapeKind::Record); }
+    pub Result<unit, SerializationError> BeginSequence(i64 count) {
+        match Next(this.state) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(shape) => {
+            if ((shape.kind != ShapeKind::Array && shape.kind != ShapeKind::List) || Array.Len<ShapeId>(shape.arguments) != 1_i64) { return StreamError(this.state, NoSource("ShapeMismatch")); }
+            if (shape.kind == ShapeKind::Array) { Open(this.state.output, "array"); } else { Open(this.state.output, "list"); }
+            Put(this.state.output, "items = ["); return Push(this.state, shape, count, "");
+        }, };
+    }
+    pub Result<unit, SerializationError> EndSequence() {
+        i64 depth = Array.Len<StreamFrame>(this.state.frames); if (depth == 0_i64) { return StreamError(this.state, NoSource("EncoderState")); }
+        ShapeKind kind = this.state.frames[depth - 1_i64].shape.kind;
+        if (kind != ShapeKind::Array && kind != ShapeKind::List) { return StreamError(this.state, NoSource("EncoderState")); }
+        return EndAggregate(this.state, kind);
+    }
+    pub Result<unit, SerializationError> BeginMap(i64 count) {
+        match Next(this.state) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(shape) => {
+            if (shape.kind != ShapeKind::Map || Array.Len<ShapeId>(shape.arguments) != 1_i64) { return StreamError(this.state, NoSource("ShapeMismatch")); }
+            Open(this.state.output, "map"); Put(this.state.output, "entries = ["); return Push(this.state, shape, count, "");
+        }, };
+    }
+    pub Result<unit, SerializationError> BeginMapEntry(string key) {
+        i64 depth = Array.Len<StreamFrame>(this.state.frames); if (depth == 0_i64) { return StreamError(this.state, NoSource("EncoderState")); }
+        mut StreamFrame frame = this.state.frames[depth - 1_i64];
+        if (frame.shape.kind != ShapeKind::Map || frame.entry || frame.position >= frame.count) { return StreamError(this.state, NoSource("EncoderState")); }
+        if (frame.position > 0_i64 && !Less(frame.key, key)) { return StreamError(this.state, NoSource("MapOrderOrDuplicate")); }
+        if (frame.position > 0_i64) { Put(this.state.output, ", "); }
+        Put(this.state.output, "entry "); Quote(this.state.output, key); Put(this.state.output, " { value = ");
+        frame.key = key; frame.entry = true; frame.pending = true; Array.Set<StreamFrame>(this.state.frames, depth - 1_i64, frame); return Status(this.state);
+    }
+    pub Result<unit, SerializationError> EndMapEntry() {
+        i64 depth = Array.Len<StreamFrame>(this.state.frames); if (depth == 0_i64) { return StreamError(this.state, NoSource("EncoderState")); }
+        mut StreamFrame frame = this.state.frames[depth - 1_i64];
+        if (frame.shape.kind != ShapeKind::Map || !frame.entry || frame.pending) { return StreamError(this.state, NoSource("EncoderState")); }
+        Put(this.state.output, " }"); frame.entry = false; frame.position = frame.position + 1_i64; Array.Set<StreamFrame>(this.state.frames, depth - 1_i64, frame); return Status(this.state);
+    }
+    pub Result<unit, SerializationError> EndMap() { return EndAggregate(this.state, ShapeKind::Map); }
+    pub Result<unit, SerializationError> BeginVariant(ShapeId identity, string name, i64 count) {
+        match Next(this.state) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(shape) => {
+            if (shape.kind != ShapeKind::Variant || !SameId(shape.id, identity)) { return StreamError(this.state, NoSource("ShapeMismatch")); }
+            mut i64 found = -1_i64; mut i64 i = 0_i64;
+            while (i < Array.Len<VariantDescriptor>(shape.variants)) { if (shape.variants[i].name == name) { found = i; } i = i + 1_i64; }
+            if (found < 0_i64 || Array.Len<FieldDescriptor>(shape.variants[found].fields) != count) { return StreamError(this.state, NoSource("InvalidVariant")); }
+            Open(this.state.output, "variant"); Put(this.state.output, "shape = "); Quote(this.state.output, Metadata.FormatShapeId(identity)); Put(this.state.output, " name = "); Quote(this.state.output, name); Put(this.state.output, " payload = ["); return Push(this.state, shape, count, name);
+        }, };
+    }
+    pub Result<unit, SerializationError> EndVariant() { return EndAggregate(this.state, ShapeKind::Variant); }
+    pub Result<unit, SerializationError> BeginOptional(bool present) {
+        match Next(this.state) { Result::Error(error) => { return StreamError(this.state, error); }, Result::Ok(shape) => {
+            if (shape.kind != ShapeKind::Optional || Array.Len<ShapeId>(shape.arguments) != 1_i64) { return StreamError(this.state, NoSource("ShapeMismatch")); }
+            Open(this.state.output, "optional"); Put(this.state.output, "present = ");
+            if (present) { Put(this.state.output, "true value = "); return Push(this.state, shape, 1_i64, ""); }
+            Put(this.state.output, "false"); return Push(this.state, shape, 0_i64, "");
+        }, };
+    }
+    pub Result<unit, SerializationError> EndOptional() { return EndAggregate(this.state, ShapeKind::Optional); }
+}
+
+pub WireEncoder CreateEncoder(ShapeId root, Registry.ShapeRegistry table) {
+    return WireEncoder { state: StreamState { output: Output { bytes: Array.Empty<u8>(), used: 0_i64, failed: false, error: NoSource(""), nodes: 0_i64, activeValues: Array.Empty<DataValue>(), limits: Limits.DefaultLimits() }, table: table, root: root, frames: Array.Empty<StreamFrame>(), rootPending: true, active: false, committed: false, ready: false, publicationStatus: Result<unit, SerializationError>::Ok(()), invalidState: Result<unit, SerializationError>::Error(NoSource("EncoderState")) } };
+}
+pub Result<string, SerializationError> EncodedText(WireEncoder encoder) {
+    if (!encoder.state.committed || encoder.state.output.failed) { return Result::Error(NoSource("UncommittedOutput")); }
+    return Result::Ok(String.FromUtf8CodeUnits(ByteSlice.SubSlice(encoder.state.output.bytes, 0_i64, encoder.state.output.used)));
+}
+
+/// Generated implementations construct T with exact typed field/variant calls.
+/// The wire document is an owned arena; no universal field-to-T cast exists.
+pub contract WireReader<T> {
+    Result<T, SerializationError> ReadSyntax(Syntax.Document document, ShapeId shape, Registry.ShapeRegistry table, SerializationLimits limits);
+}
+
+pub Result<T, SerializationError> ReadWithBinding<T, B>(string text, ShapeId shape, Registry.ShapeRegistry table, B binding, SerializationLimits limits) where B: WireReader<T> {
+    // One common format/descriptor validator, followed by statically selected
+    // typed construction. The temporary validation model is never a T adapter.
+    match ReadValue(text, shape, table, limits) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => {
+            match Parser.Parse(text, Typed.FormatLimits(limits)) {
+                Result::Error(error) => { return Result::Error(Error("InvalidSyntax", "", error.span)); },
+                Result::Ok(document) => { return binding.ReadSyntax(document, shape, table, limits); },
+            };
+        },
+    };
+}
+
+/// Constrained calls live in a free function because type/method declarations
+/// do not carry where clauses. The concrete Decoder<T> still specializes T/B.
+pub type WireDecoder<T, B> : Contracts.Decoder<T> {
+    string text,
+    ShapeId shape,
+    Registry.ShapeRegistry table,
+    B binding,
+
+    pub Result<T, SerializationError> ReadTyped(SerializationLimits limits) {
+        return ReadWithBinding<T, B>(this.text, this.shape, this.table, this.binding, limits);
+    }
+}
+
+pub WireDecoder<T, B> CreateDecoder<T, B>(string text, ShapeId shape, Registry.ShapeRegistry table, B binding) where B: WireReader<T> {
+    return WireDecoder<T, B> { text: text, shape: shape, table: table, binding: binding };
+}
+
+/// Canonical format-independent Encoder contract, statically specialized by E.
+pub Result<string, SerializationError> WriteTyped<T>(T value, ShapeId shape, Registry.ShapeRegistry table, SerializationLimits limits) where T: Contracts.Serializable<WireEncoder> {
+    WireEncoder encoder = CreateEncoder(shape, table);
+    match Contracts.Encode<T, WireEncoder>(value, encoder, limits) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => { return EncodedText(encoder); },
+    };
+}
+
+// Direct typed reader: the syntax arena is the wire representation. Scalar and
+// container reads never materialize a universal DataValue for a field.
+type ReaderFrame {
+    ShapeDescriptor shape,
+    i64 node,
+    i64[] children,
+    i64 position,
+    i64 field,
+    i64 variant,
+    bool entry,
+    string path,
+}
+type ReaderState {
+    string text,
+    Input input,
+    Registry.ShapeRegistry table,
+    ShapeId root,
+    ReaderFrame[] frames,
+    bool active,
+    bool rootConsumed,
+    bool pending,
+    i64 pendingNode,
+    ShapeId pendingShape,
+    string pendingPath,
+    ReaderApi.SourceLocation location,
+}
+type ReaderSlot { i64 node, ShapeDescriptor shape, string path, }
+
+Result<unit, SerializationError> ReaderStatus(ReaderState state) {
+    if (state.input.failed) { return Result::Error(state.input.error); }
+    return Result::Ok(());
+}
+unit ReaderReject(ReaderState state, string code, i64 node, string path) {
+    if (node >= 0_i64 && node < Array.Len<Syntax.Node>(state.input.document.nodes)) { Reject(state.input, code, node, path); }
+    else if (!state.input.failed) { state.input.failed = true; state.input.error = NoSource(code); }
+}
+
+Result<ReaderSlot, SerializationError> ReaderTake(ReaderState state) {
+    if (!state.active || state.input.failed) {
+        ReaderReject(state, "ReaderState", -1_i64, "");
+        return Result::Error(state.input.error);
+    }
+    if (!state.pending && Array.Len<ReaderFrame>(state.frames) > 0_i64) {
+        ReaderFrame frame = state.frames[Array.Len<ReaderFrame>(state.frames) - 1_i64];
+        if (frame.shape.kind == ShapeKind::Array || frame.shape.kind == ShapeKind::List || frame.shape.kind == ShapeKind::Variant || frame.shape.kind == ShapeKind::Optional) {
+            if (frame.position >= Array.Len<i64>(frame.children)) { ReaderReject(state, "UnexpectedEnd", frame.node, frame.path); }
+            else {
+                state.pendingNode = frame.children[frame.position];
+                if (frame.shape.kind == ShapeKind::Variant) { state.pendingShape = frame.shape.variants[frame.variant].fields[frame.position].shape; }
+                else { state.pendingShape = frame.shape.arguments[0_i64]; }
+                state.pendingPath = frame.path + "/" + Decimal.Signed(frame.position);
+                state.pending = true;
+                frame.position = frame.position + 1_i64;
+            }
+        }
+    }
+    if (!state.pending || state.input.failed) {
+        ReaderReject(state, "ReaderState", -1_i64, "");
+        return Result::Error(state.input.error);
+    }
+    i64 node = state.pendingNode;
+    string path = state.pendingPath;
+    state.pending = false;
+    if (state.input.nodes >= state.input.limits.maxNodes) {
+        ReaderReject(state, "CollectionLimit", node, path);
+        return Result::Error(state.input.error);
+    }
+    state.input.nodes = state.input.nodes + 1_i64;
+    Syntax.Node value = state.input.document.nodes[node];
+    state.location = ReaderApi.SourceLocation { path: path, start: value.span.start, end: value.span.end };
+    if (value.kind != Syntax.NodeKind::Block || value.name != "value" || !value.hasLabel) {
+        ReaderReject(state, "InvalidTag", node, path);
+        return Result::Error(state.input.error);
+    }
+    match Registry.Lookup(state.table, state.pendingShape) {
+        Result::Error(error) => { state.input.failed = true; state.input.error = error; return Result::Error(error); },
+        Result::Ok(shape) => {
+            if (Array.Len<ReaderFrame>(state.frames) == 0_i64) { state.rootConsumed = true; }
+            return Result::Ok(ReaderSlot { node: node, shape: shape, path: path });
+        },
+    };
+}
+
+Result<ReaderSlot, SerializationError> ReaderScalar(ReaderState state, ShapeKind kind, string tag, string[] properties) {
+    match ReaderTake(state) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(slot) => {
+            if (slot.shape.kind != kind || state.input.document.nodes[slot.node].label != tag) { ReaderReject(state, "ShapeMismatch", slot.node, slot.path); }
+            Properties(state.input, slot.node, properties, slot.path);
+            if (state.input.failed) { return Result::Error(state.input.error); }
+            return Result::Ok(slot);
+        },
+    };
+}
+
+Result<unit, SerializationError> ReaderPush(ReaderState state, ReaderSlot slot, i64[] children, i64 variant) {
+    if (Array.Len<ReaderFrame>(state.frames) >= state.input.limits.maxDepth || Array.Len<i64>(children) > state.input.limits.maxNodes - state.input.nodes) {
+        ReaderReject(state, "CollectionLimit", slot.node, slot.path);
+        return Result::Error(state.input.error);
+    }
+    Array.Append<ReaderFrame>(state.frames, ReaderFrame { shape: slot.shape, node: slot.node, children: children, position: 0_i64, field: -1_i64, variant: variant, entry: false, path: slot.path });
+    return Result::Ok(());
+}
+Result<unit, SerializationError> ReaderPop(ReaderState state, ShapeKind kind) {
+    i64 count = Array.Len<ReaderFrame>(state.frames);
+    if (count < 1_i64) { ReaderReject(state, "ReaderState", -1_i64, ""); return Result::Error(state.input.error); }
+    ReaderFrame frame = state.frames[count - 1_i64];
+    if (frame.shape.kind != kind || state.pending || frame.entry || frame.position != Array.Len<i64>(frame.children)) { ReaderReject(state, "UnexpectedEnd", frame.node, frame.path); }
+    if (state.input.failed) { return Result::Error(state.input.error); }
+    Array.RemoveLast<ReaderFrame>(state.frames);
+    return Result::Ok(());
+}
+
+pub type SyntaxReader : ReaderApi.Reader {
+    ReaderState state,
+
+    pub ReaderApi.SourceLocation Location() { return this.state.location; }
+    pub Result<unit, SerializationError> Begin(SerializationLimits limits) {
+        if (this.state.active) { return Result::Error(NoSource("ReaderState")); }
+        if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxScalarBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64) { return Result::Error(NoSource("InvalidLimits")); }
+        match Parser.Parse(this.state.text, Typed.FormatLimits(limits)) {
+            Result::Error(error) => { return Result::Error(Error("InvalidSyntax", "", error.span)); },
+            Result::Ok(document) => {
+                if (Array.Len<i64>(document.roots) != 1_i64) { return Result::Error(NoSource("InvalidEnvelope")); }
+                i64 root = document.roots[0_i64];
+                Syntax.Node envelope = document.nodes[root];
+                if (envelope.kind != Syntax.NodeKind::Block || envelope.name != "serialized" || !envelope.hasLabel || envelope.label != Metadata.FormatShapeId(this.state.root)) { return Result::Error(Error("ShapeMismatch", "", envelope.span)); }
+                this.state.input = Input { document: document, failed: false, error: NoSource(""), nodes: 0_i64, limits: limits };
+                Properties(this.state.input, root, ["version", "value"], "");
+                i64 version = Property(this.state.input, root, "version", Syntax.NodeKind::Number, "");
+                if (document.nodes[version].raw != "1") { Reject(this.state.input, "UnsupportedWireVersion", version, ""); }
+                this.state.pendingNode = Property(this.state.input, root, "value", Syntax.NodeKind::Block, "");
+                this.state.pendingShape = this.state.root;
+                this.state.pendingPath = "";
+                this.state.pending = true;
+                this.state.rootConsumed = false;
+                this.state.frames = Array.Empty<ReaderFrame>();
+                this.state.active = !this.state.input.failed;
+                return ReaderStatus(this.state);
+            },
+        };
+    }
+    pub Result<unit, SerializationError> Finish() {
+        if (!this.state.active || !this.state.rootConsumed || this.state.pending || Array.Len<ReaderFrame>(this.state.frames) != 0_i64) { ReaderReject(this.state, "UnexpectedEnd", -1_i64, ""); }
+        this.state.active = false;
+        return ReaderStatus(this.state);
+    }
+    pub Result<unit, SerializationError> ReadUnit() {
+        match ReaderScalar(this.state, ShapeKind::Unit, "unit", []) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { return Result::Ok(()); }, };
+    }
+    pub Result<bool, SerializationError> ReadBoolean() {
+        match ReaderScalar(this.state, ShapeKind::Boolean, "bool", ["data"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => { i64 node = Property(this.state.input, slot.node, "data", Syntax.NodeKind::Boolean, slot.path); if (this.state.input.failed) { return Result::Error(this.state.input.error); } return Result::Ok(this.state.input.document.nodes[node].text == "true"); },
+        };
+    }
+    pub Result<i64, SerializationError> ReadSigned(u8 width) {
+        match ReaderScalar(this.state, ShapeKind::Signed, "i" + Decimal.Unsigned(u64(width)), ["data"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (slot.shape.width != width) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                i64 node = Property(this.state.input, slot.node, "data", Syntax.NodeKind::Number, slot.path);
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                match Numeric.ParseSigned(this.state.input.document.nodes[node].raw, i64(width)) { Result::Ok(value) => { return Result::Ok(value); }, Result::Error(error) => { ReaderReject(this.state, Errors.Code(error), node, slot.path); return Result::Error(this.state.input.error); }, };
+            },
+        };
+    }
+    pub Result<u64, SerializationError> ReadUnsigned(u8 width) {
+        match ReaderScalar(this.state, ShapeKind::Unsigned, "u" + Decimal.Unsigned(u64(width)), ["data"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (slot.shape.width != width) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                i64 node = Property(this.state.input, slot.node, "data", Syntax.NodeKind::Number, slot.path);
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                match Numeric.ParseUnsigned(this.state.input.document.nodes[node].raw, i64(width)) { Result::Ok(value) => { return Result::Ok(value); }, Result::Error(error) => { ReaderReject(this.state, Errors.Code(error), node, slot.path); return Result::Error(this.state.input.error); }, };
+            },
+        };
+    }
+    pub Result<u64, SerializationError> ReadFloat(u8 width) {
+        match ReaderScalar(this.state, ShapeKind::Float, "f" + Decimal.Unsigned(u64(width)), ["data"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (slot.shape.width != width) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                i64 node = Property(this.state.input, slot.node, "data", Syntax.NodeKind::Number, slot.path);
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                match FloatDecimal.Parse(this.state.input.document.nodes[node].raw, width, this.state.input.limits) { Result::Ok(value) => { return Result::Ok(value); }, Result::Error(error) => { ReaderReject(this.state, Errors.Code(error), node, slot.path); return Result::Error(this.state.input.error); }, };
+            },
+        };
+    }
+    pub Result<char, SerializationError> ReadScalar() {
+        match ReaderScalar(this.state, ShapeKind::Scalar, "char", ["data"]) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(slot) => { i64 node = Property(this.state.input, slot.node, "data", Syntax.NodeKind::String, slot.path); char value = Scalar(this.state.input, node, slot.path); if (this.state.input.failed) { return Result::Error(this.state.input.error); } return Result::Ok(value); }, };
+    }
+    pub Result<string, SerializationError> ReadString() {
+        match ReaderScalar(this.state, ShapeKind::String, "string", ["data"]) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(slot) => { string value = QuotedProperty(this.state.input, slot.node, "data", slot.path); if (String.Len(value) > this.state.input.limits.maxScalarBytes) { ReaderReject(this.state, "ScalarLimit", slot.node, slot.path); } if (this.state.input.failed) { return Result::Error(this.state.input.error); } return Result::Ok(value); }, };
+    }
+    pub Result<u8[], SerializationError> ReadBytes() {
+        match ReaderScalar(this.state, ShapeKind::Bytes, "bytes", ["encoding", "data"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                i64 encoding = Property(this.state.input, slot.node, "encoding", Syntax.NodeKind::Identifier, slot.path);
+                if (this.state.input.document.nodes[encoding].text != "base64") { ReaderReject(this.state, "InvalidEncoding", encoding, slot.path); }
+                string text = QuotedProperty(this.state.input, slot.node, "data", slot.path);
+                i64 length = String.Len(text);
+                mut i64 decodedLength = (length / 4_i64) * 3_i64;
+                if (length > 0_i64 && String.ByteAt(text, length - 1_i64) == 61_u8) { decodedLength = decodedLength - 1_i64; }
+                if (length > 1_i64 && String.ByteAt(text, length - 2_i64) == 61_u8) { decodedLength = decodedLength - 1_i64; }
+                if (length % 4_i64 != 0_i64) { ReaderReject(this.state, "InvalidBase64", slot.node, slot.path); }
+                if (decodedLength > this.state.input.limits.maxScalarBytes) { ReaderReject(this.state, "ScalarLimit", slot.node, slot.path); }
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                u8[] bytes = ByteSlice.New(String.Len(text));
+                mut i64 index = 0_i64;
+                while (index < String.Len(text)) { Array.Set<u8>(bytes, index, String.ByteAt(text, index)); index = index + 1_i64; }
+                match Base64.DecodeBytes(bytes) { Result::Error(_) => { ReaderReject(this.state, "InvalidBase64", slot.node, slot.path); return Result::Error(this.state.input.error); }, Result::Ok(value) => { if (Array.Len<u8>(value) > this.state.input.limits.maxScalarBytes) { ReaderReject(this.state, "ScalarLimit", slot.node, slot.path); return Result::Error(this.state.input.error); } return Result::Ok(value); }, };
+            },
+        };
+    }
+
+    pub Result<i64, SerializationError> BeginRecord(ShapeId expected) {
+        match ReaderScalar(this.state, ShapeKind::Record, "record", ["shape", "fields"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (Metadata.FormatShapeId(slot.shape.id) != Metadata.FormatShapeId(expected) || QuotedProperty(this.state.input, slot.node, "shape", slot.path) != Metadata.FormatShapeId(expected)) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                i64 list = Property(this.state.input, slot.node, "fields", Syntax.NodeKind::List, slot.path);
+                i64[] fields = this.state.input.document.nodes[list].children;
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                match ReaderPush(this.state, slot, fields, -1_i64) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { return Result::Ok(Array.Len<i64>(fields)); }, };
+            },
+        };
+    }
+    pub Result<string, SerializationError> BeginField() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64 || this.state.pending) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        ReaderFrame frame = this.state.frames[count - 1_i64];
+        if (frame.shape.kind != ShapeKind::Record || frame.entry || frame.position >= Array.Len<i64>(frame.children)) { ReaderReject(this.state, "ReaderState", frame.node, frame.path); return Result::Error(this.state.input.error); }
+        i64 node = frame.children[frame.position];
+        Syntax.Node field = this.state.input.document.nodes[node];
+        if (field.kind != Syntax.NodeKind::Block || field.name != "field" || !field.hasLabel) { ReaderReject(this.state, "InvalidField", node, frame.path); return Result::Error(this.state.input.error); }
+        mut i64 prior = 0_i64;
+        while (prior < frame.position) {
+            i64 related = frame.children[prior];
+            if (this.state.input.document.nodes[related].label == field.label) { RejectRelated(this.state.input, "DuplicateField", node, related, frame.path + "/" + field.label); return Result::Error(this.state.input.error); }
+            prior = prior + 1_i64;
+        }
+        mut i64 found = -1_i64;
+        mut i64 index = 0_i64;
+        while (index < Array.Len<FieldDescriptor>(frame.shape.fields)) { if (frame.shape.fields[index].name == field.label) { found = index; } index = index + 1_i64; }
+        mut ShapeId expected = frame.shape.id;
+        if (found < 0_i64) {
+            match Registry.ExtraValue(this.state.table, frame.shape) { Result::Error(_) => { ReaderReject(this.state, "UnknownField", node, frame.path + "/" + field.label); return Result::Error(this.state.input.error); }, Result::Ok(shape) => { expected = shape; }, };
+            if (frame.position > 0_i64 && frame.field == -2_i64 && !Less(this.state.input.document.nodes[frame.children[frame.position - 1_i64]].label, field.label)) { ReaderReject(this.state, "FieldOrder", node, frame.path); }
+            frame.field = -2_i64;
+        } else {
+            if (frame.field == -2_i64 || found <= frame.field) { ReaderReject(this.state, "FieldOrder", node, frame.path); }
+            frame.field = found; expected = frame.shape.fields[found].shape;
+        }
+        Properties(this.state.input, node, ["value"], frame.path);
+        this.state.pendingNode = Property(this.state.input, node, "value", Syntax.NodeKind::Block, frame.path);
+        this.state.pendingShape = expected;
+        this.state.pendingPath = frame.path + "/" + field.label;
+        this.state.location = ReaderApi.SourceLocation { path: this.state.pendingPath, start: field.span.start, end: field.span.end };
+        this.state.pending = true;
+        frame.entry = true; frame.position = frame.position + 1_i64;
+        if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+        return Result::Ok(field.label);
+    }
+    pub Result<unit, SerializationError> EndField() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64 || this.state.pending) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        ReaderFrame frame = this.state.frames[count - 1_i64];
+        if (frame.shape.kind != ShapeKind::Record || !frame.entry) { ReaderReject(this.state, "ReaderState", frame.node, frame.path); }
+        frame.entry = false;
+        return ReaderStatus(this.state);
+    }
+    pub Result<unit, SerializationError> EndRecord() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        ReaderFrame frame = this.state.frames[count - 1_i64];
+        mut i64 field = 0_i64;
+        while (field < Array.Len<FieldDescriptor>(frame.shape.fields)) {
+            if (frame.shape.fields[field].required) {
+                mut bool present = false;
+                mut i64 node = 0_i64;
+                while (node < Array.Len<i64>(frame.children)) { if (this.state.input.document.nodes[frame.children[node]].label == frame.shape.fields[field].name) { present = true; } node = node + 1_i64; }
+                if (!present) { ReaderReject(this.state, "MissingField", frame.node, frame.path + "/" + frame.shape.fields[field].name); }
+            }
+            field = field + 1_i64;
+        }
+        return ReaderPop(this.state, ShapeKind::Record);
+    }
+    pub Result<i64, SerializationError> BeginSequence() {
+        match ReaderTake(this.state) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                string tag = this.state.input.document.nodes[slot.node].label;
+                if ((slot.shape.kind != ShapeKind::Array && slot.shape.kind != ShapeKind::List) || (slot.shape.kind == ShapeKind::Array && tag != "array") || (slot.shape.kind == ShapeKind::List && tag != "list") || Array.Len<ShapeId>(slot.shape.arguments) != 1_i64) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                Properties(this.state.input, slot.node, ["items"], slot.path);
+                i64 list = Property(this.state.input, slot.node, "items", Syntax.NodeKind::List, slot.path);
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                i64[] children = this.state.input.document.nodes[list].children;
+                match ReaderPush(this.state, slot, children, -1_i64) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { return Result::Ok(Array.Len<i64>(children)); }, };
+            },
+        };
+    }
+    pub Result<unit, SerializationError> EndSequence() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        ShapeKind kind = this.state.frames[count - 1_i64].shape.kind;
+        if (kind != ShapeKind::Array && kind != ShapeKind::List) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        return ReaderPop(this.state, kind);
+    }
+    pub Result<i64, SerializationError> BeginMap() {
+        match ReaderScalar(this.state, ShapeKind::Map, "map", ["entries"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (Array.Len<ShapeId>(slot.shape.arguments) != 1_i64) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                i64 list = Property(this.state.input, slot.node, "entries", Syntax.NodeKind::List, slot.path);
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                i64[] children = this.state.input.document.nodes[list].children;
+                match ReaderPush(this.state, slot, children, -1_i64) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { return Result::Ok(Array.Len<i64>(children)); }, };
+            },
+        };
+    }
+    pub Result<string, SerializationError> BeginMapEntry() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64 || this.state.pending) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        ReaderFrame frame = this.state.frames[count - 1_i64];
+        if (frame.shape.kind != ShapeKind::Map || frame.entry || frame.position >= Array.Len<i64>(frame.children)) { ReaderReject(this.state, "ReaderState", frame.node, frame.path); return Result::Error(this.state.input.error); }
+        i64 node = frame.children[frame.position];
+        Syntax.Node entry = this.state.input.document.nodes[node];
+        if (entry.kind != Syntax.NodeKind::Block || entry.name != "entry" || !entry.hasLabel) { ReaderReject(this.state, "InvalidMapEntry", node, frame.path); }
+        if (frame.position > 0_i64) {
+            i64 related = frame.children[frame.position - 1_i64];
+            string previous = this.state.input.document.nodes[related].label;
+            if (previous == entry.label) { RejectRelated(this.state.input, "DuplicateMapKey", node, related, frame.path); }
+            else if (!Less(previous, entry.label)) { ReaderReject(this.state, "MapOrder", node, frame.path); }
+        }
+        if (String.Len(entry.label) > this.state.input.limits.maxScalarBytes) { ReaderReject(this.state, "ScalarLimit", node, frame.path); }
+        Properties(this.state.input, node, ["value"], frame.path);
+        this.state.pendingNode = Property(this.state.input, node, "value", Syntax.NodeKind::Block, frame.path);
+        this.state.pendingShape = frame.shape.arguments[0_i64];
+        this.state.pendingPath = frame.path + "/" + entry.label;
+        this.state.pending = true;
+        this.state.location = ReaderApi.SourceLocation { path: this.state.pendingPath, start: entry.span.start, end: entry.span.end };
+        frame.entry = true; frame.position = frame.position + 1_i64;
+        if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+        return Result::Ok(entry.label);
+    }
+    pub Result<unit, SerializationError> EndMapEntry() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64 || this.state.pending) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        ReaderFrame frame = this.state.frames[count - 1_i64];
+        if (frame.shape.kind != ShapeKind::Map || !frame.entry) { ReaderReject(this.state, "ReaderState", frame.node, frame.path); }
+        frame.entry = false;
+        return ReaderStatus(this.state);
+    }
+    pub Result<unit, SerializationError> EndMap() { return ReaderPop(this.state, ShapeKind::Map); }
+    pub Result<string, SerializationError> BeginVariant(ShapeId expected) {
+        match ReaderScalar(this.state, ShapeKind::Variant, "variant", ["shape", "name", "payload"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (Metadata.FormatShapeId(slot.shape.id) != Metadata.FormatShapeId(expected) || QuotedProperty(this.state.input, slot.node, "shape", slot.path) != Metadata.FormatShapeId(expected)) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                string name = QuotedProperty(this.state.input, slot.node, "name", slot.path);
+                mut i64 found = -1_i64;
+                mut i64 index = 0_i64;
+                while (index < Array.Len<VariantDescriptor>(slot.shape.variants)) { if (slot.shape.variants[index].name == name) { found = index; } index = index + 1_i64; }
+                if (found < 0_i64) { ReaderReject(this.state, "InvalidVariant", slot.node, slot.path); return Result::Error(this.state.input.error); }
+                i64 list = Property(this.state.input, slot.node, "payload", Syntax.NodeKind::List, slot.path);
+                i64[] children = this.state.input.document.nodes[list].children;
+                if (Array.Len<i64>(children) != Array.Len<FieldDescriptor>(slot.shape.variants[found].fields)) { ReaderReject(this.state, "InvalidVariant", list, slot.path); }
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                match ReaderPush(this.state, slot, children, found) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { return Result::Ok(name); }, };
+            },
+        };
+    }
+    pub Result<i64, SerializationError> VariantCount() {
+        i64 count = Array.Len<ReaderFrame>(this.state.frames);
+        if (count < 1_i64 || this.state.frames[count - 1_i64].shape.kind != ShapeKind::Variant) { ReaderReject(this.state, "ReaderState", -1_i64, ""); return Result::Error(this.state.input.error); }
+        return Result::Ok(Array.Len<i64>(this.state.frames[count - 1_i64].children));
+    }
+    pub Result<unit, SerializationError> EndVariant() { return ReaderPop(this.state, ShapeKind::Variant); }
+    pub Result<bool, SerializationError> BeginOptional() {
+        match ReaderScalar(this.state, ShapeKind::Optional, "optional", ["present", "value"]) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(slot) => {
+                if (Array.Len<ShapeId>(slot.shape.arguments) != 1_i64) { ReaderReject(this.state, "ShapeMismatch", slot.node, slot.path); }
+                i64 presentNode = Property(this.state.input, slot.node, "present", Syntax.NodeKind::Boolean, slot.path);
+                bool present = this.state.input.document.nodes[presentNode].text == "true";
+                mut i64[] children = [];
+                if (present) { children = [Property(this.state.input, slot.node, "value", Syntax.NodeKind::Block, slot.path)]; }
+                else if (Array.Len<i64>(this.state.input.document.nodes[slot.node].children) != 1_i64) { ReaderReject(this.state, "InvalidOptional", slot.node, slot.path); }
+                if (this.state.input.failed) { return Result::Error(this.state.input.error); }
+                match ReaderPush(this.state, slot, children, -1_i64) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { return Result::Ok(present); }, };
+            },
+        };
+    }
+    pub Result<unit, SerializationError> EndOptional() { return ReaderPop(this.state, ShapeKind::Optional); }
+}
+
+pub SyntaxReader CreateSyntaxReader(string text, ShapeId root, Registry.ShapeRegistry table) {
+    return SyntaxReader { state: ReaderState {
+        text: text, input: Input { document: Syntax.Document { source: "", nodes: [], roots: [], trivia: [] }, failed: false, error: NoSource(""), nodes: 0_i64, limits: Limits.DefaultLimits() }, table: table, root: root,
+        frames: [], active: false, rootConsumed: false, pending: false, pendingNode: -1_i64, pendingShape: root, pendingPath: "", location: ReaderApi.SourceLocation { path: "", start: -1_i64, end: -1_i64 },
+    } };
+}
+
+/// Automatic typed decoding admits the complete compiler-issued descriptor
+/// closure before creating the reader. The concrete field binding is retained
+/// by a typed decoder and cannot substitute a caller-selected target ShapeId.
+pub Result<T, SerializationError> ReadTyped<T, B>(string text, B binding, SerializationLimits limits) where B: ReaderApi.FieldDecoder<T, SyntaxReader> {
+    Registry.ShapeRegistry table = Registry.Create();
+    Registry.RegisterCompiled<T>(table, 1048576_i64, limits.maxInputBytes, limits.maxNodes)?;
+    ShapeDescriptor root = Descriptors.CompiledShape<T>();
+    SyntaxReader reader = CreateSyntaxReader(text, root.id, table);
+    let decoder = Decoding.Bind<T, SyntaxReader, B>(reader, binding);
+    return decoder.ReadTyped(limits);
+}

@@ -17,6 +17,12 @@ i64 OptionalDeadlineNanos(Option<Deadline> deadline) {
     };
 }
 
+// Runtime boolean flags cross the service boundary as `u8` 0 or 1.
+u8 Flag(bool value) {
+    if value { return 1_u8; }
+    return 0_u8;
+}
+
 // This module is deliberately not re-exported by Network. The service vocabulary
 // is portable and manifest-owned; these discriminants are never native error codes.
 pub NetworkError Error(i64 status) {
@@ -54,7 +60,7 @@ pub TransferFailure TransferCause(i64 status) {
 
 pub Result<unit, NetworkError> Status(i64 status) {
     if status == 0_i64 { return Result::Ok(()); }
-    return Result::Error(Error(status));
+    return Result::Error(Network.Internal.Error(status));
 }
 
 pub Result<unit, DisposeError> Dispose(word handle) {
@@ -115,8 +121,8 @@ pub SocketAddress Decode(u8[] wire) {
 
 pub Result<SocketAddress, NetworkError> Address(word handle, bool peer) {
     u8[] wire = Slice.New(19_i64);
-    i32 status = __network_address(handle, peer, wire);
-    if status != 0_i32 { return Result::Error(Error(i64(status))); }
+    i32 status = __network_address(handle, Flag(peer), wire);
+    if status != 0_i32 { return Result::Error(Network.Internal.Error(i64(status))); }
     return Result::Ok(Decode(wire));
 }
 
@@ -137,11 +143,11 @@ pub i32 SetDeadlines(word handle, TransferDeadlines policy) {
 pub i32 ShutdownWrite(word handle) { return __network_shutdown_write(handle); }
 pub i32 ConnectDatagram(word handle, u8[] address) { return __network_udp_connect(handle, address); }
 pub i64 Receive(word handle, u8[] payload, u8[] metadata, bool connected, Option<Deadline> deadline) {
-    i64 completed = __network_receive(handle, payload, metadata, connected, OptionalDeadlineNanos(deadline));
+    i64 completed = __network_receive(handle, payload, metadata, Flag(connected), OptionalDeadlineNanos(deadline));
     if completed > Slice.Len(payload) { __panic_str("Network returned an invalid datagram length"); }
     return completed;
 }
-pub i64 Send(word handle, u8[] payload, u8[] address, bool connected, Option<Deadline> deadline) { return __network_send(handle, payload, address, connected, OptionalDeadlineNanos(deadline)); }
+pub i64 Send(word handle, u8[] payload, u8[] address, bool connected, Option<Deadline> deadline) { return __network_send(handle, payload, address, Flag(connected), OptionalDeadlineNanos(deadline)); }
 pub i32 Resolve(string hostName, i64 port, i64 family, Option<Deadline> deadline, word[] result) { return __network_dns_resolve(hostName, port, family, OptionalDeadlineNanos(deadline), result); }
 pub i64 ResolveCount(word result) { return __network_dns_count(result); }
 pub i32 ResolveAddress(word result, i64 index, u8[] address) { return __network_dns_address(result, index, address); }

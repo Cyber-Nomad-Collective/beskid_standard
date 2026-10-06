@@ -1,0 +1,90 @@
+use Core.Results;
+
+// Sealed managed representations are issued from this canonical package source.
+// These declarations have no ordinary empty aggregate construction or field copy.
+pub type DynamicValueV1 { }
+pub type DynamicPayloadV1 { }
+
+pub enum DynamicErrorV1 {
+    Invalid,
+    Foreign,
+    Busy,
+    Allocation,
+}
+
+// Loader admission reserves this immutable source-defined failure before any
+// checked Dynamic entry is published. It is never a mutable reused error object.
+Result<T, DynamicErrorV1> ReserveAllocationFailureV1<T>() {
+    return Result::Error(DynamicErrorV1::Allocation);
+}
+
+// The ordinary typed constructor is the sole layout authority for packed T.
+// Only the compiler-issued specialized bridge may erase this managed box; its
+// descriptor, complete T identity and image lifetime are validated at admission.
+type DynamicPackBoxV1<T> { T value, }
+
+// This ordinary typed Result constructor is called only by the compiler-issued
+// Pack bridge after validating the concrete canonical box representation.
+Result<DynamicPayloadV1, DynamicErrorV1> PackedResultV1(DynamicPayloadV1 payload) {
+    return Result::Ok(payload);
+}
+Result<DynamicPayloadV1, DynamicErrorV1> PackedInvalidV1() {
+    return Result::Error(DynamicErrorV1::Invalid);
+}
+
+[Extern(Abi:"C", Library:"beskid_runtime")]
+contract DynamicPackingBridgeV1<T> {
+    Result<DynamicPayloadV1, DynamicErrorV1> beskid_dynamic_v1_pack_box(DynamicPackBoxV1<T> boxed);
+}
+
+pub Result<DynamicPayloadV1, DynamicErrorV1> Pack<T>(T value) {
+    DynamicPackBoxV1<T> boxed = DynamicPackBoxV1<T> { value: value };
+    return DynamicPackingBridgeV1<T>.beskid_dynamic_v1_pack_box(boxed);
+}
+
+// This generic binding is issued from the same compiled canonical type graph
+// and initialized image closure as Pack<T>; no caller-authored signature enters.
+[Extern(Abi:"C", Library:"beskid_runtime")]
+contract DynamicShapeBridgeV1<T> {
+    u64 beskid_dynamic_v1_shape_tag();
+}
+
+pub u64 Shape<T>() {
+    return DynamicShapeBridgeV1<T>.beskid_dynamic_v1_shape_tag();
+}
+
+Result<T, DynamicErrorV1> UnpackedResultV1<T>(T value) {
+    return Result::Ok(value);
+}
+Result<T, DynamicErrorV1> UnpackedInvalidV1<T>() {
+    return Result::Error(DynamicErrorV1::Invalid);
+}
+[Extern(Abi:"C", Library:"beskid_runtime")]
+contract DynamicUnpackingBridgeV1<T> {
+    Result<T, DynamicErrorV1> beskid_dynamic_v1_unpack_box(DynamicPayloadV1 payload);
+}
+
+pub Result<T, DynamicErrorV1> Unpack<T>(DynamicPayloadV1 payload) {
+    return DynamicUnpackingBridgeV1<T>.beskid_dynamic_v1_unpack_box(payload);
+}
+
+// Private normalized transport returns the compiler-owned checked result object.
+// Public signatures expose no native status buffer or GC address.
+[Extern(Abi:"C", Library:"beskid_runtime")]
+contract DynamicCheckedBridgeV1 {
+    Result<DynamicValueV1, DynamicErrorV1> beskid_dynamic_v1_create_result(DynamicPayloadV1 payload, u64 shape);
+    Result<DynamicPayloadV1, DynamicErrorV1> beskid_dynamic_v1_cast_result(DynamicValueV1 value, u64 shape);
+    Result<DynamicValueV1, DynamicErrorV1> beskid_dynamic_v1_map_result(DynamicValueV1 value, u64 mapping);
+}
+
+pub Result<DynamicValueV1, DynamicErrorV1> Create(DynamicPayloadV1 payload, u64 shape) {
+    return DynamicCheckedBridgeV1.beskid_dynamic_v1_create_result(payload, shape);
+}
+
+pub Result<DynamicPayloadV1, DynamicErrorV1> Cast(DynamicValueV1 value, u64 shape) {
+    return DynamicCheckedBridgeV1.beskid_dynamic_v1_cast_result(value, shape);
+}
+
+pub Result<DynamicValueV1, DynamicErrorV1> Map(DynamicValueV1 value, u64 mapping) {
+    return DynamicCheckedBridgeV1.beskid_dynamic_v1_map_result(value, mapping);
+}

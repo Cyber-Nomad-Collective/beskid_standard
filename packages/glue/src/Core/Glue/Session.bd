@@ -1,0 +1,474 @@
+/// A single-owner cooperative session. Identities are checked before payload
+/// decoding; process close remains required after a protocol acknowledgment.
+use Core.Results;
+use Core.Optional.Option;
+use Core.Time;
+use Concurrency.Channel;
+use Concurrency.ChannelError;
+use Concurrency.ChannelOptions;
+use Concurrency.TryResult;
+use Concurrency.Fiber;
+use Core.Collections.Array;
+use Core.Process;
+use Core.Time.Deadline;
+use Core.Disposable;
+use Core.Serialization.DataValue;
+use Core.Glue.Envelope;
+use Core.Glue.BinaryCodec;
+use Core.Glue.Pump;
+
+pub enum SessionError { Protocol(), Transport(), Closed(), Busy(), Exhausted(), Cancelled(), TimedOut(), Remote(DataValue value), Cleanup(), }
+pub type Session: Disposable {
+    ChildProcess child,
+    string library,
+    u64 generation,
+    u64 nextRequest,
+    u8 phase,
+    Result<unit,SessionError> cleanupStatus,
+
+    pub Result<DataValue,SessionError> Call(u8[] binding, u8[] shapes, DataValue arguments, Deadline deadline) {
+        if this.phase == 2_u8 { return Result::Error(SessionError::Busy); }
+        if this.phase != 1_u8 { return Result::Error(SessionError::Closed); }
+        if this.nextRequest == 18446744073709551615_u64 { Invalidate(this); return Result::Error(SessionError::Exhausted); }
+        Result<u8[],CodecError> encoded = BinaryCodec.Encode(arguments);
+        return match encoded {
+            Result::Error(error) => Result::Error(SessionError::Protocol),
+            Result::Ok(payload) => CallEncoded(this, binding, shapes, payload, deadline),
+        };
+    }
+
+    pub Result<unit,SessionError> Close(Deadline deadline) {
+        if this.phase == 3_u8 { return this.cleanupStatus; }
+        if this.phase == 2_u8 { Invalidate(this); return Result::Error(SessionError::Busy); }
+        return match Deadline.After(Time.FromMilliseconds(5000)) {
+            Result::Error(error) => CloseUnavailable(this),
+            Result::Ok(cap) => CloseCapped(this, deadline, cap),
+        };
+    }
+
+    pub Result<unit,DisposeError> Dispose() {
+        this.phase = 3_u8;
+        Result<unit,DisposeError> result = this.child.Dispose();
+        match result {
+            Result::Ok(value) => { this.cleanupStatus = Result::Ok(()); },
+            Result::Error(error) => { this.cleanupStatus = Result::Error(SessionError::Cleanup); },
+        };
+        return result;
+    }
+}
+
+Result<DataValue,SessionError> CallEncoded(Session session, u8[] binding, u8[] shapes, u8[] payload, Deadline deadline) {
+    u64 requestId = session.nextRequest;
+    session.nextRequest = session.nextRequest + 1_u64;
+    session.phase = 2_u8;
+    Envelope request = Envelope { kind: 1_u8, generation: session.generation, request: requestId, library: session.library, binding: binding, shapes: shapes, payload: payload };
+    Result<Envelope,SessionError> exchanged = Exchange(session, request, deadline);
+    return match exchanged {
+        Result::Error(error) => CallFailed(session, error),
+        Result::Ok(response) => CallResponse(session, response, requestId, binding, shapes),
+    };
+}
+
+Result<DataValue,SessionError> CallFailed(Session session, SessionError error) {
+    Invalidate(session);
+    return Result::Error(error);
+}
+
+Result<DataValue,SessionError> CallResponse(Session session, Envelope response, u64 requestId, u8[] binding, u8[] shapes) {
+    if (response.kind != 2_u8 && response.kind != 3_u8) || response.request != requestId || !Same(response.binding, binding) || !Same(response.shapes, shapes) {
+        return CallFailed(session, SessionError::Protocol);
+    }
+    Result<DataValue,CodecError> decoded = BinaryCodec.Decode(response.payload);
+    return match decoded {
+        Result::Error(error) => CallFailed(session, SessionError::Protocol),
+        Result::Ok(value) => CallComplete(session, response, value),
+    };
+}
+
+Result<DataValue,SessionError> CallComplete(Session session, Envelope response, DataValue value) {
+    session.phase = 1_u8;
+    if response.kind == 3_u8 { return Result::Error(SessionError::Remote(value)); }
+    return Result::Ok(value);
+}
+
+Result<unit,SessionError> CloseUnavailable(Session session) {
+    Invalidate(session);
+    return Result::Error(SessionError::Transport);
+}
+
+Result<unit,SessionError> CloseCapped(Session session, Deadline deadline, Deadline cap) {
+    Deadline overall = Deadline.Earlier(deadline, cap);
+    return match Deadline.Reserve(overall, Time.FromMilliseconds(1000)) {
+        Result::Error(error) => CloseUnavailable(session),
+        Result::Ok(acknowledgement) => CloseExchange(session, overall, acknowledgement),
+    };
+}
+
+Result<unit,SessionError> CloseExchange(Session session, Deadline overall, Deadline acknowledgement) {
+    session.phase = 2_u8;
+    u8[] payload = Array.Empty<u8>();
+    Envelope request = Envelope { kind: 5_u8, generation: session.generation, request: 0_u64, library: session.library, binding: Zero(), shapes: Array.Empty<u8>(), payload: payload };
+    Result<Envelope,SessionError> exchanged = Exchange(session, request, acknowledgement);
+    session.phase = 3_u8;
+    // The ACK grace and OS cleanup consume one issued overall deadline.
+    // Cleanup always probes termination/reap even after a failed exchange.
+    match session.child.CloseUntil(overall) {
+        Result::Ok(value) => { session.cleanupStatus = Result::Ok(()); },
+        Result::Error(error) => { session.cleanupStatus = Result::Error(SessionError::Cleanup); },
+    };
+    match session.cleanupStatus {
+        Result::Ok(value) => { },
+        Result::Error(error) => { return Result::Error(error); },
+    };
+    return match exchanged {
+        Result::Error(error) => CloseRecorded(session, error),
+        Result::Ok(response) => CloseAcknowledged(session, response, payload),
+    };
+}
+
+Result<unit,SessionError> CloseRecorded(Session session, SessionError error) {
+    session.cleanupStatus = Result::Error(error);
+    return session.cleanupStatus;
+}
+
+Result<unit,SessionError> CloseAcknowledged(Session session, Envelope response, u8[] payload) {
+    if response.kind != 6_u8 || response.request != 0_u64 || !Same(response.binding, Zero()) || Array.Len(response.shapes) != 0 || !Same(response.payload, payload) {
+        return CloseRecorded(session, SessionError::Protocol);
+    }
+    return Result::Ok(());
+}
+
+bool Same(u8[] left,u8[] right){if Array.Len(left)!=Array.Len(right){return false;}mut i64 index=0;while index<Array.Len(left){if left[index]!=right[index]{return false;}index=index+1;}return true;}
+u8[] Zero(){u8[] value=Array.Empty<u8>();mut i64 index=0;while index<32{Array.Append(value,0_u8);index=index+1;}return value;}
+Result<Envelope,SessionError> Exchange(Session session, Envelope envelope, Deadline deadline) {
+    return match Envelope.Encode(envelope) {
+        Result::Error(error) => Result::Error(SessionError::Protocol),
+        Result::Ok(frame) => ExchangeFrame(session, frame, deadline),
+    };
+}
+
+Result<Envelope,SessionError> ExchangeFrame(Session session, u8[] frame, Deadline deadline) {
+    match Pump.WriteFrame(session.child.StdinUntil(deadline), session.child.StderrUntil(deadline), frame, deadline) {
+        Result::Ok(value) => { },
+        Result::Error(error) => { return Result::Error(SessionError::Transport); },
+    };
+    return match Pump.ReadFrame(session.child.StdoutUntil(deadline), session.child.StderrUntil(deadline), deadline) {
+        Result::Error(error) => Result::Error(SessionError::Transport),
+        Result::Ok(response) => ExchangeResponse(session, response),
+    };
+}
+
+Result<Envelope,SessionError> ExchangeResponse(Session session, u8[] response) {
+    return match Envelope.Decode(response) {
+        Result::Error(error) => Result::Error(SessionError::Protocol),
+        Result::Ok(decoded) => ExchangeDecoded(session, decoded),
+    };
+}
+
+Result<Envelope,SessionError> ExchangeDecoded(Session session, Envelope decoded) {
+    if decoded.library != session.library || decoded.generation != session.generation { return Result::Error(SessionError::Protocol); }
+    return Result::Ok(decoded);
+}
+
+unit Invalidate(Session session) {
+    session.phase = 3_u8;
+    match session.child.Close() {
+        Result::Ok(value) => { session.cleanupStatus = Result::Ok(()); },
+        Result::Error(error) => { session.cleanupStatus = Result::Error(SessionError::Cleanup); },
+    };
+}
+
+pub Result<Session,SessionError> Open(ProcessStartInfo info, string library, u64 generation, DataValue compatibility, Deadline deadline) {
+    if generation == 0_u64 || library == "" { return Result::Error(SessionError::Protocol); }
+    return match BinaryCodec.Encode(compatibility) {
+        Result::Error(error) => Result::Error(SessionError::Protocol),
+        Result::Ok(payload) => OpenEncoded(info, library, generation, payload, deadline),
+    };
+}
+
+Result<Session,SessionError> OpenEncoded(ProcessStartInfo info, string library, u64 generation, u8[] payload, Deadline deadline) {
+    Envelope request = Envelope { kind: 0_u8, generation: generation, request: 0_u64, library: library, binding: Zero(), shapes: Array.Empty<u8>(), payload: payload };
+    if !Envelope.Valid(request) { return Result::Error(SessionError::Protocol); }
+    return match Process.SpawnUntil(info, deadline) {
+        Result::Error(error) => Result::Error(SessionError::Transport),
+        Result::Ok(child) => OpenSpawned(child, library, generation, request, payload, deadline),
+    };
+}
+
+Result<Session,SessionError> OpenSpawned(ChildProcess child, string library, u64 generation, Envelope request, u8[] payload, Deadline deadline) {
+    Session session = Session { child: child, library: library, generation: generation, nextRequest: 1_u64, phase: 0_u8, cleanupStatus: Result::Error(SessionError::Closed) };
+    Result<Envelope,SessionError> exchanged = Exchange(session, request, deadline);
+    return match exchanged {
+        Result::Error(error) => OpenFailed(session, error),
+        Result::Ok(response) => OpenAcknowledged(session, response, payload),
+    };
+}
+
+Result<Session,SessionError> OpenFailed(Session session, SessionError error) {
+    Invalidate(session);
+    return Result::Error(error);
+}
+
+Result<Session,SessionError> OpenAcknowledged(Session session, Envelope response, u8[] payload) {
+    if response.kind != 6_u8 || response.request != 0_u64 || !Same(response.binding, Zero()) || Array.Len(response.shapes) != 0 || !Same(response.payload, payload) {
+        return OpenFailed(session, SessionError::Protocol);
+    }
+    session.phase = 1_u8;
+    return Result::Ok(session);
+}
+
+/// Public asynchronous calls enqueue into the existing bounded channel. The
+/// single bridge fiber owns pipes, request numbering, pending delivery and
+/// serialized wire publication. Ticket cancellation is a flag observed by that
+/// owner even when a cancelled caller cannot commit a channel send.
+pub type BindingSpec { pub u8[] identity, pub u8[] shapes, }
+pub type RequestTicket {
+    u64 request,
+    u8[] binding,
+    u8[] shapes,
+    Channel<Result<DataValue,SessionError>> completion,
+    Deadline deadline,
+    bool cancelled,
+    bool settled,
+
+    pub unit Cancel() {
+        this.cancelled = true;
+        return;
+    }
+
+    pub Result<DataValue,SessionError> Await() {
+        Result<Result<DataValue,SessionError>,ChannelError> received = Channel.Receive(this.completion);
+        return match received {
+            Result::Ok(value) => value,
+            Result::Error(error) => AwaitCancelled(this),
+        };
+    }
+}
+
+Result<DataValue,SessionError> AwaitCancelled(RequestTicket ticket) {
+    ticket.cancelled = true;
+    return Result::Error(SessionError::Cancelled);
+}
+
+type QueuedFrame { u8[] bytes, }
+type BeginRequest { i64 bindingIndex, DataValue arguments, Deadline deadline, Channel<Result<RequestTicket,SessionError>> issued, }
+type AsyncControl { bool closing, Deadline closeDeadline, bool finished, bool joinClaimed, Result<unit,SessionError> closeResult, }
+pub type AsyncSession {
+    Channel<BeginRequest> requests,
+    AsyncControl control,
+    Fiber<unit> worker,
+
+    pub Result<RequestTicket,SessionError> Begin(i64 bindingIndex, DataValue arguments, Deadline deadline) {
+        if this.control.closing { return Result::Error(SessionError::Closed); }
+        Channel<Result<RequestTicket,SessionError>> issued = Channel.CreateWithOptions<Result<RequestTicket,SessionError>>(ChannelOptions.Bounded(1));
+        match Channel.Send(this.requests, BeginRequest { bindingIndex: bindingIndex, arguments: arguments, deadline: deadline, issued: issued }) {
+            Result::Ok(value) => { },
+            Result::Error(error) => { return Result::Error(SessionError::Cancelled); },
+        };
+        while true {
+            if this.control.closing { Channel.Close(issued); return Result::Error(SessionError::Closed); }
+            match Channel.TryReceive(issued) {
+                TryResult::Ok(value) => { return value; },
+                TryResult::Err(error) => { Channel.Close(issued); return Result::Error(SessionError::Cancelled); },
+                TryResult::WouldBlock => { },
+            };
+            match Deadline.After(Time.FromMilliseconds(1)) {
+                Result::Error(error) => { Channel.Close(issued); return Result::Error(SessionError::Transport); },
+                Result::Ok(pause) => {
+                    match Process.WaitReady(pause) {
+                        Result::Ok(value) => { },
+                        Result::Error(error) => {
+                            match error {
+                                ProcessError::TimedOut => { },
+                                _ => { Channel.Close(issued); return Result::Error(SessionError::Cancelled); },
+                            };
+                        },
+                    };
+                },
+            };
+        }
+        return Result::Error(SessionError::Closed);
+    }
+
+    pub Result<unit,SessionError> Close(Deadline deadline) {
+        if !this.control.closing {
+            match Deadline.After(Time.FromMilliseconds(5000)) {
+                Result::Error(error) => { return Result::Error(SessionError::Transport); },
+                Result::Ok(cap) => {
+                    this.control.closeDeadline = Deadline.Earlier(deadline, cap);
+                    this.control.closing = true;
+                },
+            };
+        }
+        while !this.control.finished {
+            match Deadline.IsExpired(deadline) {
+                Result::Error(error) => { return Result::Error(SessionError::Transport); },
+                Result::Ok(expired) => { if expired { return Result::Error(SessionError::TimedOut); } },
+            };
+            match Deadline.After(Time.FromMilliseconds(1)) {
+                Result::Error(error) => { return Result::Error(SessionError::Transport); },
+                Result::Ok(pause) => {
+                    match Process.WaitReady(Deadline.Earlier(pause, deadline)) {
+                        Result::Ok(value) => { },
+                        Result::Error(error) => {
+                            match error {
+                                ProcessError::TimedOut => { },
+                                _ => { return Result::Error(SessionError::Cancelled); },
+                            };
+                        },
+                    };
+                },
+            };
+        }
+        // Cleanup result is retained; repeated close does not consume a channel
+        // twice or join the same fiber twice. Owner cleanup precedes publication.
+        if !this.control.joinClaimed {
+            this.control.joinClaimed = true;
+            this.worker.Join();
+        }
+        return this.control.closeResult;
+    }
+}
+unit Settle(RequestTicket ticket,Result<DataValue,SessionError> result){
+    if ticket.settled{return;}ticket.settled=true;Channel.TrySend(ticket.completion,result);Channel.Close(ticket.completion);
+}
+RequestTicket[] Remove(RequestTicket[] tickets,i64 index){i64 last=Array.Len(tickets)-1;if index!=last{tickets[index]=tickets[last];}return Array.RemoveLast(tickets);}
+QueuedFrame[] PopFrame(QueuedFrame[] frames){mut i64 index=1;while index<Array.Len(frames){frames[index-1]=frames[index];index=index+1;}return Array.RemoveLast(frames);}
+Result<u8[],SessionError> EncodeRequest(Session session, u64 request, u8[] binding, u8[] shapes, DataValue value) {
+    return match BinaryCodec.Encode(value) {
+        Result::Error(error) => Result::Error(SessionError::Protocol),
+        Result::Ok(payload) => EncodeEnvelope(session, request, binding, shapes, payload),
+    };
+}
+Result<u8[],SessionError> EncodeEnvelope(Session session, u64 request, u8[] binding, u8[] shapes, u8[] payload) {
+    Envelope message = Envelope { kind: 1_u8, generation: session.generation, request: request, library: session.library, binding: binding, shapes: shapes, payload: payload };
+    return match Envelope.Encode(message) {
+        Result::Ok(bytes) => Result::Ok(bytes),
+        Result::Error(error) => Result::Error(SessionError::Protocol),
+    };
+}
+Result<u8[],SessionError> EncodeCancel(Session session,RequestTicket ticket){
+    Envelope control=Envelope{kind:4_u8,generation:session.generation,request:ticket.request,library:session.library,binding:ticket.binding,shapes:ticket.shapes,payload:Array.Empty<u8>()};
+    return match Envelope.Encode(control){Result::Ok(bytes)=>Result::Ok(bytes),Result::Error(error)=>Result::Error(SessionError::Protocol),};
+}
+unit BridgeLoop(Session session,BindingSpec[] bindings,Channel<BeginRequest> commands,AsyncControl control){
+    mut RequestTicket[] pending=Array.Empty<RequestTicket>();mut QueuedFrame[] outgoing=Array.Empty<QueuedFrame>();mut i64 queuedBytes=0;
+    FrameReader reader=Pump.NewFrameReader();FrameWriter writer=Pump.NewFrameWriter();mut bool failed=false;
+    while !failed&&!control.closing {
+        mut i64 batch=0;
+        while batch<256&&!failed {
+            TryResult<BeginRequest,ChannelError> next=Channel.TryReceive(commands);
+            match next {
+                TryResult::WouldBlock=>{break;},
+                TryResult::Err(error)=>{failed=true;},
+                TryResult::Ok(command)=>{
+                    if command.bindingIndex<0||command.bindingIndex>=Array.Len(bindings){Channel.TrySend(command.issued,Result::Error(SessionError::Protocol));Channel.Close(command.issued);}
+                    else if Array.Len(pending)>=256{Channel.TrySend(command.issued,Result::Error(SessionError::Busy));Channel.Close(command.issued);}
+                    else if session.nextRequest==18446744073709551615_u64{failed=true;Channel.TrySend(command.issued,Result::Error(SessionError::Exhausted));Channel.Close(command.issued);}
+                    else {
+                        BindingSpec binding=bindings[command.bindingIndex];u64 id=session.nextRequest;session.nextRequest=session.nextRequest+1_u64;
+                        Result<u8[],SessionError> encoded=EncodeRequest(session,id,binding.identity,binding.shapes,command.arguments);
+                        match encoded {
+                            Result::Error(error)=>{Channel.TrySend(command.issued,Result::Error(error));Channel.Close(command.issued);},
+                            Result::Ok(frame)=>{
+                                if Array.Len(frame)>16777220-queuedBytes{Channel.TrySend(command.issued,Result::Error(SessionError::Busy));Channel.Close(command.issued);}
+                                else {
+                                    RequestTicket ticket=RequestTicket{request:id,binding:binding.identity,shapes:binding.shapes,completion:Channel.CreateWithOptions<Result<DataValue,SessionError>>(ChannelOptions.Bounded(1)),deadline:command.deadline,cancelled:false,settled:false};
+                                    TryResult<SendOk,ChannelError> delivered=Channel.TrySend(command.issued,Result::Ok(ticket));Channel.Close(command.issued);
+                                    match delivered {TryResult::Ok(value)=>{Array.Append(pending,ticket);Array.Append(outgoing,QueuedFrame{bytes:frame});queuedBytes=queuedBytes+Array.Len(frame);},_=>{Settle(ticket,Result::Error(SessionError::Cancelled));},};
+                                }
+                            },
+                        };
+                    }
+                },
+            };batch=batch+1;
+        }
+        mut i64 index=0;
+        while index<Array.Len(pending)&&!failed {
+            RequestTicket ticket=pending[index];mut bool expired=false;match Deadline.IsExpired(ticket.deadline){Result::Ok(value)=>{expired=value;},Result::Error(error)=>{failed=true;},};
+            if failed{break;}
+            if ticket.cancelled||expired {
+                pending=Remove(pending,index);
+                if expired{Settle(ticket,Result::Error(SessionError::TimedOut));}else{Settle(ticket,Result::Error(SessionError::Cancelled));}
+                // Delivery ownership is consumed before cancellation is published.
+                mut u8[] cancel=Array.Empty<u8>();match EncodeCancel(session,ticket){Result::Ok(bytes)=>{cancel=bytes;},Result::Error(error)=>{failed=true;},};
+                if failed{break;}
+                if Array.Len(cancel)>16777220-queuedBytes{failed=true;}else{Array.Append(outgoing,QueuedFrame{bytes:cancel});queuedBytes=queuedBytes+Array.Len(cancel);}
+            }else{index=index+1;}
+        }
+        if failed{break;}
+        if writer.IsIdle()&&Array.Len(outgoing)>0 {
+            match writer.Enqueue(outgoing[0].bytes){Result::Ok(value)=>{},Result::Error(error)=>{failed=true;},};
+            outgoing=PopFrame(outgoing);
+        }
+        match writer.Poll(session.child.Stdin(),session.child.Stderr()){Result::Ok(done)=>{if done&&writer.IsIdle(){queuedBytes=0;mut i64 i=0;while i<Array.Len(outgoing){queuedBytes=queuedBytes+Array.Len(outgoing[i].bytes);i=i+1;}}},Result::Error(error)=>{failed=true;},};
+        match reader.Poll(session.child.Stdout(),session.child.Stderr()) {
+            Result::Error(error)=>{failed=true;},
+            Result::Ok(ready)=>{match ready {
+                Option::None=>{},
+                Option::Some(frame)=>{
+                    match Envelope.Decode(frame){Result::Error(error)=>{failed=true;},Result::Ok(response)=>{
+                    if response.library!=session.library||response.generation!=session.generation||(response.kind!=2_u8&&response.kind!=3_u8)||response.request==0_u64||response.request>=session.nextRequest{failed=true;}
+                    else {
+                        mut i64 found=-1;mut i64 i=0;while i<Array.Len(pending){if pending[i].request==response.request{found=i;}i=i+1;}
+                        if found>=0 {
+                            RequestTicket ticket=pending[found];pending=Remove(pending,found);
+                            if !Same(ticket.binding,response.binding)||!Same(ticket.shapes,response.shapes){Settle(ticket,Result::Error(SessionError::Protocol));failed=true;}
+                            else {
+                                Result<DataValue,CodecError> value=BinaryCodec.Decode(response.payload);
+                                match value{Result::Error(error)=>{Settle(ticket,Result::Error(SessionError::Protocol));failed=true;},Result::Ok(decoded)=>{if response.kind==3_u8{Settle(ticket,Result::Error(SessionError::Remote(decoded)));}else{Settle(ticket,Result::Ok(decoded));}},};
+                            }
+                        }
+                        // An already-issued settled response is late; no waiter
+                        // is allocated or resurrected for it.
+                    }
+                    },};
+                },
+            };},
+        };
+        if !failed&&!control.closing {
+            match Deadline.After(Time.FromMilliseconds(1)){
+                Result::Error(error)=>{failed=true;},
+                Result::Ok(pause)=>{match Process.WaitReady(pause){Result::Ok(value)=>{},Result::Error(error)=>{match error{ProcessError::TimedOut=>{},_=>{failed=true;},};},};},
+            };
+        }
+    }
+    mut i64 index=0;while index<Array.Len(pending){Settle(pending[index],Result::Error(SessionError::Closed));index=index+1;}
+    Channel.Close(commands);session.phase=1_u8;
+    mut Result<unit,SessionError> closed=Result::Error(SessionError::Transport);
+    if failed{Invalidate(session);match session.cleanupStatus{Result::Ok(value)=>{},Result::Error(error)=>{closed=Result::Error(error);},};}else{closed=session.Close(control.closeDeadline);}
+    control.closing=true;control.closeResult=closed;control.finished=true;
+}
+pub Result<AsyncSession,SessionError> OpenAsync(ProcessStartInfo info, string library, u64 generation, DataValue compatibility, BindingSpec[] bindings, Deadline deadline) {
+    if Array.Len(bindings) > 4096 { return Result::Error(SessionError::Protocol); }
+    mut i64 index = 0;
+    mut i64 bytes = 0;
+    mut BindingSpec[] copied = Array.Empty<BindingSpec>();
+    while index < Array.Len(bindings) {
+        BindingSpec binding = bindings[index];
+        if Array.Len(binding.identity) != 32 || Array.Len(binding.shapes) % 32 != 0 || Array.Len(binding.shapes) > 8192 || Same(binding.identity, Zero()) { return Result::Error(SessionError::Protocol); }
+        bytes = bytes + 32 + Array.Len(binding.shapes);
+        if bytes > 16777216 { return Result::Error(SessionError::Busy); }
+        mut i64 previous = 0;
+        while previous < index {
+            if Same(copied[previous].identity, binding.identity) { return Result::Error(SessionError::Protocol); }
+            previous = previous + 1;
+        }
+        Array.Append(copied, BindingSpec { identity: CopyBytes(binding.identity), shapes: CopyBytes(binding.shapes) });
+        index = index + 1;
+    }
+    Result<Session,SessionError> opened = Open(info, library, generation, compatibility, deadline);
+    return match opened {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(session) => StartAsync(session, copied, deadline),
+    };
+}
+
+Result<AsyncSession,SessionError> StartAsync(Session session, BindingSpec[] copied, Deadline deadline) {
+    Channel<BeginRequest> commands = Channel.CreateWithOptions<BeginRequest>(ChannelOptions.Bounded(256));
+    AsyncControl control = AsyncControl { closing: false, closeDeadline: deadline, finished: false, joinClaimed: false, closeResult: Result::Error(SessionError::Cleanup) };
+    Fiber<unit> worker = spawn BridgeLoop(session, copied, commands, control);
+    return Result::Ok(AsyncSession { requests: commands, control: control, worker: worker });
+}
+
+u8[] CopyBytes(u8[] bytes){u8[] copied=Array.Empty<u8>();mut i64 index=0;while index<Array.Len(bytes){Array.Append(copied,bytes[index]);index=index+1;}return copied;}

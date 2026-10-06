@@ -1,0 +1,99 @@
+use Core.Collections.Array;
+
+use Core.Results;
+
+use Core.Serialization.FloatDecimal;
+
+use Core.Serialization.Limits;
+
+use Testing.Assert;
+
+unit Roundtrip(u64 bits, u8 width)
+{
+    match FloatDecimal.Format(bits, width, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("finite bits format natively"),
+
+        Result::Ok(text) => {
+            match FloatDecimal.Parse(text, width, Limits.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("formatted decimal parses"),
+
+                Result::Ok(actual) => Assert.Equal(actual, bits, "exact bit roundtrip at declared width"),
+            };
+        },
+    };
+}
+
+test serialization_float_f64_normal_subnormal_boundary_roundtrips
+{
+    u64[] values = [0_u64, 0x8000000000000000_u64, 1_u64, 0x000fffffffffffff_u64, 0x0010000000000000_u64, 0x3ff0000000000000_u64, 0x3ff0000000000001_u64, 0x3fb999999999999a_u64, 0x7fefffffffffffff_u64, 0x8010000000000000_u64];
+
+    mut i64 index = 0_i64;
+
+    while (index < Array.Len<u64>(values))
+    {
+        Roundtrip(values[index], 64_u8);
+        index = index + 1_i64;
+    }
+}
+
+test serialization_float_f32_direct_width_roundtrips
+{
+    u64[] values = [0_u64, 0x80000000_u64, 1_u64, 0x007fffff_u64, 0x00800000_u64, 0x3f800000_u64, 0x3f800001_u64, 0x3dcccccd_u64, 0x7f7fffff_u64];
+
+    mut i64 index = 0_i64;
+
+    while (index < Array.Len<u64>(values))
+    {
+        Roundtrip(values[index], 32_u8);
+        index = index + 1_i64;
+    }
+}
+
+test serialization_float_decimal_direct_f32_avoids_double_rounding
+{
+    match FloatDecimal.Parse("1.0000000596046448", 32_u8, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("finite decimal admitted"),
+
+        Result::Ok(bits) => Assert.Equal(bits, 0x3f800001_u64, "direct round above f32 midpoint"),
+    };
+
+    match FloatDecimal.Parse("1.000000059604644775390625", 32_u8, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("exact halfway admitted"),
+
+        Result::Ok(bits) => Assert.Equal(bits, 0x3f800000_u64, "halfway rounds to even"),
+    };
+}
+
+test serialization_float_nonfinite_invalid_width_and_input_limits_reject
+{
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7ff0000000000000_u64, 64_u8, Limits.DefaultLimits())), "infinity rejects");
+
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7ff8000000000001_u64, 64_u8, Limits.DefaultLimits())), "NaN rejects, no normalization");
+
+    Assert.True(Results.IsError(FloatDecimal.Format(0x100000000_u64, 32_u8, Limits.DefaultLimits())), "bits exceed declared f32 storage");
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("1e309", 64_u8, Limits.DefaultLimits())), "overflow rejects");
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("NaN", 64_u8, Limits.DefaultLimits())), "special spelling rejects");
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("1.0x", 64_u8, Limits.DefaultLimits())), "trailing garbage rejects");
+
+    mut SerializationLimits limits = Limits.DefaultLimits();
+
+    limits.maxScalarBytes = 2_i64;
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("1.0", 64_u8, limits)), "scalar byte limit checked first");
+}
+
+test serialization_float_shortest_search_checks_asymmetric_rounding_interval {
+    // 2^-1017: the nearest 16-digit decimal is outside the narrower lower
+    // rounding boundary, while the adjacent upper candidate roundtrips.
+    match FloatDecimal.Format(27021597764222976_u64, 64_u8, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("finite power-of-two conversion"),
+        Result::Ok(text) => Assert.Equal(text, "7120236347223045e-322", "16 significant digits rather than unnecessary 17"),
+    };
+}

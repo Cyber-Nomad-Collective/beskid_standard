@@ -1,0 +1,213 @@
+use Core.Bsol.Parser;
+
+use Core.Output;
+
+use Core.Bsol.Schema;
+
+use Core.Bsol.Limits;
+
+use Core.Collections.Array;
+
+use Core.Results;
+
+use Testing.Assert;
+
+string FixtureProfile()
+{
+    return "profile \"fixture.v2\" {
+  version = 2
+  rule \"config\" {
+    scope = top
+    match = keyword
+    keyword = config
+    label = forbidden
+    cardinality = one
+    extras = false
+    field \"name\" { type = quoted required = true }
+    field \"count\" { type = u32 required = false }
+    field \"enabled\" { type = bool required = false }
+  }
+}";
+}
+
+Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ValidateFixture(string source)
+{
+    match Schema.ParseProfile(FixtureProfile(), Limits.DefaultLimits())
+    {
+        Result::Error(_) => {
+            Assert.Fail("valid declared profile compiles natively");
+            return Result::Error(Array.Empty<Schema.Diagnostic>());
+        },
+
+        Result::Ok(profile) => match Parser.Parse(source, Limits.DefaultLimits())
+        {
+            Result::Error(_) => {
+                Assert.Fail("validation fixture is syntactically valid");
+                return Result::Error(Array.Empty<Schema.Diagnostic>());
+            },
+
+            Result::Ok(document) => {
+                Output.WriteLine("schema diagnostic source " + source);
+                mut i64 ruleIndex = 0_i64;
+                while (ruleIndex < Array.Len<Schema.Rule>(profile.rules))
+                {
+                    Schema.Rule rule = profile.rules[ruleIndex];
+                    Output.WriteLine("schema rule " + rule.name + " fields " + Array.Len<Schema.Field>(rule.fields));
+                    mut i64 fieldIndex = 0_i64;
+                    while (fieldIndex < Array.Len<Schema.Field>(rule.fields))
+                    {
+                        Schema.Field field = rule.fields[fieldIndex];
+                        Output.WriteLine("schema field " + field.name + " type " + field.typeIndex + " default " + field.defaultNode);
+                        if (field.required)
+                        {
+                            Output.WriteLine("schema field required true");
+                        }
+                        else
+                        {
+                            Output.WriteLine("schema field required false");
+                        }
+                        fieldIndex = fieldIndex + 1_i64;
+                    }
+                    ruleIndex = ruleIndex + 1_i64;
+                }
+                match Schema.Validate(document, profile, Limits.DefaultLimits())
+                {
+                    Result::Ok(validated) => {
+                        Output.WriteLine("schema validation OK");
+                        return Result::Ok(validated);
+                    },
+
+                    Result::Error(diagnostics) => {
+                        Output.WriteLine("schema diagnostics " + Array.Len<Schema.Diagnostic>(diagnostics));
+                        mut i64 diagnosticIndex = 0_i64;
+                        while (diagnosticIndex < Array.Len<Schema.Diagnostic>(diagnostics))
+                        {
+                            Schema.Diagnostic diagnostic = diagnostics[diagnosticIndex];
+                            Output.WriteLine("schema error " + diagnostic.code + " field " + diagnostic.field + " rule " + diagnostic.rule);
+                            diagnosticIndex = diagnosticIndex + 1_i64;
+                        }
+                        return Result::Error(diagnostics);
+                    },
+                };
+            },
+        },
+    };
+}
+
+unit RequireDiagnostic(string source, string code, string field)
+{
+    match ValidateFixture(source)
+    {
+        Result::Ok(_) => Assert.Fail("invalid profile input must reject"),
+
+        Result::Error(diagnostics) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(diagnostics))
+            {
+                Schema.Diagnostic diagnostic = diagnostics[i];
+                if (diagnostic.code == code && diagnostic.field == field)
+                {
+                    found = true;
+                    Assert.True(match diagnostic.stage
+                    {
+                        Schema.DiagnosticStage::Validation => true,
+
+                        _ => false,
+                    }, "profile violation owns validation stage");
+                    Assert.Equal(diagnostic.profile, "fixture.v2", "profile identity retained on diagnostic");
+                    Assert.True(diagnostic.span.start >= 0_i64 && diagnostic.span.end >= diagnostic.span.start, "ordered source byte span");
+                    if (code == "DuplicateField")
+                    {
+                        Assert.True(diagnostic.hasRelated, "duplicate exposes previous definition span");
+                        Assert.True(diagnostic.relatedSpan.start < diagnostic.span.start, "both duplicate assignment spans ordered");
+                    }
+                    if (code == "TypeMismatch" || code == "UnknownField")
+                    {
+                        Assert.True(diagnostic.span.end > diagnostic.span.start, "offending existing syntax has nonempty source span");
+                    }
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "required stable diagnostic code and field found");
+        },
+    };
+}
+
+test bsol_native_profile_v1_and_v2_declared_rule_load
+{
+    match Schema.ParseProfile(FixtureProfile(), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("v2 fixture profile loads"),
+
+        Result::Ok(profile) => {
+            Assert.Equal(profile.name, "fixture.v2", "declared profile name");
+            Assert.Equal(profile.version, 2_i64, "declared v2 version");
+        },
+    };
+
+    string v1 = "profile \"fixture.v1\" { version = 1 rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one field \"name\" { type = quoted required = true } } }";
+
+    match Schema.ParseProfile(v1, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("v1 fixture profile loads using real rule grammar"),
+
+        Result::Ok(profile) => Assert.Equal(profile.version, 1_i64, "v1 identity stays explicit"),
+    };
+}
+
+test bsol_native_schema_valid_primitives_return_checked_document
+{
+    match ValidateFixture("config { name = \"native\" count = 4294967295 enabled = true }")
+    {
+        Result::Error(_) => Assert.Fail("declared quoted u32 and bool validate"),
+
+        Result::Ok(validated) => Assert.Equal(validated.profile, "fixture.v2", "checked result retains profile identity"),
+    };
+}
+
+test bsol_native_schema_missing_required_field
+{
+    RequireDiagnostic("config { count = 1 }", "MissingField", "name");
+}
+
+test bsol_native_schema_duplicate_field_keeps_both_spans
+{
+    RequireDiagnostic("config { name = \"first\" name = \"second\" }", "DuplicateField", "name");
+}
+
+test bsol_native_schema_unknown_field_rejects_without_extras
+{
+    RequireDiagnostic("config { name = \"ok\" unexpected = true }", "UnknownField", "unexpected");
+}
+
+test bsol_native_schema_wrong_primitive_kind_and_integer_range
+{
+    RequireDiagnostic("config { name = native }", "TypeMismatch", "name");
+
+    RequireDiagnostic("config { name = \"ok\" count = -1 }", "TypeMismatch", "count");
+
+    RequireDiagnostic("config { name = \"ok\" count = 4294967296 }", "TypeMismatch", "count");
+
+    RequireDiagnostic("config { name = \"ok\" enabled = \"true\" }", "TypeMismatch", "enabled");
+}
+
+test bsol_native_schema_invalid_profile_fails_at_profile_boundary
+{
+    string invalid = "profile \"broken.v2\" { version = 2 rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one field \"name\" { type = made_up_type required = true } } }";
+
+    match Schema.ParseProfile(invalid, Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("unknown declared field type rejects profile"),
+
+        Result::Error(diagnostics) => {
+            Assert.True(Array.Len<Schema.Diagnostic>(diagnostics) > 0_i64, "profile diagnostic returned");
+            Assert.True(match diagnostics[0].stage
+            {
+                Schema.DiagnosticStage::Profile => true,
+
+                _ => false,
+            }, "invalid schema owns profile stage");
+        },
+    };
+}

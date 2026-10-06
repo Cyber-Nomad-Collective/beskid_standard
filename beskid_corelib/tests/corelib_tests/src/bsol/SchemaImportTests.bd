@@ -1,0 +1,77 @@
+use Core.Bsol.Imports;
+
+use Core.Bsol.Schema;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Limits;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Testing.Assert;
+
+/// Deterministic host contract control; proves no production filesystem or lock authority.
+type FixtureResolver : Imports.Resolver
+{
+    bool missing,
+
+    bool corrupt,
+
+    i64 calls,
+}
+
+unit RejectImport(bool missing, bool corrupt, string code)
+{
+    string source = "profile \"local.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"schemas/base.bsol\" alias = base } }";
+    match Parser.Parse(source, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("import request syntax valid"),
+
+        Result::Ok(document) => {
+            mut FixtureResolver resolver = FixtureResolver
+            {
+                missing: missing,
+
+                corrupt: corrupt,
+
+                calls: 0_i64,
+            };
+            match Schema.LoadProfile<FixtureResolver>(document, resolver, Limits.DefaultLimits())
+            {
+                Result::Ok(_) => Assert.Fail("invalid host materialization rejected"),
+
+                Result::Error(errors) => {
+                    mut bool found = false;
+                    mut i64 i = 0_i64;
+                    while (i < Array.Len<Schema.Diagnostic>(errors))
+                    {
+                        Schema.Diagnostic error = errors[i];
+                        if (error.code == code)
+                        {
+                            found = true;
+                            Assert.True(error.span.end > error.span.start, "failure points to import declaration");
+                            Assert.Equal(error.profile, "local.v2", "import failure retains profile identity");
+                        }
+                        i = i + 1_i64;
+                    }
+                    Assert.True(found, "exact import materialization diagnostic");
+                },
+            };
+            Assert.Equal(resolver.calls, 1_i64, "one explicit host resolution, no hidden fetch");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_import_missing_materialized_cache_is_source_spanned
+{
+    RejectImport(true, false, "MissingCache");
+}
+
+/// @native-only
+test bsol_schema_import_source_digest_mismatch_rejects
+{
+    RejectImport(false, true, "ImportDigestMismatch");
+}

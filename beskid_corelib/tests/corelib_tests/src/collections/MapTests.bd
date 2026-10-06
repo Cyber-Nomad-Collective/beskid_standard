@@ -1,5 +1,7 @@
 /// Public API coverage for `Core.Collections.Map`.
+use Core.Collections.Array;
 use Core.Collections.Map;
+use Core.String;
 use Testing.Assert;
 
 
@@ -34,4 +36,62 @@ test map_remove_preserves_remaining_entries {
     Assert.True(values.ContainsKey(1), "remove preserves earlier entry");
     Assert.True(values.ContainsKey(3), "remove preserves later entry");
     Assert.False(values.ContainsKey(2), "removed key is absent");
+}
+
+test map_keys_of_empty_map_is_empty {
+    Map<string, i64> values = Map.New<string, i64>();
+    string[] keys = values.Keys();
+    Assert.Equal(Array.Len<string>(keys), 0, "empty map has no keys");
+    Assert.Equal(Array.Len<string>(String.SortOrdinal(keys)), 0, "sorting no keys yields no keys");
+}
+
+test map_keys_follow_entry_order_after_update_and_remove {
+    mut Map<string, i64> values = Map.New<string, i64>();
+    values = values.Insert("b", 1);
+    values = values.Insert("a", 2);
+    values = values.Insert("c", 3);
+    values = values.Insert("b", 4);
+    values = values.Remove("a");
+    string[] keys = values.Keys();
+    Assert.Equal(Array.Len<string>(keys), 2, "keys match count after update and remove");
+    Assert.Equal(Array.Get<string>(keys, 0), "b", "update keeps the entry position");
+    Assert.Equal(Array.Get<string>(keys, 1), "c", "remove shifts later entries");
+}
+
+test map_keys_sort_in_ordinal_utf8_order {
+    mut Map<string, i64> values = Map.New<string, i64>();
+    values = values.Insert("é", 1);
+    values = values.Insert("abc", 2);
+    values = values.Insert("Z", 3);
+    values = values.Insert("ab", 4);
+    values = values.Insert("z", 5);
+    values = values.Insert("", 6);
+    string[] keys = values.Keys();
+    string[] sorted = String.SortOrdinal(keys);
+    Assert.Equal(Array.Len<string>(sorted), 6, "sorting keeps every key");
+    Assert.Equal(Array.Get<string>(sorted, 0), "", "empty string orders first");
+    Assert.Equal(Array.Get<string>(sorted, 1), "Z", "uppercase ASCII orders before lowercase");
+    Assert.Equal(Array.Get<string>(sorted, 2), "ab", "a proper prefix orders first");
+    Assert.Equal(Array.Get<string>(sorted, 3), "abc", "the longer string follows its prefix");
+    Assert.Equal(Array.Get<string>(sorted, 4), "z", "ASCII orders before multi-byte UTF-8");
+    Assert.Equal(Array.Get<string>(sorted, 5), "é", "U+00E9 (C3 A9) orders after z (7A)");
+    Assert.Equal(Array.Get<string>(keys, 0), "é", "sorting does not modify the input array");
+    Assert.Equal(String.CompareOrdinal("ab", "ab"), 0, "equal strings compare equal");
+    Assert.Equal(String.CompareOrdinal("ab", "abc"), -1, "prefix compares lower");
+    Assert.Equal(String.CompareOrdinal("b", "abc"), 1, "first differing byte decides");
+}
+
+test map_keys_snapshot_is_independent_of_later_mutation {
+    mut Map<string, i64> values = Map.New<string, i64>();
+    values = values.Insert("first", 1);
+    values = values.Insert("second", 2);
+    string[] keys = values.Keys();
+    values = values.Remove("first");
+    values = values.Insert("third", 3);
+    values = values.Insert("second", 20);
+    Assert.CollectGarbage();
+    Assert.Equal(Array.Len<string>(keys), 2, "later insert and remove do not resize the snapshot");
+    Assert.Equal(Array.Get<string>(keys, 0), "first", "removed key stays in the snapshot");
+    Assert.Equal(Array.Get<string>(keys, 1), "second", "snapshot keeps its order");
+    Assert.Equal(Array.Len<string>(values.Keys()), 2, "a new snapshot reflects the mutation");
 }

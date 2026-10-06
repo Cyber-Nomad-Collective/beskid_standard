@@ -1,0 +1,208 @@
+/// Shared native/Rust constraint cases. Runner supplies the common corpus root.
+use Core.Bsol.Schema;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Limits;
+
+use Core.Environment;
+
+use Core.FS;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Testing.Assert;
+
+string ReadCase(string name)
+{
+    match Environment.Get("BESKID_BSOL_CORPUS")
+    {
+        Result::Error(_) => {
+            Assert.Fail("shared corpus root required");
+            return "";
+        },
+
+        Result::Ok(directory) => match FS.ReadAllText(directory + "/cases/schema-constraints/" + name + ".bsol")
+        {
+            Result::Error(_) => {
+                Assert.Fail("shared constraint case must be readable");
+                return "";
+            },
+
+            Result::Ok(source) => {
+                return source;
+            },
+        },
+    };
+}
+
+Result<Schema.ValidatedDocument, Schema.Diagnostic[]> CheckCase(string name)
+{
+    match Schema.ParseProfile(ReadCase("profile"), Limits.DefaultLimits())
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(profile) => match Parser.Parse(ReadCase(name), Limits.DefaultLimits())
+        {
+            Result::Error(_) => {
+                Assert.Fail("shared constraint input syntax valid");
+                return Result::Error(Array.Empty<Schema.Diagnostic>());
+            },
+
+            Result::Ok(document) => {
+                return Schema.Validate(document, profile, Limits.DefaultLimits());
+            },
+        },
+    };
+}
+
+unit CheckBoundValue(Schema.ValidatedDocument document, string name, string expected, bool defaulted, bool numeric)
+{
+    mut bool found = false;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Schema.FieldBinding>(document.fields))
+    {
+        Schema.FieldBinding binding = document.fields[i];
+        Schema.Field field = document.schema.rules[binding.rule].fields[binding.field];
+        if (field.name == name)
+        {
+            found = true;
+            Assert.Equal(binding.fromDefault, defaulted, "default applies only to absent fields");
+            if (numeric)
+            {
+                Assert.True(match binding.value.kind
+                {
+                    Syntax.NodeKind::Number => true,
+
+                    _ => false,
+                }, "default remains a typed number");
+                Assert.Equal(binding.value.raw, expected, "exact numeric raw value retained");
+            }
+            else
+            {
+                Assert.True(match binding.value.kind
+                {
+                    Syntax.NodeKind::String => true,
+
+                    _ => false,
+                }, "default remains a typed quoted value");
+                Assert.Equal(binding.value.text, expected, "checked string value retained");
+            }
+        }
+        i = i + 1_i64;
+    }
+    Assert.True(found, "checked declared field binding available to typed mapping");
+}
+
+unit RejectCase(string name, string code, string field)
+{
+    match CheckCase(name)
+    {
+        Result::Ok(_) => Assert.Fail("invalid constraint input rejects"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                Schema.Diagnostic error = errors[i];
+                if (error.code == code && error.field == field)
+                {
+                    found = true;
+                    Assert.True(match error.stage
+                    {
+                        Schema.DiagnosticStage::Validation => true,
+
+                        _ => false,
+                    }, "constraint rejection owns validation stage");
+                    Assert.Equal(error.profile, "constraints.v2", "active profile identity retained");
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "exact shared rejection category and field retained");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_missing_only_defaults_remain_typed
+{
+    match CheckCase("defaults")
+    {
+        Result::Error(_) => Assert.Fail("valid defaults satisfy declared required field and variant payload"),
+
+        Result::Ok(document) => {
+            CheckBoundValue(document, "count", "3", true, true);
+            CheckBoundValue(document, "name", "default-name", true, false);
+            CheckBoundValue(document, "rev", "head", true, false);
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_supplied_values_override_defaults_at_numeric_boundary
+{
+    match CheckCase("override")
+    {
+        Result::Error(_) => Assert.Fail("declared max boundary and explicit values validate"),
+
+        Result::Ok(document) => {
+            CheckBoundValue(document, "count", "5", false, true);
+            CheckBoundValue(document, "name", "explicit", false, false);
+            CheckBoundValue(document, "rev", "exact", false, false);
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_numeric_limits_reject_outside_boundaries
+{
+    RejectCase("below-min", "BelowMinimum", "count");
+
+    RejectCase("above-max", "AboveMaximum", "count");
+}
+
+/// @native-only
+test bsol_schema_actual_inline_map_conditional_constraints
+{
+    RejectCase("required-if", "RequiredIf", "url");
+
+    RejectCase("forbid-if", "ForbiddenIf", "url");
+}
+
+/// @native-only
+test bsol_schema_variants_require_payload_and_known_discriminant
+{
+    RejectCase("variant-missing", "VariantRequiredField", "path");
+
+    RejectCase("variant-unknown", "UnknownVariant", "source");
+}
+
+/// @native-only
+test bsol_schema_invalid_typed_default_rejects_profile
+{
+    match Schema.ParseProfile(ReadCase("invalid-default"), Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("default must type check before profile publication"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                if (errors[i].code == "InvalidDefault" && errors[i].field == "name")
+                {
+                    found = true;
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "invalid typed default identified at profile boundary");
+        },
+    };
+}

@@ -1,0 +1,1128 @@
+use Core.Bsol.Limits;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Schema;
+
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Writer;
+
+use Core.Collections.Array;
+
+
+use Core.Serialization.FloatDecimal;
+
+use Core.Serialization.Limits as SerializationPolicy;
+
+use Core.String;
+
+pub enum Rewrite
+{
+    AddField(string key, i64 value),
+
+    RenameField(string from, string to),
+
+    ReplaceValue(i64 from, i64 to),
+}
+
+pub type MigrationPlan
+{
+    pub string from,
+
+    pub string to,
+
+    Schema.Profile target,
+
+    i64[] blocks,
+
+    Rewrite[] rewrites,
+
+    Syntax.Document source,
+}
+
+type Work
+{
+    i64 remaining,
+
+    bool failed,
+
+    Limits.BsolLimits limits,
+}
+
+bool Step(mut Work work)
+{
+    if (work.remaining <= 0_i64)
+    {
+        work.failed = true;
+        return false;
+    }
+    work.remaining = work.remaining - 1_i64;
+    return true;
+}
+
+Schema.Diagnostic Error(string code, Syntax.Span span, string profile)
+{
+    return Schema.Diagnostic
+    {
+        code: code,
+
+        stage: Schema.DiagnosticStage::Migration,
+
+        span: span,
+
+        field: "",
+
+        rule: "",
+
+        profile: profile,
+
+        hasRelated: false,
+
+        relatedSpan: span,
+
+        message: code,
+    };
+}
+
+i64 Property(Syntax.Document document, Syntax.Node block, string name)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(block.children))
+    {
+        i64 index = block.children[i];
+        Syntax.Node child = document.nodes[index];
+        if (child.kind == Syntax.NodeKind::Assignment && child.name == name)
+        {
+            return index;
+        }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+i64 Value(Syntax.Document document, Syntax.Node block, string name)
+{
+    i64 assignment = Property(document, block, name);
+    if (assignment < 0_i64 || Array.Len<i64>(document.nodes[assignment].children) != 1_i64)
+    {
+        return -1_i64;
+    }
+    return document.nodes[assignment].children[0_i64];
+}
+
+string Text(Syntax.Document document, Syntax.Node block, string name)
+{
+    i64 value = Value(document, block, name);
+    if (value < 0_i64)
+    {
+        return "";
+    }
+    return document.nodes[value].text;
+}
+
+bool Scalar(Syntax.Node node)
+{
+    return node.kind == Syntax.NodeKind::Identifier || node.kind == Syntax.NodeKind::String || node.kind == Syntax.NodeKind::Number || node.kind == Syntax.NodeKind::Boolean;
+}
+
+bool Fractional(string raw)
+{
+    mut i64 i = 0_i64;
+    while (i < String.Len(raw))
+    {
+        u8 byte = String.ByteAt(raw, i);
+        if (byte == 46_u8 || byte == 101_u8 || byte == 69_u8)
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+string IntegerIdentity(string raw)
+{
+    mut i64 start = 0_i64;
+    mut bool negative = false;
+    if (String.Len(raw) > 0_i64 && (String.ByteAt(raw, 0_i64) == 45_u8 || String.ByteAt(raw, 0_i64) == 43_u8))
+    {
+        negative = String.ByteAt(raw, 0_i64) == 45_u8;
+        start = 1_i64;
+    }
+    while (start + 1_i64 < String.Len(raw) && String.ByteAt(raw, start) == 48_u8)
+    {
+        start = start + 1_i64;
+    }
+
+    string magnitude = String.SubSlice(raw, start, String.Len(raw) - start);
+    if (negative && magnitude != "0")
+    {
+        return "-" + magnitude;
+    }
+    return magnitude;
+}
+
+bool SameScalar(Syntax.Node a, Syntax.Node b)
+{
+    if (a.kind != b.kind || !Scalar(a))
+    {
+        return false;
+    }
+    if (a.kind != Syntax.NodeKind::Number)
+    {
+        return a.text == b.text;
+    }
+
+    bool fractional = Fractional(a.raw);
+    if (fractional != Fractional(b.raw))
+    {
+        return false;
+    }
+    if (!fractional)
+    {
+        return IntegerIdentity(a.raw) == IntegerIdentity(b.raw);
+    }
+    return match FloatDecimal.Parse(a.raw, 64_u8, SerializationPolicy.DefaultLimits())
+    {
+        Result::Error(_) => false,
+
+        Result::Ok(left) => match FloatDecimal.Parse(b.raw, 64_u8, SerializationPolicy.DefaultLimits())
+        {
+            Result::Error(_) => false,
+
+            Result::Ok(right) => left == right,
+        },
+    };
+}
+
+i64[] CopyIndices(i64[] source)
+{
+    mut i64[] result = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(source))
+    {
+        Array.Append<i64>(result, source[i]);
+        i = i + 1_i64;
+    }
+    return result;
+}
+
+Syntax.Node CopyNode(Syntax.Node node)
+{
+    return Syntax.Node
+    {
+        kind: node.kind,
+
+        span: Syntax.Span
+        {
+            start: node.span.start,
+
+            end: node.span.end,
+        },
+
+        raw: node.raw,
+
+        text: node.text,
+
+        name: node.name,
+
+        label: node.label,
+
+        hasLabel: node.hasLabel,
+
+        schemaless: node.schemaless,
+
+        children: CopyIndices(node.children),
+
+        attributes: CopyIndices(node.attributes),
+    };
+}
+
+Syntax.Document CopyDocument(Syntax.Document source)
+{
+    mut Syntax.Node[] nodes = Array.Empty<Syntax.Node>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Syntax.Node>(source.nodes))
+    {
+        Array.Append<Syntax.Node>(nodes, CopyNode(source.nodes[i]));
+        i = i + 1_i64;
+    }
+
+    mut Syntax.Trivia[] trivia = Array.Empty<Syntax.Trivia>();
+    i = 0_i64;
+    while (i < Array.Len<Syntax.Trivia>(source.trivia))
+    {
+        Syntax.Trivia item = source.trivia[i];
+        Array.Append<Syntax.Trivia>(trivia, Syntax.Trivia
+        {
+            span: item.span,
+
+            raw: item.raw,
+        });
+        i = i + 1_i64;
+    }
+    return Syntax.Document
+    {
+        source: source.source,
+
+        nodes: nodes,
+
+        roots: CopyIndices(source.roots),
+
+        trivia: trivia,
+    };
+}
+
+i64 CloneValue(Syntax.Document target, Syntax.Document source, i64 index, mut Work work, i64 depth)
+{
+    if (!Step(work) || depth > work.limits.maxDepth || index < 0_i64 || index >= Array.Len<Syntax.Node>(source.nodes) || Array.Len<Syntax.Node>(target.nodes) >= work.limits.maxNodes)
+    {
+        work.failed = true;
+        return -1_i64;
+    }
+
+    Syntax.Node original = source.nodes[index];
+    mut Syntax.Node result = CopyNode(original);
+    result.children = Array.Empty<i64>();
+    result.attributes = Array.Empty<i64>();
+    i64 next = Array.Len<Syntax.Node>(target.nodes);
+    Array.Append<Syntax.Node>(target.nodes, result);
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(original.children))
+    {
+        i64 child = CloneValue(target, source, original.children[i], work, depth + 1_i64);
+        if (child < 0_i64)
+        {
+            return -1_i64;
+        }
+        Array.Append<i64>(result.children, child);
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<i64>(original.attributes))
+    {
+        i64 attributeIndex = CloneValue(target, source, original.attributes[i], work, depth + 1_i64);
+        if (attributeIndex < 0_i64)
+        {
+            return -1_i64;
+        }
+        Array.Append<i64>(result.attributes, attributeIndex);
+        i = i + 1_i64;
+    }
+    Array.Set<Syntax.Node>(target.nodes, next, result);
+    return next;
+}
+
+bool HasVersion(Syntax.Document document)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Syntax.Node>(document.nodes))
+    {
+        Syntax.Node node = document.nodes[i];
+        if (node.kind == Syntax.NodeKind::Assignment && (node.name == "profile_version" || node.name == "version"))
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+bool When(Syntax.Document document, Syntax.Node block, Syntax.Document definitions, Syntax.Node clause)
+{
+    mut string kind = Text(definitions, clause, "block_kind");
+    if (kind == "")
+    {
+        kind = Text(definitions, clause, "block");
+    }
+    if (kind != "" && kind != block.name)
+    {
+        return false;
+    }
+
+    string field = Text(definitions, clause, "field");
+    if (field != "")
+    {
+        i64 input = Value(document, block, field);
+        if (input < 0_i64)
+        {
+            return false;
+        }
+
+        i64 expected = Value(definitions, clause, "field_value");
+        if (expected >= 0_i64 && !SameScalar(document.nodes[input], definitions.nodes[expected]))
+        {
+            return false;
+        }
+    }
+
+    string missing = Text(definitions, clause, "missing_field");
+    if (missing != "" && Property(document, block, missing) >= 0_i64)
+    {
+        return false;
+    }
+    return true;
+}
+
+i64[] Selected(Syntax.Document document, Schema.Profile target, Syntax.Node migration, mut Work work)
+{
+    mut i64[] selected = Array.Empty<i64>();
+    mut bool detect = false;
+    mut bool hasDetect = false;
+    mut bool hasWhen = false;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(migration.children))
+    {
+        Syntax.Node child = target.document.nodes[migration.children[i]];
+        if (child.kind == Syntax.NodeKind::Block && child.name == "detect")
+        {
+            hasDetect = true;
+            detect = (!HasVersion(document)) == (Text(target.document, child, "profile_version_missing") == "true");
+        }
+        if (child.kind == Syntax.NodeKind::Block && child.name == "when")
+        {
+            hasWhen = true;
+        }
+        i = i + 1_i64;
+    }
+    if (hasDetect && !detect)
+    {
+        return selected;
+    }
+    i = 0_i64;
+    while (i < Array.Len<Syntax.Node>(document.nodes))
+    {
+        if (!Step(work))
+        {
+            return selected;
+        }
+
+        Syntax.Node block = document.nodes[i];
+        mut bool matches = false;
+        if (block.kind == Syntax.NodeKind::Block)
+        {
+            if (hasWhen)
+            {
+                mut i64 j = 0_i64;
+                while (j < Array.Len<i64>(migration.children))
+                {
+                    if (!Step(work))
+                    {
+                        return selected;
+                    }
+
+                    Syntax.Node clause = target.document.nodes[migration.children[j]];
+                    if (clause.kind == Syntax.NodeKind::Block && clause.name == "when" && When(document, block, target.document, clause))
+                    {
+                        matches = true;
+                    }
+                    j = j + 1_i64;
+                }
+            }
+            else if (detect)
+            {
+                mut i64 root = 0_i64;
+                while (root < Array.Len<i64>(document.roots))
+                {
+                    if (document.roots[root] == i)
+                    {
+                        matches = true;
+                    }
+                    root = root + 1_i64;
+                }
+            }
+        }
+        if (matches)
+        {
+            Array.Append<i64>(selected, i);
+        }
+        i = i + 1_i64;
+    }
+    return selected;
+}
+
+Result<Rewrite[], Schema.Diagnostic[]> Rewrites(Schema.Profile profile, Syntax.Node migration, mut Work work)
+{
+    mut Rewrite[] rewrites = Array.Empty<Rewrite>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(migration.children))
+    {
+        Syntax.Node section = profile.document.nodes[migration.children[i]];
+        if (section.kind == Syntax.NodeKind::Block && section.name == "rewrite")
+        {
+            mut i64 j = 0_i64;
+            while (j < Array.Len<i64>(section.children))
+            {
+                if (!Step(work))
+                {
+                    return Result::Error([Error("MigrationWorkLimit", section.span, profile.name)]);
+                }
+
+                Syntax.Node operation = profile.document.nodes[section.children[j]];
+                if (operation.kind == Syntax.NodeKind::Assignment && (operation.name == "add_field" || operation.name == "rename_field"))
+                {
+                    i64 mapIndex = Value(profile.document, section, operation.name);
+                    if (mapIndex < 0_i64 || profile.document.nodes[mapIndex].kind != Syntax.NodeKind::Map)
+                    {
+                        return Result::Error([Error("InvalidMigrationRewrite", operation.span, profile.name)]);
+                    }
+
+                    Syntax.Node map = profile.document.nodes[mapIndex];
+                    mut i64 entry = 0_i64;
+                    while (entry < Array.Len<i64>(map.children))
+                    {
+                        Syntax.Node assignment = profile.document.nodes[map.children[entry]];
+                        if (Array.Len<i64>(assignment.children) != 1_i64)
+                        {
+                            return Result::Error([Error("InvalidMigrationRewrite", assignment.span, profile.name)]);
+                        }
+
+                        i64 value = assignment.children[0_i64];
+                        if (operation.name == "add_field")
+                        {
+                            Array.Append<Rewrite>(rewrites, Rewrite::AddField(assignment.name, value));
+                        }
+                        else
+                        {
+                            Syntax.Node destination = profile.document.nodes[value];
+                            if (destination.kind != Syntax.NodeKind::String && destination.kind != Syntax.NodeKind::Identifier)
+                            {
+                                return Result::Error([Error("InvalidMigrationRewrite", destination.span, profile.name)]);
+                            }
+                            Array.Append<Rewrite>(rewrites, Rewrite::RenameField(assignment.name, destination.text));
+                        }
+                        entry = entry + 1_i64;
+                    }
+                }
+                else if ((operation.kind == Syntax.NodeKind::Block || operation.kind == Syntax.NodeKind::Assignment) && operation.name == "replace_value")
+                {
+                    mut Syntax.Node owner = operation;
+                    if (operation.kind == Syntax.NodeKind::Assignment)
+                    {
+                        owner = section;
+                    }
+
+                    i64 from = Value(profile.document, owner, "from");
+                    i64 to = Value(profile.document, owner, "to");
+                    if (from < 0_i64 || to < 0_i64 || !Scalar(profile.document.nodes[from]) || !Scalar(profile.document.nodes[to]))
+                    {
+                        return Result::Error([Error("MigrationScalarRequired", operation.span, profile.name)]);
+                    }
+                    Array.Append<Rewrite>(rewrites, Rewrite::ReplaceValue(from, to));
+                }
+                j = j + 1_i64;
+            }
+        }
+        i = i + 1_i64;
+    }
+    if (Array.Len<Rewrite>(rewrites) == 0_i64)
+    {
+        return Result::Error([Error("MigrationRewriteRequired", migration.span, profile.name)]);
+    }
+    return Result::Ok(rewrites);
+}
+
+Result<MigrationPlan, Schema.Diagnostic[]> PlanWithWork(Syntax.Document document, Schema.Profile target, Limits.BsolLimits limits, mut Work work)
+{
+    mut i64 chosen = -1_i64;
+    mut i64[] blocks = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(target.migrationNodes))
+    {
+        if (!Step(work))
+        {
+            return Result::Error([Error("MigrationWorkLimit", target.document.nodes[target.migrationNodes[i]].span, target.name)]);
+        }
+
+        Syntax.Node migration = target.document.nodes[target.migrationNodes[i]];
+        string from = Text(target.document, migration, "from");
+        if (from == target.name)
+        {
+            return Result::Error([Error("MigrationCycle", migration.span, target.name)]);
+        }
+
+        i64[] selected = Selected(document, target, migration, work);
+        if (Array.Len<i64>(selected) > 0_i64)
+        {
+            if (chosen >= 0_i64)
+            {
+                mut Schema.Diagnostic diagnostic = Error("AmbiguousMigrationRoute", migration.span, target.name);
+                diagnostic.hasRelated = true;
+                diagnostic.relatedSpan = target.document.nodes[chosen].span;
+                return Result::Error([diagnostic]);
+            }
+            chosen = target.migrationNodes[i];
+            blocks = selected;
+        }
+        i = i + 1_i64;
+    }
+    if (work.failed)
+    {
+        return Result::Error([Error("MigrationWorkLimit", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target.name)]);
+    }
+    if (chosen < 0_i64)
+    {
+        match Schema.Validate(document, target, limits)
+        {
+            Result::Ok(_) => {
+                return Result::Error([Error("AlreadyAtTarget", Syntax.Span
+                {
+                    start: 0_i64,
+
+                    end: 0_i64,
+                }, target.name)]);
+            },
+
+            Result::Error(_) => { },
+        };
+        return Result::Error([Error("NoMigrationRoute", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target.name)]);
+    }
+
+    Syntax.Node migration = target.document.nodes[chosen];
+    return match Rewrites(target, migration, work)
+    {
+        Result::Error(errors) => Result::Error(errors),
+
+        Result::Ok(rewrites) => Result::Ok(MigrationPlan
+        {
+            from: Text(target.document, migration, "from"),
+
+            to: target.name,
+
+            target: target,
+
+            blocks: blocks,
+
+            rewrites: rewrites,
+
+            source: CopyDocument(document),
+        }),
+    };
+}
+
+Result<MigrationPlan, Schema.Diagnostic[]> PlanOwned(Syntax.Document document, Schema.Profile target, Limits.BsolLimits limits)
+{
+    mut Work work = Work
+    {
+        remaining: 16777216_i64,
+
+        failed: false,
+
+        limits: limits,
+    };
+    return PlanWithWork(document, target, limits, work);
+}
+
+/// Public planning re-establishes both syntax/profile owners. Public mutable
+/// source arenas cannot supply unchecked indices or invented profile models.
+pub Result<MigrationPlan, Schema.Diagnostic[]> PlanMigration(Syntax.Document document, Schema.Profile target, Limits.BsolLimits limits)
+{
+    match Schema.ReownProfile(target, limits)
+    {
+        Result::Error(errors) => {
+            return Result::Error(errors);
+        },
+
+        Result::Ok(ownedProfile) => {
+            match Writer.Write(document, limits)
+            {
+                Result::Error(error) => {
+                    return Result::Error([Error("InvalidMigrationSource", error.span, target.name)]);
+                },
+
+                Result::Ok(text) => {
+                    match Parser.Parse(text, limits)
+                    {
+                        Result::Error(error) => {
+                            return Result::Error([Error("InvalidMigrationSource", error.span, target.name)]);
+                        },
+
+                        Result::Ok(ownedDocument) => {
+                            return PlanOwned(ownedDocument, ownedProfile, limits);
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+unit Replace(Syntax.Document document, i64 index, Syntax.Node from, Syntax.Node to, mut Work work, i64 depth)
+{
+    if (!Step(work) || depth > work.limits.maxDepth)
+    {
+        work.failed = true;
+        return;
+    }
+
+    Syntax.Node node = document.nodes[index];
+    if (SameScalar(node, from))
+    {
+        mut Syntax.Node fresh = CopyNode(to);
+        fresh.span = node.span;
+        Array.Set<Syntax.Node>(document.nodes, index, fresh);
+        return;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(node.children))
+    {
+        Replace(document, node.children[i], from, to, work, depth + 1_i64);
+        i = i + 1_i64;
+    }
+}
+
+Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ApplyWithWork(MigrationPlan plan, Limits.BsolLimits limits, mut Work work)
+{
+    mut Syntax.Document document = CopyDocument(plan.source);
+    mut i64 operation = 0_i64;
+    while (operation < Array.Len<Rewrite>(plan.rewrites))
+    {
+        mut i64 blockIndex = 0_i64;
+        while (blockIndex < Array.Len<i64>(plan.blocks))
+        {
+            if (!Step(work))
+            {
+                return Result::Error([Error("MigrationWorkLimit", Syntax.Span
+                {
+                    start: 0_i64,
+
+                    end: 0_i64,
+                }, plan.to)]);
+            }
+
+            i64 index = plan.blocks[blockIndex];
+            mut Syntax.Node block = document.nodes[index];
+            match plan.rewrites[operation]
+            {
+                Rewrite::AddField(key, value) => {
+                    if (Property(document, block, key) < 0_i64)
+                    {
+                        i64 child = CloneValue(document, plan.target.document, value, work, 1_i64);
+                        if (child < 0_i64 || Array.Len<Syntax.Node>(document.nodes) >= limits.maxNodes)
+                        {
+                            return Result::Error([Error("MigrationNodeLimit", block.span, plan.to)]);
+                        }
+
+                        i64 assignment = Array.Len<Syntax.Node>(document.nodes);
+                        Array.Append<Syntax.Node>(document.nodes, Syntax.Node
+                        {
+                            kind: Syntax.NodeKind::Assignment,
+
+                            span: block.span,
+
+                            raw: "",
+
+                            text: "",
+
+                            name: key,
+
+                            label: "",
+
+                            hasLabel: false,
+
+                            schemaless: false,
+
+                            children: [child],
+
+                            attributes: Array.Empty<i64>(),
+                        });
+                        Array.Append<i64>(block.children, assignment);
+                    }
+                },
+
+                Rewrite::RenameField(from, to) => {
+                    i64 assignment = Property(document, block, from);
+                    if (assignment >= 0_i64 && from != to)
+                    {
+                        i64 collision = Property(document, block, to);
+                        if (collision >= 0_i64)
+                        {
+                            mut Schema.Diagnostic diagnostic = Error("MigrationDestinationCollision", document.nodes[assignment].span, plan.to);
+                            diagnostic.hasRelated = true;
+                            diagnostic.relatedSpan = document.nodes[collision].span;
+                            return Result::Error([diagnostic]);
+                        }
+
+                        mut Syntax.Node renamed = CopyNode(document.nodes[assignment]);
+                        renamed.name = to;
+                        Array.Set<Syntax.Node>(document.nodes, assignment, renamed);
+                    }
+                },
+
+                Rewrite::ReplaceValue(from, to) => {
+                    mut i64 field = 0_i64;
+                    while (field < Array.Len<i64>(block.children))
+                    {
+                        Syntax.Node assignment = document.nodes[block.children[field]];
+                        if (assignment.kind == Syntax.NodeKind::Assignment)
+                        {
+                            mut i64 value = 0_i64;
+                            while (value < Array.Len<i64>(assignment.children))
+                            {
+                                Replace(document, assignment.children[value], plan.target.document.nodes[from], plan.target.document.nodes[to], work, 1_i64);
+                                value = value + 1_i64;
+                            }
+                        }
+                        field = field + 1_i64;
+                    }
+                },
+            };
+            Array.Set<Syntax.Node>(document.nodes, index, block);
+            blockIndex = blockIndex + 1_i64;
+        }
+        operation = operation + 1_i64;
+    }
+    if (work.failed)
+    {
+        return Result::Error([Error("MigrationWorkLimit", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, plan.to)]);
+    }
+    match Writer.Write(document, limits)
+    {
+        Result::Error(error) => {
+            return Result::Error([Error("InvalidMigrationOutput", error.span, plan.to)]);
+        },
+
+        Result::Ok(text) => {
+            match Parser.Parse(text, limits)
+            {
+                Result::Error(error) => {
+                    return Result::Error([Error("InvalidMigrationOutput", error.span, plan.to)]);
+                },
+
+                Result::Ok(owned) => {
+                    return match Schema.Validate(owned, plan.target, limits)
+                    {
+                        Result::Error(errors) => Result::Error(errors),
+
+                        Result::Ok(checked) => Schema.ResolveReferences(checked, limits),
+                    };
+                },
+            };
+        },
+    };
+}
+
+/// Apply a privately owned single-stage plan; intermediate arenas never escape.
+pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ApplyMigration(MigrationPlan plan, Limits.BsolLimits limits)
+{
+    mut Work work = Work
+    {
+        remaining: 16777216_i64,
+
+        failed: false,
+
+        limits: limits,
+    };
+    return ApplyWithWork(plan, limits, work);
+}
+
+type RouteEdge
+{
+    string from,
+
+    string to,
+
+    i64 profile,
+
+    i64 definition,
+}
+
+type Routes
+{
+    i64 count,
+
+    i64 alternative,
+
+    i64[] chosen,
+
+    Schema.Diagnostic[] errors,
+}
+
+bool ContainsName(string[] names, string name)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<string>(names))
+    {
+        if (names[i] == name)
+        {
+            return true;
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+unit FindRoutes(string current, string target, RouteEdge[] edges, Schema.Profile[] profiles, string[] active, i64[] path, mut Routes routes, mut Work work)
+{
+    if (!Step(work) || Array.Len<string>(active) > work.limits.maxImportDepth)
+    {
+        Array.Append<Schema.Diagnostic>(routes.errors, Error("MigrationWorkLimit", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target));
+        return;
+    }
+    if (current == target)
+    {
+        routes.count = routes.count + 1_i64;
+        if (routes.count == 1_i64)
+        {
+            routes.chosen = CopyIndices(path);
+        }
+        else if (routes.count == 2_i64 && Array.Len<i64>(path) > 0_i64)
+        {
+            routes.alternative = path[Array.Len<i64>(path) - 1_i64];
+        }
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<RouteEdge>(edges))
+    {
+        if (!Step(work))
+        {
+            return;
+        }
+
+        RouteEdge edge = edges[i];
+        if (edge.from == current)
+        {
+            if (ContainsName(active, edge.to))
+            {
+                mut Schema.Diagnostic diagnostic = Error("MigrationCycle", profiles[edge.profile].document.nodes[edge.definition].span, target);
+                diagnostic.hasRelated = true;
+                diagnostic.relatedSpan = diagnostic.span;
+                if (Array.Len<i64>(path) > 0_i64)
+                {
+                    RouteEdge previous = edges[path[Array.Len<i64>(path) - 1_i64]];
+                    diagnostic.relatedSpan = profiles[previous.profile].document.nodes[previous.definition].span;
+                }
+                Array.Append<Schema.Diagnostic>(routes.errors, diagnostic);
+            }
+            else
+            {
+                mut string[] next = Array.Empty<string>();
+                mut i64 j = 0_i64;
+                while (j < Array.Len<string>(active))
+                {
+                    Array.Append<string>(next, active[j]);
+                    j = j + 1_i64;
+                }
+                Array.Append<string>(next, edge.to);
+                mut i64[] nextPath = CopyIndices(path);
+                Array.Append<i64>(nextPath, i);
+                FindRoutes(edge.to, target, edges, profiles, next, nextPath, routes, work);
+            }
+        }
+        i = i + 1_i64;
+    }
+}
+
+/// The host supplies an already resolved profile closure. No filesystem, cache,
+/// registry or network resolver is introduced here. Every model is reparsed
+/// into its own arena before definition indices can become route authority.
+pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> MigrateChain(Syntax.Document document, string from, string target, Schema.Profile[] closure, Limits.BsolLimits limits)
+{
+    mut Work work = Work
+    {
+        remaining: 16777216_i64,
+
+        failed: false,
+
+        limits: limits,
+    };
+    mut Schema.Profile[] profiles = Array.Empty<Schema.Profile>();
+    mut RouteEdge[] edges = Array.Empty<RouteEdge>();
+    mut i64 bytes = 0_i64;
+    mut i64 targetIndex = -1_i64;
+    mut i64 i = 0_i64;
+    if (Array.Len<Schema.Profile>(closure) > limits.maxImports)
+    {
+        return Result::Error([Error("MigrationClosureLimit", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target)]);
+    }
+    while (i < Array.Len<Schema.Profile>(closure))
+    {
+        if (!Step(work) || String.Len(closure[i].source) > limits.maxResolvedSchemaBytes - bytes)
+        {
+            return Result::Error([Error("MigrationWorkLimit", Syntax.Span
+            {
+                start: 0_i64,
+
+                end: 0_i64,
+            }, target)]);
+        }
+        bytes = bytes + String.Len(closure[i].source);
+        match Schema.ReownProfile(closure[i], limits)
+        {
+            Result::Error(errors) => {
+                return Result::Error(errors);
+            },
+
+            Result::Ok(profile) => {
+                mut i64 j = 0_i64;
+                while (j < Array.Len<Schema.Profile>(profiles))
+                {
+                    if (profiles[j].name == profile.name)
+                    {
+                        return Result::Error([Error("DuplicateMigrationProfile", profile.document.nodes[profile.document.roots[0_i64]].span, target)]);
+                    }
+                    j = j + 1_i64;
+                }
+                if (profile.name == target)
+                {
+                    targetIndex = i;
+                }
+                Array.Append<Schema.Profile>(profiles, profile);
+                j = 0_i64;
+                while (j < Array.Len<i64>(profile.migrationNodes))
+                {
+                    Syntax.Node definition = profile.document.nodes[profile.migrationNodes[j]];
+                    Array.Append<RouteEdge>(edges, RouteEdge
+                    {
+                        from: Text(profile.document, definition, "from"),
+
+                        to: profile.name,
+
+                        profile: i,
+
+                        definition: profile.migrationNodes[j],
+                    });
+                    j = j + 1_i64;
+                }
+            },
+        };
+        i = i + 1_i64;
+    }
+    if (targetIndex < 0_i64)
+    {
+        return Result::Error([Error("MissingMigrationTarget", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target)]);
+    }
+
+    mut Routes routes = Routes
+    {
+        count: 0_i64,
+
+        alternative: -1_i64,
+
+        chosen: Array.Empty<i64>(),
+
+        errors: Array.Empty<Schema.Diagnostic>(),
+    };
+    FindRoutes(from, target, edges, profiles, [from], Array.Empty<i64>(), routes, work);
+    if (work.failed)
+    {
+        return Result::Error([Error("MigrationWorkLimit", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target)]);
+    }
+    if (Array.Len<Schema.Diagnostic>(routes.errors) > 0_i64)
+    {
+        return Result::Error(routes.errors);
+    }
+    if (routes.count == 0_i64)
+    {
+        return Result::Error([Error("NoMigrationRoute", Syntax.Span
+        {
+            start: 0_i64,
+
+            end: 0_i64,
+        }, target)]);
+    }
+    if (routes.count > 1_i64)
+    {
+        RouteEdge second = edges[routes.alternative];
+        mut Schema.Diagnostic diagnostic = Error("AmbiguousMigrationRoute", profiles[second.profile].document.nodes[second.definition].span, target);
+        if (Array.Len<i64>(routes.chosen) > 0_i64)
+        {
+            RouteEdge first = edges[routes.chosen[Array.Len<i64>(routes.chosen) - 1_i64]];
+            diagnostic.hasRelated = true;
+            diagnostic.relatedSpan = profiles[first.profile].document.nodes[first.definition].span;
+        }
+        return Result::Error([diagnostic]);
+    }
+
+    mut Syntax.Document current = CopyDocument(document);
+    match Writer.Write(document, limits)
+    {
+        Result::Error(error) => {
+            return Result::Error([Error("InvalidMigrationInput", error.span, target)]);
+        },
+
+        Result::Ok(text) => match Parser.Parse(text, limits)
+        {
+            Result::Error(error) => {
+                return Result::Error([Error("InvalidMigrationInput", error.span, target)]);
+            },
+
+            Result::Ok(owned) => {
+                current = owned;
+            },
+        },
+    };
+    i = 0_i64;
+    while (i < Array.Len<i64>(routes.chosen))
+    {
+        RouteEdge edge = edges[routes.chosen[i]];
+        Schema.Profile owner = profiles[edge.profile];
+        mut Schema.Profile stage = owner;
+        match Schema.MigrationStage(owner, edge.definition) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(selected) => { stage = selected; },
+        };
+        match PlanWithWork(current, stage, limits, work)
+        {
+            Result::Error(errors) => {
+                return Result::Error(errors);
+            },
+
+            Result::Ok(plan) => match ApplyWithWork(plan, limits, work)
+            {
+                Result::Error(errors) => {
+                    return Result::Error(errors);
+                },
+
+                Result::Ok(checked) => {
+                    current = checked.document;
+                },
+            },
+        };
+        i = i + 1_i64;
+    }
+    return match Schema.Validate(current, profiles[targetIndex], limits)
+    {
+        Result::Error(errors) => Result::Error(errors),
+
+        Result::Ok(checked) => Schema.ResolveReferences(checked, limits),
+    };
+}

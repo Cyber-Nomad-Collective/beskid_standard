@@ -1,0 +1,336 @@
+use Beskid.Compiler.Collect;
+use Beskid.Compiler.Diagnostics;
+use Beskid.Compiler.Query;
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use SerializationMod.Syntax;
+use SerializationMod.Collect as Selection;
+use SerializationMod.Policies;
+use SerializationMod.Generation;
+use SerializationMod.Eligibility;
+use SerializationMod.Read;
+
+/// These are closed logical selectors. The host determines the actual caller
+/// namespace from its registered assembly, not from these descriptive labels.
+string[] Symbols() {
+    return ["Core.Results.Result", "Core.Optional.Option", "Core.Collections.Array.Append", "Core.Collections.Array.Len",
+        "Core.Collections.List.New", "Core.Collections.Map.New", "Core.String.Core.SortOrdinal", "Core.Serialization.Contracts.Serializable", "Core.Serialization.Contracts.Encoder",
+        "Core.Serialization.Contracts.Decoder", "Core.Serialization.Reader.Reader", "Core.Serialization.Reader.FieldDecoder",
+        "Core.Serialization.Limits.SerializationLimits", "Core.Serialization.Errors.SerializationError", "Core.Serialization.Errors.Diagnostic",
+        "Core.Serialization.Errors.NumericError", "Core.Serialization.Descriptors.CompiledShape", "Core.Numeric.FloatBits.ToBits32",
+        "Core.Numeric.FloatBits.FromBits32", "Core.Numeric.FloatBits.ToBits64", "Core.Numeric.FloatBits.FromBits64"];
+}
+
+Result<Syntax.CanonicalPath[], SemanticError> Paths(NodeRef target) {
+    match Semantic.PlanCanonicalPaths(target, Symbols()) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(plans) => {
+            mut Syntax.CanonicalPath[] paths = [];
+            mut i64 index = 0_i64;
+            while (index < Array.Len(plans)) {
+                paths = Array.Append<Syntax.CanonicalPath>(paths, Syntax.CanonicalPath { logicalName: plans[index].logicalName, segments: plans[index].segments });
+                index = index + 1_i64;
+            }
+            return Result::Ok(paths);
+        },
+    };
+}
+
+/// Inline-module ancestry of a node, outermost first.
+type Scope {
+    string[] names,
+    SpannedVisibility[] visibility,
+}
+
+Scope Ancestry(NodeRef node) {
+    NodeRef[] ancestors = Query.Ancestors(node);
+    mut string[] names = [];
+    mut SpannedVisibility[] visibility = [];
+    mut i64 index = Array.Len(ancestors);
+    while (index > 0_i64) {
+        index = index - 1_i64;
+        match Query.AsInlineModule(ancestors[index]) {
+            Option::Some(module) => {
+                names = Array.Append<string>(names, module.name.node.name);
+                visibility = Array.Append<SpannedVisibility>(visibility, module.visibility);
+            },
+            _ => { },
+        };
+    }
+    return Scope { names: names, visibility: visibility };
+}
+
+SpannedPath Receiver(Syntax.Builder builder, Scope moduleScope, SpannedIdentifier name, SpannedIdentifier[] parameters) {
+    mut string[] names = Syntax.Copy<string>(moduleScope.names);
+    names = Array.Append<string>(names, name.node.name);
+    mut SpannedType[] arguments = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(parameters)) { arguments = Array.Append<SpannedType>(arguments, Syntax.Named(builder, [parameters[index].node.name], [])); index = index + 1_i64; }
+    return Syntax.PathValue(builder, names, arguments);
+}
+
+/// Syntactic declared-type eligibility, before generation. It keeps the
+/// field's own span; semantic authority is proven after the closure.
+Result<unit, Eligibility.Rejection> DeclaredProofs(SpannedField[] fields, Read.FieldPolicy[] policies) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        match Eligibility.Declared(fields[index], policies[index]) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+        index = index + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+/// Default factory proof against the issued semantic field types. Generated
+/// decoders call the factory from the compilation root, so `caller` is that root.
+Result<unit, Eligibility.Rejection> FactoryProofs(NodeRef caller, SpannedField[] fields, Semantic.Field[] semanticFields, Read.FieldPolicy[] policies, NodeSpan span) {
+    if (Array.Len(fields) != Array.Len(semanticFields) || Array.Len(fields) != Array.Len(policies)) {
+        return Result::Error(Eligibility.RejectionValue(SemanticError { code: "SerializationShapeCorrespondence", message: "declared field count differs from its semantic shape" }, span));
+    }
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        match policies[index].defaultFactory {
+            OptionalSpannedPath::Some(factory) => {
+                match Eligibility.Factory<Eligibility.HostShapes>(Eligibility.Host(caller), factory, semanticFields[index].ty, fields[index].span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+            },
+            _ => { },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+/// A template has no issued semantic field types. Its default factories are
+/// proven by the host at every concrete specialization: the same compilation-root
+/// resolution, zero parameters, no generics, visibility and exact result type
+/// against the substituted field type. The Mod checks only the path syntax here.
+Result<unit, Eligibility.Rejection> TemplateDefaults(SpannedField[] fields, Read.FieldPolicy[] policies) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        match policies[index].defaultFactory {
+            OptionalSpannedPath::Some(factory) => {
+                mut i64 segment = 0_i64;
+                while (segment < Array.Len(factory.node.segments.items)) {
+                    if (Array.Len(factory.node.segments.items[segment].node.typeArgs.items) != 0_i64) {
+                        return Result::Error(Eligibility.RejectionValue(SemanticError { code: "SerializationDefaultFactory", message: "default factory path must not carry type arguments" }, fields[index].span));
+                    }
+                    segment = segment + 1_i64;
+                }
+            },
+            _ => { },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+/// The invocation-issued semantic authority a contribution binds to.
+enum TargetBinding {
+    Concrete(SemanticHandle handle),
+    Template(TypeTemplate template),
+}
+
+type Planned {
+    Generation.GeneratedTarget generated,
+    TargetBinding binding,
+}
+
+Eligibility.Rejection Located(SemanticError error, NodeSpan span) {
+    return Eligibility.RejectionValue(error, span);
+}
+
+Result<Planned, Eligibility.Rejection> PlanRecord(Syntax.Builder builder, NodeRef target, TypeDefinition record, Scope moduleScope, NodeRef caller, NodeSpan span) {
+    match Eligibility.Accessible(record.visibility, moduleScope.visibility, span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    SpannedField[] fields = record.fields.items;
+    mut Read.FieldPolicy[] policies = [];
+    match Policies.Fields(builder, fields) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(value) => { policies = value; }, };
+    match DeclaredProofs(fields, policies) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    SpannedPath receiver = Receiver(builder, moduleScope, record.name, record.generics.items);
+    if (Array.Len(record.generics.items) == 0_i64) {
+        match Semantic.ResolveSyntaxType(target) {
+            Result::Error(error) => { return Result::Error(Located(error, span)); },
+            Result::Ok(handle) => {
+                match Eligibility.RecordClosure<Eligibility.HostShapes>(Eligibility.Host(caller), handle, fields, policies, span) {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(closure) => {
+                        match FactoryProofs(caller, fields, closure.fields, policies, span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                        mut i64 index = 0_i64;
+                        while (index < Array.Len(fields)) {
+                            if (policies[index].catchall) {
+                                match Eligibility.IssuedCatchall(handle, closure.fields[index], fields[index].span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                            }
+                            index = index + 1_i64;
+                        }
+                        match Generation.Record(builder, receiver, record.generics.items, fields, policies, closure.sites) {
+                            Result::Error(error) => { return Result::Error(Located(error, span)); },
+                            Result::Ok(generated) => { return Result::Ok(Planned { generated: generated, binding: TargetBinding::Concrete(handle) }); },
+                        };
+                    },
+                };
+            },
+        };
+    }
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        if (policies[index].catchall) {
+            return Result::Error(Eligibility.RejectionValue(SemanticError { code: "SerializationCatchallTemplate", message: "a catchall proof is issued only for a concrete record owner" }, fields[index].span));
+        }
+        index = index + 1_i64;
+    }
+    match TemplateDefaults(fields, policies) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    match Semantic.ResolveSyntaxTemplate(target) {
+        Result::Error(error) => { return Result::Error(Located(error, span)); },
+        Result::Ok(template) => {
+            match Generation.Record(builder, receiver, record.generics.items, fields, policies, []) {
+                Result::Error(error) => { return Result::Error(Located(error, span)); },
+                Result::Ok(generated) => { return Result::Ok(Planned { generated: generated, binding: TargetBinding::Template(template) }); },
+            };
+        },
+    };
+}
+
+Result<Planned, Eligibility.Rejection> PlanEnum(Syntax.Builder builder, NodeRef target, EnumDefinition enumeration, Scope moduleScope, NodeRef caller, NodeSpan span) {
+    match Eligibility.Accessible(enumeration.visibility, moduleScope.visibility, span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+    SpannedEnumVariant[] variants = enumeration.variants.items;
+    mut Read.VariantPolicy[] policies = [];
+    mut i64 variant = 0_i64;
+    while (variant < Array.Len(variants)) {
+        SpannedField[] fields = variants[variant].node.fields.items;
+        match Policies.Variant(builder, fields) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(value) => {
+                match DeclaredProofs(fields, value) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                policies = Array.Append<Read.VariantPolicy>(policies, Read.VariantPolicy { fields: value });
+            },
+        };
+        variant = variant + 1_i64;
+    }
+    SpannedPath receiver = Receiver(builder, moduleScope, enumeration.name, enumeration.generics.items);
+    if (Array.Len(enumeration.generics.items) == 0_i64) {
+        match Semantic.ResolveSyntaxType(target) {
+            Result::Error(error) => { return Result::Error(Located(error, span)); },
+            Result::Ok(handle) => {
+                match Eligibility.EnumClosure<Eligibility.HostShapes>(Eligibility.Host(caller), handle, variants, policies, span) {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(closure) => {
+                        if (Array.Len(closure.variants) != Array.Len(variants)) { return Result::Error(Eligibility.RejectionValue(SemanticError { code: "SerializationShapeCorrespondence", message: "declared variants differ from the semantic shape" }, span)); }
+                        mut i64 proven = 0_i64;
+                        while (proven < Array.Len(variants)) {
+                            match FactoryProofs(caller, variants[proven].node.fields.items, closure.variants[proven].fields, policies[proven].fields, variants[proven].span) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                            proven = proven + 1_i64;
+                        }
+                        match Generation.Enumeration(builder, receiver, enumeration.generics.items, variants, policies, closure.sites) {
+                            Result::Error(error) => { return Result::Error(Located(error, span)); },
+                            Result::Ok(generated) => { return Result::Ok(Planned { generated: generated, binding: TargetBinding::Concrete(handle) }); },
+                        };
+                    },
+                };
+            },
+        };
+    }
+    mut i64 templateVariant = 0_i64;
+    while (templateVariant < Array.Len(variants)) {
+        match TemplateDefaults(variants[templateVariant].node.fields.items, policies[templateVariant].fields) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+        templateVariant = templateVariant + 1_i64;
+    }
+    match Semantic.ResolveSyntaxTemplate(target) {
+        Result::Error(error) => { return Result::Error(Located(error, span)); },
+        Result::Ok(template) => {
+            match Generation.Enumeration(builder, receiver, enumeration.generics.items, variants, policies, []) {
+                Result::Error(error) => { return Result::Error(Located(error, span)); },
+                Result::Ok(generated) => { return Result::Ok(Planned { generated: generated, binding: TargetBinding::Template(template) }); },
+            };
+        },
+    };
+}
+
+/// One shared plan for Generate and Analyze: eligibility, policies, factory
+/// proofs, semantic closure, generation and target authority. A failure is a
+/// source-spanned rejection, never a panic and never a partial contribution.
+Result<Planned, Eligibility.Rejection> Plan(Syntax.Builder builder, NodeRef target, NodeRef caller) {
+    NodeSpan span = Query.Span(target);
+    match Paths(target) {
+        Result::Error(error) => { return Result::Error(Located(error, span)); },
+        Result::Ok(paths) => { Syntax.Rebind(builder, span, paths); },
+    };
+    Scope moduleScope = Ancestry(target);
+    match Query.AsTypeDefinition(target) {
+        Option::Some(record) => { return PlanRecord(builder, target, record, moduleScope, caller, span); },
+        _ => { },
+    };
+    match Query.AsEnumDefinition(target) {
+        Option::Some(enumeration) => { return PlanEnum(builder, target, enumeration, moduleScope, caller, span); },
+        _ => { },
+    };
+    return Result::Error(Located(SemanticError { code: "SerializationTarget", message: "selected target is not a current record or payload enum" }, span));
+}
+
+/// Contribution indexes are u32; a group that would overflow them is rejected.
+bool Fits(i64 current, i64 added) {
+    return current <= 4294967295_i64 - added;
+}
+
+/// A rejected target contributes nothing; Analyze reports the same rejection
+/// with its source span, so a missing adapter never passes silently.
+pub GeneratedSyntaxContribution Generate(GenerationRequest request) {
+    mut GeneratedSyntaxContribution output = GeneratedSyntaxContribution { items: [], codeOutputs: [], targetBindings: [], templateBindings: [] };
+    NodeRef[] targets = Selection.Selected(request.context);
+    Syntax.Builder builder = Syntax.Create(Query.Span(Query.At(request.context.compilation.entryRoot)));
+    NodeRef caller = request.context.compilation.entryRoot;
+    mut i64 index = 0_i64;
+    while (index < Array.Len(targets)) {
+        NodeRef target = targets[index];
+        if (Selection.Requested(request, target)) {
+            match Plan(builder, target, caller) {
+                Result::Error(_) => { },
+                Result::Ok(planned) => {
+                    Generation.GeneratedTarget generated = planned.generated;
+                    if (Fits(Array.Len(output.items), Array.Len(generated.items))) {
+                        u32 start = u32(Array.Len(output.items));
+                        mut i64 item = 0_i64;
+                        while (item < Array.Len(generated.items)) { output.items = Array.Append<SyntaxContributionItem>(output.items, generated.items[item]); item = item + 1_i64; }
+                        match planned.binding {
+                            TargetBinding::Concrete(handle) => {
+                                output.targetBindings = Array.Append<SerializationTargetBinding>(output.targetBindings, SerializationTargetBinding { contributionIndex: start + generated.encoderIndex, target: handle });
+                                output.targetBindings = Array.Append<SerializationTargetBinding>(output.targetBindings, SerializationTargetBinding { contributionIndex: start + generated.decoderIndex, target: handle });
+                            },
+                            TargetBinding::Template(template) => {
+                                output.templateBindings = Array.Append<SerializationTemplateBinding>(output.templateBindings, SerializationTemplateBinding { contributionIndex: start + generated.encoderIndex, template: template });
+                                output.templateBindings = Array.Append<SerializationTemplateBinding>(output.templateBindings, SerializationTemplateBinding { contributionIndex: start + generated.decoderIndex, template: template });
+                            },
+                        };
+                    }
+                },
+            };
+        }
+        index = index + 1_i64;
+    }
+    return output;
+}
+
+Diagnostic Report(string code, string message, NodeSpan span) {
+    return Diagnostic { code: code, message: message, severity: Severity::Error, spanStart: span.start, spanEnd: span.end };
+}
+
+pub AnalysisResult Analyze(AnalysisRequest request) {
+    mut Diagnostic[] diagnostics = [];
+    NodeRef[] targets = Selection.Selected(request.context);
+    Syntax.Builder builder = Syntax.Create(Query.Span(Query.At(request.context.compilation.entryRoot)));
+    NodeRef caller = request.context.compilation.entryRoot;
+    mut i64 total = 0_i64;
+    mut i64 index = 0_i64;
+    while (index < Array.Len(targets)) {
+        NodeRef target = targets[index];
+        match Plan(builder, target, caller) {
+            Result::Error(rejection) => { diagnostics = Array.Append<Diagnostic>(diagnostics, Report(rejection.code, rejection.message, rejection.span)); },
+            Result::Ok(planned) => {
+                if (Fits(total, Array.Len(planned.generated.items))) { total = total + Array.Len(planned.generated.items); }
+                else { diagnostics = Array.Append<Diagnostic>(diagnostics, Report("SerializationContributionLimit", "serialization contribution index exceeds u32", Query.Span(target))); }
+            },
+        };
+        index = index + 1_i64;
+    }
+    return AnalysisResult { diagnostics: diagnostics, fixes: [] };
+}

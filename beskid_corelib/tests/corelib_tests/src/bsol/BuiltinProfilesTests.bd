@@ -1,0 +1,153 @@
+use Core.Bsol.Limits;
+use Core.Bsol.Parser;
+use Core.Bsol.Schema;
+use Core.Bsol.Syntax;
+use Core.Collections.Array;
+use Core.Environment;
+use Core.FS;
+use Core.Results;
+use Testing.Assert;
+
+/// Native profile loading uses the exact standalone bootstrap schema files.
+/// This verifies profile parsing/composition, not host materialization authority
+/// or generated typed adapter eligibility.
+unit CheckProfile(string directory, string name) {
+    match FS.ReadAllText(directory + "/../schemas/" + name + ".bsol") {
+        Result::Error(_) => { Assert.Fail("canonical embedded profile must be readable"); },
+        Result::Ok(source) => {
+            match Parser.Parse(source, Limits.DefaultLimits()) {
+                Result::Error(_) => { Assert.Fail("canonical profile BSOL syntax must parse"); },
+                Result::Ok(document) => {
+                    match Schema.ParseProfile(source, Limits.DefaultLimits()) {
+                        Result::Error(_) => { Assert.Fail("canonical profile definitions must parse natively"); },
+                        Result::Ok(profile) => {
+                            Assert.Equal(name, profile.name, "canonical profile identity preserved");
+                            match Schema.Compose(profile, Limits.DefaultLimits()) {
+                                Result::Error(_) => { Assert.Fail("canonical profile composition must validate"); },
+                                Result::Ok(composed) => { Assert.True(Array.Len<Schema.Rule>(composed.rules) > 0_i64, "canonical profile retains rules"); },
+                            };
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+/// @native-only
+test bsol_all_fourteen_canonical_profiles_parse_and_compose {
+    match Environment.Get("BESKID_BSOL_CORPUS") {
+        Result::Error(_) => { Assert.Fail("BESKID_BSOL_CORPUS must name the shared conformance root"); },
+        Result::Ok(directory) => {
+            CheckProfile(directory, "schema.v1");
+            CheckProfile(directory, "schema.v2");
+            CheckProfile(directory, "project.v1");
+            CheckProfile(directory, "project.v2");
+            CheckProfile(directory, "workspace.v1");
+            CheckProfile(directory, "runtime.v1");
+            CheckProfile(directory, "runtime.v2");
+            CheckProfile(directory, "board.v1");
+            CheckProfile(directory, "board.v2");
+            CheckProfile(directory, "board.v3");
+            CheckProfile(directory, "shell.pages.v1");
+            CheckProfile(directory, "tools.config.v1");
+            CheckProfile(directory, "configuration.v1");
+            CheckProfile(directory, "configuration.v2");
+        },
+    };
+}
+
+
+unit CheckNumericBinding(Schema.ValidatedDocument document, string name, string expected, bool defaulted) {
+    mut bool found = false;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Schema.FieldBinding>(document.fields)) {
+        Schema.FieldBinding binding = document.fields[i];
+        Schema.Field field = document.schema.rules[binding.rule].fields[binding.field];
+        if (field.name == name) {
+            found = true;
+            Assert.Equal(binding.fromDefault, defaulted, "default provenance retained");
+            Assert.Equal(binding.value.raw, expected, "exact numeric value retained");
+            Assert.True(match binding.value.kind {
+                Syntax.NodeKind::Number => true,
+                _ => false,
+            }, "numeric binding remains typed");
+        }
+        i = i + 1_i64;
+    }
+    Assert.True(found, "declared numeric binding available for typed mapping");
+}
+
+unit CheckProfileDocument(string directory, string name, bool accepted) {
+    mut string suffix = "invalid";
+    if (accepted) { suffix = "valid"; }
+    match FS.ReadAllText(directory + "/cases/builtin-profiles/" + name + "." + suffix + ".bsol") {
+        Result::Error(_) => Assert.Fail("shared builtin document must be readable"),
+        Result::Ok(source) => match Parser.Parse(source, Limits.DefaultLimits()) {
+            Result::Error(_) => Assert.Fail("builtin positive and negative documents have valid syntax"),
+            Result::Ok(document) => match FS.ReadAllText(directory + "/../schemas/" + name + ".bsol") {
+                Result::Error(_) => Assert.Fail("canonical profile must be readable"),
+                Result::Ok(profileSource) => match Schema.ParseProfile(profileSource, Limits.DefaultLimits()) {
+                    Result::Error(_) => Assert.Fail("canonical profile must parse"),
+                    Result::Ok(profile) => match Schema.Validate(document, profile, Limits.DefaultLimits()) {
+                        Result::Ok(checked) => {
+                            Assert.True(accepted, "missing required root must reject");
+                            Assert.Equal(checked.schema.name, name, "validated document retains exact profile");
+                            if (name == "schema.v2") { CheckNumericBinding(checked, "version", "2", false); }
+                            if (name == "board.v3") { CheckNumericBinding(checked, "version", "3", true); }
+                            if (name == "runtime.v1" || name == "runtime.v2") { CheckNumericBinding(checked, "abi_version", "5", false); }
+
+                        },
+                        Result::Error(errors) => {
+                            Assert.True(!accepted, "ordinary builtin document must validate");
+                            mut bool cardinality = false;
+                            mut i64 i = 0_i64;
+                            while (i < Array.Len<Schema.Diagnostic>(errors)) {
+                                if (errors[i].code == "Cardinality") { cardinality = true; }
+                                i = i + 1_i64;
+                            }
+                            Assert.True(cardinality, "missing required root reports cardinality");
+                        },
+                    },
+                },
+            },
+        },
+    };
+}
+
+/// @native-only
+test bsol_all_fourteen_builtin_profiles_validate_real_documents {
+    match Environment.Get("BESKID_BSOL_CORPUS") {
+        Result::Error(_) => Assert.Fail("shared conformance root required"),
+        Result::Ok(directory) => {
+            CheckProfileDocument(directory, "schema.v1", true);
+            CheckProfileDocument(directory, "schema.v1", false);
+            CheckProfileDocument(directory, "schema.v2", true);
+            CheckProfileDocument(directory, "schema.v2", false);
+            CheckProfileDocument(directory, "project.v1", true);
+            CheckProfileDocument(directory, "project.v1", false);
+            CheckProfileDocument(directory, "project.v2", true);
+            CheckProfileDocument(directory, "project.v2", false);
+            CheckProfileDocument(directory, "workspace.v1", true);
+            CheckProfileDocument(directory, "workspace.v1", false);
+            CheckProfileDocument(directory, "runtime.v1", true);
+            CheckProfileDocument(directory, "runtime.v1", false);
+            CheckProfileDocument(directory, "runtime.v2", true);
+            CheckProfileDocument(directory, "runtime.v2", false);
+            CheckProfileDocument(directory, "board.v1", true);
+            CheckProfileDocument(directory, "board.v1", false);
+            CheckProfileDocument(directory, "board.v2", true);
+            CheckProfileDocument(directory, "board.v2", false);
+            CheckProfileDocument(directory, "board.v3", true);
+            CheckProfileDocument(directory, "board.v3", false);
+            CheckProfileDocument(directory, "shell.pages.v1", true);
+            CheckProfileDocument(directory, "shell.pages.v1", false);
+            CheckProfileDocument(directory, "tools.config.v1", true);
+            CheckProfileDocument(directory, "tools.config.v1", false);
+            CheckProfileDocument(directory, "configuration.v1", true);
+            CheckProfileDocument(directory, "configuration.v1", false);
+            CheckProfileDocument(directory, "configuration.v2", true);
+            CheckProfileDocument(directory, "configuration.v2", false);
+        },
+    };
+}

@@ -1,4 +1,5 @@
 use Core.Collections.Array;
+use Tls.TlsConfig;
 
 // Connection configuration shared by clients and servers.
 
@@ -7,6 +8,10 @@ pub enum HandshakeKind {
     /// INSECURE: the loopback stand-in of `QuicHandshake` (no authentication, no secrecy).
     /// Test-only; `suite` selects the packet protection suite (QuicProtection.Suite*).
     InsecureLoopback(i64 suite),
+    /// TLS 1.3 client (server authentication per the TLS configuration).
+    TlsClient(TlsClientConfig config),
+    /// TLS 1.3 server (certificate chain and P-256 key).
+    TlsServer(TlsServerConfig config),
 }
 
 pub type QuicConfig {
@@ -32,6 +37,25 @@ pub type QuicConfig {
 pub i64 MaxStreamSlots() { return 16_i64; }
 /// Connections per endpoint.
 pub i64 MaxConnections() { return 8_i64; }
+
+QuicConfig Defaults(string[] alpn, string serverName, HandshakeKind handshake) {
+    return QuicConfig {
+        alpn: alpn, serverName: serverName, idleTimeoutMs: 30000_i64, maxData: 65536_i64,
+        streamBuffer: 8192_i64, maxStreamsBidi: 4_i64, maxStreamsUni: 2_i64, requireRetry: false,
+        handshake: handshake,
+    };
+}
+
+/// A client configuration with the TLS 1.3 handshake. `alpn` lists the offered protocols;
+/// the TLS configuration supplies the server name and the certificate verification policy.
+pub QuicConfig TlsClientConfigFor(TlsClientConfig tls, string[] alpn) {
+    return Defaults(alpn, tls.serverName, HandshakeKind::TlsClient(tls));
+}
+
+/// A server configuration with the TLS 1.3 handshake (`alpn`: accepted protocols).
+pub QuicConfig TlsServerConfigFor(TlsServerConfig tls, string[] alpn) {
+    return Defaults(alpn, "", HandshakeKind::TlsServer(tls));
+}
 
 /// A configuration that uses the INSECURE loopback handshake. Only for tests of the transport
 /// until the TLS 1.3 handshake is wired in; it provides neither authentication nor secrecy.

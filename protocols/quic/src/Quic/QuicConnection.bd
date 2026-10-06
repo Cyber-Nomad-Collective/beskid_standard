@@ -111,7 +111,7 @@ pub type Connection {
     i64[] recvHandshake,
     i64[] recvApplication,
     pub Recovery rec,
-    Handshake hs,
+    CryptoHandshake hs,
     TransportParams local,
     TransportParams[] peer,
     QuicConfig config,
@@ -171,14 +171,16 @@ TransportParams LocalParams(QuicConfig cfg, u8[] scid, bool isServer, u8[] odcid
     return p;
 }
 
-Handshake MakeHandshake(QuicConfig cfg, bool isServer, u8[] params) {
+CryptoHandshake MakeHandshake(QuicConfig cfg, bool isServer, u8[] params) {
     HandshakeKind kind = cfg.handshake;
     return match kind {
         HandshakeKind::InsecureLoopback(suite) => MakeLoopback(cfg, isServer, params, suite),
+        HandshakeKind::TlsClient(tc) => QuicHandshake.TlsClient(tc, cfg.alpn, params),
+        HandshakeKind::TlsServer(ts) => QuicHandshake.TlsServer(ts, cfg.alpn, params),
     };
 }
 
-Handshake MakeLoopback(QuicConfig cfg, bool isServer, u8[] params, i64 suite) {
+CryptoHandshake MakeLoopback(QuicConfig cfg, bool isServer, u8[] params, i64 suite) {
     if isServer { return QuicHandshake.InsecureLoopbackServer(cfg.alpn, params, suite); }
     return QuicHandshake.InsecureLoopbackClient(cfg.alpn, params, suite);
 }
@@ -227,7 +229,8 @@ pub Connection NewClient(QuicConfig cfg, i64 now) {
     u8[] dcid = RandomCid();
     Connection c = Make(cfg, false, RandomCid(), dcid, dcid, Slice.New(0_i64), QuicProtection.DeriveInitial(dcid));
     c.n[NIdleDeadline()] = IdleDeadlineFrom(c, now);
-    QuicHandshake.Start(c.hs);
+    i64 alert = QuicHandshake.Start(c.hs);
+    if alert != 0_i64 { CloseWithError(c, QuicErrors.CryptoErrorBase() + alert, 6_i64, now); return c; }
     ProcessEvents(c, now);
     return c;
 }
@@ -242,6 +245,8 @@ pub Connection NewServer(QuicConfig cfg, u8[] clientDcid, u8[] clientScid, u8[] 
     Connection c = Make(cfg, true, local, clientScid, odcid, retryScid, QuicProtection.DeriveInitial(clientDcid));
     if Slice.Len(retryScid) > 0_i64 { c.n[NValidated()] = 1_i64; }
     c.n[NIdleDeadline()] = IdleDeadlineFrom(c, now);
+    i64 alert = QuicHandshake.BrokenAlert(c.hs);
+    if alert != 0_i64 { CloseWithError(c, QuicErrors.CryptoErrorBase() + alert, 6_i64, now); }
     return c;
 }
 

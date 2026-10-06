@@ -3,7 +3,8 @@
 src/Http2/HpackHuffman.bd between the GENERATED HuffmanFsm markers.
 
 States are the internal nodes of the code tree (root = 0). For each state and 4-bit input,
-the entry packs: next state (bits 0-7), EMIT (bit 8), EOS (bit 9), symbol (bits 16-23).
+the entry packs: next state (bits 0-7), EMIT (bit 8), EOS (bit 9), symbol (bits 10-17),
+stored as 5 characters 'A'..'P' in a string literal.
 Codes are at least 5 bits long, so one nibble completes at most one symbol.
 `StateInfo` packs the depth of a state (bits since the last symbol, bits 0-7) and whether
 the path from the root is all ones (bit 8): a string may end only in an all-ones state of
@@ -70,13 +71,18 @@ def rows(values, per=16):
         out.append("        " + ", ".join(f"{v}_i64" for v in values[i:i + per]) + ",")
     return "\n".join(out)
 
+def packed(e):
+    # 18-bit entry: next | EMIT << 8 | EOS << 9 | symbol << 10, as 5 base-16 digits 'A'..'P'
+    v = (e & 255) | (((e >> 8) & 3) << 8) | (((e >> 16) & 255) << 10)
+    return "".join(chr(65 + ((v >> (4 * k)) & 15)) for k in range(4, -1, -1))
+
+fsm = "".join(packed(e) for e in table)
+
 gen = f"""// BEGIN GENERATED HuffmanFsm (tools/huffgen.py)
-/// Nibble automaton: entry = next state | EMIT << 8 | EOS << 9 | symbol << 16.
-i64[] FsmTable() {{
-    return [
-{rows(table)}
-    ];
-}}
+/// Nibble automaton, 5 characters per entry (state * 16 + nibble), base-16 digits 'A'..'P'
+/// of: next state | EMIT << 8 | EOS << 9 | symbol << 10. A string literal compiles in
+/// negligible time; a 4096-element array literal costs minutes per test (COMPILER-GAPS PERF1).
+string FsmTable() {{ return "{fsm}"; }}
 
 /// Per state: depth since the last symbol | all-ones path << 8.
 i64[] StateInfo() {{

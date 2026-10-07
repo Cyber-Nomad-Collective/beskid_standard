@@ -1,0 +1,126 @@
+/// Table control, multi-line panel, cluster width, and wrap style carry-over tests.
+
+use Testing.Expect;
+use Ansi.Escape;
+use Ansi.Text;
+use Console;
+use Console.Controls.Panel;
+use Console.Controls.Table;
+use Core.Collections.Array;
+use Core.String;
+
+string U(i64 cp) {
+    mut u8[] bytes = Array.Empty<u8>();
+    if cp < 128 {
+        bytes = Array.Append<u8>(bytes, u8(cp));
+    } else {
+        if cp < 2048 {
+            bytes = Array.Append<u8>(bytes, u8(192 + cp / 64));
+            bytes = Array.Append<u8>(bytes, u8(128 + cp % 64));
+        } else {
+            if cp < 65536 {
+                bytes = Array.Append<u8>(bytes, u8(224 + cp / 4096));
+                bytes = Array.Append<u8>(bytes, u8(128 + (cp / 64) % 64));
+                bytes = Array.Append<u8>(bytes, u8(128 + cp % 64));
+            } else {
+                bytes = Array.Append<u8>(bytes, u8(240 + cp / 262144));
+                bytes = Array.Append<u8>(bytes, u8(128 + (cp / 4096) % 64));
+                bytes = Array.Append<u8>(bytes, u8(128 + (cp / 64) % 64));
+                bytes = Array.Append<u8>(bytes, u8(128 + cp % 64));
+            }
+        }
+    }
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+string Lines3(string a, string b, string c) {
+    return a + String.Newline() + b + String.Newline() + c;
+}
+
+Table.Table Fruit() {
+    mut Table.Table t = Table.New(["Name", "Qty"]);
+    t = Table.WithRow(t, ["apple", "3"]);
+    t = Table.WithRow(t, ["kiwi", "12"]);
+    return Table.WithAlign(t, 1, Table.ColumnAlign::Right);
+}
+
+test table_ascii_render {
+    Table.Table t = Table.WithBorder(Fruit(), Table.TableBorder::Ascii);
+    string nl = String.Newline();
+    string expected = "+-------+-----+" + nl + "| Name  | Qty |" + nl + "+-------+-----+" + nl + "| apple |   3 |" + nl + "| kiwi  |  12 |" + nl + "+-------+-----+";
+    Expect.EqualString(Table.Render(t), expected, "ASCII table");
+}
+
+test table_borderless_render {
+    Table.Table t = Table.WithBorder(Fruit(), Table.TableBorder::None);
+    Expect.EqualString(Table.Render(t), Lines3("Name   Qty", "apple    3", "kiwi    12"), "borderless table");
+}
+
+test table_unicode_and_widths {
+    string rendered = Table.Render(Fruit());
+    Expect.StartsWithText(rendered, U(9484), "unicode top-left corner");
+    Expect.ContainsText(rendered, U(9532), "unicode cross junction");
+    Expect.EqualI64Array(Table.ColumnWidths(Fruit()), [5_i64, 3_i64], "column widths");
+}
+
+test table_caps_and_measures_by_display_width {
+    mut Table.Table t = Table.New(["k", "v"]);
+    string styled = Escape.Csi("1", "m") + "x" + Escape.Csi("0", "m");
+    string wide = U(26085) + U(26412);
+    t = Table.WithRow(t, ["apple", styled]);
+    t = Table.WithRow(t, [wide, "short row"]);
+    t = Table.WithMaxWidth(t, 0, 4);
+    t = Table.WithBorder(t, Table.TableBorder::None);
+    Expect.EqualI64Array(Table.ColumnWidths(t), [4_i64, 9_i64], "cap and styled/wide widths");
+    string[] lines = String.Lines(Table.Render(t));
+    Expect.StartsWithText(Array.Get<string>(lines, 1), "a...", "capped cell truncates");
+    Expect.EqualI64(Text.VisibleWidth(Array.Get<string>(lines, 2)), 15, "wide row aligned by columns");
+}
+
+test table_short_rows_pad_with_empty_cells {
+    mut Table.Table t = Table.New(["a", "b"]);
+    t = Table.WithRow(t, ["only"]);
+    t = Table.WithBorder(t, Table.TableBorder::Ascii);
+    string[] lines = String.Lines(Table.Render(t));
+    Expect.EqualString(Array.Get<string>(lines, 3), "| only |   |", "missing cell renders empty");
+}
+
+test panel_multi_line_body {
+    Panel.Panel p = Panel.WithAsciiFrame(Panel.New("one" + String.Newline() + "three"));
+    Console.ConsoleSize available = Console.ConsoleSize { columns: 40, rows: 10 };
+    Console.ConsoleSize measured = Panel.Measure(p, available);
+    Expect.EqualI64(i64(measured.columns), 7, "width from the widest line");
+    Expect.EqualI64(i64(measured.rows), 4, "one row per line plus borders");
+    string nl = String.Newline();
+    Expect.EqualString(Panel.Render(p, measured), "+-----+" + nl + "|one  |" + nl + "|three|" + nl + "+-----+", "multi-line render");
+}
+
+test panel_truncates_overlong_lines {
+    Panel.Panel p = Panel.WithAsciiFrame(Panel.New("abcdefghij"));
+    Console.ConsoleSize size = Console.ConsoleSize { columns: 8, rows: 3 };
+    string[] lines = String.Lines(Panel.Render(p, size));
+    Expect.EqualString(Array.Get<string>(lines, 1), "|abc...|", "right border stays aligned");
+}
+
+test clusters_measure_like_terminals {
+    string flag = U(127477) + U(127473);
+    Expect.EqualI64(Text.VisibleWidth(flag), 2, "regional-indicator pair is one flag");
+    string family = U(128104) + U(8205) + U(128105) + U(8205) + U(128103);
+    Expect.EqualI64(Text.VisibleWidth(family), 2, "ZWJ sequence is one emoji");
+    Expect.EqualI64(Text.VisibleWidth(U(128075) + U(127997)), 2, "skin-tone modifier joins its base");
+    Expect.EqualI64(Text.VisibleWidth(U(10084) + U(65039)), 2, "VS16 makes a heart emoji-wide");
+    Expect.EqualI64(Text.VisibleWidth(U(10084)), 1, "text-presentation heart");
+    Expect.EqualString(Text.Truncate(flag + "ab", 3, ""), flag + "a", "truncate keeps the flag whole");
+}
+
+test wrap_carries_styles_across_lines {
+    string bold = Escape.Csi("1", "m");
+    string reset = Escape.Csi("0", "m");
+    string[] lines = Text.Wrap(bold + "alpha beta" + reset + " gamma", 6);
+    Expect.EqualI64(Array.Len<string>(lines), 3, "three lines");
+    Expect.EqualString(Array.Get<string>(lines, 0), bold + "alpha" + reset, "first line closed");
+    Expect.EqualString(Array.Get<string>(lines, 1), bold + "beta" + reset, "second line re-opened");
+    Expect.EqualString(Array.Get<string>(lines, 2), "gamma", "unstyled after reset");
+    Expect.EqualString(Text.ActiveStyleAfter("", bold + "x"), bold, "style tracked");
+    Expect.EqualString(Text.ActiveStyleAfter(bold, reset), "", "reset clears");
+}

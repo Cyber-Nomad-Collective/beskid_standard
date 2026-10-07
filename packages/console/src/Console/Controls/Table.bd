@@ -1,0 +1,243 @@
+/// Console.Controls.Table — column-aligned text tables measured by display width.
+/// @tier(supported)
+/// Cells may contain ANSI styling and wide characters; widths come from
+/// `Ansi.Text.VisibleWidth`. A column is as wide as its widest cell (header included), capped
+/// by an optional per-column maximum, beyond which cells are truncated with `...`. Tables are
+/// values: every `With*` call returns the updated table.
+use Ansi.Text;
+use Core.Collections.Array;
+use Core.String;
+
+/// Horizontal placement of cell text within its column.
+pub enum ColumnAlign {
+    Left,
+    Right,
+    Center,
+}
+
+/// Border drawing style.
+pub enum TableBorder {
+    Unicode,
+    Ascii,
+    None,
+}
+
+/// One row of cells. Rows shorter than the header are padded with empty cells.
+pub type TableRow {
+    string[] cells,
+}
+
+pub type Table {
+    string[] headers,
+    TableRow[] rows,
+    ColumnAlign[] aligns,
+    i64[] maxWidths,
+    TableBorder border,
+}
+
+/// Creates a table with `headers`; every column starts left-aligned and uncapped.
+pub Table New(string[] headers) {
+    mut ColumnAlign[] aligns = Array.Empty<ColumnAlign>();
+    mut i64[] maxWidths = Array.Empty<i64>();
+    mut i64 i = 0;
+    while i < Array.Len<string>(headers) {
+        aligns = Array.Append<ColumnAlign>(aligns, ColumnAlign::Left);
+        maxWidths = Array.Append<i64>(maxWidths, 0);
+        i = i + 1;
+    }
+    return Table { headers: headers, rows: Array.Empty<TableRow>(), aligns: aligns, maxWidths: maxWidths, border: TableBorder::Unicode };
+}
+
+/// Appends a row. Cells beyond the header count are ignored when rendering.
+pub Table WithRow(Table table, string[] cells) {
+    mut TableRow[] rows = table.rows;
+    rows = Array.Append<TableRow>(rows, TableRow { cells: cells });
+    return Table { headers: table.headers, rows: rows, aligns: table.aligns, maxWidths: table.maxWidths, border: table.border };
+}
+
+/// Sets the alignment of `column`; out-of-range columns are ignored.
+pub Table WithAlign(Table table, i64 column, ColumnAlign align) {
+    if column < 0 || column >= Array.Len<ColumnAlign>(table.aligns) {
+        return table;
+    }
+    mut ColumnAlign[] aligns = Array.Empty<ColumnAlign>();
+    mut i64 i = 0;
+    while i < Array.Len<ColumnAlign>(table.aligns) {
+        if i == column {
+            aligns = Array.Append<ColumnAlign>(aligns, align);
+        } else {
+            aligns = Array.Append<ColumnAlign>(aligns, Array.Get<ColumnAlign>(table.aligns, i));
+        }
+        i = i + 1;
+    }
+    return Table { headers: table.headers, rows: table.rows, aligns: aligns, maxWidths: table.maxWidths, border: table.border };
+}
+
+/// Caps `column` at `width` display columns (`0` removes the cap).
+pub Table WithMaxWidth(Table table, i64 column, i64 width) {
+    if column < 0 || column >= Array.Len<i64>(table.maxWidths) {
+        return table;
+    }
+    mut i64[] maxWidths = Array.Empty<i64>();
+    mut i64 i = 0;
+    while i < Array.Len<i64>(table.maxWidths) {
+        if i == column {
+            maxWidths = Array.Append<i64>(maxWidths, width);
+        } else {
+            maxWidths = Array.Append<i64>(maxWidths, Array.Get<i64>(table.maxWidths, i));
+        }
+        i = i + 1;
+    }
+    return Table { headers: table.headers, rows: table.rows, aligns: table.aligns, maxWidths: maxWidths, border: table.border };
+}
+
+/// Selects the border style.
+pub Table WithBorder(Table table, TableBorder border) {
+    return Table { headers: table.headers, rows: table.rows, aligns: table.aligns, maxWidths: table.maxWidths, border: border };
+}
+
+/// The cell of `row` in `column`, or `""` when the row is short.
+string CellOf(TableRow row, i64 column) {
+    string[] cells = row.cells;
+    if column < Array.Len<string>(cells) {
+        return Array.Get<string>(cells, column);
+    }
+    return "";
+}
+
+/// Rendered width of each column.
+pub i64[] ColumnWidths(Table table) {
+    i64 columns = Array.Len<string>(table.headers);
+    mut i64[] widths = Array.Empty<i64>();
+    mut i64 c = 0;
+    while c < columns {
+        mut i64 width = Text.VisibleWidth(Array.Get<string>(table.headers, c));
+        mut i64 r = 0;
+        while r < Array.Len<TableRow>(table.rows) {
+            i64 cell = Text.VisibleWidth(CellOf(Array.Get<TableRow>(table.rows, r), c));
+            if cell > width {
+                width = cell;
+            }
+            r = r + 1;
+        }
+        i64 cap = Array.Get<i64>(table.maxWidths, c);
+        if cap > 0 && width > cap {
+            width = cap;
+        }
+        widths = Array.Append<i64>(widths, width);
+        c = c + 1;
+    }
+    return widths;
+}
+
+string Aligned(string text, i64 width, ColumnAlign align) {
+    string fitted = Text.Truncate(text, width, "...");
+    return match align {
+        ColumnAlign::Left => Text.PadEnd(fitted, width),
+        ColumnAlign::Right => Text.PadStart(fitted, width),
+        ColumnAlign::Center => Text.Center(fitted, width),
+    };
+}
+
+/// One content line: cells aligned to their widths and separated by the vertical rule.
+string ContentLine(Table table, string[] cells, i64[] widths, string vertical) {
+    i64 columns = Array.Len<i64>(widths);
+    mut string line = "";
+    if String.Len(vertical) > 0 {
+        line = vertical + " ";
+    }
+    mut i64 c = 0;
+    while c < columns {
+        if c > 0 {
+            if String.Len(vertical) > 0 {
+                line = line + " " + vertical + " ";
+            } else {
+                line = line + "  ";
+            }
+        }
+        mut string cell = "";
+        if c < Array.Len<string>(cells) {
+            cell = Array.Get<string>(cells, c);
+        }
+        line = String.Concat(line, Aligned(cell, Array.Get<i64>(widths, c), Array.Get<ColumnAlign>(table.aligns, c)));
+        c = c + 1;
+    }
+    if String.Len(vertical) > 0 {
+        line = line + " " + vertical;
+    }
+    return line;
+}
+
+/// A horizontal rule such as `├─────┼───┤`.
+string Rule(i64[] widths, string left, string fill, string junction, string right) {
+    mut string line = left;
+    mut i64 c = 0;
+    while c < Array.Len<i64>(widths) {
+        if c > 0 {
+            line = line + junction;
+        }
+        line = line + String.Repeat(fill, Array.Get<i64>(widths, c) + 2);
+        c = c + 1;
+    }
+    return line + right;
+}
+
+/// Renders the table as lines joined by line feeds: a top border, the header, a separator,
+/// every row, and a bottom border (borders are omitted for `TableBorder::None`).
+pub string Render(Table table) {
+    i64[] widths = ColumnWidths(table);
+    mut string vertical = "|";
+    mut string fill = "-";
+    mut string topLeft = "+";
+    mut string topJunction = "+";
+    mut string topRight = "+";
+    mut string midLeft = "+";
+    mut string midJunction = "+";
+    mut string midRight = "+";
+    mut string bottomLeft = "+";
+    mut string bottomJunction = "+";
+    mut string bottomRight = "+";
+    bool bordered = match table.border {
+        TableBorder::None => false,
+        _ => true,
+    };
+    bool unicode = match table.border {
+        TableBorder::Unicode => true,
+        _ => false,
+    };
+    if unicode {
+        vertical = "│";
+        fill = "─";
+        topLeft = "┌";
+        topJunction = "┬";
+        topRight = "┐";
+        midLeft = "├";
+        midJunction = "┼";
+        midRight = "┤";
+        bottomLeft = "└";
+        bottomJunction = "┴";
+        bottomRight = "┘";
+    }
+    mut string[] lines = Array.Empty<string>();
+    if bordered {
+        lines = Array.Append<string>(lines, Rule(widths, topLeft, fill, topJunction, topRight));
+        lines = Array.Append<string>(lines, ContentLine(table, table.headers, widths, vertical));
+        lines = Array.Append<string>(lines, Rule(widths, midLeft, fill, midJunction, midRight));
+    } else {
+        lines = Array.Append<string>(lines, String.TrimEnd(ContentLine(table, table.headers, widths, "")));
+    }
+    mut i64 r = 0;
+    while r < Array.Len<TableRow>(table.rows) {
+        TableRow row = Array.Get<TableRow>(table.rows, r);
+        if bordered {
+            lines = Array.Append<string>(lines, ContentLine(table, row.cells, widths, vertical));
+        } else {
+            lines = Array.Append<string>(lines, String.TrimEnd(ContentLine(table, row.cells, widths, "")));
+        }
+        r = r + 1;
+    }
+    if bordered {
+        lines = Array.Append<string>(lines, Rule(widths, bottomLeft, fill, bottomJunction, bottomRight));
+    }
+    return String.Join(lines, String.Newline());
+}

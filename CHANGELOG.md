@@ -44,6 +44,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   wrap) and `Ansi.Modes` (synchronized output, bracketed paste, focus
   reporting, cursor shape, hyperlink ids, OSC 52 clipboard, OSC 9
   notifications).
+- Add `Console.Controls.Table` (display-width columns, alignment, width caps
+  with truncation, Unicode/ASCII/no borders), multi-line `Panel` bodies, and
+  cluster-aware width (flags, ZWJ emoji, skin tones, VS16) in `Ansi.Text`;
+  `Wrap` now re-opens active styles on continuation lines.
 - Add `Capabilities.FromEnvironment` and `TerminalEnvironment` so color policy
   is a pure, testable function of `TERM`, `COLORTERM`, `NO_COLOR`,
   `FORCE_COLOR`, and TTY state; `ProbeStdout` now uses it.
@@ -86,7 +90,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `TERM` values containing `256color`, honor `FORCE_COLOR` levels, and treat
   an empty `NO_COLOR` as unset.
 - Size `Console.Controls.Panel` by visible width so ANSI styling and wide
-  characters no longer misalign its border.
+  characters no longer misalign its border; `Measure` no longer adds a row
+  for a title drawn inside the top border, and over-wide lines truncate
+  instead of pushing the border out.
 - Correct the `Core.String` reference: `Contains` scans substrings, and the
   page now covers the full search, transform, and builder surface.
 - Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.

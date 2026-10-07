@@ -4,8 +4,10 @@
 /// strings, and two-byte ESC sequences) occupy zero columns. Code points are measured with
 /// `CodePointWidth`: wide East Asian and emoji-presentation code points take two columns,
 /// combining marks, zero-width joiners, variation selectors, and control characters take none.
-/// Width is measured per code point, not per grapheme cluster, so multi-code-point emoji
-/// sequences can measure wider than a terminal renders them.
+/// Width is measured per cluster (`ClusterAt`): combining marks, emoji modifiers, variation
+/// selectors, zero-width-joiner sequences, and regional-indicator pairs join the preceding code
+/// point, and VS16 turns a narrow symbol into a two-column emoji. This approximates extended
+/// grapheme clusters; terminals differ on some sequences.
 use Core.Collections.Array;
 use Core.String;
 
@@ -126,21 +128,85 @@ pub i64 CodePointWidth(i64 cp) {
     return 1;
 }
 
+/// One display cluster: its column width and UTF-8 byte length.
+pub type Cluster {
+    i64 width,
+    i64 length,
+}
+
+bool IsRegionalIndicator(i64 cp) {
+    return cp >= 127462 && cp <= 127487;
+}
+
+bool IsEmojiModifier(i64 cp) {
+    return cp >= 127995 && cp <= 127999;
+}
+
+/// Measures the cluster starting at `at`: a base code point plus the extenders that render with
+/// it. An escape sequence always ends a cluster.
+pub Cluster ClusterAt(string text, i64 at) {
+    i64 len = String.Len(text);
+    Rune base = DecodeAt(text, at);
+    mut i64 width = CodePointWidth(base.codePoint);
+    bool regional = IsRegionalIndicator(base.codePoint);
+    mut bool paired = false;
+    mut i64 i = at + base.length;
+    while i < len {
+        if String.ByteAt(text, i) == 27 {
+            break;
+        }
+        Rune next = DecodeAt(text, i);
+        i64 cp = next.codePoint;
+        if cp == 65039 {
+            if width == 1 {
+                width = 2;
+            }
+            i = i + next.length;
+            continue;
+        }
+        if cp == 65038 || IsEmojiModifier(cp) {
+            i = i + next.length;
+            continue;
+        }
+        if cp == 8205 {
+            i = i + next.length;
+            if i < len && String.ByteAt(text, i) != 27 {
+                Rune joined = DecodeAt(text, i);
+                i = i + joined.length;
+            }
+            continue;
+        }
+        if regional && !paired && IsRegionalIndicator(cp) {
+            width = 2;
+            paired = true;
+            i = i + next.length;
+            continue;
+        }
+        if cp >= 768 && CodePointWidth(cp) == 0 {
+            i = i + next.length;
+            continue;
+        }
+        break;
+    }
+    return Cluster { width: width, length: i - at };
+}
+
 /// Removes every escape sequence, keeping the visible text.
 pub string Strip(string text) {
     i64 len = String.Len(text);
-    mut u8[] bytes = Array.Empty<u8>();
+    mut string result = "";
+    mut i64 runStart = 0;
     mut i64 i = 0;
     while i < len {
-        u8 b = String.ByteAt(text, i);
-        if b == 27 {
+        if String.ByteAt(text, i) == 27 {
+            result = String.Concat(result, String.SubSlice(text, runStart, i - runStart));
             i = i + EscapeLength(text, i);
+            runStart = i;
         } else {
-            bytes = Array.Append<u8>(bytes, b);
             i = i + 1;
         }
     }
-    return String.FromUtf8CodeUnits(bytes);
+    return String.Concat(result, String.SubSlice(text, runStart, len - runStart));
 }
 
 /// Number of terminal columns `text` occupies, ignoring escape sequences.
@@ -152,9 +218,9 @@ pub i64 VisibleWidth(string text) {
         if String.ByteAt(text, i) == 27 {
             i = i + EscapeLength(text, i);
         } else {
-            Rune rune = DecodeAt(text, i);
-            width = width + CodePointWidth(rune.codePoint);
-            i = i + rune.length;
+            Cluster cluster = ClusterAt(text, i);
+            width = width + cluster.width;
+            i = i + cluster.length;
         }
     }
     return width;
@@ -179,12 +245,7 @@ bool HasSgr(string text) {
 }
 
 string ResetSgr() {
-    mut u8[] bytes = Array.Empty<u8>();
-    bytes = Array.Append<u8>(bytes, u8(27));
-    bytes = Array.Append<u8>(bytes, u8(91));
-    bytes = Array.Append<u8>(bytes, u8(48));
-    bytes = Array.Append<u8>(bytes, u8(109));
-    return String.FromUtf8CodeUnits(bytes);
+    return String.FromAscii(27) + "[0m";
 }
 
 /// Shortens `text` to at most `width` columns. When it does not fit, visible text is cut and
@@ -205,34 +266,21 @@ pub string Truncate(string text, i64 width, string ellipsis) {
         budget = width;
     }
     i64 len = String.Len(text);
-    mut u8[] bytes = Array.Empty<u8>();
     mut i64 used = 0;
     mut i64 i = 0;
     while i < len {
         if String.ByteAt(text, i) == 27 {
-            i64 n = EscapeLength(text, i);
-            mut i64 k = 0;
-            while k < n {
-                bytes = Array.Append<u8>(bytes, String.ByteAt(text, i + k));
-                k = k + 1;
-            }
-            i = i + n;
+            i = i + EscapeLength(text, i);
         } else {
-            Rune rune = DecodeAt(text, i);
-            i64 w = CodePointWidth(rune.codePoint);
-            if used + w > budget {
+            Cluster cluster = ClusterAt(text, i);
+            if used + cluster.width > budget {
                 break;
             }
-            mut i64 k = 0;
-            while k < rune.length {
-                bytes = Array.Append<u8>(bytes, String.ByteAt(text, i + k));
-                k = k + 1;
-            }
-            used = used + w;
-            i = i + rune.length;
+            used = used + cluster.width;
+            i = i + cluster.length;
         }
     }
-    string kept = String.FromUtf8CodeUnits(bytes);
+    string kept = String.SubSlice(text, 0, i);
     if HasSgr(kept) {
         return String.Concat(String.Concat(kept, ResetSgr()), tail);
     }
@@ -278,15 +326,14 @@ string[] BreakWord(string word, i64 width) {
         if String.ByteAt(word, i) == 27 {
             i = i + EscapeLength(word, i);
         } else {
-            Rune rune = DecodeAt(word, i);
-            i64 w = CodePointWidth(rune.codePoint);
-            if used + w > width && used > 0 {
+            Cluster cluster = ClusterAt(word, i);
+            if used + cluster.width > width && used > 0 {
                 pieces = Array.Append<string>(pieces, String.SubSlice(word, start, i - start));
                 start = i;
                 used = 0;
             }
-            used = used + w;
-            i = i + rune.length;
+            used = used + cluster.width;
+            i = i + cluster.length;
         }
     }
     if start < len {
@@ -297,8 +344,60 @@ string[] BreakWord(string word, i64 width) {
 
 /// Word-wraps `text` into lines of at most `width` columns. Existing line feeds start new
 /// lines, runs of spaces between words collapse to one, and words wider than `width` are broken
-/// across lines. Styles are not re-opened on continuation lines.
+/// across lines. SGR styling that is still active at the end of a line is closed with a reset
+/// and re-opened at the start of the next line, so each line renders independently.
 pub string[] Wrap(string text, i64 width) {
+    return CarryStyles(WrapPlain(text, width));
+}
+
+/// SGR sequences still in effect after `line`, starting from `active`. A reset (`ESC [ m` or
+/// `ESC [ 0 m`) clears the state; any other SGR sequence is appended to it.
+pub string ActiveStyleAfter(string active, string line) {
+    i64 len = String.Len(line);
+    mut string state = active;
+    mut i64 i = 0;
+    while i < len {
+        if String.ByteAt(line, i) == 27 {
+            i64 n = EscapeLength(line, i);
+            if n >= 3 && String.ByteAt(line, i + 1) == 91 && String.ByteAt(line, i + n - 1) == 109 {
+                string params = String.SubSlice(line, i + 2, n - 3);
+                if params == "" || params == "0" {
+                    state = "";
+                } else {
+                    if String.StartsWith(params, "0;") {
+                        state = String.SubSlice(line, i, n);
+                    } else {
+                        state = String.Concat(state, String.SubSlice(line, i, n));
+                    }
+                }
+            }
+            i = i + n;
+        } else {
+            i = i + 1;
+        }
+    }
+    return state;
+}
+
+string[] CarryStyles(string[] lines) {
+    mut string[] result = Array.Empty<string>();
+    mut string active = "";
+    mut i64 i = 0;
+    while i < Array.Len<string>(lines) {
+        string line = Array.Get<string>(lines, i);
+        string opened = String.Concat(active, line);
+        active = ActiveStyleAfter(active, line);
+        if String.Len(active) > 0 {
+            result = Array.Append<string>(result, String.Concat(opened, ResetSgr()));
+        } else {
+            result = Array.Append<string>(result, opened);
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+string[] WrapPlain(string text, i64 width) {
     mut string[] lines = Array.Empty<string>();
     mut i64 limit = width;
     if limit < 1 {

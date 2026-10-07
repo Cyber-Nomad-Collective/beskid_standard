@@ -4,7 +4,7 @@
 
 ## Ansi.Text: measuring and laying out terminal text
 
-Escape sequences take no columns. Code points are measured with `CodePointWidth`: wide East Asian characters and emoji take 2 columns; combining marks, zero-width joiners, variation selectors, and controls take 0.
+Escape sequences take no columns. Text is measured in clusters (`ClusterAt`): a base code point plus combining marks, emoji modifiers, variation selectors, zero-width-joiner sequences, and a second regional indicator. Wide East Asian characters and emoji take 2 columns, a flag pair takes 2, and VS16 widens a text-presentation symbol (such as a heart) to 2; controls take 0.
 
 | Function | Behavior |
 |----------|----------|
@@ -12,8 +12,9 @@ Escape sequences take no columns. Code points are measured with `CodePointWidth`
 | `VisibleWidth(text)` | Columns occupied on screen. Use this instead of `String.Len` for alignment. |
 | `Truncate(text, width, ellipsis)` | Cuts to `width` columns, appending `ellipsis` inside the width; never splits a wide character; appends an SGR reset when the kept text was styled. |
 | `PadEnd`, `PadStart`, `Center(text, width)` | Space padding by columns; never truncates. |
-| `Wrap(text, width)` | Word wrap by columns; keeps existing newlines, collapses runs of spaces, and hard-breaks words wider than `width`. |
-| `CodePointWidth(cp)`, `DecodeAt(text, at)`, `EscapeLength(text, at)` | Building blocks for custom layout. |
+| `Wrap(text, width)` | Word wrap by columns; keeps existing newlines, collapses runs of spaces, and hard-breaks words wider than `width`. Styling still active at a line end is closed with a reset and re-opened on the next line. |
+| `ActiveStyleAfter(active, line)` | SGR state after `line`, for carrying styles across separately printed lines. |
+| `ClusterAt(text, at)`, `CodePointWidth(cp)`, `DecodeAt(text, at)`, `EscapeLength(text, at)` | Building blocks for custom layout. |
 
 ```beskid
 use Ansi.Text;
@@ -21,7 +22,7 @@ use Ansi.Text;
 string cell = Text.PadEnd(Text.Truncate(name, 20, "..."), 20);
 ```
 
-Widths are per code point, not per grapheme cluster: multi-code-point emoji sequences (family emoji, flags) can measure wider than a terminal draws them.
+Clusters approximate Unicode extended grapheme clusters; terminals disagree on a few sequences (for example some ZWJ emoji they cannot render as one glyph).
 
 ## Colors
 
@@ -63,4 +64,20 @@ Raw (ungated) sequences; wrap them in `Escape.WhenEnabled` when the stream may n
 
 ## Controls
 
-`Console.Controls.Panel` sizes its border from `Ansi.Text.VisibleWidth`, so styled or wide-character bodies and titles stay aligned.
+### Table
+
+```beskid
+use Console.Controls.Table;
+
+mut Table.Table t = Table.New(["Name", "Qty"]);
+t = Table.WithRow(t, ["apple", "3"]);
+t = Table.WithAlign(t, 1, Table.ColumnAlign::Right);
+t = Table.WithMaxWidth(t, 0, 20);
+string text = Table.Render(t);
+```
+
+Columns are as wide as their widest cell (by display width), capped by `WithMaxWidth`, beyond which cells truncate with `...`. `WithBorder` selects `Unicode` (default), `Ascii`, or `None` (columns separated by two spaces). Short rows render empty cells; extra cells are ignored.
+
+### Panel
+
+`Console.Controls.Panel` frames a body of one or more lines (split on line feeds). Its width comes from the widest line by display width, `Measure` returns one row per line plus the borders (the title sits in the top border), and lines wider than the frame are truncated with `...` so the right border stays aligned.

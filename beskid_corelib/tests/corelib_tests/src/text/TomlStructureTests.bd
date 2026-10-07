@@ -1,0 +1,91 @@
+/// Core.Text.Toml tests.
+
+use Testing.Expect;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Core.Text.Toml;
+
+// ---------------------------------------------------------------------------------------------
+// TOML
+// ---------------------------------------------------------------------------------------------
+
+Toml.TomlValue Doc(string text) {
+    return match Toml.Parse(text) {
+        Result::Ok(v) => v,
+        Result::Error(_) => Toml.TomlValue::Text("<parse error>"),
+    };
+}
+
+string TextAt(Toml.TomlValue doc, string path) {
+    return match Toml.GetPath(doc, path) {
+        Option::Some(v) => match Toml.AsText(v) {
+            Option::Some(t) => t,
+            Option::None => "<not text>",
+        },
+        Option::None => "<missing>",
+    };
+}
+
+i64 IntAt(Toml.TomlValue doc, string path) {
+    return match Toml.GetPath(doc, path) {
+        Option::Some(v) => match Toml.AsInteger(v) {
+            Option::Some(n) => n,
+            Option::None => -999_i64,
+        },
+        Option::None => -998_i64,
+    };
+}
+
+Toml.TomlValue ValueAt(Toml.TomlValue doc, string path) {
+    return match Toml.GetPath(doc, path) {
+        Option::Some(v) => v,
+        Option::None => Toml.TomlValue::Text("<missing>"),
+    };
+}
+
+string TomlFailure(string text) {
+    return match Toml.Parse(text) {
+        Result::Ok(_) => "ok",
+        Result::Error(error) => match error {
+            Toml.TomlError::UnexpectedCharacter(_) => "unexpected",
+            Toml.TomlError::UnexpectedEnd(_) => "end",
+            Toml.TomlError::UnterminatedString(_) => "unterminated",
+            Toml.TomlError::InvalidEscape(_) => "escape",
+            Toml.TomlError::InvalidNumber(_) => "number",
+            Toml.TomlError::DuplicateKey(_) => "duplicate",
+            Toml.TomlError::InvalidTable(_) => "table",
+        },
+    };
+}
+
+string Q(string text) {
+    return String.Replace(text, "'", "\"");
+}
+
+string N() {
+    return String.Newline();
+}
+
+test toml_arrays_of_tables {
+    string source = Q("[[bin]]") + N() + Q("name = 'a'") + N() + Q("[[bin]]") + N() + Q("name = 'b'") + N() + "[bin.meta]" + N() + "x = 1" + N();
+    Toml.TomlValue doc = Doc(source);
+    Toml.TomlValue bins = ValueAt(doc, "bin");
+    Expect.EqualI64(Toml.Length(bins), 2, "two tables");
+    Toml.TomlValue second = match Toml.At(bins, 1) {
+        Option::Some(t) => t,
+        Option::None => Toml.EmptyTable(),
+    };
+    Expect.EqualString(TextAt(second, "name"), "b", "second table");
+    Expect.EqualI64(IntAt(second, "meta.x"), 1, "sub-table attaches to the last element");
+}
+
+test toml_errors {
+    Expect.EqualString(TomlFailure("a = 1" + N() + "a = 2"), "duplicate", "duplicate key");
+    Expect.EqualString(TomlFailure("[t]" + N() + "[t]"), "table", "table defined twice");
+    Expect.EqualString(TomlFailure("a = 1" + N() + "[a]"), "table", "key reused as table");
+    Expect.EqualString(TomlFailure("a = 1 b = 2"), "unexpected", "two pairs on one line");
+    Expect.EqualString(TomlFailure("a ="), "end", "missing value");
+    Expect.EqualString(TomlFailure("= 1"), "unexpected", "missing key");
+    Expect.EqualString(TomlFailure(""), "ok", "empty document");
+}

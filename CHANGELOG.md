@@ -90,6 +90,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Make the free-function forms of the `Ansi` cursor, erase, OSC, screen, and
   input-mode builders delegate to their methods instead of duplicating every
   sequence.
+- Add `Core.Text.SemVer` (SemVer 2.0 parsing, precedence, bumps, and
+  npm/Cargo-style requirements), `Core.Text.Glob` (plain and path-aware
+  wildcards), `Core.Text.Csv` (RFC 4180), `Core.Text.Url` (RFC 3986 parsing,
+  percent-encoding, query parameters, reference resolution), and
+  `Core.Text.Toml` (TOML 1.0 into `TomlValue`), with reference pages and a
+  guide for merging this branch with the 0.5.3 line.
 - Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
   gray-ramp entry (every gray previously mapped to black), and 16-color
   mapping picks the nearest palette entry including bright codes (white and

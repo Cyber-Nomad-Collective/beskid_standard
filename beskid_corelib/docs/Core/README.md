@@ -12,6 +12,11 @@
 | [Optional](./Optional.md) | `Option<T>` and `Some` / `None` |
 | [Number](./Text/Number.md) | Integer and float parsing, formatting, checked f64-to-i64 conversion |
 | [Json](./Json.md) | RFC 8259 parse, build, inspect, and serialize |
+| [SemVer](./Text/SemVer.md) | Semantic versions, precedence, and requirement matching |
+| [Glob](./Text/Glob.md) | Shell-style and path-aware wildcard matching |
+| [Csv](./Text/Csv.md) | RFC 4180 parse and format |
+| [Url](./Text/Url.md) | RFC 3986 parse, percent-encoding, queries, and resolution |
+| [Toml](./Text/Toml.md) | TOML 1.0 documents |
 
 ## OS runtime (foundation)
 

@@ -10,11 +10,15 @@ use Tls.Record;
 use Tls.Suites;
 use Tls.TlsErrors;
 use Tls.Wire;
+use Codec.Mem;
 
 // TLS 1.3 record layer carrier over any `Core.IO.Stream` (RFC 8446 section 5). The
 // transport is passed to every call (a contract value cannot be stored in a struct in
 // Beskid 0.5.2). One read and one write record buffer are allocated per connection and
-// reused for every record.
+// reused for every record. They start at 4 KiB (a literal allocation) and grow once to
+// `Record.BufferLength()` when a larger record arrives or is written: a 16 KiB buffer costs
+// about 120 ms to allocate in 0.5.3 (COMPILER-GAPS PERF1), which would otherwise dominate
+// every handshake.
 
 pub type TlsConnection {
     HandshakeEngine engine,
@@ -40,13 +44,32 @@ i64 PLength() { return 8_i64; }
 
 TlsError F(i64 alert) { return TlsErrors.Fatal(alert); }
 
+/// Initial size of the record buffers (handshake flights and small records fit).
+i64 InitialBuffer() { return 4096_i64; }
+
+/// Grows the read buffer to the full record size, keeping the 5-byte header already read.
+unit GrowRead(TlsConnection c, i64 need) {
+    if Slice.Len(c.rbuf) >= need { return; }
+    u8[] grown = Mem.Zeroed(Record.BufferLength());
+    Mem.Copy(grown, 0_i64, c.rbuf, 0_i64, 5_i64);
+    c.rbuf = grown;
+    return;
+}
+
+/// Grows the write buffer to the full record size (contents are rebuilt per record).
+unit GrowWrite(TlsConnection c, i64 need) {
+    if Slice.Len(c.wbuf) >= need { return; }
+    c.wbuf = Mem.Zeroed(Record.BufferLength());
+    return;
+}
+
 /// Wraps a handshake engine (from `Handshake.NewClient` / `NewServer`) in a record layer.
 pub Result<TlsConnection, TlsError> New(HandshakeEngine engine) {
-    RecordKeys none = Record.FromKeyIv(Suites.Aes128(), Slice.New(16_i64), Slice.New(12_i64))?;
+    RecordKeys none = Record.FromKeyIv(Suites.Aes128(), Mem.Zeroed(16_i64), Mem.Zeroed(12_i64))?;
     mut TlsError[] failure = Array.Empty<TlsError>();
     return Result::Ok(TlsConnection {
         engine: engine, readKeys: none, writeKeys: none,
-        rbuf: Slice.New(Record.BufferLength()), wbuf: Slice.New(Record.BufferLength()),
+        rbuf: Mem.Zeroed(InitialBuffer()), wbuf: Mem.Zeroed(InitialBuffer()),
         st: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64], failure: failure,
     });
 }
@@ -77,7 +100,8 @@ Result<unit, TlsError> WriteRecords(TlsConnection c, Stream transport, i64 conte
         first = false;
         mut i64 n = count - done;
         if n > Wire.MaxPlaintext() { n = Wire.MaxPlaintext(); }
-        Slice.Copy(c.wbuf, 5_i64, src, offset + done, n);
+        GrowWrite(c, n + 22_i64);
+        Mem.Copy(c.wbuf, 5_i64, src, offset + done, n);
         if c.st[PWriteProtected()] == 1_i64 {
             i64 total = Record.Seal(c.writeKeys, c.wbuf, contentType, n, 0_i64)?;
             Result<unit, TlsError> r1 = WriteRaw(transport, c.wbuf, total);
@@ -100,6 +124,7 @@ Result<i64, TlsError> ReadRecord(TlsConnection c, Stream transport) {
     i64 outer = i64(c.rbuf[0]);
     i64 length = (i64(c.rbuf[3]) << 8_i64) | i64(c.rbuf[4]);
     if length > Wire.MaxCiphertext() { return Result::Error(F(Alert.RecordOverflow())); }
+    GrowRead(c, 5_i64 + length);
     Result<unit, IoError> body = IO.ReadExact(transport, c.rbuf, 5_i64, length);
     match body { Result::Error(e) => { return Result::Error(TlsError::Io(e)); }, Result::Ok(_) => {}, };
     if outer == Wire.ContentChangeCipherSpec() {
@@ -248,7 +273,7 @@ Result<i64, TlsError> DoRead(TlsConnection c, Stream transport, u8[] destination
     i64 start = c.st[PStart()];
     mut i64 n = c.st[PEnd()] - start;
     if n > count { n = count; }
-    Slice.Copy(destination, offset, c.rbuf, start, n);
+    Mem.Copy(destination, offset, c.rbuf, start, n);
     c.st[PStart()] = start + n;
     return Result::Ok(n);
 }

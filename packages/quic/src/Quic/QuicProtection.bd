@@ -11,6 +11,7 @@ use Crypto.Hmac;
 use Codec.Hex;
 use Quic.QuicPacket;
 use Quic.QuicWire;
+use Codec.Mem;
 
 // QUIC packet protection (RFC 9001 section 5): initial secrets, key/iv/hp derivation,
 // AEAD payload protection in place, AES and ChaCha20 header protection, key update,
@@ -122,27 +123,64 @@ pub u8[] Mask(PacketKeys k, u8[] buf, i64 sampleAt) {
         u8[] nonce = QuicWire.CopyOf(buf, sampleAt + 4_i64, 12_i64);
         return match ChaCha20.Block(k.hp, counter, nonce) {
             Result::Ok(block) => block,
-            Result::Error(_) => Slice.New(64_i64),
+            Result::Error(_) => Mem.Zeroed(64_i64),
         };
     }
-    u8[] out = Slice.New(16_i64);
+    u8[] out = [0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8];
     Aes.EncryptBlock(k.hpAes[0], buf, sampleAt, out, 0_i64);
     return out;
 }
 
-u8 Xor8(u8 a, u8 b) { return (a | b) - (a & b); }
+/// XORs `mask[0] & bits` into buf[start] and returns the new first byte (one CLIF block).
+/// Precondition: start in bounds, mask non-empty.
+i64 MaskFirst(u8[] buf, i64 start, u8[] mask, i64 bits) {
+    return clif {
+        %b = payload %0
+        %fp = iadd %b, %1
+        %m = payload %2
+        %f = load.i8 %fp
+        %m0 = load.i8 %m
+        %bits8 = ireduce.i8 %3
+        %mm = band %m0, %bits8
+        %f2 = bxor %f, %mm
+        store %f2, %fp
+        %r = uextend.i64 %f2
+        return %r
+    };
+}
+
+/// XORs mask[1 .. 1 + pnLength) into buf[pnOffset .. pnOffset + pnLength) with one 32-bit
+/// load, masked XOR and store (one CLIF block, no per-byte loop).
+/// Precondition: pnOffset + 4 <= len(buf) (the header protection sample follows), len(mask) >= 5,
+/// 1 <= pnLength <= 4.
+unit MaskPn(u8[] buf, i64 pnOffset, i64 pnLength, u8[] mask) {
+    clif {
+        %b = payload %0
+        %pp = iadd %b, %1
+        %x = load.i32 %pp
+        %m = payload %3
+        %one = iconst.i64 1
+        %mp = iadd %m, %one
+        %mv = load.i32 %mp
+        %eight = iconst.i64 8
+        %sh = imul %2, %eight
+        %k64 = ishl %one, %sh
+        %keep64 = isub %k64, %one
+        %keep = ireduce.i32 %keep64
+        %mk = band %mv, %keep
+        %y = bxor %x, %mk
+        store %y, %pp
+    };
+    return;
+}
 
 /// Applies (or removes: the operation is symmetric for the packet number bytes) header
 /// protection. `long` selects the 4-bit (long header) or 5-bit (short header) first-byte mask.
 unit ApplyMask(u8[] buf, i64 start, i64 pnOffset, i64 pnLength, u8[] mask, bool long) {
-    mut u8 bits = 31_u8;
-    if long { bits = 15_u8; }
-    buf[start] = Xor8(buf[start], mask[0] & bits);
-    mut i64 i = 0_i64;
-    while i < pnLength {
-        buf[pnOffset + i] = Xor8(buf[pnOffset + i], mask[1_i64 + i]);
-        i = i + 1_i64;
-    }
+    mut i64 bits = 31_i64;
+    if long { bits = 15_i64; }
+    MaskFirst(buf, start, mask, bits);
+    MaskPn(buf, pnOffset, pnLength, mask);
     return;
 }
 
@@ -175,15 +213,14 @@ pub i64 Seal(PacketKeys k, u8[] buf, i64 start, i64 pnOffset, i64 pnLength, i64 
 pub bool Unmask(PacketKeys k, u8[] buf, i64 start, i64 pnOffset, i64 end, i64 largestPn, i64[] out) {
     if pnOffset + 20_i64 > end { return false; }
     u8[] mask = Mask(k, buf, pnOffset + 4_i64);
-    bool long = (i64(buf[start]) & 128_i64) != 0_i64;
-    mut u8 bits = 31_u8;
-    if long { bits = 15_u8; }
-    buf[start] = Xor8(buf[start], mask[0] & bits);
-    i64 pnLength = (i64(buf[start]) & 3_i64) + 1_i64;
+    mut i64 bits = 31_i64;
+    if (i64(buf[start]) & 128_i64) != 0_i64 { bits = 15_i64; }
+    i64 first = MaskFirst(buf, start, mask, bits);
+    i64 pnLength = (first & 3_i64) + 1_i64;
+    MaskPn(buf, pnOffset, pnLength, mask);
     mut i64 truncated = 0_i64;
     mut i64 i = 0_i64;
     while i < pnLength {
-        buf[pnOffset + i] = Xor8(buf[pnOffset + i], mask[1_i64 + i]);
         truncated = (truncated << 8_i64) | i64(buf[pnOffset + i]);
         i = i + 1_i64;
     }
@@ -220,11 +257,11 @@ pub i64 Open(PacketKeys k, u8[] buf, i64 start, i64 pnOffset, i64 pnLength, i64 
 /// ODCID length, ODCID, and the Retry packet without its tag.
 pub u8[] RetryTag(u8[] odcid, u8[] packet, i64 start, i64 count) {
     i64 ol = Slice.Len(odcid);
-    u8[] pseudo = Slice.New(1_i64 + ol + count);
+    u8[] pseudo = Mem.Zeroed(1_i64 + ol + count);
     pseudo[0] = u8(ol);
-    Slice.Copy(pseudo, 1_i64, odcid, 0_i64, ol);
-    Slice.Copy(pseudo, 1_i64 + ol, packet, start, count);
-    u8[] tag = Slice.New(16_i64);
+    Mem.Copy(pseudo, 1_i64, odcid, 0_i64, ol);
+    Mem.Copy(pseudo, 1_i64 + ol, packet, start, count);
+    u8[] tag = Mem.Zeroed(16_i64);
     match AesGcm.New(Hex.Of("be0c690b9f66575a1d766b54e368c84e")) {
         Result::Ok(key) => {
             match AesGcm.SealInto(key, Hex.Of("461599d35d632bf2239825bb"), pseudo, tag, 0_i64, 0_i64, tag, 0_i64) { Result::Ok(_) => (), Result::Error(_) => (), };
@@ -244,7 +281,7 @@ pub bool RetryValid(u8[] odcid, u8[] buf, i64 start, i64 end) {
 /// Builds a Retry packet (RFC 9000 section 17.2.5) with its integrity tag.
 pub u8[] BuildRetry(u8[] odcid, u8[] dcid, u8[] scid, u8[] token) {
     i64 n = 7_i64 + Slice.Len(dcid) + Slice.Len(scid) + Slice.Len(token);
-    u8[] out = Slice.New(n + 16_i64);
+    u8[] out = Mem.Zeroed(n + 16_i64);
     Writer w = QuicWire.NewWriter(out, 0_i64, n);
     QuicWire.PutByte(w, 255_i64);
     QuicWire.PutUint(w, 4_i64, 1_i64);
@@ -253,6 +290,6 @@ pub u8[] BuildRetry(u8[] odcid, u8[] dcid, u8[] scid, u8[] token) {
     QuicWire.PutByte(w, Slice.Len(scid));
     QuicWire.PutAll(w, scid);
     QuicWire.PutAll(w, token);
-    Slice.Copy(out, n, RetryTag(odcid, out, 0_i64, n), 0_i64, 16_i64);
+    Mem.Copy(out, n, RetryTag(odcid, out, 0_i64, n), 0_i64, 16_i64);
     return out;
 }

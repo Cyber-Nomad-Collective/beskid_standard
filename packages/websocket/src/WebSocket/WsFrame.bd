@@ -3,6 +3,7 @@ use Core.Collections.Array;
 use Core.Results;
 use WebSocket.WsErrors;
 use WebSocket.WsUtf8;
+use Codec.Mem;
 
 // RFC 6455 section 5 base framing: header codec, masking, close payloads.
 
@@ -98,7 +99,7 @@ pub Result<FrameHeader, WsError> DecodeHeader(u8[] buf, i64 start, i64 stop) {
         if length > MaxControlPayload() { return Result::Error(WsError::ProtocolError(ReasonControlTooLong())); }
     }
     mut u8[] key = Slice.New(0_i64);
-    if masked { key = Slice.SubSlice(buf, pos, 4_i64); }
+    if masked { key = Mem.SubSlice(buf, pos, 4_i64); }
     return Result::Ok(FrameHeader { fin: fin, rsv: rsv, opcode: opcode, masked: masked, maskKey: key, payloadLength: length, headerLength: headerLength });
 }
 
@@ -111,10 +112,66 @@ pub Result<unit, WsError> CheckRole(bool masked, bool receiverIsServer) {
 
 u8 XorByte(u8 a, u8 b) { return (a | b) - (a & b); }
 
+/// XORs data[at, at + 64) with the 8-byte little-endian key word `k` (one CLIF block,
+/// eight 64-bit loads, XORs and stores). Precondition: at + 64 <= len(data).
+unit Xor64(u8[] data, i64 at, i64 k) {
+    clif {
+        %b = payload %0
+        %p0 = iadd %b, %1
+        %c8 = iconst.i64 8
+        %x0 = load.i64 %p0
+        %y0 = bxor %x0, %2
+        store %y0, %p0
+        %p1 = iadd %p0, %c8
+        %x1 = load.i64 %p1
+        %y1 = bxor %x1, %2
+        store %y1, %p1
+        %p2 = iadd %p1, %c8
+        %x2 = load.i64 %p2
+        %y2 = bxor %x2, %2
+        store %y2, %p2
+        %p3 = iadd %p2, %c8
+        %x3 = load.i64 %p3
+        %y3 = bxor %x3, %2
+        store %y3, %p3
+        %p4 = iadd %p3, %c8
+        %x4 = load.i64 %p4
+        %y4 = bxor %x4, %2
+        store %y4, %p4
+        %p5 = iadd %p4, %c8
+        %x5 = load.i64 %p5
+        %y5 = bxor %x5, %2
+        store %y5, %p5
+        %p6 = iadd %p5, %c8
+        %x6 = load.i64 %p6
+        %y6 = bxor %x6, %2
+        store %y6, %p6
+        %p7 = iadd %p6, %c8
+        %x7 = load.i64 %p7
+        %y7 = bxor %x7, %2
+        store %y7, %p7
+    };
+    return;
+}
+
 /// XORs `count` bytes from `offset` with the 4-byte key, starting at key position
 /// `keyIndex` (so a payload can be unmasked in pieces). Applying it twice restores the data.
+/// Whole 64-byte blocks go through `Xor64`; 64 is a multiple of 4, so the key phase is the
+/// same at every block start.
 pub unit ApplyMask(u8[] data, i64 offset, i64 count, u8[] key, i64 keyIndex) {
     mut i64 i = 0_i64;
+    if count >= 64_i64 && offset >= 0_i64 && offset + count <= Slice.Len(data) {
+        mut i64 k = 0_i64;
+        mut i64 j = 7_i64;
+        while j >= 0_i64 {
+            k = (k << 8_i64) | i64(key[(keyIndex + j) & 3_i64]);
+            j = j - 1_i64;
+        }
+        while i + 64_i64 <= count {
+            Xor64(data, offset + i, k);
+            i = i + 64_i64;
+        }
+    }
     while i < count {
         data[offset + i] = XorByte(data[offset + i], key[(keyIndex + i) & 3_i64]);
         i = i + 1_i64;
@@ -138,7 +195,7 @@ pub Result<u8[], WsError> EncodeHeader(bool fin, i64 opcode, i64 count, u8[] mas
     if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
     if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
     bool masked = keyLength == 4_i64;
-    u8[] out = Slice.New(EncodedHeaderLength(count, masked));
+    u8[] out = Mem.Zeroed(EncodedHeaderLength(count, masked));
     WriteHeader(out, fin, opcode, count, maskKey);
     return Result::Ok(out);
 }
@@ -169,7 +226,7 @@ i64 WriteHeader(u8[] out, bool fin, i64 opcode, i64 count, u8[] maskKey) {
         out[1] = u8(maskBit | count);
     }
     if masked {
-        Slice.Copy(out, pos, maskKey, 0_i64, 4_i64);
+        Mem.Copy(out, pos, maskKey, 0_i64, 4_i64);
         pos = pos + 4_i64;
     }
     return pos;
@@ -183,9 +240,9 @@ pub Result<u8[], WsError> EncodeFrame(bool fin, i64 opcode, u8[] payload, i64 of
     if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
     if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
     bool masked = keyLength == 4_i64;
-    u8[] out = Slice.New(EncodedHeaderLength(count, masked) + count);
+    u8[] out = Mem.Zeroed(EncodedHeaderLength(count, masked) + count);
     i64 pos = WriteHeader(out, fin, opcode, count, maskKey);
-    Slice.Copy(out, pos, payload, offset, count);
+    Mem.Copy(out, pos, payload, offset, count);
     if masked { ApplyMask(out, pos, count, maskKey, 0_i64); }
     return Result::Ok(out);
 }
@@ -214,10 +271,10 @@ pub Result<u8[], WsError> EncodeClosePayload(i64 code, u8[] reason) {
     }
     if !ValidCloseCode(code) || n + 2_i64 > MaxControlPayload() { return Result::Error(WsError::InvalidArgument()); }
     if !WsUtf8.IsValid(reason, 0_i64, n) { return Result::Error(WsError::InvalidUtf8()); }
-    u8[] out = Slice.New(n + 2_i64);
+    u8[] out = Mem.Zeroed(n + 2_i64);
     out[0] = u8((code >> 8_i64) & 255_i64);
     out[1] = u8(code & 255_i64);
-    Slice.Copy(out, 2_i64, reason, 0_i64, n);
+    Mem.Copy(out, 2_i64, reason, 0_i64, n);
     return Result::Ok(out);
 }
 
@@ -237,5 +294,5 @@ pub Result<i64, WsError> DecodeCloseCode(u8[] payload) {
 pub u8[] CloseReason(u8[] payload) {
     i64 n = Slice.Len(payload);
     if n <= 2_i64 { return Slice.New(0_i64); }
-    return Slice.SubSlice(payload, 2_i64, n - 2_i64);
+    return Mem.SubSlice(payload, 2_i64, n - 2_i64);
 }

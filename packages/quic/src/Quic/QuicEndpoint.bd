@@ -17,6 +17,7 @@ use Quic.QuicErrors;
 use Quic.QuicPacket;
 use Quic.QuicProtection;
 use Quic.QuicWire;
+use Codec.Mem;
 
 // A QUIC endpoint: one UDP socket, connections demultiplexed by destination connection ID,
 // a driver fiber (`Start`) that processes received datagrams, runs timers and sends, and a
@@ -79,7 +80,7 @@ Endpoint Make(UdpSocket socket, QuicConfig config, bool isServer) {
     mut Connection[] conns = Array.Empty<Connection>();
     mut SocketAddress[] peers = Array.Empty<SocketAddress>();
     mut i64[] used = Array.Empty<i64>();
-    u8[] key = match Entropy.Bytes(32_i64) { Result::Ok(k) => k, Result::Error(_) => Slice.New(32_i64), };
+    u8[] key = match Entropy.Bytes(32_i64) { Result::Ok(k) => k, Result::Error(_) => Mem.Zeroed(32_i64), };
     return Endpoint {
         isServer: isServer, socket: socket, config: config,
         n: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
@@ -253,7 +254,7 @@ u8[] AddressBytes(SocketAddress a) {
 }
 
 u8[] V4Bytes(u8 x, u8 y, u8 z, u8 w, i64 p) {
-    u8[] out = Slice.New(7_i64);
+    u8[] out = Mem.Zeroed(7_i64);
     out[0] = 4_u8;
     out[1] = x;
     out[2] = y;
@@ -265,7 +266,7 @@ u8[] V4Bytes(u8 x, u8 y, u8 z, u8 w, i64 p) {
 }
 
 u8[] V6Bytes(u32 x, u32 y, u32 z, u32 w, i64 p) {
-    u8[] out = Slice.New(19_i64);
+    u8[] out = Mem.Zeroed(19_i64);
     out[0] = 6_u8;
     PutWord(out, 1_i64, x);
     PutWord(out, 5_i64, y);
@@ -328,7 +329,7 @@ i64 AcceptInitial(Endpoint ep, u8[] payload, i64 length, SocketAddress from, i64
     mut u8[] retryScid = Slice.New(0_i64);
     if ep.config.requireRetry {
         if Slice.Len(h.token) == 0_i64 {
-            u8[] newScid = match Entropy.Bytes(8_i64) { Result::Ok(b) => b, Result::Error(_) => Slice.New(8_i64), };
+            u8[] newScid = match Entropy.Bytes(8_i64) { Result::Ok(b) => b, Result::Error(_) => Mem.Zeroed(8_i64), };
             SendRaw(ep, QuicProtection.BuildRetry(h.dcid, h.scid, newScid, MakeToken(ep, h.dcid, from)), from);
             ep.n[5] = ep.n[5] + 1_i64;
             return -1_i64;
@@ -377,19 +378,19 @@ unit SendRaw(Endpoint ep, u8[] datagram, SocketAddress to) {
 u8[] TokenTag(Endpoint ep, u8[] odcid, SocketAddress from) {
     u8[] address = AddressBytes(from);
     i64 al = Slice.Len(address);
-    u8[] input = Slice.New(al + Slice.Len(odcid));
-    Slice.Copy(input, 0_i64, address, 0_i64, al);
-    Slice.Copy(input, al, odcid, 0_i64, Slice.Len(odcid));
+    u8[] input = Mem.Zeroed(al + Slice.Len(odcid));
+    Mem.Copy(input, 0_i64, address, 0_i64, al);
+    Mem.Copy(input, al, odcid, 0_i64, Slice.Len(odcid));
     u8[] mac = Hmac.Compute(HashAlgorithm::Sha256, ep.retryKey, input);
     return QuicWire.CopyOf(mac, 0_i64, 16_i64);
 }
 
 u8[] MakeToken(Endpoint ep, u8[] odcid, SocketAddress from) {
     i64 ol = Slice.Len(odcid);
-    u8[] token = Slice.New(1_i64 + ol + 16_i64);
+    u8[] token = Mem.Zeroed(1_i64 + ol + 16_i64);
     token[0] = u8(ol);
-    Slice.Copy(token, 1_i64, odcid, 0_i64, ol);
-    Slice.Copy(token, 1_i64 + ol, TokenTag(ep, odcid, from), 0_i64, 16_i64);
+    Mem.Copy(token, 1_i64, odcid, 0_i64, ol);
+    Mem.Copy(token, 1_i64 + ol, TokenTag(ep, odcid, from), 0_i64, 16_i64);
     return token;
 }
 

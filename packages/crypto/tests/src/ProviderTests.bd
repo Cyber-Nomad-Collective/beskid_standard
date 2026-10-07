@@ -1,7 +1,8 @@
 /// Runs the crypto known-answer vectors (FIPS 180-4, RFC 4231, NIST GCM, RFC 8439, and the
-/// SymLongVectors digests) through both providers: the pure `Crypto.*` kernels and the
-/// OpenSSL `CryptoOpenSsl.Native*` drop-ins, and asserts identical outputs. Also checks
-/// tag rejection, the no-plaintext-on-failure rule, offsets, and provider selection.
+/// SymLongVectors digests) through both providers (ruling R27): `P*` helpers force the pure
+/// kernels with `BESKID_CRYPTO_PROVIDER=pure`, `N*` helpers clear the switch so the native
+/// OpenSSL provider serves the call. Also checks tag rejection, the no-plaintext-on-failure
+/// rule, offsets, and provider selection. Needs a host with OpenSSL 3 (`libcrypto.so.3`).
 use Testing.Assert;
 use Core.Bytes.Slice;
 use Core.Results;
@@ -12,13 +13,29 @@ use Crypto.Errors;
 use Crypto.Hmac;
 use Crypto.Sha256;
 use Crypto.Sha512;
-use CryptoOpenSsl.Native;
-use CryptoOpenSsl.NativeAesGcm;
-use CryptoOpenSsl.NativeChaCha20Poly1305;
-use CryptoOpenSsl.NativeHmac;
-use CryptoOpenSsl.NativeSha256;
-use CryptoOpenSsl.NativeSha512;
-use CryptoOpenSsl.Provider;
+use Crypto.Provider;
+
+unit UsePure() { Provider.ForcePure(true); return; }
+unit UseNative() { Provider.ForcePure(false); return; }
+u8[] PSha256(u8[] m) { UsePure(); u8[] r = Sha256.Hash(m); UseNative(); return r; }
+u8[] NSha256(u8[] m) { UseNative(); return Sha256.Hash(m); }
+u8[] PSha512(u8[] m) { UsePure(); u8[] r = Sha512.Hash512(m); UseNative(); return r; }
+u8[] NSha512(u8[] m) { UseNative(); return Sha512.Hash512(m); }
+u8[] PSha384(u8[] m) { UsePure(); u8[] r = Sha512.Hash384(m); UseNative(); return r; }
+u8[] NSha384(u8[] m) { UseNative(); return Sha512.Hash384(m); }
+u8[] PHmac(HashAlgorithm a, u8[] k, u8[] m) { UsePure(); u8[] r = Hmac.Compute(a, k, m); UseNative(); return r; }
+u8[] NHmac(HashAlgorithm a, u8[] k, u8[] m) { UseNative(); return Hmac.Compute(a, k, m); }
+u8[] PDigest(HashAlgorithm a, u8[] m) { UsePure(); u8[] r = Hmac.Digest(a, m); UseNative(); return r; }
+u8[] NDigest(HashAlgorithm a, u8[] m) { UseNative(); return Hmac.Digest(a, m); }
+Result<AesGcmKey, CryptoError> PAesKey(u8[] k) { UsePure(); Result<AesGcmKey, CryptoError> r = AesGcm.New(k); UseNative(); return r; }
+Result<AesGcmKey, CryptoError> NAesKey(u8[] k) { UseNative(); return AesGcm.New(k); }
+Result<u8[], CryptoError> PChaSeal(u8[] k, u8[] n, u8[] a, u8[] m) { UsePure(); Result<u8[], CryptoError> r = ChaCha20Poly1305.Seal(k, n, a, m); UseNative(); return r; }
+Result<u8[], CryptoError> NChaSeal(u8[] k, u8[] n, u8[] a, u8[] m) { UseNative(); return ChaCha20Poly1305.Seal(k, n, a, m); }
+Result<u8[], CryptoError> PChaOpen(u8[] k, u8[] n, u8[] a, u8[] m) { UsePure(); Result<u8[], CryptoError> r = ChaCha20Poly1305.Open(k, n, a, m); UseNative(); return r; }
+Result<u8[], CryptoError> NChaOpen(u8[] k, u8[] n, u8[] a, u8[] m) { UseNative(); return ChaCha20Poly1305.Open(k, n, a, m); }
+Result<unit, CryptoError> PChaSealInto(u8[] k, u8[] n, u8[] a, u8[] i, i64 io, i64 c, u8[] o, i64 oo) { UsePure(); Result<unit, CryptoError> r = ChaCha20Poly1305.SealInto(k, n, a, i, io, c, o, oo); UseNative(); return r; }
+Result<unit, CryptoError> NChaSealInto(u8[] k, u8[] n, u8[] a, u8[] i, i64 io, i64 c, u8[] o, i64 oo) { UseNative(); return ChaCha20Poly1305.SealInto(k, n, a, i, io, c, o, oo); }
+Result<i64, CryptoError> NChaOpenInto(u8[] k, u8[] n, u8[] a, u8[] i, i64 io, i64 c, u8[] o, i64 oo) { UseNative(); return ChaCha20Poly1305.OpenInto(k, n, a, i, io, c, o, oo); }
 
 u8 Nibble(u8 c) {
     if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
@@ -63,41 +80,41 @@ string Msg896() { return "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijkl
 string Sunscreen() { return "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."; }
 
 unit CheckSha256(u8[] message, string expected) {
-    Assert.True(Same(Sha256.Hash(message), Hex(expected)), "pure sha256");
-    Assert.True(Same(NativeSha256.Hash(message), Hex(expected)), "native sha256");
+    Assert.True(Same(PSha256(message), Hex(expected)), "pure sha256");
+    Assert.True(Same(NSha256(message), Hex(expected)), "native sha256");
     return;
 }
 unit CheckSha512(u8[] message, string expected) {
-    Assert.True(Same(Sha512.Hash512(message), Hex(expected)), "pure sha512");
-    Assert.True(Same(NativeSha512.Hash512(message), Hex(expected)), "native sha512");
+    Assert.True(Same(PSha512(message), Hex(expected)), "pure sha512");
+    Assert.True(Same(NSha512(message), Hex(expected)), "native sha512");
     return;
 }
 unit CheckSha384(u8[] message, string expected) {
-    Assert.True(Same(Sha512.Hash384(message), Hex(expected)), "pure sha384");
-    Assert.True(Same(NativeSha512.Hash384(message), Hex(expected)), "native sha384");
+    Assert.True(Same(PSha384(message), Hex(expected)), "pure sha384");
+    Assert.True(Same(NSha384(message), Hex(expected)), "native sha384");
     return;
 }
 
 unit CheckHmac(HashAlgorithm algorithm, string key, string message, i64 n, string expected) {
-    u8[] pure = Hmac.Compute(algorithm, Hex(key), Hex(message));
-    u8[] native = NativeHmac.Compute(algorithm, Hex(key), Hex(message));
+    u8[] pure = PHmac(algorithm, Hex(key), Hex(message));
+    u8[] native = NHmac(algorithm, Hex(key), Hex(message));
     Assert.True(Same(Prefix(pure, n), Hex(expected)), "pure hmac");
     Assert.True(Same(pure, native), "native hmac equals pure");
     return;
 }
 
 unit CheckAes(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext, string expected) {
-    match AesGcm.New(key) {
+    match PAesKey(key) {
         Result::Error(_) => { Assert.Fail("pure key"); },
         Result::Ok(pure) => {
-            match NativeAesGcm.New(key) {
+            match NAesKey(key) {
                 Result::Error(_) => { Assert.Fail("native key"); },
                 Result::Ok(native) => {
                     u8[] a = Unwrap(AesGcm.Seal(pure, nonce, aad, plaintext));
-                    u8[] b = Unwrap(NativeAesGcm.Seal(native, nonce, aad, plaintext));
+                    u8[] b = Unwrap(AesGcm.Seal(native, nonce, aad, plaintext));
                     Assert.True(Same(a, Hex(expected)), "pure aes-gcm");
                     Assert.True(Same(b, Hex(expected)), "native aes-gcm");
-                    Assert.True(Same(Unwrap(NativeAesGcm.Open(native, nonce, aad, a)), plaintext), "native opens pure");
+                    Assert.True(Same(Unwrap(AesGcm.Open(native, nonce, aad, a)), plaintext), "native opens pure");
                     Assert.True(Same(Unwrap(AesGcm.Open(pure, nonce, aad, b)), plaintext), "pure opens native");
                 },
             };
@@ -107,12 +124,12 @@ unit CheckAes(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext, string expected) {
 }
 
 unit CheckChaCha(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext, string expected) {
-    u8[] a = Unwrap(ChaCha20Poly1305.Seal(key, nonce, aad, plaintext));
-    u8[] b = Unwrap(NativeChaCha20Poly1305.Seal(key, nonce, aad, plaintext));
+    u8[] a = Unwrap(PChaSeal(key, nonce, aad, plaintext));
+    u8[] b = Unwrap(NChaSeal(key, nonce, aad, plaintext));
     Assert.True(Same(a, Hex(expected)), "pure chacha20-poly1305");
     Assert.True(Same(b, Hex(expected)), "native chacha20-poly1305");
-    Assert.True(Same(Unwrap(NativeChaCha20Poly1305.Open(key, nonce, aad, a)), plaintext), "native opens pure");
-    Assert.True(Same(Unwrap(ChaCha20Poly1305.Open(key, nonce, aad, b)), plaintext), "pure opens native");
+    Assert.True(Same(Unwrap(NChaOpen(key, nonce, aad, a)), plaintext), "native opens pure");
+    Assert.True(Same(Unwrap(PChaOpen(key, nonce, aad, b)), plaintext), "pure opens native");
     return;
 }
 
@@ -123,11 +140,11 @@ unit CheckLongChaCha(i64 n, string expected) {
     u8[] nonce = Hex("000000090000004a00000000");
     u8[] aad = Pattern(13_i64, 1_i64, 0_i64);
     u8[] message = Pattern(n, 7_i64, 3_i64);
-    u8[] a = Unwrap(ChaCha20Poly1305.Seal(key, nonce, aad, message));
-    u8[] b = Unwrap(NativeChaCha20Poly1305.Seal(key, nonce, aad, message));
-    Assert.True(Same(Sha256.Hash(a), Hex(expected)), "pure long chacha");
+    u8[] a = Unwrap(PChaSeal(key, nonce, aad, message));
+    u8[] b = Unwrap(NChaSeal(key, nonce, aad, message));
+    Assert.True(Same(PSha256(a), Hex(expected)), "pure long chacha");
     Assert.True(Same(a, b), "native long chacha equals pure");
-    Assert.True(Same(Unwrap(NativeChaCha20Poly1305.Open(key, nonce, aad, b)), message), "native long chacha open");
+    Assert.True(Same(Unwrap(NChaOpen(key, nonce, aad, b)), message), "native long chacha open");
     return;
 }
 unit CheckLongAes(i64 keyLength, i64 n, string expected) {
@@ -135,17 +152,17 @@ unit CheckLongAes(i64 keyLength, i64 n, string expected) {
     u8[] nonce = Hex("000000090000004a00000000");
     u8[] aad = Pattern(13_i64, 1_i64, 0_i64);
     u8[] message = Pattern(n, 7_i64, 3_i64);
-    match AesGcm.New(key) {
+    match PAesKey(key) {
         Result::Error(_) => { Assert.Fail("pure key"); },
         Result::Ok(pure) => {
-            match NativeAesGcm.New(key) {
+            match NAesKey(key) {
                 Result::Error(_) => { Assert.Fail("native key"); },
                 Result::Ok(native) => {
                     u8[] a = Unwrap(AesGcm.Seal(pure, nonce, aad, message));
-                    u8[] b = Unwrap(NativeAesGcm.Seal(native, nonce, aad, message));
-                    Assert.True(Same(Sha256.Hash(a), Hex(expected)), "pure long aes");
+                    u8[] b = Unwrap(AesGcm.Seal(native, nonce, aad, message));
+                    Assert.True(Same(PSha256(a), Hex(expected)), "pure long aes");
                     Assert.True(Same(a, b), "native long aes equals pure");
-                    Assert.True(Same(Unwrap(NativeAesGcm.Open(native, nonce, aad, b)), message), "native long aes open");
+                    Assert.True(Same(Unwrap(AesGcm.Open(native, nonce, aad, b)), message), "native long aes open");
                 },
             };
         },
@@ -214,9 +231,9 @@ test provider_sha_length_sweep {
     mut i64 n = 0_i64;
     while n <= 300_i64 {
         u8[] m = Pattern(n, 11_i64, 5_i64);
-        Assert.True(Same(Sha256.Hash(m), NativeSha256.Hash(m)), "sha256 sweep");
-        Assert.True(Same(Sha512.Hash384(m), NativeSha512.Hash384(m)), "sha384 sweep");
-        Assert.True(Same(Sha512.Hash512(m), NativeSha512.Hash512(m)), "sha512 sweep");
+        Assert.True(Same(PSha256(m), NSha256(m)), "sha256 sweep");
+        Assert.True(Same(PSha384(m), NSha384(m)), "sha384 sweep");
+        Assert.True(Same(PSha512(m), NSha512(m)), "sha512 sweep");
         n = n + 13_i64;
     }
 }
@@ -226,9 +243,9 @@ test provider_hmac_long_key_sweep {
     mut i64 k = 0_i64;
     while k <= 200_i64 {
         u8[] key = Pattern(k, 5_i64, 7_i64);
-        Assert.True(Same(Hmac.Compute(HashAlgorithm::Sha256(), key, data), NativeHmac.Compute(HashAlgorithm::Sha256(), key, data)), "hmac-sha256 key sweep");
-        Assert.True(Same(Hmac.Compute(HashAlgorithm::Sha512(), key, data), NativeHmac.Compute(HashAlgorithm::Sha512(), key, data)), "hmac-sha512 key sweep");
-        Assert.True(Same(Hmac.Digest(HashAlgorithm::Sha384(), key), NativeHmac.Digest(HashAlgorithm::Sha384(), key)), "digest sweep");
+        Assert.True(Same(PHmac(HashAlgorithm::Sha256(), key, data), NHmac(HashAlgorithm::Sha256(), key, data)), "hmac-sha256 key sweep");
+        Assert.True(Same(PHmac(HashAlgorithm::Sha512(), key, data), NHmac(HashAlgorithm::Sha512(), key, data)), "hmac-sha512 key sweep");
+        Assert.True(Same(PDigest(HashAlgorithm::Sha384(), key), NDigest(HashAlgorithm::Sha384(), key)), "digest sweep");
         k = k + 25_i64;
     }
 }
@@ -241,24 +258,24 @@ test provider_aead_offsets_in_place {
     u8[] nativeBuf = Pattern(300_i64, 7_i64, 1_i64);
     u8[] original = Pattern(300_i64, 7_i64, 1_i64);
     // ChaCha20-Poly1305 in place at offset 9, 200 bytes.
-    Assert.True(match ChaCha20Poly1305.SealInto(key, nonce, aad, pureBuf, 9_i64, 200_i64, pureBuf, 9_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "pure seal into");
-    Assert.True(match NativeChaCha20Poly1305.SealInto(key, nonce, aad, nativeBuf, 9_i64, 200_i64, nativeBuf, 9_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "native seal into");
+    Assert.True(match PChaSealInto(key, nonce, aad, pureBuf, 9_i64, 200_i64, pureBuf, 9_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "pure seal into");
+    Assert.True(match NChaSealInto(key, nonce, aad, nativeBuf, 9_i64, 200_i64, nativeBuf, 9_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "native seal into");
     Assert.True(Same(pureBuf, nativeBuf), "chacha in place equal");
-    i64 opened = match NativeChaCha20Poly1305.OpenInto(key, nonce, aad, nativeBuf, 9_i64, 216_i64, nativeBuf, 9_i64) { Result::Ok(n) => n, Result::Error(_) => -1_i64, };
+    i64 opened = match NChaOpenInto(key, nonce, aad, nativeBuf, 9_i64, 216_i64, nativeBuf, 9_i64) { Result::Ok(n) => n, Result::Error(_) => -1_i64, };
     Assert.Equal<i64>(opened, 200_i64, "native open into length");
     Assert.True(Same(Prefix(nativeBuf, 209_i64), Prefix(original, 209_i64)), "native open into restores plaintext");
-    match AesGcm.New(Pattern(16_i64, 1_i64, 0_i64)) {
+    match PAesKey(Pattern(16_i64, 1_i64, 0_i64)) {
         Result::Error(_) => { Assert.Fail("pure key"); },
         Result::Ok(pure) => {
-            match NativeAesGcm.New(Pattern(16_i64, 1_i64, 0_i64)) {
+            match NAesKey(Pattern(16_i64, 1_i64, 0_i64)) {
                 Result::Error(_) => { Assert.Fail("native key"); },
                 Result::Ok(native) => {
                     u8[] p = Pattern(300_i64, 7_i64, 1_i64);
                     u8[] q = Pattern(300_i64, 7_i64, 1_i64);
                     Assert.True(match AesGcm.SealInto(pure, nonce, aad, p, 31_i64, 150_i64, p, 31_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "pure aes seal into");
-                    Assert.True(match NativeAesGcm.SealInto(native, nonce, aad, q, 31_i64, 150_i64, q, 31_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "native aes seal into");
+                    Assert.True(match AesGcm.SealInto(native, nonce, aad, q, 31_i64, 150_i64, q, 31_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "native aes seal into");
                     Assert.True(Same(p, q), "aes in place equal");
-                    i64 n = match NativeAesGcm.OpenInto(native, nonce, aad, q, 31_i64, 166_i64, q, 31_i64) { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+                    i64 n = match AesGcm.OpenInto(native, nonce, aad, q, 31_i64, 166_i64, q, 31_i64) { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
                     Assert.Equal<i64>(n, 150_i64, "native aes open into length");
                     Assert.True(Same(Prefix(q, 181_i64), Prefix(original, 181_i64)), "native aes open into restores plaintext");
                 },
@@ -270,18 +287,18 @@ test provider_aead_offsets_in_place {
 test provider_aead_length_sweep {
     u8[] key = Pattern(32_i64, 3_i64, 2_i64);
     u8[] nonce = Pattern(12_i64, 5_i64, 4_i64);
-    match AesGcm.New(key) {
+    match PAesKey(key) {
         Result::Error(_) => { Assert.Fail("pure key"); },
         Result::Ok(pure) => {
-            match NativeAesGcm.New(key) {
+            match NAesKey(key) {
                 Result::Error(_) => { Assert.Fail("native key"); },
                 Result::Ok(native) => {
                     mut i64 n = 0_i64;
                     while n <= 130_i64 {
                         u8[] m = Pattern(n, 9_i64, 1_i64);
                         u8[] aad = Pattern(n % 37_i64, 1_i64, 3_i64);
-                        Assert.True(Same(Unwrap(AesGcm.Seal(pure, nonce, aad, m)), Unwrap(NativeAesGcm.Seal(native, nonce, aad, m))), "aes sweep");
-                        Assert.True(Same(Unwrap(ChaCha20Poly1305.Seal(key, nonce, aad, m)), Unwrap(NativeChaCha20Poly1305.Seal(key, nonce, aad, m))), "chacha sweep");
+                        Assert.True(Same(Unwrap(AesGcm.Seal(pure, nonce, aad, m)), Unwrap(AesGcm.Seal(native, nonce, aad, m))), "aes sweep");
+                        Assert.True(Same(Unwrap(PChaSeal(key, nonce, aad, m)), Unwrap(NChaSeal(key, nonce, aad, m))), "chacha sweep");
                         n = n + 7_i64;
                     }
                 },
@@ -293,33 +310,33 @@ test provider_aead_length_sweep {
 test provider_native_aes_gcm_rejects_tampering {
     u8[] nonce = Hex("cafebabefacedbaddecaf888");
     u8[] aad = Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
-    match NativeAesGcm.New(Hex("feffe9928665731c6d6a8f9467308308")) {
+    match NAesKey(Hex("feffe9928665731c6d6a8f9467308308")) {
         Result::Error(_) => { Assert.Fail("key"); },
         Result::Ok(key) => {
-            u8[] sealed = Unwrap(NativeAesGcm.Seal(key, nonce, aad, Pattern(60_i64, 1_i64, 0_i64)));
+            u8[] sealed = Unwrap(AesGcm.Seal(key, nonce, aad, Pattern(60_i64, 1_i64, 0_i64)));
             mut i64 position = 0_i64;
             while position < Slice.Len(sealed) {
                 u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
                 copy[position] = Flip(copy[position]);
-                Assert.True(AuthFailBytes(NativeAesGcm.Open(key, nonce, aad, copy)), "tampered byte rejected");
+                Assert.True(AuthFailBytes(AesGcm.Open(key, nonce, aad, copy)), "tampered byte rejected");
                 position = position + 7_i64;
             }
-            Assert.True(AuthFailBytes(NativeAesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), aad, sealed)), "nonce bound");
-            Assert.True(AuthFailBytes(NativeAesGcm.Open(key, nonce, Hex("feedface"), sealed)), "aad bound");
-            Assert.True(AuthFailBytes(NativeAesGcm.Open(key, nonce, aad, Slice.New(15_i64))), "short input");
-            bool badNonce = match NativeAesGcm.Seal(key, Hex("cafebabe"), aad, sealed) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidNonceLength => true, _ => false, }, };
+            Assert.True(AuthFailBytes(AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), aad, sealed)), "nonce bound");
+            Assert.True(AuthFailBytes(AesGcm.Open(key, nonce, Hex("feedface"), sealed)), "aad bound");
+            Assert.True(AuthFailBytes(AesGcm.Open(key, nonce, aad, Slice.New(15_i64))), "short input");
+            bool badNonce = match AesGcm.Seal(key, Hex("cafebabe"), aad, sealed) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidNonceLength => true, _ => false, }, };
             Assert.True(badNonce, "nonce length");
             // A failed OpenInto leaves no plaintext in the output range.
             u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
             copy[70] = Flip(copy[70]);
             u8[] output = Pattern(64_i64, 0_i64, 170_i64);
-            Assert.True(AuthFailLen(NativeAesGcm.OpenInto(key, nonce, aad, copy, 0_i64, 76_i64, output, 2_i64)), "open into rejected");
+            Assert.True(AuthFailLen(AesGcm.OpenInto(key, nonce, aad, copy, 0_i64, 76_i64, output, 2_i64)), "open into rejected");
             Assert.True(Same(Prefix(output, 2_i64), Pattern(2_i64, 0_i64, 170_i64)), "bytes before the range untouched");
             Assert.True(Same(Slice.SubSlice(output, 2_i64, 60_i64), Slice.New(60_i64)), "output range zeroed");
             Assert.True(Same(Slice.SubSlice(output, 62_i64, 2_i64), Pattern(2_i64, 0_i64, 170_i64)), "bytes after the range untouched");
         },
     };
-    bool badKey = match NativeAesGcm.New(Slice.New(20_i64)) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
+    bool badKey = match NAesKey(Slice.New(20_i64)) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
     Assert.True(badKey, "key length");
 }
 
@@ -327,32 +344,47 @@ test provider_native_chacha20poly1305_rejects_tampering {
     u8[] key = Pattern(32_i64, 1_i64, 128_i64);
     u8[] nonce = Hex("070000004041424344454647");
     u8[] aad = Hex("50515253c0c1c2c3c4c5c6c7");
-    u8[] sealed = Unwrap(NativeChaCha20Poly1305.Seal(key, nonce, aad, Ascii(Sunscreen())));
+    u8[] sealed = Unwrap(NChaSeal(key, nonce, aad, Ascii(Sunscreen())));
     mut i64 position = 0_i64;
     while position < Slice.Len(sealed) {
         u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
         copy[position] = Flip(copy[position]);
-        Assert.True(AuthFailBytes(NativeChaCha20Poly1305.Open(key, nonce, aad, copy)), "tampered byte rejected");
+        Assert.True(AuthFailBytes(NChaOpen(key, nonce, aad, copy)), "tampered byte rejected");
         position = position + 17_i64;
     }
-    Assert.True(AuthFailBytes(NativeChaCha20Poly1305.Open(key, nonce, Hex("50515253c0c1c2c3c4c5c6c8"), sealed)), "aad bound");
-    Assert.True(AuthFailBytes(NativeChaCha20Poly1305.Open(key, Hex("070000004041424344454648"), aad, sealed)), "nonce bound");
-    Assert.True(AuthFailBytes(NativeChaCha20Poly1305.Open(key, nonce, aad, Slice.New(15_i64))), "short input");
+    Assert.True(AuthFailBytes(NChaOpen(key, nonce, Hex("50515253c0c1c2c3c4c5c6c8"), sealed)), "aad bound");
+    Assert.True(AuthFailBytes(NChaOpen(key, Hex("070000004041424344454648"), aad, sealed)), "nonce bound");
+    Assert.True(AuthFailBytes(NChaOpen(key, nonce, aad, Slice.New(15_i64))), "short input");
     u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
     copy[0] = Flip(copy[0]);
     i64 total = Slice.Len(copy);
-    Assert.True(AuthFailLen(NativeChaCha20Poly1305.OpenInto(key, nonce, aad, copy, 0_i64, total, copy, 0_i64)), "in-place open rejected");
+    Assert.True(AuthFailLen(NChaOpenInto(key, nonce, aad, copy, 0_i64, total, copy, 0_i64)), "in-place open rejected");
     Assert.True(Same(Prefix(copy, total - 16_i64), Slice.New(total - 16_i64)), "in-place range zeroed");
-    bool badKey = match NativeChaCha20Poly1305.Seal(Slice.New(31_i64), nonce, aad, sealed) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
+    bool badKey = match NChaSeal(Slice.New(31_i64), nonce, aad, sealed) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
     Assert.True(badKey, "key length");
+}
+
+test provider_native_is_selected_on_this_host {
+    Assert.True(Provider.NativeAvailable(), "libcrypto.so.3 resolved");
+    Assert.True(Provider.SelfTest(), "native self-test");
+    UseNative();
+    Assert.True(Provider.IsNative(), "native provider selected");
+    match NAesKey(Pattern(16_i64, 1_i64, 0_i64)) {
+        Result::Error(_) => { Assert.Fail("native key"); },
+        Result::Ok(k) => { Assert.True(AesGcm.UsesNative(k), "key bound to the native provider"); },
+    };
 }
 
 test provider_selection {
     Assert.True(Provider.SelfTest(), "native self-test");
-    Native.SetEnv(Provider.SwitchName(), Provider.PureValue(), false);
-    bool forced = match Provider.Select() { ProviderKind::Pure => true, ProviderKind::Native => false, };
+    UsePure();
+    bool forced = match Provider.Current() { ProviderKind::Pure => true, ProviderKind::Native => false, };
     Assert.True(forced, "BESKID_CRYPTO_PROVIDER=pure forces Pure");
-    Native.SetEnv(Provider.SwitchName(), Provider.PureValue(), true);
-    bool native = match Provider.Select() { ProviderKind::Pure => false, ProviderKind::Native => true, };
+    match AesGcm.New(Pattern(16_i64, 1_i64, 0_i64)) {
+        Result::Error(_) => { Assert.Fail("pure key"); },
+        Result::Ok(k) => { Assert.False(AesGcm.UsesNative(k), "key created under the switch stays pure"); },
+    };
+    UseNative();
+    bool native = match Provider.Current() { ProviderKind::Pure => false, ProviderKind::Native => true, };
     Assert.True(native, "Native when the self-test passes");
 }

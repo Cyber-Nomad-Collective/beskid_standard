@@ -1,6 +1,7 @@
 use Core.Bytes.Slice;
 use Quic.QuicRanges;
 use Quic.QuicWire;
+use Codec.Mem;
 
 // QUIC streams (RFC 9000 sections 2-4): stream identifiers, send and receive state machines,
 // bounded ring buffers with ordered reassembly, and per-stream flow control.
@@ -94,7 +95,7 @@ pub Stream New(i64 id, i64 sendCapacity, i64 recvCapacity, i64 peerMax) {
     s[RecvCap()] = recvCapacity;
     if sendCapacity == 0_i64 { s[SendSt()] = SendDataRecvd(); }
     if recvCapacity == 0_i64 { s[RecvSt()] = RecvDataRead(); }
-    return Stream { id: id, s: s, sendBuf: Slice.New(sendCapacity), recvBuf: Slice.New(recvCapacity), acked: QuicRanges.New(16_i64), lost: QuicRanges.New(16_i64), recvd: QuicRanges.New(32_i64) };
+    return Stream { id: id, s: s, sendBuf: Mem.Zeroed(sendCapacity), recvBuf: Mem.Zeroed(recvCapacity), acked: QuicRanges.New(16_i64), lost: QuicRanges.New(16_i64), recvd: QuicRanges.New(32_i64) };
 }
 
 pub i64 SendState(Stream st) { return st.s[SendSt()]; }
@@ -143,8 +144,8 @@ pub i64 Write(Stream st, u8[] src, i64 offset, i64 count) {
     i64 at = st.s[Written()] % cap;
     mut i64 first = n;
     if at + first > cap { first = cap - at; }
-    Slice.Copy(st.sendBuf, at, src, offset, first);
-    if n > first { Slice.Copy(st.sendBuf, 0_i64, src, offset + first, n - first); }
+    Mem.Copy(st.sendBuf, at, src, offset, first);
+    if n > first { Mem.Copy(st.sendBuf, 0_i64, src, offset + first, n - first); }
     st.s[Written()] = st.s[Written()] + n;
     return n;
 }
@@ -324,8 +325,8 @@ pub i64 OnData(Stream st, i64 offset, u8[] src, i64 start, i64 length, bool fin)
         i64 n = end - lo;
         mut i64 first = n;
         if at + first > cap { first = cap - at; }
-        Slice.Copy(st.recvBuf, at, src, start + (lo - offset), first);
-        if n > first { Slice.Copy(st.recvBuf, 0_i64, src, start + (lo - offset) + first, n - first); }
+        Mem.Copy(st.recvBuf, at, src, start + (lo - offset), first);
+        if n > first { Mem.Copy(st.recvBuf, 0_i64, src, start + (lo - offset) + first, n - first); }
     }
     mut i64 grew = 0_i64;
     if end > st.s[Highest()] { grew = end - st.s[Highest()]; st.s[Highest()] = end; }
@@ -362,8 +363,8 @@ pub i64 ReadInto(Stream st, u8[] dst, i64 offset, i64 count) {
         i64 at = read % cap;
         mut i64 first = n;
         if at + first > cap { first = cap - at; }
-        Slice.Copy(dst, offset, st.recvBuf, at, first);
-        if n > first { Slice.Copy(dst, offset + first, st.recvBuf, 0_i64, n - first); }
+        Mem.Copy(dst, offset, st.recvBuf, at, first);
+        if n > first { Mem.Copy(dst, offset + first, st.recvBuf, 0_i64, n - first); }
         st.s[Read()] = read + n;
         QuicRanges.DropBelow(st.recvd, read + n);
     }

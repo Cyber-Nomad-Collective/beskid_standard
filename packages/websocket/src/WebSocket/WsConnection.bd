@@ -28,6 +28,7 @@ use WebSocket.WsFrame;
 use WebSocket.WsHandshake;
 use WebSocket.WsTransport;
 use WebSocket.WsUtf8;
+use Codec.Mem;
 
 // RFC 6455 connection: opening handshake on a transport, message send/receive with
 // fragmentation, automatic pong, and the closing handshake. One fiber may Receive
@@ -501,12 +502,12 @@ Result<unit, WsError> WriteFrame(WsConnection self, bool fin, i64 opcode, u8[] p
         Result::Ok(_) => {},
     };
     if self.isServer { return WsTransport.WriteRange(self.transport, payload, 0_i64, count); }
-    u8[] scratch = Slice.New(SingleWriteLimit());
+    u8[] scratch = Mem.Zeroed(SingleWriteLimit());
     mut i64 done = 0_i64;
     while done < count {
         mut i64 n = count - done;
         if n > SingleWriteLimit() { n = SingleWriteLimit(); }
-        Slice.Copy(scratch, 0_i64, payload, done, n);
+        Mem.Copy(scratch, 0_i64, payload, done, n);
         WsFrame.ApplyMask(scratch, 0_i64, n, key, done);
         Result<unit, WsError> wrote = WsTransport.WriteRange(self.transport, scratch, 0_i64, n);
         match wrote {
@@ -627,9 +628,9 @@ Result<i64, WsError> Accumulate(WsConnection self, bool fin, i64 opcode, u8[] pa
     if self.st[2] == 0_i64 {
         self.partial = payload;
     } else if length > 0_i64 {
-        u8[] joined = Slice.New(total);
-        Slice.Copy(joined, 0_i64, self.partial, 0_i64, self.st[2]);
-        Slice.Copy(joined, self.st[2], payload, 0_i64, length);
+        u8[] joined = Mem.Zeroed(total);
+        Mem.Copy(joined, 0_i64, self.partial, 0_i64, self.st[2]);
+        Mem.Copy(joined, self.st[2], payload, 0_i64, length);
         self.partial = joined;
     }
     self.st[2] = total;

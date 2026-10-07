@@ -1,4 +1,6 @@
 use Core.Bytes.Slice;
+use Crypto.Native;
+use Crypto.Provider;
 use Crypto.Sha256;
 use Crypto.Sha512;
 use Crypto.Scratch;
@@ -61,11 +63,21 @@ pub HashState HashClone(HashState state) {
     };
 }
 
-/// One-shot digest.
+/// One-shot digest (OpenSSL when the native provider is selected, R27).
 pub u8[] Digest(HashAlgorithm algorithm, u8[] data) {
-    HashState state = HashNew(algorithm);
-    HashUpdate(state, data);
-    return HashFinish(state);
+    return match algorithm {
+        HashAlgorithm::Sha256 => Sha256.Hash(data),
+        HashAlgorithm::Sha384 => Sha512.Hash384(data),
+        HashAlgorithm::Sha512 => Sha512.Hash512(data),
+    };
+}
+
+i64 NativeMd(HashAlgorithm algorithm) {
+    return match algorithm {
+        HashAlgorithm::Sha256 => Native.Sha256Md(),
+        HashAlgorithm::Sha384 => Native.Sha384Md(),
+        HashAlgorithm::Sha512 => Native.Sha512Md(),
+    };
 }
 
 /// Keyed HMAC state (RFC 2104): the inner hash has absorbed K ^ ipad, the outer K ^ opad.
@@ -112,8 +124,12 @@ pub u8[] Finish(HmacState state) {
     return HashFinish(state.outer);
 }
 
-/// One-shot HMAC.
+/// One-shot HMAC (OpenSSL `HMAC` when the native provider is selected, R27).
 pub u8[] Compute(HashAlgorithm algorithm, u8[] key, u8[] data) {
+    if Slice.Len(key) < Native.MaxEvpLength() && Slice.Len(data) < Native.MaxEvpLength() && Provider.IsNative() {
+        u8[] tag = Scratch.Bytes(HashLength(algorithm));
+        if Native.HmacInto(NativeMd(algorithm), key, data, tag) != 0_i64 { return tag; }
+    }
     HmacState state = New(algorithm, key);
     Update(state, data);
     return Finish(state);

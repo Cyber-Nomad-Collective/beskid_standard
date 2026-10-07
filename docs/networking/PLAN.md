@@ -30,7 +30,7 @@ The program notes, gap log, and repros are in `docs/networking/`.
 ## Environment (mandatory)
 
 ```bash
-export BESKID_RUNTIME_PREFIX=<0.5.3 runtime kit>   # builder: /workspace/v053-kit2
+export BESKID_RUNTIME_PREFIX=<0.5.3 runtime kit>   # builder: /workspace/v053-kit3
 unset BESKID_CORELIB_ROOT
 beskid test --project packages/<pkg>/tests --target <Target> --plain
 ```
@@ -49,8 +49,8 @@ beskid test --project packages/<pkg>/tests --target <Target> --plain
   and on the exact sibling packages whose modules its `src` imports
   (`corelib_concurrency`, `corelib_network`, `corelib_http`, `corelib_<pkg>`).
   It never depends on the aggregate, because the aggregate depends on it.
-- `packages/crypto-openssl` (`corelib_crypto_openssl`) is opt-in and is not in
-  the aggregate (R20). Its tests depend on the aggregate plus the package.
+- `corelib_crypto` carries the optional OpenSSL 3 provider in process (R27);
+  there is no separate native package.
 - A test or interop project depends only on the aggregate
   (`dependency "corelib"`, path to `beskid_corelib`), like `corelib_tests`.
 

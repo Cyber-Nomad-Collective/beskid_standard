@@ -31,6 +31,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   parents; `Core.Time.Calendar` constant-time date arithmetic, ISO weekdays,
   and RFC 3339 parsing and formatting; and `Testing.Expect` expectations that
   report expected and actual values.
+- Add seeded property and model-based tests (sorting, hash maps against the
+  linear `Map`, an all-collision hash table, the priority queue), a JSON
+  accept/reject conformance corpus with random-tree round trips, UTF-8 and
+  float edge cases, and a full 146097-day Gregorian-cycle calendar sweep
+  checked against Python-generated reference dates.
+- Add `Number.FormatI64`, correct for the minimum `i64` that 0.5.2
+  interpolation prints as `-`; route `StringBuilder.AppendI64` and
+  `Testing.Expect` messages through the same guard.
 - Document the 0.5.2 compiler and runtime limits that shape these APIs, and
   how to test a modified Corelib with a released binary.
 

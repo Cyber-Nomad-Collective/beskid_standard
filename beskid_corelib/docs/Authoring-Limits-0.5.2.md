@@ -13,6 +13,7 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 | Method calling a method on `this` | `this.Append(...)` inside a method ICEs. | Methods delegate to private module functions taking the receiver. |
 | `match` yielding `self` or a generic value inside a method | ICE. | Move the logic into a module function that uses `if` and early `return`. |
 | Nested field access through a struct field | `value.time.hour` and `this.table.count` ICE. | Copy the inner struct to a local first, or read through an accessor function. |
+| Field access on a call result | `Calendar.AddDays(d, 1).day` ICEs. | Bind the result to a local first. |
 | `bulk` parameters with several arguments | `List.Of<i64>(1, 2)` reports an arity error; passing one array ICEs. | `List.FromArray`, `Set.FromArray`, or array literals. |
 | Array literals of enum values | ICE. | Build with `Array.Append`. |
 | `f64` to `i64` cast | `i64(x)` on an f64 ICEs. | `Number.TruncateToI64`, a bit-by-bit decomposition. |
@@ -32,7 +33,9 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 
 ## Runtime defects
 
+- **Interpolating the minimum `i64`** (`"${value}"` with `value == -2^63`) produces `-` alone. Use `Number.FormatI64`; `StringBuilder.AppendI64` and `Testing.Expect` already do.
 - **Empty-plus-empty string concatenation** produces an invalid string that later fails to write. `String.Concat` avoids it; use it wherever both operands can be empty.
+- **`Core.Time.ToUtcDateTime` does not compile when called.** Its body assigns to the non-`mut` locals `nanos` and `remaining`, which only surfaces once a caller pulls it into analysis. `Time.bd` is a compiler-embedded service file, so the fix must land in the compiler's copy too; `Core.Time.Calendar.ToDateTime` is the working replacement.
 - **A failed assertion traps the whole test process**, so later tests in the target do not run. Keep expected-failure checks out of the suite.
 
 ## Testing a modified Corelib with a released binary

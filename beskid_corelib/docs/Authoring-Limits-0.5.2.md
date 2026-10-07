@@ -1,6 +1,6 @@
 # Writing Corelib for the 0.5.2 compiler
 
-Corelib code must compile and run on the released toolchain. These are the gaps in the 0.5.2 compiler and runtime found while writing the string, number, collection, JSON, path, calendar, and testing modules, with the workaround each module uses. Each gap was reproduced with the shipped `beskid 0.5.2` binary; "ICE" means an internal compiler error during lowering.
+Corelib code must compile and run on the released toolchain. These are the gaps in the 0.5.2 compiler and runtime found while writing the string, number, collection, JSON, path, calendar, and testing modules, with the workaround each module uses. Each gap was reproduced with the shipped `beskid 0.5.2` binary and has a runnable canary listed in the [0.5.3 compiler fix list](./0.5.3-Compiler-Fix-List.md); "ICE" means an internal compiler error during lowering.
 
 ## Language features that do not lower
 
@@ -19,7 +19,6 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 | Array literals of enum values | ICE. | Build with `Array.Append`. |
 | `f64` to `i64` cast | `i64(x)` on an f64 ICEs. | `Number.TruncateToI64`, a bit-by-bit decomposition. |
 | Interpolating `f64` or `bool` | f64 ICEs; bool produces wrong text. | `Number.FormatGeneral`, `StringBuilder.AppendBool`. |
-| Interpolation with two or more holes | Not lowerable. | Concatenate single-hole strings. |
 
 ## Semantics to keep in mind
 

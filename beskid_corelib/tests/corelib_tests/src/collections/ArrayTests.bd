@@ -1,6 +1,8 @@
 /// Public API coverage for typed `Core.Collections.Array` operations.
 use Core.Collections.Array;
 use Core.Collections.Array.ArrayIter;
+use Core.Time;
+use Core.Time.Instant;
 use Testing.Assert;
 
 
@@ -49,4 +51,51 @@ test array_iterator_stops_at_logical_length {
     Assert.Equal(Array.Current<i64>(values, iterator), 5, "iterator reads second value");
     iterator = Array.Advance<i64>(iterator);
     Assert.False(Array.HasNext<i64>(iterator), "iterator stops at logical length");
+}
+
+// PERF1: Append grows geometrically, so n appends cost O(n) copies in total.
+test array_append_growth_is_geometric {
+    mut u8[] values = Array.Empty<u8>();
+    Instant start = Time.MonotonicNow();
+    mut i64 i = 0;
+    while i < 262144 {
+        Array.Append<u8>(values, u8(i % 256));
+        i = i + 1;
+    }
+    i64 elapsed = Time.MonotonicNow().nanos - start.nanos;
+    Assert.Equal(Array.Len<u8>(values), 262144, "every append is visible");
+    Assert.True(Array.Capacity<u8>(values) >= 262144, "capacity covers the length");
+    Assert.True(Array.Capacity<u8>(values) <= 524288, "capacity at most doubles past the length");
+    Assert.Equal(i64(values[0]) + i64(values[255]) + i64(values[262143]), 0 + 255 + 255, "appended values are stored in order");
+    Assert.True(elapsed < 500000000, "256 Ki appends take less than 500 ms");
+}
+
+test array_zeroed_allocates_exact_zero_filled_length {
+    i64[] values = Array.Zeroed<i64>(1000);
+    Assert.Equal(Array.Len<i64>(values), 1000, "zeroed length");
+    Assert.Equal(Array.Capacity<i64>(values), 1000, "zeroed capacity");
+    Assert.Equal(values[0] + values[999], 0, "zeroed elements");
+}
+
+// Reference elements survive geometric growth and forced collections (pointer map, barriers).
+test array_append_of_managed_references_survives_collection {
+    mut string[] values = Array.Empty<string>();
+    mut i64 i = 0;
+    while i < 3000 {
+        Array.Append<string>(values, "item");
+        if i % 500 == 0 { Assert.CollectGarbage(); }
+        i = i + 1;
+    }
+    Assert.CollectGarbage();
+    Assert.Equal(Array.Len<string>(values), 3000, "every reference element is present");
+    Assert.Equal(values[0], "item", "first reference survives growth");
+    Assert.Equal(values[2999], "item", "last reference survives growth");
+    mut i64[] nested = Array.Zeroed<i64>(16);
+    mut i64 round = 0;
+    while round < 200 {
+        i64[] inner = Array.Zeroed<i64>(4096);
+        nested[round % 16] = Array.Len<i64>(inner);
+        round = round + 1;
+    }
+    Assert.Equal(nested[15], 4096, "zeroed arrays allocated in a loop have their length");
 }

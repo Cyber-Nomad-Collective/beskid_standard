@@ -1,5 +1,8 @@
 use Core.Bytes.Convert;
 use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Time;
+use Core.Time.Instant;
 use Testing.Assert;
 
 
@@ -40,4 +43,72 @@ test bytes_copy_range {
     u8[] src = Convert.StringToBytes("xyz");
     Slice.Copy(dst, 0, src, 0, 3);
     Assert.Equal(Slice.Get(dst, 2), 122, "Copy third byte");
+}
+
+i64 ElapsedNanos(Instant start) {
+    return Time.MonotonicNow().nanos - start.nanos;
+}
+
+// PERF1 / C53-5: Slice.New is one zeroed allocation, not one append per byte.
+test bytes_new_one_mebibyte_is_one_zeroed_allocation {
+    Instant start = Time.MonotonicNow();
+    u8[] buf = Slice.New(1048576);
+    i64 elapsed = ElapsedNanos(start);
+    Assert.Equal(Slice.Len(buf), 1048576, "1 MiB length");
+    Assert.Equal(Array.Capacity<u8>(buf), 1048576, "sized allocation has exact capacity");
+    Assert.Equal(Slice.Get(buf, 0), 0, "first byte is zero");
+    Assert.Equal(Slice.Get(buf, 524288), 0, "middle byte is zero");
+    Assert.Equal(Slice.Get(buf, 1048575), 0, "last byte is zero");
+    Assert.True(elapsed < 50000000, "Slice.New(1 MiB) takes less than 50 ms");
+}
+
+test bytes_new_non_positive_length_is_empty {
+    Assert.Equal(Slice.Len(Slice.New(0)), 0, "zero length");
+    Assert.Equal(Slice.Len(Slice.New(-5)), 0, "negative length");
+}
+
+// A 4 MiB buffer stays live and intact through 16 KiB churn and forced collections.
+test bytes_four_mebibyte_live_buffer_survives_churn {
+    u8[] big = Slice.New(4194304);
+    mut i64 i = 0;
+    while i < 4194304 {
+        big[i] = u8(i % 251);
+        i = i + 4099;
+    }
+    mut i64 round = 0;
+    while round < 1000 {
+        u8[] scratch = Slice.New(16384);
+        scratch[16383] = u8(round % 256);
+        Assert.Equal(Slice.Get(scratch, 0), 0, "fresh scratch is zeroed");
+        round = round + 1;
+    }
+    Assert.CollectGarbage();
+    i = 0;
+    while i < 4194304 {
+        Assert.Equal(i64(big[i]), i % 251, "live 4 MiB buffer keeps its contents");
+        i = i + 4099;
+    }
+}
+
+// HQ3 / W5: three live 64 KiB buffers plus repeated 16-20 KiB garbage stay far below the cap.
+test bytes_three_live_64k_buffers_with_garbage_do_not_exhaust_heap {
+    u8[] a = Slice.New(65536);
+    u8[] b = Slice.New(65536);
+    u8[] c = Slice.New(65536);
+    a[65535] = 1;
+    b[65535] = 2;
+    c[65535] = 3;
+    mut i64 round = 0;
+    while round < 1000 {
+        u8[] x = Slice.New(16384);
+        u8[] y = Slice.New(20000);
+        u8[] z = Slice.New(18432);
+        x[0] = 1;
+        y[0] = 1;
+        z[0] = 1;
+        if round % 250 == 0 { Assert.CollectGarbage(); }
+        round = round + 1;
+    }
+    Assert.CollectGarbage();
+    Assert.Equal(i64(a[65535]) + i64(b[65535]) + i64(c[65535]), 6, "live 64 KiB buffers keep their contents");
 }

@@ -1,0 +1,111 @@
+/// Color downgrade, capability policy, terminal mode, and panel width tests. Expected palette
+/// indexes come from an exhaustive nearest-color search over the xterm palette.
+
+use Testing.Expect;
+use Ansi.Escape;
+use Ansi.Modes;
+use Ansi.Sgr;
+use Ansi.Text;
+use Console.Capabilities;
+use Console.Controls.Panel;
+
+string ModelName(Capabilities.ColorModel model) {
+    return match model {
+        Capabilities.ColorModel::Basic8 => "basic8",
+        Capabilities.ColorModel::Basic16 => "basic16",
+        Capabilities.ColorModel::Indexed256 => "indexed256",
+        Capabilities.ColorModel::TrueColor => "truecolor",
+    };
+}
+
+string ModelOf(Capabilities.TerminalEnvironment env) {
+    Capabilities.Capabilities caps = Capabilities.FromEnvironment(env);
+    return ModelName(caps.model);
+}
+
+Capabilities.TerminalEnvironment Env(bool tty, string term, string colorTerm) {
+    return Capabilities.TerminalEnvironment { isTty: tty, term: term, colorTerm: colorTerm, noColor: "", forceColorSet: false, forceColor: "" };
+}
+
+Capabilities.TerminalEnvironment Forced(bool tty, string term, string level) {
+    return Capabilities.TerminalEnvironment { isTty: tty, term: term, colorTerm: "", noColor: "", forceColorSet: true, forceColor: level };
+}
+
+test color_256_index_nearest {
+    Expect.EqualI64(Sgr.RgbTo256Index(255, 0, 0), 196, "pure red");
+    Expect.EqualI64(Sgr.RgbTo256Index(128, 128, 128), 244, "mid gray uses the gray ramp");
+    Expect.EqualI64(Sgr.RgbTo256Index(0, 0, 0), 16, "black");
+    Expect.EqualI64(Sgr.RgbTo256Index(255, 255, 255), 231, "white");
+    Expect.EqualI64(Sgr.RgbTo256Index(95, 135, 175), 67, "exact cube color");
+    Expect.EqualI64(Sgr.RgbTo256Index(30, 30, 30), 234, "dark gray");
+    Expect.EqualI64(Sgr.RgbTo256Index(200, 100, 50), 167, "orange");
+    Expect.EqualI64(Sgr.RgbTo256Index(300, -5, 0), 196, "channels clamp");
+}
+
+test color_basic_codes_nearest {
+    Expect.EqualI64(Sgr.RgbToBasicForeground(255, 255, 255), 97, "white is bright white");
+    Expect.EqualI64(Sgr.RgbToBasicForeground(0, 0, 0), 30, "black");
+    Expect.EqualI64(Sgr.RgbToBasicForeground(255, 0, 0), 91, "bright red");
+    Expect.EqualI64(Sgr.RgbToBasicForeground(128, 128, 128), 90, "gray is bright black");
+    Expect.EqualI64(Sgr.RgbToBasicBackground(0, 0, 238), 44, "blue background");
+    Expect.EqualI64(Sgr.RgbToBasicBackground(255, 255, 0), 103, "bright yellow background");
+}
+
+test color_args_per_model {
+    Expect.EqualString(Sgr.ForegroundArgsFor(Capabilities.ColorModel::TrueColor, 1, 2, 3), "38;2;1;2;3", "truecolor");
+    Expect.EqualString(Sgr.ForegroundArgsFor(Capabilities.ColorModel::Indexed256, 255, 0, 0), "38;5;196", "256 colors");
+    Expect.EqualString(Sgr.ForegroundArgsFor(Capabilities.ColorModel::Basic16, 255, 255, 255), "97", "16 colors");
+    Expect.EqualString(Sgr.ForegroundArgsFor(Capabilities.ColorModel::Basic8, 255, 255, 255), "37", "8 colors");
+    Expect.EqualString(Sgr.BackgroundArgsFor(Capabilities.ColorModel::TrueColor, 300, 0, -1), "48;2;255;0;0", "clamped truecolor");
+    Expect.EqualString(Sgr.BackgroundArgsFor(Capabilities.ColorModel::Basic8, 0, 205, 0), "42", "8-color background");
+}
+
+test capabilities_detect_color_model {
+    Expect.EqualString(ModelOf(Env(true, "xterm-256color", "")), "indexed256", "256color TERM");
+    Expect.EqualString(ModelOf(Env(true, "tmux-256color", "")), "indexed256", "tmux 256");
+    Expect.EqualString(ModelOf(Env(true, "xterm", "truecolor")), "truecolor", "COLORTERM truecolor");
+    Expect.EqualString(ModelOf(Env(true, "xterm", "24bit")), "truecolor", "COLORTERM 24bit");
+    Expect.EqualString(ModelOf(Env(true, "xterm", "yes")), "basic16", "unknown COLORTERM ignored");
+    Expect.EqualString(ModelOf(Env(true, "xterm-direct", "")), "truecolor", "direct-color TERM");
+    Expect.EqualString(ModelOf(Env(true, "xterm", "")), "basic16", "plain xterm");
+}
+
+test capabilities_strip_policy {
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Env(true, "xterm", ""))), false, "TTY keeps color");
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Env(false, "xterm", ""))), true, "pipe strips color");
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Env(true, "dumb", ""))), true, "dumb terminal strips");
+    Capabilities.TerminalEnvironment noColor = Capabilities.TerminalEnvironment { isTty: true, term: "xterm", colorTerm: "", noColor: "1", forceColorSet: false, forceColor: "" };
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(noColor)), true, "NO_COLOR strips");
+    Capabilities.TerminalEnvironment emptyNoColor = Capabilities.TerminalEnvironment { isTty: true, term: "xterm", colorTerm: "", noColor: "", forceColorSet: false, forceColor: "" };
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(emptyNoColor)), false, "empty NO_COLOR ignored");
+}
+
+test capabilities_force_color_levels {
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Forced(false, "", "1"))), false, "forced without TTY");
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Forced(true, "xterm", "0"))), true, "FORCE_COLOR=0 disables");
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Forced(true, "xterm", "false"))), true, "FORCE_COLOR=false disables");
+    Expect.EqualString(ModelOf(Forced(false, "xterm", "2")), "indexed256", "level 2");
+    Expect.EqualString(ModelOf(Forced(false, "xterm", "3")), "truecolor", "level 3");
+    Expect.EqualBool(Capabilities.ShouldStripColor(Capabilities.FromEnvironment(Forced(true, "dumb", ""))), false, "force beats dumb");
+}
+
+test modes_sequences {
+    string esc = Escape.Esc();
+    Expect.EqualString(Modes.SynchronizedOutput(true), esc + "[?2026h", "begin synchronized update");
+    Expect.EqualString(Modes.SynchronizedOutput(false), esc + "[?2026l", "end synchronized update");
+    Expect.EqualString(Modes.BracketedPaste(true), esc + "[?2004h", "bracketed paste");
+    Expect.EqualString(Modes.FocusReporting(false), esc + "[?1004l", "focus reporting off");
+    Expect.EqualString(Modes.CursorShape(Modes.CursorStyle::SteadyBar), esc + "[6 q", "steady bar cursor");
+    Expect.EqualString(Modes.CursorShape(Modes.CursorStyle::Default), esc + "[0 q", "default cursor");
+    Expect.EqualString(Text.Strip(Modes.HyperlinkWithId("x1", "https://beskid-lang.org", "site")), "site", "hyperlink label survives strip");
+    Expect.ContainsText(Modes.HyperlinkWithId("x1", "https://beskid-lang.org", "site"), "]8;id=x1;https://beskid-lang.org", "hyperlink id parameter");
+    Expect.ContainsText(Modes.SetClipboard("hi"), "]52;c;aGk=", "clipboard payload is base64");
+    Expect.ContainsText(Modes.Notify("done"), "]9;done", "notification");
+}
+
+test panel_measures_visible_width {
+    Panel.Panel plain = Panel.New("hello");
+    Panel.Panel styled = Panel.New(Escape.Csi("1", "m") + "hello" + Escape.Csi("0", "m"));
+    Expect.EqualI64(Panel.ContentWidth(plain), 5, "plain body");
+    Expect.EqualI64(Panel.ContentWidth(styled), 5, "styling does not widen the panel");
+}

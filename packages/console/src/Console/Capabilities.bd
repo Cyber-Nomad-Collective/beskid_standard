@@ -1,4 +1,7 @@
 /// Terminal capability probing (TTY, color model, NO_COLOR / FORCE_COLOR).
+use Core.Environment;
+use Core.Optional.Option;
+use Core.String;
 use Platform.Terminal;
 
 pub enum ColorModel {
@@ -44,16 +47,87 @@ pub ColorModel EffectiveColorModel(Capabilities caps) {
     return caps.model;
 }
 
-pub Capabilities ProbeStdout() {
-    i64 atty = Terminal.IsAtty(1);
-    bool tty = atty == 1;
-    bool noColor = Terminal.EnvFlagSet("NO_COLOR");
-    bool forceColor = Terminal.EnvFlagSet("FORCE_COLOR");
-    ColorModel model = Terminal.ProbeColorModel();
+/// Environment inputs to color detection, captured so the policy can be computed and tested
+/// without touching the process environment.
+pub type TerminalEnvironment {
+    bool isTty,
+    string term,
+    string colorTerm,
+    string noColor,
+    bool forceColorSet,
+    string forceColor,
+}
+
+/// Color policy for `env`, following common terminal conventions:
+/// - `NO_COLOR` set to a non-empty value disables color (no-color.org);
+/// - `FORCE_COLOR` forces color even without a TTY: `0` or `false` disables instead, `2`
+///   raises the model to at least 256 colors, `3` to truecolor, other values keep the detected
+///   model;
+/// - `COLORTERM=truecolor|24bit` or a `TERM` containing `direct`/`truecolor` selects truecolor;
+///   a `TERM` containing `256color` selects 256 colors; anything else selects 16 colors;
+/// - `TERM=dumb` disables color unless forced.
+pub Capabilities FromEnvironment(TerminalEnvironment env) {
+    mut ColorModel model = ColorModel::Basic16;
+    if env.colorTerm == "truecolor" || env.colorTerm == "24bit" || String.Contains(env.term, "direct") || String.Contains(env.term, "truecolor") {
+        model = ColorModel::TrueColor;
+    } else {
+        if String.Contains(env.term, "256color") {
+            model = ColorModel::Indexed256;
+        }
+    }
+    mut bool disabled = String.Len(env.noColor) > 0;
+    mut bool forced = false;
+    if env.forceColorSet {
+        if env.forceColor == "0" || env.forceColor == "false" {
+            disabled = true;
+        } else {
+            forced = !disabled;
+            if env.forceColor == "3" {
+                model = ColorModel::TrueColor;
+            }
+            if env.forceColor == "2" && !IsTrueColor(model) {
+                model = ColorModel::Indexed256;
+            }
+        }
+    }
+    if env.term == "dumb" && !forced {
+        disabled = true;
+    }
     return Capabilities {
-        isTty: tty,
-        colorDisabled: noColor,
-        colorForced: forceColor,
+        isTty: env.isTty,
+        colorDisabled: disabled,
+        colorForced: forced,
         model: model
     };
+}
+
+bool IsTrueColor(ColorModel model) {
+    return match model {
+        ColorModel::TrueColor => true,
+        _ => false,
+    };
+}
+
+string EnvOrEmpty(string name) {
+    return match Environment.TryGet(name) {
+        Option::Some(value) => value,
+        Option::None => "",
+    };
+}
+
+/// Captures the stdout TTY state and color-related environment variables.
+pub TerminalEnvironment ProbeEnvironment() {
+    return TerminalEnvironment {
+        isTty: Terminal.IsAtty(1) == 1,
+        term: EnvOrEmpty("TERM"),
+        colorTerm: EnvOrEmpty("COLORTERM"),
+        noColor: EnvOrEmpty("NO_COLOR"),
+        forceColorSet: Environment.Has("FORCE_COLOR"),
+        forceColor: EnvOrEmpty("FORCE_COLOR"),
+    };
+}
+
+/// Color capabilities of stdout under the current environment.
+pub Capabilities ProbeStdout() {
+    return FromEnvironment(ProbeEnvironment());
 }

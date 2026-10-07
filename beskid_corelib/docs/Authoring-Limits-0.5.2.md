@@ -14,6 +14,7 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 | `match` yielding `self` or a generic value inside a method | ICE. | Move the logic into a module function that uses `if` and early `return`. |
 | Nested field access through a struct field | `value.time.hour` and `this.table.count` ICE. | Copy the inner struct to a local first, or read through an accessor function. |
 | Field access on a call result | `Calendar.AddDays(d, 1).day` ICEs. | Bind the result to a local first. |
+| Calls inside array literals | `[U(1), U(2)]` ICEs. | Build the array with `Array.Append`. |
 | `bulk` parameters with several arguments | `List.Of<i64>(1, 2)` reports an arity error; passing one array ICEs. | `List.FromArray`, `Set.FromArray`, or array literals. |
 | Array literals of enum values | ICE. | Build with `Array.Append`. |
 | `f64` to `i64` cast | `i64(x)` on an f64 ICEs. | `Number.TruncateToI64`, a bit-by-bit decomposition. |
@@ -29,6 +30,7 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 - **Float literals have no exponent form** (`1e308` does not parse). Write the digits out or compute them.
 - **String literals only escape `\"`, `\\`, and `\${`.** Use `String.Newline()`, `String.Tab()`, `String.FromAscii(code)`.
 - **Blocks cannot end in a value expression.** Use explicit `return` inside match-arm blocks.
+- **Types are imported through their module.** From another package, `use Console.Capabilities.ColorModel;` fails; import `Console.Capabilities` and write `Capabilities.ColorModel`.
 - **Arithmetic wraps** on overflow (no trap), which the hash functions rely on.
 
 ## Runtime defects

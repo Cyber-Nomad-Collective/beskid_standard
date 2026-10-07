@@ -39,6 +39,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Add `Number.FormatI64`, correct for the minimum `i64` that 0.5.2
   interpolation prints as `-`; route `StringBuilder.AppendI64` and
   `Testing.Expect` messages through the same guard.
+- Add `Ansi.Text` (escape stripping, display-width measurement with wide and
+  zero-width code points, ANSI-aware truncation, padding, centering, and word
+  wrap) and `Ansi.Modes` (synchronized output, bracketed paste, focus
+  reporting, cursor shape, hyperlink ids, OSC 52 clipboard, OSC 9
+  notifications).
+- Add `Capabilities.FromEnvironment` and `TerminalEnvironment` so color policy
+  is a pure, testable function of `TERM`, `COLORTERM`, `NO_COLOR`,
+  `FORCE_COLOR`, and TTY state; `ProbeStdout` now uses it.
+- Add `Sgr.ForegroundArgsFor` and `BackgroundArgsFor` for an explicit color
+  model, and a console reference page.
 - Document the 0.5.2 compiler and runtime limits that shape these APIs, and
   how to test a modified Corelib with a released binary.
 
@@ -61,6 +71,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
+  gray-ramp entry (every gray previously mapped to black), and 16-color
+  mapping picks the nearest palette entry including bright codes (white and
+  black previously both mapped to red). Remove the faulty
+  `ClampChannelBucket` and `DominantChannelIndex` helpers.
+- Detect truecolor only for `COLORTERM=truecolor|24bit`, 256 colors only for
+  `TERM` values containing `256color`, honor `FORCE_COLOR` levels, and treat
+  an empty `NO_COLOR` as unset.
+- Size `Console.Controls.Panel` by visible width so ANSI styling and wide
+  characters no longer misalign its border.
 - Correct the `Core.String` reference: `Contains` scans substrings, and the
   page now covers the full search, transform, and builder surface.
 - Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.

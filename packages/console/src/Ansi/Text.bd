@@ -1,0 +1,354 @@
+/// Ansi.Text — display-width measurement and layout for text that may contain ANSI escapes.
+/// @tier(supported)
+/// Escape sequences (CSI such as SGR colors, OSC such as hyperlinks and titles, DCS/APC/PM/SOS
+/// strings, and two-byte ESC sequences) occupy zero columns. Code points are measured with
+/// `CodePointWidth`: wide East Asian and emoji-presentation code points take two columns,
+/// combining marks, zero-width joiners, variation selectors, and control characters take none.
+/// Width is measured per code point, not per grapheme cluster, so multi-code-point emoji
+/// sequences can measure wider than a terminal renders them.
+use Core.Collections.Array;
+use Core.String;
+
+/// Byte length of the escape sequence starting at `at` (which holds ESC), or `1` for a lone ESC.
+pub i64 EscapeLength(string text, i64 at) {
+    i64 len = String.Len(text);
+    if at + 1 >= len {
+        return 1;
+    }
+    u8 kind = String.ByteAt(text, at + 1);
+    if kind == 91 {
+        // CSI: parameters and intermediates, then a final byte in 0x40..0x7E.
+        mut i64 i = at + 2;
+        while i < len {
+            u8 b = String.ByteAt(text, i);
+            if b >= 64 && b <= 126 {
+                return i - at + 1;
+            }
+            i = i + 1;
+        }
+        return len - at;
+    }
+    if kind == 93 || kind == 80 || kind == 88 || kind == 94 || kind == 95 {
+        // OSC, DCS, SOS, PM, APC: terminated by BEL (OSC only) or ST (ESC \).
+        mut i64 i = at + 2;
+        while i < len {
+            u8 b = String.ByteAt(text, i);
+            if b == 7 && kind == 93 {
+                return i - at + 1;
+            }
+            if b == 27 && i + 1 < len && String.ByteAt(text, i + 1) == 92 {
+                return i - at + 2;
+            }
+            i = i + 1;
+        }
+        return len - at;
+    }
+    return 2;
+}
+
+/// Decoded code point at `at` and its UTF-8 byte length.
+pub type Rune {
+    i64 codePoint,
+    i64 length,
+}
+
+/// Decodes the UTF-8 sequence at `at`. Malformed bytes decode as themselves with length 1.
+pub Rune DecodeAt(string text, i64 at) {
+    i64 len = String.Len(text);
+    i64 lead = i64(String.ByteAt(text, at));
+    mut i64 need = 0;
+    mut i64 cp = lead;
+    if lead >= 192 && lead < 224 {
+        need = 1;
+        cp = lead - 192;
+    }
+    if lead >= 224 && lead < 240 {
+        need = 2;
+        cp = lead - 224;
+    }
+    if lead >= 240 && lead < 248 {
+        need = 3;
+        cp = lead - 240;
+    }
+    if need == 0 || at + need >= len {
+        return Rune { codePoint: lead, length: 1 };
+    }
+    mut i64 i = 1;
+    while i <= need {
+        i64 b = i64(String.ByteAt(text, at + i));
+        if b < 128 || b >= 192 {
+            return Rune { codePoint: lead, length: 1 };
+        }
+        cp = cp * 64 + (b - 128);
+        i = i + 1;
+    }
+    return Rune { codePoint: cp, length: need + 1 };
+}
+
+bool InRange(i64 cp, i64 low, i64 high) {
+    return cp >= low && cp <= high;
+}
+
+/// Terminal column width of one code point: `0`, `1`, or `2`.
+pub i64 CodePointWidth(i64 cp) {
+    if cp < 32 || InRange(cp, 127, 159) {
+        return 0;
+    }
+    if cp < 768 {
+        return 1;
+    }
+    // Zero width: combining marks, joiners, directional marks, variation selectors, BOM.
+    if InRange(cp, 768, 879) || InRange(cp, 1155, 1161) || InRange(cp, 1425, 1469) || InRange(cp, 6832, 6911)
+        || InRange(cp, 7616, 7679) || InRange(cp, 8203, 8207) || InRange(cp, 8232, 8238) || InRange(cp, 8288, 8292)
+        || InRange(cp, 8400, 8447) || InRange(cp, 65024, 65039) || InRange(cp, 65056, 65071) || cp == 65279
+        || InRange(cp, 917760, 917999) {
+        return 0;
+    }
+    // Wide: Hangul Jamo, CJK, Hangul syllables, fullwidth forms, and emoji presentation blocks.
+    if InRange(cp, 4352, 4447) || InRange(cp, 8986, 8987) || InRange(cp, 9001, 9002) || InRange(cp, 9193, 9196)
+        || cp == 9200 || cp == 9203 || InRange(cp, 9725, 9726) || InRange(cp, 9748, 9749) || InRange(cp, 9800, 9811)
+        || cp == 9855 || cp == 9875 || cp == 9889 || InRange(cp, 9898, 9899) || InRange(cp, 9917, 9918)
+        || InRange(cp, 9924, 9925) || cp == 9934 || cp == 9940 || cp == 9962 || InRange(cp, 9970, 9971) || cp == 9973
+        || cp == 9978 || cp == 9981 || cp == 9989 || InRange(cp, 9994, 9995) || cp == 10024 || cp == 10060
+        || cp == 10062 || InRange(cp, 10067, 10069) || cp == 10071 || InRange(cp, 10133, 10135) || cp == 10160
+        || cp == 10175 || InRange(cp, 11035, 11036) || cp == 11088 || cp == 11093 {
+        return 2;
+    }
+    if InRange(cp, 11904, 12350) || InRange(cp, 12353, 13311) || InRange(cp, 13312, 19903) || InRange(cp, 19968, 40959)
+        || InRange(cp, 40960, 42191) || InRange(cp, 43360, 43391) || InRange(cp, 44032, 55203) || InRange(cp, 63744, 64255)
+        || InRange(cp, 65040, 65049) || InRange(cp, 65072, 65135) || InRange(cp, 65280, 65376) || InRange(cp, 65504, 65510)
+        || InRange(cp, 126980, 126980) || InRange(cp, 127374, 127374) || InRange(cp, 127377, 127386)
+        || InRange(cp, 127488, 127569) || InRange(cp, 127744, 128591) || InRange(cp, 128640, 128767)
+        || InRange(cp, 129280, 129535) || InRange(cp, 129648, 129791) || InRange(cp, 131072, 196605)
+        || InRange(cp, 196608, 262141) {
+        return 2;
+    }
+    return 1;
+}
+
+/// Removes every escape sequence, keeping the visible text.
+pub string Strip(string text) {
+    i64 len = String.Len(text);
+    mut u8[] bytes = Array.Empty<u8>();
+    mut i64 i = 0;
+    while i < len {
+        u8 b = String.ByteAt(text, i);
+        if b == 27 {
+            i = i + EscapeLength(text, i);
+        } else {
+            bytes = Array.Append<u8>(bytes, b);
+            i = i + 1;
+        }
+    }
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+/// Number of terminal columns `text` occupies, ignoring escape sequences.
+pub i64 VisibleWidth(string text) {
+    i64 len = String.Len(text);
+    mut i64 width = 0;
+    mut i64 i = 0;
+    while i < len {
+        if String.ByteAt(text, i) == 27 {
+            i = i + EscapeLength(text, i);
+        } else {
+            Rune rune = DecodeAt(text, i);
+            width = width + CodePointWidth(rune.codePoint);
+            i = i + rune.length;
+        }
+    }
+    return width;
+}
+
+/// Returns true when `text` contains an SGR sequence (`ESC [ ... m`).
+bool HasSgr(string text) {
+    i64 len = String.Len(text);
+    mut i64 i = 0;
+    while i < len {
+        if String.ByteAt(text, i) == 27 {
+            i64 n = EscapeLength(text, i);
+            if n >= 3 && String.ByteAt(text, i + 1) == 91 && String.ByteAt(text, i + n - 1) == 109 {
+                return true;
+            }
+            i = i + n;
+        } else {
+            i = i + 1;
+        }
+    }
+    return false;
+}
+
+string ResetSgr() {
+    mut u8[] bytes = Array.Empty<u8>();
+    bytes = Array.Append<u8>(bytes, u8(27));
+    bytes = Array.Append<u8>(bytes, u8(91));
+    bytes = Array.Append<u8>(bytes, u8(48));
+    bytes = Array.Append<u8>(bytes, u8(109));
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+/// Shortens `text` to at most `width` columns. When it does not fit, visible text is cut and
+/// `ellipsis` is appended within the width (an ellipsis wider than `width` is dropped).
+/// Escape sequences before the cut are kept, and an SGR reset is appended when the kept text
+/// contains styling, so color never leaks past the cut.
+pub string Truncate(string text, i64 width, string ellipsis) {
+    if width <= 0 {
+        return "";
+    }
+    if VisibleWidth(text) <= width {
+        return text;
+    }
+    mut string tail = ellipsis;
+    mut i64 budget = width - VisibleWidth(ellipsis);
+    if budget < 0 {
+        tail = "";
+        budget = width;
+    }
+    i64 len = String.Len(text);
+    mut u8[] bytes = Array.Empty<u8>();
+    mut i64 used = 0;
+    mut i64 i = 0;
+    while i < len {
+        if String.ByteAt(text, i) == 27 {
+            i64 n = EscapeLength(text, i);
+            mut i64 k = 0;
+            while k < n {
+                bytes = Array.Append<u8>(bytes, String.ByteAt(text, i + k));
+                k = k + 1;
+            }
+            i = i + n;
+        } else {
+            Rune rune = DecodeAt(text, i);
+            i64 w = CodePointWidth(rune.codePoint);
+            if used + w > budget {
+                break;
+            }
+            mut i64 k = 0;
+            while k < rune.length {
+                bytes = Array.Append<u8>(bytes, String.ByteAt(text, i + k));
+                k = k + 1;
+            }
+            used = used + w;
+            i = i + rune.length;
+        }
+    }
+    string kept = String.FromUtf8CodeUnits(bytes);
+    if HasSgr(kept) {
+        return String.Concat(String.Concat(kept, ResetSgr()), tail);
+    }
+    return String.Concat(kept, tail);
+}
+
+/// Appends spaces until `text` is at least `width` columns wide.
+pub string PadEnd(string text, i64 width) {
+    i64 missing = width - VisibleWidth(text);
+    if missing <= 0 {
+        return text;
+    }
+    return String.Concat(text, String.Repeat(" ", missing));
+}
+
+/// Prepends spaces until `text` is at least `width` columns wide.
+pub string PadStart(string text, i64 width) {
+    i64 missing = width - VisibleWidth(text);
+    if missing <= 0 {
+        return text;
+    }
+    return String.Concat(String.Repeat(" ", missing), text);
+}
+
+/// Centers `text` in `width` columns; an odd remainder goes to the right.
+pub string Center(string text, i64 width) {
+    i64 missing = width - VisibleWidth(text);
+    if missing <= 0 {
+        return text;
+    }
+    i64 left = missing / 2;
+    return String.Concat(String.Concat(String.Repeat(" ", left), text), String.Repeat(" ", missing - left));
+}
+
+/// Hard-breaks `word` into pieces of at most `width` columns.
+string[] BreakWord(string word, i64 width) {
+    mut string[] pieces = Array.Empty<string>();
+    i64 len = String.Len(word);
+    mut i64 start = 0;
+    mut i64 used = 0;
+    mut i64 i = 0;
+    while i < len {
+        if String.ByteAt(word, i) == 27 {
+            i = i + EscapeLength(word, i);
+        } else {
+            Rune rune = DecodeAt(word, i);
+            i64 w = CodePointWidth(rune.codePoint);
+            if used + w > width && used > 0 {
+                pieces = Array.Append<string>(pieces, String.SubSlice(word, start, i - start));
+                start = i;
+                used = 0;
+            }
+            used = used + w;
+            i = i + rune.length;
+        }
+    }
+    if start < len {
+        pieces = Array.Append<string>(pieces, String.SubSlice(word, start, len - start));
+    }
+    return pieces;
+}
+
+/// Word-wraps `text` into lines of at most `width` columns. Existing line feeds start new
+/// lines, runs of spaces between words collapse to one, and words wider than `width` are broken
+/// across lines. Styles are not re-opened on continuation lines.
+pub string[] Wrap(string text, i64 width) {
+    mut string[] lines = Array.Empty<string>();
+    mut i64 limit = width;
+    if limit < 1 {
+        limit = 1;
+    }
+    string[] paragraphs = String.Split(text, String.Newline());
+    mut i64 p = 0;
+    while p < Array.Len<string>(paragraphs) {
+        string[] words = String.Split(Array.Get<string>(paragraphs, p), " ");
+        mut string line = "";
+        mut i64 lineWidth = 0;
+        mut i64 w = 0;
+        while w < Array.Len<string>(words) {
+            string word = Array.Get<string>(words, w);
+            i64 wordWidth = VisibleWidth(word);
+            if String.Len(word) > 0 {
+                if wordWidth > limit {
+                    if lineWidth > 0 {
+                        lines = Array.Append<string>(lines, line);
+                        line = "";
+                        lineWidth = 0;
+                    }
+                    string[] pieces = BreakWord(word, limit);
+                    mut i64 k = 0;
+                    while k + 1 < Array.Len<string>(pieces) {
+                        lines = Array.Append<string>(lines, Array.Get<string>(pieces, k));
+                        k = k + 1;
+                    }
+                    line = Array.Get<string>(pieces, k);
+                    lineWidth = VisibleWidth(line);
+                } else {
+                    if lineWidth == 0 {
+                        line = word;
+                        lineWidth = wordWidth;
+                    } else {
+                        if lineWidth + 1 + wordWidth <= limit {
+                            line = line + " " + word;
+                            lineWidth = lineWidth + 1 + wordWidth;
+                        } else {
+                            lines = Array.Append<string>(lines, line);
+                            line = word;
+                            lineWidth = wordWidth;
+                        }
+                    }
+                }
+            }
+            w = w + 1;
+        }
+        lines = Array.Append<string>(lines, line);
+        p = p + 1;
+    }
+    return lines;
+}

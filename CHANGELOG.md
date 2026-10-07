@@ -96,6 +96,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   percent-encoding, query parameters, reference resolution), and
   `Core.Text.Toml` (TOML 1.0 into `TomlValue`), with reference pages and a
   guide for merging this branch with the 0.5.3 line.
+- **Breaking:** `List.Get`, `Map.Get`, `Queue.Peek`, and `Stack.Peek` return
+  `Result<_, CollectionError>` (`IndexOutOfRange(index, count)`,
+  `KeyNotFound`, `Empty`) instead of `Result<_, string>`.
 - Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
   gray-ramp entry (every gray previously mapped to black), and 16-color
   mapping picks the nearest palette entry including bright codes (white and

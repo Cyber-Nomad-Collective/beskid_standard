@@ -14,6 +14,7 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 | `match` yielding `self` or a generic value inside a method | ICE. | Move the logic into a module function that uses `if` and early `return`. |
 | Nested field access through a struct field | `value.time.hour` and `this.table.count` ICE. | Copy the inner struct to a local first, or read through an accessor function. |
 | Field access on a call result | `Calendar.AddDays(d, 1).day` ICEs. | Bind the result to a local first. |
+| Fully qualified generic calls | `Core.Collections.Queue.New<i64>()` ICEs. | `use Core.Collections.Queue;` and call `Queue.New<i64>()`. |
 | Calls inside array literals | `[U(1), U(2)]` ICEs. | Build the array with `Array.Append`. |
 | `bulk` parameters with several arguments | `List.Of<i64>(1, 2)` reports an arity error; passing one array ICEs. | `List.FromArray`, `Set.FromArray`, or array literals. |
 | Array literals of enum values | ICE. | Build with `Array.Append`. |
@@ -33,6 +34,7 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 - **Float literals have no exponent form** (`1e308` does not parse). Write the digits out or compute them.
 - **String literals only escape `\"`, `\\`, and `\${`.** Use `String.Newline()`, `String.Tab()`, `String.FromAscii(code)`.
 - **Blocks cannot end in a value expression.** Use explicit `return` inside match-arm blocks.
+- **Reserved words cannot be identifiers.** Besides the familiar ones, the grammar reserves `host`, `registry`, `scope`, `startup`, `init`, `dispose`, `with`, `launch`, `inject`, `single`, `transient`, `global`, `event`, `when`, `using`, `bulk`, `test`, `skip`, `spawn`, `clif`, `async`, `await`, `try`, and `catch`, so a field or local named `host` or `when` is a parse error.
 - **Types are imported through their module.** From another package, `use Console.Capabilities.ColorModel;` fails; import `Console.Capabilities` and write `Capabilities.ColorModel`.
 - **Prefer string concatenation to `u8[]` growth for building text.** Appending 100 KB to a `u8[]` one byte at a time took about 20 s and exhausted the 1 GiB heap at 500 KB, while `+` concatenation of the same text took well under a second. `StringBuilder` concatenates; `Join`, `Replace`, and `Repeat` concatenate through `String.Concat`.
 - **Arithmetic wraps** on overflow (no trap), which the hash functions rely on.

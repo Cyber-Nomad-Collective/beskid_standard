@@ -48,6 +48,7 @@ These are deliberate changes from 0.5.2 behavior; confirm or revert each explici
 3. **Query**: `Operators.Map` and `Filter` (placeholders) are removed and `FoldI64` is renamed `SumI64`. When 0.5.3 lambdas land, add real predicate/projection overloads rather than restoring the placeholders.
 4. **Panel**: `Measure` no longer adds a row for the title (it is drawn in the top border) and returns one row per body line; over-wide lines truncate with `...`.
 5. **`Url.hostname`**: named so because `host` is a reserved word.
+6. **Typed collection errors (breaking)**: `List.Get`, `Map.Get`, `Queue.Peek`, and `Stack.Peek` return `Result<_, CollectionError>` instead of `Result<_, string>`. Callers that match `Result::Error(_)` are unaffected; callers that annotate `Result<T, string>` or read the message must switch to `CollectionError`. No caller in Corelib, the compiler repository, or `beskid_templates` depended on the strings at the time of this change.
 
 ## After the 0.5.3 compiler lands
 

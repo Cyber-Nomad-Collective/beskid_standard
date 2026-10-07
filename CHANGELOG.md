@@ -49,6 +49,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `FORCE_COLOR`, and TTY state; `ProbeStdout` now uses it.
 - Add `Sgr.ForegroundArgsFor` and `BackgroundArgsFor` for an explicit color
   model, and a console reference page.
+- Add runnable compiler-gap canaries (`beskid_corelib/tests/canaries`), a
+  0.5.3 compiler fix list, and a `Time.bd` patch to apply with the compiler
+  rebuild; record the silent method-parameter/field shadowing miscompile.
 - Document the 0.5.2 compiler and runtime limits that shape these APIs, and
   how to test a modified Corelib with a released binary.
 
@@ -71,6 +74,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Build `StringBuilder` output by string concatenation instead of per-byte
+  `u8[]` growth, which 0.5.2 performs far more slowly; keep `Join`, `Replace`,
+  and `Repeat` on concatenation for the same reason.
 - Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
   gray-ramp entry (every gray previously mapped to black), and 16-color
   mapping picks the nearest palette entry including bright codes (white and

@@ -20,6 +20,10 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 | `f64` to `i64` cast | `i64(x)` on an f64 ICEs. | `Number.TruncateToI64`, a bit-by-bit decomposition. |
 | Interpolating `f64` or `bool` | f64 ICEs; bool produces wrong text. | `Number.FormatGeneral`, `StringBuilder.AppendBool`. |
 
+## Silent miscompiles
+
+- **A method parameter named like a field of `this` reads the field.** In `pub string Echo(string text)` on a type with a `text` field, `text` is `this.text`, with no diagnostic. Never give a method parameter the name of one of the type's fields. (`StringBuilder` hit this: `Append(string text)` appended the empty `text` field.)
+
 ## Semantics to keep in mind
 
 - **Integer literals default to `i32`.** `-9223372036854775807 - 1` evaluates as `i32`, and match arms mixing `0` with an `i64` call fail to lower (`InvalidMatchArms`). Suffix large or arm-result literals with `_i64`.
@@ -30,6 +34,7 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 - **String literals only escape `\"`, `\\`, and `\${`.** Use `String.Newline()`, `String.Tab()`, `String.FromAscii(code)`.
 - **Blocks cannot end in a value expression.** Use explicit `return` inside match-arm blocks.
 - **Types are imported through their module.** From another package, `use Console.Capabilities.ColorModel;` fails; import `Console.Capabilities` and write `Capabilities.ColorModel`.
+- **Prefer string concatenation to `u8[]` growth for building text.** Appending 100 KB to a `u8[]` one byte at a time took about 20 s and exhausted the 1 GiB heap at 500 KB, while `+` concatenation of the same text took well under a second. `StringBuilder` concatenates; `Join`, `Replace`, and `Repeat` concatenate through `String.Concat`.
 - **Arithmetic wraps** on overflow (no trap), which the hash functions rely on.
 
 ## Runtime defects

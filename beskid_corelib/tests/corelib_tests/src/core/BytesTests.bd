@@ -46,7 +46,8 @@ test bytes_copy_range {
 }
 
 i64 ElapsedNanos(Instant start) {
-    return Time.MonotonicNow().nanos - start.nanos;
+    Instant now = Time.MonotonicNow();
+    return now.nanos - start.nanos;
 }
 
 // PERF1 / C53-5: Slice.New is one zeroed allocation, not one append per byte.
@@ -72,20 +73,25 @@ test bytes_four_mebibyte_live_buffer_survives_churn {
     u8[] big = Slice.New(4194304);
     mut i64 i = 0;
     while i < 4194304 {
-        big[i] = u8(i % 251);
+        i64 value = i % 251;
+        big[i] = u8(value);
         i = i + 4099;
     }
     mut i64 round = 0;
     while round < 1000 {
         u8[] scratch = Slice.New(16384);
-        scratch[16383] = u8(round % 256);
+        i64 marker = round % 256;
+        scratch[16383] = u8(marker);
         Assert.Equal(Slice.Get(scratch, 0), 0, "fresh scratch is zeroed");
         round = round + 1;
     }
     Assert.CollectGarbage();
     i = 0;
     while i < 4194304 {
-        Assert.Equal(i64(big[i]), i % 251, "live 4 MiB buffer keeps its contents");
+        u8 stored = big[i];
+        i64 expected = i % 251;
+        i64 storedWide = i64(stored);
+        Assert.Equal(storedWide, expected, "live 4 MiB buffer keeps its contents");
         i = i + 4099;
     }
 }
@@ -95,20 +101,24 @@ test bytes_three_live_64k_buffers_with_garbage_do_not_exhaust_heap {
     u8[] a = Slice.New(65536);
     u8[] b = Slice.New(65536);
     u8[] c = Slice.New(65536);
-    a[65535] = 1;
-    b[65535] = 2;
-    c[65535] = 3;
+    a[65535] = 1_u8;
+    b[65535] = 2_u8;
+    c[65535] = 3_u8;
     mut i64 round = 0;
     while round < 1000 {
         u8[] x = Slice.New(16384);
         u8[] y = Slice.New(20000);
         u8[] z = Slice.New(18432);
-        x[0] = 1;
-        y[0] = 1;
-        z[0] = 1;
+        x[0] = 1_u8;
+        y[0] = 1_u8;
+        z[0] = 1_u8;
         if round % 250 == 0 { Assert.CollectGarbage(); }
         round = round + 1;
     }
     Assert.CollectGarbage();
-    Assert.Equal(i64(a[65535]) + i64(b[65535]) + i64(c[65535]), 6, "live 64 KiB buffers keep their contents");
+    u8 lastA = a[65535];
+    u8 lastB = b[65535];
+    u8 lastC = c[65535];
+    i64 sum = i64(lastA) + i64(lastB) + i64(lastC);
+    Assert.Equal(sum, 6, "live 64 KiB buffers keep their contents");
 }

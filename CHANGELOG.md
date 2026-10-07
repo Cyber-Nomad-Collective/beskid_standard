@@ -17,9 +17,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   Requires compiler 0.5.3, which grants corelib authority per service file.
   Program notes, compiler gap log, rulings, and repros are in
   `docs/networking/`.
-- Add the opt-in `corelib_crypto_openssl` package (`packages/crypto-openssl`),
-  a Linux OpenSSL 3 provider for `corelib_crypto`. It is not part of the
-  aggregate, so the aggregate still loads on hosts without OpenSSL 3.
+- Select an in-process OpenSSL 3 provider in `corelib_crypto` (ruling R27):
+  `libcrypto.so.3` is an optional extern contract (compiler 0.5.3), so the
+  aggregate still loads on hosts without OpenSSL 3. One-shot SHA-2, HMAC,
+  AES-GCM and ChaCha20-Poly1305 use EVP when it is available and passes a
+  known-answer self-test; otherwise, or with `BESKID_CRYPTO_PROVIDER=pure`,
+  the CLIF kernels run. The opt-in `crypto-openssl` package is removed.
+- Fix QUIC loss of datagrams on deadline-bounded receives (WEB7): the endpoint
+  receives on a dedicated fiber without a deadline, and PTO probes carry
+  in-flight flow-control credit frames.
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent

@@ -19,13 +19,19 @@ use Quic.QuicProtection;
 use Quic.QuicWire;
 
 // A QUIC endpoint: one UDP socket, connections demultiplexed by destination connection ID,
-// and one driver fiber (`Start`) that receives, runs timers and sends. Application calls
-// (Connect, Accept, stream reads and writes) only change connection state and poll it with
-// short sleeps until their timeout (milliseconds, -1 for none); they never touch the socket.
-// No channels are used.
+// a driver fiber (`Start`) that processes received datagrams, runs timers and sends, and a
+// receiver fiber that only waits for datagrams and queues them for the driver. Application
+// calls (Connect, Accept, stream reads and writes) only change connection state and poll it
+// with short sleeps until their timeout (milliseconds, -1 for none); they never touch the
+// socket. No channels are used.
+//
+// The receiver waits without a deadline. A receive with a deadline can lose a datagram the
+// runtime already took from the socket when the deadline wins the race (COMPILER-GAPS
+// WEB7); with millisecond driver waits that dropped a large share of loopback datagrams.
 
-// n indices: 0 stop request, 1 driver running, 2 last network error code (0 none),
-// 3 datagrams received, 4 datagrams sent, 5 Retry packets sent.
+// n indices: 0 stop request, 1 driver running, 2 network errors, 3 datagrams received,
+// 4 datagrams sent, 5 Retry packets sent, 6 driver steps, 7 receives completed,
+// 8 send errors, 9 next inbox index, 10 receiver running.
 pub type Endpoint {
     pub bool isServer,
     UdpSocket socket,
@@ -35,10 +41,12 @@ pub type Endpoint {
     SocketAddress[] peers,
     i64[] used,
     u8[] retryKey,
+    /// Datagrams queued by the receiver fiber; the driver consumes them from n[9].
+    Datagram[] inbox,
 }
 
 i64 PollMillis() { return 1_i64; }
-i64 DriverWaitMillis() { return 5_i64; }
+i64 DriverWaitMillis() { return 1_i64; }
 
 pub i64 NowNanos() {
     Instant now = Time.MonotonicNow();
@@ -73,8 +81,9 @@ Endpoint Make(UdpSocket socket, QuicConfig config, bool isServer) {
     mut i64[] used = Array.Empty<i64>();
     u8[] key = match Entropy.Bytes(32_i64) { Result::Ok(k) => k, Result::Error(_) => Slice.New(32_i64), };
     return Endpoint {
-        isServer: isServer, socket: socket, config: config, n: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
-        conns: conns, peers: peers, used: used, retryKey: key,
+        isServer: isServer, socket: socket, config: config,
+        n: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
+        conns: conns, peers: peers, used: used, retryKey: key, inbox: Array.Empty<Datagram>(),
     };
 }
 
@@ -88,7 +97,8 @@ pub Result<SocketAddress, QuicError> LocalAddress(Endpoint ep) {
 
 // ------------------------------------------------------------ driver
 
-/// Spawns the driver fiber. Call `Stop` and join the fiber to shut down.
+/// Spawns the driver fiber (which runs the receiver fiber). Call `Stop` and join the fiber
+/// to shut down.
 pub Fiber<unit> Start(Endpoint ep) {
     ep.n[1] = 1_i64;
     return spawn (() => Run(ep));
@@ -100,11 +110,13 @@ pub unit Stop(Endpoint ep) { ep.n[0] = 1_i64; return; }
 pub i64 DatagramsReceived(Endpoint ep) { return ep.n[3]; }
 pub i64 DatagramsSent(Endpoint ep) { return ep.n[4]; }
 pub i64 RetriesSent(Endpoint ep) { return ep.n[5]; }
-/// Driver diagnostics: [steps started, receives completed, network errors].
+/// Driver diagnostics by n index (see the comment on Endpoint).
 pub i64 Diagnostic(Endpoint ep, i64 index) { return ep.n[index]; }
 
 unit Run(Endpoint ep) {
     ep.n[1] = 2_i64;
+    ep.n[10] = 1_i64;
+    Fiber<unit> receiver = spawn (() => Receive(ep));
     while ep.n[0] == 0_i64 {
         Step(ep);
     }
@@ -118,7 +130,39 @@ unit Run(Endpoint ep) {
     }
     UdpSocket socket = ep.socket;
     match socket.Close() { Result::Ok(_) => (), Result::Error(_) => (), };
+    // Closing the socket ends the receiver's pending wait.
+    match receiver.Join() { Result::Ok(_) => (), Result::Error(_) => (), };
     ep.n[1] = 0_i64;
+    return;
+}
+
+// The receiver fiber: waits for datagrams without a deadline and queues them.
+unit Receive(Endpoint ep) {
+    UdpSocket socket = ep.socket;
+    while ep.n[10] == 1_i64 {
+        Result<Datagram, NetworkError> received = socket.ReceiveFrom(1500_i64, Option.Empty<Deadline>());
+        match received {
+            Result::Ok(d) => { Enqueue(ep, d); },
+            Result::Error(e) => { OnReceiveError(ep, e); },
+        };
+    }
+    return;
+}
+
+unit Enqueue(Endpoint ep, Datagram d) {
+    mut Datagram[] inbox = ep.inbox;
+    Array.Append<Datagram>(inbox, d);
+    ep.inbox = inbox;
+    ep.n[7] = ep.n[7] + 1_i64;
+    return;
+}
+
+unit OnReceiveError(Endpoint ep, NetworkError e) {
+    match e {
+        NetworkError::Closed => { ep.n[10] = 0_i64; },
+        NetworkError::Cancelled => { ep.n[10] = 0_i64; },
+        _ => { ep.n[2] = ep.n[2] + 1_i64; Nap(); },
+    };
     return;
 }
 
@@ -137,36 +181,28 @@ i64 WaitNanos(Endpoint ep, i64 now) {
     return wait;
 }
 
-/// One driver iteration: receive (bounded wait), timers, sends.
+/// One driver iteration: queued datagrams, timers, sends, then a short sleep (at most
+/// DriverWaitMillis, less when a connection timer is due earlier).
 pub unit Step(Endpoint ep) {
     ep.n[6] = ep.n[6] + 1_i64;
-    i64 now = NowNanos();
-    i64 wait = WaitNanos(ep, now);
-    Option<Deadline> deadline = match Deadline.After(Time.FromNanoseconds(wait)) {
-        Result::Ok(d) => Option.FromValue<Deadline>(d),
-        Result::Error(_) => Option.Empty<Deadline>(),
-    };
-    UdpSocket socket = ep.socket;
-    Result<Datagram, NetworkError> received = socket.ReceiveFrom(1500_i64, deadline);
-    ep.n[7] = ep.n[7] + 1_i64;
-    OnReceived(ep, received);
+    DrainInbox(ep);
     Service(ep);
+    if ep.n[9] < Array.Len<Datagram>(ep.inbox) { return; }
+    i64 wait = WaitNanos(ep, NowNanos());
+    match Time.Sleep(Time.FromNanoseconds(wait)) { Result::Ok(_) => (), Result::Error(_) => (), };
     return;
 }
 
-unit OnReceived(Endpoint ep, Result<Datagram, NetworkError> received) {
-    match received {
-        Result::Ok(d) => { Dispatch(ep, d); },
-        Result::Error(e) => { NoteError(ep, e); },
-    };
-    return;
-}
-
-unit NoteError(Endpoint ep, NetworkError e) {
-    match e {
-        NetworkError::TimedOut => (),
-        _ => { ep.n[2] = ep.n[2] + 1_i64; },
-    };
+// Dispatches queued datagrams. Sends may yield to the receiver fiber, which can append
+// more; the queue is reset only when everything queued was consumed.
+unit DrainInbox(Endpoint ep) {
+    while ep.n[9] < Array.Len<Datagram>(ep.inbox) {
+        Datagram d = ep.inbox[ep.n[9]];
+        ep.n[9] = ep.n[9] + 1_i64;
+        Dispatch(ep, d);
+    }
+    ep.inbox = Array.Empty<Datagram>();
+    ep.n[9] = 0_i64;
     return;
 }
 
@@ -194,7 +230,7 @@ unit Flush(Endpoint ep, i64 slot, i64 now) {
     mut i64 length = QuicConnection.BuildDatagram(c, now);
     while length > 0_i64 && sent < 16_i64 {
         u8[] datagram = QuicWire.CopyOf(c.out, 0_i64, length);
-        match socket.SendTo(datagram, peer, Option.Empty<Deadline>()) { Result::Ok(_) => (), Result::Error(_) => (), };
+        match socket.SendTo(datagram, peer, Option.Empty<Deadline>()) { Result::Ok(_) => (), Result::Error(_) => { ep.n[8] = ep.n[8] + 1_i64; }, };
         ep.n[4] = ep.n[4] + 1_i64;
         sent = sent + 1_i64;
         length = QuicConnection.BuildDatagram(c, now);
@@ -332,7 +368,7 @@ i64 AddConnection(Endpoint ep, Connection c, SocketAddress peer) {
 
 unit SendRaw(Endpoint ep, u8[] datagram, SocketAddress to) {
     UdpSocket socket = ep.socket;
-    match socket.SendTo(datagram, to, Option.Empty<Deadline>()) { Result::Ok(_) => (), Result::Error(_) => (), };
+    match socket.SendTo(datagram, to, Option.Empty<Deadline>()) { Result::Ok(_) => (), Result::Error(_) => { ep.n[8] = ep.n[8] + 1_i64; }, };
     ep.n[4] = ep.n[4] + 1_i64;
     return;
 }

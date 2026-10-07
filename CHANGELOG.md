@@ -72,6 +72,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fix QUIC loopback datagram loss (WEB7): the `QuicEndpoint` receiver fiber now
+  waits without a deadline, because a timed-out runtime receive can drop a datagram
+  that was already read. A PTO probe also carries the in-flight credit frames
+  (MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS) again. The new `QuicCreditLoss` test
+  checks this in memory with lost credit frames.
 - `Crypto.Entropy` AOT link on macOS: compiler 0.5.3 links `libc.so.6` as
   `-lc`, so the libc link shim in the web interop script is removed (WEB4).
 - Validate a request's `Host` field as soon as its header completes, before

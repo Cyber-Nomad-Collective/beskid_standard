@@ -17,6 +17,7 @@ use Http3.H3Client;
 use Http3.H3Connection;
 use Http3.H3Errors;
 use Http3.H3Quic;
+use Quic.QuicEndpoint;
 use Http3.H3Server;
 use Tls.PeerKeys;
 use Tls.TlsConfig;
@@ -42,6 +43,15 @@ string Dec(i64 v) {
     if v < 0_i64 { return "-" + Dec(0_i64 - v); }
     if v < 10_i64 { return String.DigitChar(v); }
     return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+// Datagram counters of the link's endpoint: a gap between one side's tx and the
+// other side's rx is loss (WEB7).
+string Counts(QuicLink link) {
+    return match link {
+        QuicLink::Quic(s) => "rx=" + Dec(QuicEndpoint.DatagramsReceived(s.endpoint)) + " tx=" + Dec(QuicEndpoint.DatagramsSent(s.endpoint)) + " senderr=" + Dec(QuicEndpoint.Diagnostic(s.endpoint, 8_i64)),
+        QuicLink::Memory(_) => "memory",
+    };
 }
 
 string LocalIp() { return "127.0.0.1"; }
@@ -127,7 +137,7 @@ i64 ServeConn(H3Conn start, i64[] t0) {
         Result<unit,H3Error> sent = H3Server.Respond(conn, incoming.streamId, response);
         i64 failed = match sent { Result::Ok(_) => 0_i64, Result::Error(e) => Failure(55_i64, e), };
         if failed != 0_i64 { return failed; }
-        Mark(t0, "server responded");
+        Mark(t0, "server responded " + Counts(conn.link));
         served = served + 1_i64;
     }
     // Graceful shutdown: GOAWAY naming the first unprocessed request stream (8).
@@ -217,10 +227,10 @@ i64 Talk(H3Conn start, i64[] t0) {
     Mark(t0, "client connected alpn=" + H3Quic.Alpn(conn.link));
     if H3Quic.Alpn(conn.link) != "h3" { return 2_i64; }
     i64 a = CheckGet(H3Client.Send(conn, Get("/hello"), 15000_i64));
-    Mark(t0, "client GET=" + Dec(a));
+    Mark(t0, "client GET=" + Dec(a) + " " + Counts(conn.link));
     if a != 0_i64 { return a; }
     i64 b = CheckPost(H3Client.Send(conn, Post("/upload", Payload()), 20000_i64));
-    Mark(t0, "client POST=" + Dec(b));
+    Mark(t0, "client POST=" + Dec(b) + " " + Counts(conn.link));
     if b != 0_i64 { return b; }
     // The server's GOAWAY names stream 8: requests 0 and 4 were processed.
     i64 deadline = H3Quic.DeadlineIn(15000_i64);

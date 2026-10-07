@@ -1110,6 +1110,37 @@ unit OnPto(Connection c, i64 space) {
             if QuicStream.IsOpen(st) && QuicStream.CanSend(st.id, c.isServer) { QuicStream.OnChunkLost(st, 0_i64, QuicStream.SentOffset(st), true); }
             i = i + 1_i64;
         }
+        RequeueControl(c);
+    }
+    return;
+}
+
+// Control frames still in flight (credit updates, MAX_STREAMS, HANDSHAKE_DONE, RESET_STREAM,
+// STOP_SENDING) go into the probe again with their current values (RFC 9000 section 13.3,
+// RFC 9002 section 6.2.4), so a lost credit update is recovered by the probe itself instead
+// of one more round trip of loss detection after the probe is acknowledged.
+unit RequeueControl(Connection c) {
+    i64[] live = QuicRecovery.Outstanding(c.rec, 2_i64);
+    mut i64 k = 0_i64;
+    while k < Array.Len<i64>(live) {
+        i64 r = live[k];
+        i64 flags = QuicRecovery.RecordFlags(c.rec, 2_i64, r);
+        if (flags & QuicRecovery.FlagHandshakeDone()) != 0_i64 { c.n[NHandshakeDonePending()] = 1_i64; }
+        if (flags & QuicRecovery.FlagMaxData()) != 0_i64 { c.n[NMaxDataPending()] = 1_i64; }
+        if (flags & QuicRecovery.FlagMaxStreamsBidi()) != 0_i64 { c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] | 1_i64; }
+        if (flags & QuicRecovery.FlagMaxStreamsUni()) != 0_i64 { c.n[NMaxStreamsPending()] = c.n[NMaxStreamsPending()] | 2_i64; }
+        i64 items = QuicRecovery.RecordItems(c.rec, 2_i64, r);
+        mut i64 i = 0_i64;
+        while i < items {
+            i64 kind = QuicRecovery.Item(c.rec, 2_i64, r, i, 0_i64);
+            i64 extra = QuicRecovery.Item(c.rec, 2_i64, r, i, 3_i64);
+            if kind >= 0_i64 && extra > 1_i64 {
+                i64 slot = FindStream(c, kind);
+                if slot >= 0_i64 { OnStreamItem(c.streams[slot], 0_i64, 0_i64, extra, false); }
+            }
+            i = i + 1_i64;
+        }
+        k = k + 1_i64;
     }
     return;
 }

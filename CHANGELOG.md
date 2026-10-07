@@ -81,6 +81,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Build `StringBuilder` output by string concatenation instead of per-byte
   `u8[]` growth, which 0.5.2 performs far more slowly; keep `Join`, `Replace`,
   and `Repeat` on concatenation for the same reason.
+- Replace the placeholder `Query.Operators.Map` (returned copies of a sample)
+  and `Filter` (returned its second argument) with lambda-free `Where`
+  (mask), `WhereEquals`, `WhereNotEquals`, `Distinct`, `CountOf`, `IndexOf`,
+  `Concat`, `Reverse`, and typed `SumI64`/`SumF64`/`MinI64`/`MaxI64`/
+  `AverageF64`; rename `FoldI64` to `SumI64`; sort `OrderBy` with the stable
+  merge sort instead of bubble sort; rewrite the stale Query docs.
 - Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
   gray-ramp entry (every gray previously mapped to black), and 16-color
   mapping picks the nearest palette entry including bright codes (white and

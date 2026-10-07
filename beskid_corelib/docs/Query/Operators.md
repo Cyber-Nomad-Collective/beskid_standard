@@ -1,32 +1,36 @@
-`Query.Operators` defines **`QueryState<T>`** and array-backed combinators over `T[]` windows.
+# Query.Operators
 
-## Type
+Every operator takes an `ArrayIterator<T>` and works on its remaining elements, starting at the current one.
+
+The 0.5.2 compiler cannot lower lambdas, so there are no predicate or projection callbacks. Selection uses a boolean mask (`Where`) or value comparison (`WhereEquals`, `Distinct`); equality is `==`, which compares primitives and strings by value and other types by identity.
+
+| Function | Result |
+|----------|--------|
+| `Take(it, n)`, `Skip(it, n)` | First `n` / all but the first `n` remaining elements. |
+| `Count(it)`, `IteratorIsEmpty(it)` | Remaining count / whether none remain. |
+| `First(it)`, `Last(it)` | `Option<T>`. |
+| `ToArray(it)` | Remaining elements as a new array. |
+| `Any(it, value)`, `All(it, value)` | Whether any / all remaining elements equal `value` (`All` of nothing is `true`). |
+| `Where(it, keep)` | Elements whose position in the `bool[]` mask is `true`. |
+| `WhereEquals(it, value)`, `WhereNotEquals(it, value)` | Elements equal / not equal to `value`. |
+| `Distinct(it)` | First occurrence of each value, in order. |
+| `CountOf(it, value)`, `IndexOf(it, value)` | Occurrences / offset of the first match (`-1` when absent). |
+| `Concat(it, tail)`, `Reverse(it)` | Remaining elements followed by `tail` / reversed. |
+| `OrderBy(it, ascending)` | Sorted `i64` values via the stable merge sort in `Core.Collections.Sort`. |
+| `SumI64`, `SumF64`, `MinI64`, `MaxI64`, `AverageF64` | Numeric aggregates; min, max, and average return `None` when empty. |
 
 ```beskid
-pub type QueryState<T> {
-    T[] source,
-    i64 index,
-    i64 length,
-    Core.Optional.Option<T> first,
+use Query.ArrayIterator;
+use Query.Operators;
+
+i64[] scores = [72_i64, 95_i64, 88_i64];
+mut bool[] passed = Array.Empty<bool>();
+mut i64 i = 0;
+while i < Array.Len<i64>(scores) {
+    passed = Array.Append<bool>(passed, Array.Get<i64>(scores, i) >= 80);
+    i = i + 1;
 }
+i64[] passing = Operators.Where<i64>(ArrayIterator.Over<i64>(scores), passed); // 95, 88
 ```
 
-## Operators
-
-| Function | Role |
-|----------|------|
-| `FromArray<T>` | Build state from a source array (`index=0`, `length=Len(source)`). |
-| `Where` | Drop the window when `predicate` is false at the current position. |
-| `Select` | Project the current element using a `sample` value (staged projection). |
-| `Take` / `Skip` | Bound or advance the logical window. |
-| `Count` | Remaining element count (`length - index`). |
-| `First` | Optional first element for the current window. |
-| `ToList` | Materialize the remaining window into a new `T[]`. |
-| `Any` / `All` | Scan the window for any / all elements equal to a reference value. |
-| `OrderBy` | Sort an `i64` window ascending or descending (bubble sort, v1). |
-| `CollectArray` | Returns `Len(ToList(state))`. |
-
-## Policy
-
-- Import `Core.Optional` for optional query results; `Query.Contracts` has been removed (deprecated shim deleted per D-CORE-OPT-0003).
-- Prefer explicit `Core.Collections.Array` helpers for production storage until query syntax lowering lands.
+For sorting other element types by a key, use `Core.Collections.Sort.ByI64Key` and its siblings.

@@ -869,3 +869,33 @@ limits, and `H3Quic.ForH3` uses it (R25).
   Renaming the function did not help; moving it below the first declaration did.
 - Workaround: put a declaration between two doc-comment blocks, or use `//` for a module
   comment.
+
+## 2026-10-07, allocation and deadline race (0.5.3 CLI, kit4)
+
+### ALLOC1. Resolved in 0.5.3: PERF1, C53-5, HQ3, W5 and the WEB7 runtime gap
+- `Array.Zeroed<T>(n)` is one rooted runtime allocation of n zeroed elements, and
+  `Slice.New(n)` uses it: `Slice.New(1048576)` is under 50 ms on the builder (it was
+  98-155 ms for 16 KiB). `Array.Append` doubles the capacity when full.
+- Root cause of HQ3/W5: a freed heap span was reused only for a request of exactly the same
+  page count, and allocation searched only the newest region. After a collection, a region
+  full of freed 2-3 page array spans could not serve a 1-page request, so the heap grew region
+  by region to the 1 GiB cap with `live=0`. The collector now splits larger free spans,
+  merges adjacent free spans during sweep, and searches every region before it grows.
+  `docs/networking/repros/array_oom` variants A-C pass.
+- WEB7 runtime gap: `NetworkFinish` now delivers a transfer that the reactor completed after
+  the deadline won the wait (UDP datagram, TCP bytes, accepted socket, connection). Runtime
+  tests `native_network_*_deadline_race_*` force that order 20 times each.
+- Workarounds that can now go: `Codec.Mem.Zeroed` literals, 4 KiB-first record and frame
+  buffers, 4 KiB H3 DATA chunks, the QUIC receiver fiber (keep it if it helps latency).
+
+### ALLOC2. An untyped integer literal stored at a constant index of a large `u8[]` is lost
+- Symptom: `u8[] c = Slice.New(70000); c[4095] = 1; u8 r = c[4095];` gives `r = 0`.
+  `c[4095] = 1_u8`, a variable index (`c[k] = 1`), and small arrays (`d[7] = 1` on 8 bytes)
+  work. Reproduced with the baseline 0.5.3 CLI and kit3, so it predates the allocation change.
+- Workaround: write a typed literal (`1_u8`) or a typed local.
+
+### ALLOC3. A primitive conversion as a call argument can fail lowering
+- Symptom: `Assert.Equal(i64(stored), expected, ...)` or `Assert.Equal(f(x), i64(CONST), ...)`
+  gives "semantic fact `call_lowering` is unavailable"; `Time.MonotonicNow().nanos - start.nanos`
+  gives "no ISLE lowering rule or fact for `BinaryExpression`".
+- Workaround: bind the conversion or the call result to a typed local first.

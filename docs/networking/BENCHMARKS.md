@@ -69,3 +69,35 @@ not measured.
   `MaskFirst`/`MaskPn`, WebSocket `Xor64`, and the OpenSSL EVP calls of `Crypto.Native` (R27).
 - Remaining limit: buffers above 4 KiB still allocate in O(n^2) and a larger literal costs
   minutes of compile time (PERF1); a sized allocation primitive in the compiler removes it.
+
+## Sized allocation, geometric growth and heap reuse (0.5.3 CLI, kit4, 2026-10-07)
+
+Same targets, one run each, builder load 4-6. "Before" is the kit3 acceptance run of
+2026-10-06/07 (`/workspace/net-crypto-select-logs/accA2-*`, `accB-quic-QuicBench.log`);
+"after" adds `Array.Zeroed`/`Slice.New` as one allocation, geometric `Array.Append`, and span
+reuse across page counts and regions (COMPILER-GAPS ALLOC1). No package code changed.
+
+| Benchmark | Mode | Before (kit3) | After (kit4) |
+| --- | --- | --- | --- |
+| `Slice.New(16384)` | - | 90539 us | 10 us |
+| TLS 1.3 full handshake, loopback (best) | AES-128-GCM pure / native | 3.78 / 3.74 ms | 2.72 / 2.57 ms |
+| same | ChaCha20-Poly1305 pure / native | 4.05 / 4.12 ms | 2.85 / 3.11 ms |
+| TLS 8 MiB in 16 KiB records over TlsStream | AES-128-GCM pure / native | 19.96 / 23.60 MB/s | 71.80 / 192.26 MB/s |
+| same | ChaCha20-Poly1305 pure / native | 22.94 / 23.27 MB/s | 130.97 / 182.75 MB/s |
+| TLS `Record.Seal` / `Open` 16 KiB | AES-128-GCM pure | 210 / 213 MB/s | 214 / 213 MB/s |
+| same | AES-128-GCM native | 2466 / 2515 MB/s | 2400 / 2574 MB/s |
+| same | ChaCha20-Poly1305 pure / native | 636-646 / 1821-1922 MB/s | 662-664 / 1967-2001 MB/s |
+| plain TCP 8 MiB in 16 KiB writes | - | 366.5 MB/s | 351.5 MB/s |
+| h2c GETs over loopback TCP | 2048 x 4 KiB | 0.08 MB/s | 0.08 MB/s |
+| same | 64 x 16 KiB | 0.12 MB/s | 0.25 MB/s |
+| h2 DATA frame decode / encode 4 KiB, in memory | - | 513.5 / 0.68 MB/s | 446.4 / 1204.5 MB/s |
+| HPACK encode / decode, 6-field request | - | 142.2 / 11.6 us | 140.8 / 10.8 us |
+| HPACK Huffman decode, 48 octets | - | 50.2 us | 53.2 us |
+| QUIC handshake (best) | AES-128-GCM pure / native | 1243 ms / - | 9.4 / 9.8 ms |
+| QUIC 2 MiB stream in 4 KiB writes | AES-128-GCM pure / native | 0.22 MB/s / - | 2.60 / 2.70 MB/s |
+
+The TLS transfer gains come from the record buffers: growing a 4 KiB buffer to 16 KiB no
+longer costs about 100 ms. The in-memory AEAD, HPACK and plain TCP rows do not allocate in
+their timed loops and are unchanged within noise. h2c GETs stay bound by the per-request
+fiber and frame round trips, not by allocation. QUIC gains come from the 8 KiB scratch and
+stream buffers; "before" had only a pure-provider row.

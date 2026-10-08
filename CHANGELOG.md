@@ -12,6 +12,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   when two versions grow from one base. `Array.Append` grows storage in place
   with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
   only when the version owns the storage tip and copies the prefix otherwise.
+- Keep earlier versions intact on removal and overwrite: `List.Pop`,
+  `Stack.Pop`, and `Queue.Dequeue` no longer clear the shared slot, `Map.Remove`
+  and `Set.Remove` copy instead of shifting shared storage, and `Map.Insert`
+  copies before overwriting an existing key. `Storage.CopyPrefix` and
+  `Storage.CopyWithout` are the only copy loops. `HashTable`, `StringMap`,
+  `I64Map`, and `PriorityQueue` document that they are single-owner values.
 
 ### Added
 

@@ -1,7 +1,7 @@
 /// Growable list backed by typed `T[]` storage.
 /// @tier(supported)
-/// Lists are linear values: mutating operations return the updated list, and callers keep using
-/// the returned value. Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
+/// Lists are persistent values: every operation returns a new version and leaves earlier versions
+/// unchanged, even when they share storage (see `Core.Collections.Storage`). Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
 /// primitives and strings by value and other types by identity.
 use Core.Collections.Array;
 use Core.Collections.CollectionError;
@@ -26,11 +26,13 @@ pub type List<T> {
         return List<T> { storage: nextStorage, count: count + 1 };
     }
 
+    /// Returns the list without its last element. Storage is left untouched because earlier
+    /// versions may still own the removed slot; the next `Push` copies the prefix instead.
     pub List<T> Pop() {
         if count == 0 {
             return self;
         }
-        return List<T> { storage: Array.RemoveLast<T>(storage), count: count - 1 };
+        return List<T> { storage: storage, count: count - 1 };
     }
 
     /// Returns the element at `index`, or `IndexOutOfRange(index, Count())`.
@@ -186,14 +188,7 @@ Result<List<T>, CollectionError> RemoveAtIn<T>(T[] storage, i64 count, i64 index
     if index < 0 || index >= count {
         return Result<List<T>, CollectionError>::Error(CollectionError::IndexOutOfRange(index, count));
     }
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = 0;
-    while i < count {
-        if i != index {
-            next = Array.Append<T>(next, Array.Get<T>(storage, i));
-        }
-        i = i + 1;
-    }
+    T[] next = Storage.CopyWithout<T>(storage, count, index);
     return Result<List<T>, CollectionError>::Ok(List<T> { storage: next, count: count - 1 });
 }
 
@@ -202,14 +197,7 @@ List<T> RemoveFirstIn<T>(T[] storage, i64 count, T value) {
     if index < 0 {
         return List<T> { storage: storage, count: count };
     }
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = 0;
-    while i < count {
-        if i != index {
-            next = Array.Append<T>(next, Array.Get<T>(storage, i));
-        }
-        i = i + 1;
-    }
+    T[] next = Storage.CopyWithout<T>(storage, count, index);
     return List<T> { storage: next, count: count - 1 };
 }
 

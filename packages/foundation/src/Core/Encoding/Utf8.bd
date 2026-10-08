@@ -1,28 +1,10 @@
 /// UTF-8 encoding (language default).
 /// @tier(standard)
 use Core.Bytes.Slice;
+use Core.Collections.Array;
 use Core.Encoding.EncodingError;
 use Core.Results;
 use Core.String;
-
-pub i64 RuneByteLen(u8 lead) {
-    if lead < 128 {
-        return 1;
-    }
-    if lead < 192 {
-        return 0;
-    }
-    if lead < 224 {
-        return 2;
-    }
-    if lead < 240 {
-        return 3;
-    }
-    if lead < 248 {
-        return 4;
-    }
-    return 0;
-}
 
 pub u8[] CopyCodeUnits(string text) {
     i64 len = String.Len(text);
@@ -52,7 +34,7 @@ pub bool IsValid(u8[] data) {
         if b < 194 || b > 244 {
             return false;
         }
-        i64 need = RuneByteLen(b);
+        i64 need = String.Utf8RuneByteLen(b);
         if need > len - i {
             return false;
         }
@@ -79,4 +61,29 @@ pub Core.Results.Result<string, EncodingError> DecodeFromBytes(u8[] data) {
         return Result::Error(EncodingError::InvalidSequence(EncodingErrorDetail { position: 0, value: 0 }));
     }
     return Result::Ok(String.FromUtf8CodeUnits(data));
+}
+
+/// Appends the UTF-8 encoding of scalar value `cp` (`0..=0x10FFFF`, not a surrogate) to `bytes`.
+pub u8[] AppendCodePoint(u8[] bytes, i64 cp) {
+    mut u8[] out = bytes;
+    if cp < 128 {
+        out = Array.Append<u8>(out, u8(cp));
+        return out;
+    }
+    if cp < 2048 {
+        out = Array.Append<u8>(out, u8(192 + cp / 64));
+        out = Array.Append<u8>(out, u8(128 + cp % 64));
+        return out;
+    }
+    if cp < 65536 {
+        out = Array.Append<u8>(out, u8(224 + cp / 4096));
+        out = Array.Append<u8>(out, u8(128 + (cp / 64) % 64));
+        out = Array.Append<u8>(out, u8(128 + cp % 64));
+        return out;
+    }
+    out = Array.Append<u8>(out, u8(240 + cp / 262144));
+    out = Array.Append<u8>(out, u8(128 + (cp / 4096) % 64));
+    out = Array.Append<u8>(out, u8(128 + (cp / 64) % 64));
+    out = Array.Append<u8>(out, u8(128 + cp % 64));
+    return out;
 }

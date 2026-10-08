@@ -15,6 +15,7 @@
 |----------|---------|
 | `ParseI64(text)` | Optional `+`/`-`, decimal digits, the full `i64` range. No whitespace. |
 | `ParseHex(text)` | Optional `0x`/`0X`, hex digits, up to `2^63 - 1`. |
+| `DigitsAt(text, at, count, radix)` | Exactly `count` digits in base `radix` (2 to 16) at offset `at`, as an `i64`, or `-1`. Reads fixed-width fields such as `\uXXXX` escapes, RFC 3339 date parts, and `#rrggbb` colors. |
 | `ParseF64(text)` | Optional sign, digits with optional fraction (`.5` and `3.` allowed), optional `e`/`E` exponent. Rejects `nan` and `inf`. |
 
 ```beskid

@@ -6,19 +6,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
-### Fixed
-
-- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
-  when two versions grow from one base. `Array.Append` grows storage in place
-  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
-  only when the version owns the storage tip and copies the prefix otherwise.
-- Keep earlier versions intact on removal and overwrite: `List.Pop`,
-  `Stack.Pop`, and `Queue.Dequeue` no longer clear the shared slot, `Map.Remove`
-  and `Set.Remove` copy instead of shifting shared storage, and `Map.Insert`
-  copies before overwriting an existing key. `Storage.CopyPrefix` and
-  `Storage.CopyWithout` are the only copy loops. `HashTable`, `StringMap`,
-  `I64Map`, and `PriorityQueue` document that they are single-owner values.
-
 ### Added
 
 - Add `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`
@@ -109,6 +96,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Unify helpers with the same behavior so each exists once. `Core.String.Ascii`
+  holds the ASCII byte classes and hex digit values; `Number.DigitsAt` reads
+  fixed-width digit fields; `Search.StartsWithAt` and `Search.SkipWhitespace`
+  back the affix tests, JSON, and TOML; `Encoding.Utf8.AppendCodePoint` is the
+  UTF-8 encoder; and `Core.Collections.Storage` (`CopyRange`, `CopyWithout`,
+  `Concat`, `Reversed`, `IndexOf`) is the only copier for persistent
+  collections, with one sized allocation per copy. Console controls use
+  `String.Repeat`, `Core.Math`, and `Number.DigitsAt`.
+- Remove the duplicates (breaking): `Casing.IsAsciiLower`, `IsAsciiUpper`,
+  `IsAsciiDigit`, `IsSnakePartChar`, `PascalToSnake`, and `CamelToSnake` (use
+  `Ascii.*` and `Casing.ToSnake`), `Pest.Expr.IsIdentChar`,
+  `Encoding.Hex.HexToNibble`, `Encoding.Utf8.RuneByteLen` (use
+  `String.Utf8RuneByteLen`), `Sort.Reverse` (use `Storage.Reversed`),
+  `Console.Controls.Frame.Repeat` (use `String.Repeat`), the
+  `Console.Format.Scan` forwarders, and the `Console.Format.Attributes` digit
+  tables (`ParseHexNibble`, `ParseHexByte`, `ParseU8`, `ParseDecimalDigit`, and
+  their result types).
 - Build `StringBuilder` output by string concatenation instead of per-byte
   `u8[]` growth, which 0.5.2 performs far more slowly; keep `Join`, `Replace`,
   and `Repeat` on concatenation for the same reason.
@@ -177,6 +181,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
+  when two versions grow from one base. `Array.Append` grows storage in place
+  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
+  only when the version owns the storage tip and copies the prefix otherwise.
+- Keep earlier versions intact on removal and overwrite: `List.Pop`,
+  `Stack.Pop`, and `Queue.Dequeue` no longer clear the shared slot, `Map.Remove`
+  and `Set.Remove` copy instead of shifting shared storage, and `Map.Insert`
+  copies before overwriting an existing key, all through the shared
+  `Core.Collections.Storage` copiers. `HashTable`, `StringMap`,
+  `I64Map`, and `PriorityQueue` document that they are single-owner values.
 - Fix QUIC loopback datagram loss (WEB7): the `QuicEndpoint` receiver fiber now
   waits without a deadline, because a timed-out runtime receive can drop a datagram
   that was already read. A PTO probe also carries the in-flight credit frames
@@ -244,3 +258,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Results and Optional tests with their leaf modules and generic construction APIs.
 - Replace stale Time and concurrency test calls with current typed APIs.
 - Type Random byte comparisons explicitly as `u8`.
+

@@ -1,0 +1,101 @@
+/// Certificate signature verification with the Crypto package.
+///
+/// The TBSCertificate bytes are hashed with Crypto.Sha256/Sha512 and the digest is
+/// checked with Crypto.Rsa (PKCS#1 v1.5, PSS) or Crypto.Ecdsa (P-256). RSA keys below
+/// `MinRsaBits` are rejected. Ed25519 and EC curves other than P-256 are recognized
+/// but fail with UnsupportedKey.
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.Ecdsa;
+use Crypto.PkErrors;
+use Crypto.Rsa;
+use Crypto.Sha256;
+use Crypto.Sha512;
+use X509.Certificate;
+use X509.X509Errors;
+
+/// Policy floor for RSA moduli in certificate signatures.
+pub i64 MinRsaBits() { return 2048_i64; }
+
+/// SHA-2 digest by output size in bits (256, 384, 512).
+pub u8[] DigestBits(i64 bits, u8[] data, i64 offset, i64 count) {
+    if bits == 256_i64 {
+        Sha256State s = Sha256.New();
+        Sha256.UpdateRange(s, data, offset, count);
+        return Sha256.Finish(s);
+    }
+    mut Sha512State t = Sha512.New512();
+    if bits == 384_i64 { t = Sha512.New384(); }
+    Sha512.UpdateRange(t, data, offset, count);
+    return Sha512.Finish(t);
+}
+
+/// The PSS hash (MGF1 and H') as a Crypto.Rsa.PssDigest.
+pub type ShaDigest: PssDigest {
+    i64 bits,
+    pub u8[] Digest(u8[] data) { return DigestBits(bits, data, 0_i64, Slice.Len(data)); }
+}
+
+i64 HashBitsOf(SignatureAlgorithm alg) {
+    i64 s = Certificate.SchemeIndex(alg.scheme);
+    if s == 0_i64 || s == 4_i64 { return 256_i64; }
+    if s == 1_i64 || s == 5_i64 { return 384_i64; }
+    if s == 2_i64 || s == 6_i64 { return 512_i64; }
+    if s == 3_i64 { return alg.pssHashBits; }
+    return 0_i64;
+}
+
+X509Error FromPk(Result<unit, PkError> r) {
+    return match r {
+        Result::Ok(_) => X509Error::None,
+        Result::Error(e) => FromPkError(e),
+    };
+}
+
+X509Error FromPkError(PkError e) {
+    return match e {
+        PkError::BadSignature => X509Error::BadSignature,
+        PkError::MalformedSignature => X509Error::BadSignature,
+        PkError::InvalidPoint => X509Error::BadKey,
+        PkError::InvalidModulus => X509Error::BadKey,
+        PkError::InvalidExponent => X509Error::BadKey,
+        _ => X509Error::BadSignature,
+    };
+}
+
+X509Error VerifyRsa(u8[] modulus, u8[] exponent, i64 scheme, i64 hashBits, i64 salt, u8[] digest, u8[] signature) {
+    Result<PublicKey, PkError> key = Rsa.NewPublicKey(modulus, exponent);
+    return match key {
+        Result::Error(_) => X509Error::BadKey,
+        Result::Ok(k) => VerifyRsaKey(k, scheme, hashBits, salt, digest, signature),
+    };
+}
+
+X509Error VerifyRsaKey(PublicKey k, i64 scheme, i64 hashBits, i64 salt, u8[] digest, u8[] signature) {
+    if k.bits < MinRsaBits() { return X509Error::BadKey; }
+    if scheme == 3_i64 { return FromPk(Rsa.VerifyPss(k, ShaDigest { bits: hashBits }, digest, signature, salt)); }
+    mut RsaHash hash = RsaHash::Sha256;
+    if hashBits == 384_i64 { hash = RsaHash::Sha384; }
+    if hashBits == 512_i64 { hash = RsaHash::Sha512; }
+    return FromPk(Rsa.VerifyPkcs1v15(k, hash, digest, signature));
+}
+
+/// Verifies `cert`'s signature with `issuerKey`. Returns X509Error::None on success.
+pub X509Error VerifySignature(Certificate cert, PublicKeyInfo issuerKey) {
+    SignatureAlgorithm alg = cert.signatureAlgorithm;
+    i64 scheme = Certificate.SchemeIndex(alg.scheme);
+    i64 bits = HashBitsOf(alg);
+    if bits == 0_i64 { return X509Error::UnsupportedAlgorithm; }
+    i64 keyKind = Certificate.KeyIndexOf(issuerKey.algorithm);
+    bool rsaScheme = scheme <= 3_i64;
+    if rsaScheme && keyKind != 0_i64 { return X509Error::BadAlgorithm; }
+    if !rsaScheme && keyKind != 1_i64 {
+        if keyKind == 2_i64 || keyKind == 3_i64 { return X509Error::UnsupportedKey; }
+        return X509Error::BadAlgorithm;
+    }
+    u8[] digest = DigestBits(bits, cert.der, cert.tbsStart, cert.tbsLength);
+    if rsaScheme {
+        return VerifyRsa(issuerKey.rsaModulus, issuerKey.rsaExponent, scheme, bits, alg.pssSaltLength, digest, cert.signature);
+    }
+    return FromPk(Ecdsa.VerifyDer(issuerKey.keyBytes, digest, cert.signature));
+}

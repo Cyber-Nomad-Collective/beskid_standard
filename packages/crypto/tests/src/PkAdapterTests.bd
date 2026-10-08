@@ -1,0 +1,127 @@
+/// Adapter tests. RSA-PSS and ECDSA P-384-digest vectors were generated once with
+/// python3 cryptography (RSA 2048, e=65537, PSS(MGF1(H), salt_length=digest length),
+/// Prehashed; ec.SECP256R1 with ECDSA(Prehashed(SHA384))) over "beskid pk adapter vector".
+/// The RFC 6979 A.2.5 sample comes from the RFC.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Crypto.PkAdapters;
+use Crypto.PkErrors;
+use Crypto.Rsa;
+use Crypto.BigNat;
+use Crypto.Ecdsa;
+
+pub u8 PkNibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
+    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
+    return u8(0);
+}
+
+pub u8[] Hex(string text) {
+    i64 len = String.Len(text);
+    u8[] out = Slice.New(len / 2_i64);
+    mut i64 i = 0_i64;
+    while i < len {
+        u8 nib = PkNibble(String.ByteAt(text, i));
+        i64 index = i / 2_i64;
+        if i % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string HexDigit(u8 v) {
+    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
+    return String.CodeUnitChar(v + u8(87));
+}
+
+pub string ToHex(u8[] bytes) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) {
+        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string Hx(Result<u8[], PkError> r) {
+    return match r { Result::Ok(v) => ToHex(v), Result::Error(_) => "error", };
+}
+
+pub bool Ok(Result<unit, PkError> r) { return match r { Result::Ok(_) => true, Result::Error(_) => false, }; }
+
+pub u8[] Flip(u8[] bytes) {
+    u8[] out = Slice.New(Slice.Len(bytes));
+    Slice.Copy(out, 0_i64, bytes, 0_i64, Slice.Len(bytes));
+    i64 last = Slice.Len(out) - 1_i64;
+    out[last] = out[last] + u8(1);
+    return out;
+}
+
+pub u8[] Msg() { return Hex("6265736b696420706b206164617074657220766563746f72"); }
+
+pub PublicKey RsaKey() {
+    Result<PublicKey, PkError> key = Rsa.NewPublicKey(Hex("d0fb06100e36892c1fc6a1b452354c56b258c0513cd5bbef661b49dee888a54dfadb08c1b3ede863109314b01c5fe1e661535f24970866f3c700e4db691428d6d0be7c3e796cbeb37157e58a902637eb1d66f09ef18104b07ac9b61612d51668a5480c3bed34215d63dc3e614fad3eb7a45474e84ba954e6294e49e14229cee131470371d77eab4d5a7ce44badf97006ee6b1ba8b3d0f0ecf05862680fc44b4d0d0e17a136db7dfbbf7a192cd4c0feb392eb9e5c550c6618cdd3ec69c6394944ffb7aa57322705495d6b0256e641fb1da3d90c10cac437c9701c5122fd6602899216f270559459c479ff7915d46e5a7b4cf7e19f10c6c3c821a0e9c87c3f9e5f"), Hex("010001"));
+    return match key {
+        Result::Ok(k) => k,
+        Result::Error(_) => PublicKey { n: BigNat.Zeros(1_i64), e: Hex("03"), bits: 0_i64, size: 0_i64 },
+    };
+}
+
+test pk_adapter_digest_helpers {
+    Assert.Equal<string>(ToHex(HashRsa(RsaHash::Sha256(), Msg())), "2539d31ea8432cb5e358945d162959fd43007202d04c409894dec0b1fbb74114", "sha256 helper");
+    Assert.Equal<string>(ToHex(HashRsa(RsaHash::Sha384(), Msg())), "bb2549a0ee1dcda943b1d3f48e98e52980629fcfc42958673182b00d71e13633c51f25bedb0ae6367471b74dd9d04e38", "sha384 helper");
+}
+
+test pk_adapter_rsa_pss_sha256 {
+    PublicKey key = RsaKey();
+    u8[] sig = Hex("6552a2c96ef870d36155860eb4dc23c0b21074c9d0676dc61913e289d558b20806066c9eadd5ab6c5ff5792999c87f2479de45ddd359f2323e934d9b0e73346521f49b6b5b26e20af67a9abbcdff3b5128597cfd90e1353a7251f211b597e55da904b1f31f61e0977b12138d3a63d9712cd6f83562c5b9ca71f8d44feabd3286b94f0a349c17de6161b8ea795a877c5a362ce952ceae41ba16e0fde867ba77e73b6c8f28b8a037c49ed8c396d12dbfd96cb628675a11d235272dc838faaa3750222e31c339416d194bf0383a987a941303d00d64359fb6a93f030a7f86ce826c6939ef52d44b3f12737b3c48698541f101012e414a8e272fc117452d37766054");
+    Assert.True(Ok(VerifyRsaPss(key, RsaHash::Sha256(), Hex("2539d31ea8432cb5e358945d162959fd43007202d04c409894dec0b1fbb74114"), sig, 32_i64)), "PSS SHA-256 verifies");
+    Assert.True(Ok(VerifyRsaPssMessage(key, RsaHash::Sha256(), Msg(), sig, 32_i64)), "PSS SHA-256 message form");
+    Assert.False(Ok(VerifyRsaPss(key, RsaHash::Sha384(), Hex("2539d31ea8432cb5e358945d162959fd43007202d04c409894dec0b1fbb74114"), sig, 32_i64)), "wrong hash fails");
+    Assert.False(Ok(VerifyRsaPss(key, RsaHash::Sha256(), Hex("2539d31ea8432cb5e358945d162959fd43007202d04c409894dec0b1fbb74114"), Flip(sig), 32_i64)), "tampered signature fails");
+    Assert.False(Ok(VerifyRsaPss(key, RsaHash::Sha256(), Hex("2539d31ea8432cb5e358945d162959fd43007202d04c409894dec0b1fbb74114"), sig, 20_i64)), "wrong salt length fails");
+}
+
+test pk_adapter_rsa_pss_sha384 {
+    PublicKey key = RsaKey();
+    u8[] sig = Hex("983f9a1598782eb1cd6fce35fb97451b0982c853b49ae73b10d4ab474de2a9f100065f9c930904edb985f77099b2d24f305ac875c99c2da2a31a3832faa121b97ec6c109657ba2b06ffd16d67f0a36dd11f8bd56ace3b722899e57dbe1348c12157e014fe2030be6fb22d466a831219b5cd0c9429b8fb797b60b293038adc412c4f811e7234f388daa8c5152de2042f8bb0e732e8a13e64a480942019fecde6e8d78d9bc8d0c0fe75a4e64d97bae93e756ce512dda1dde322dd68443d8a8a53398da8895c322b9367c4baff931cfa66839d0a575ec4ba04851a13022f7c1328a01aadacb46bd1fd2c414f543e6b40812a5b20f47bd06e013bee3aa3f564a401e");
+    Assert.True(Ok(VerifyRsaPss(key, RsaHash::Sha384(), Hex("bb2549a0ee1dcda943b1d3f48e98e52980629fcfc42958673182b00d71e13633c51f25bedb0ae6367471b74dd9d04e38"), sig, 48_i64)), "PSS SHA-384 verifies");
+    Assert.True(Ok(VerifyRsaPssMessage(key, RsaHash::Sha384(), Msg(), sig, 48_i64)), "PSS SHA-384 message form");
+    Assert.False(Ok(VerifyRsaPss(key, RsaHash::Sha384(), Flip(Hex("bb2549a0ee1dcda943b1d3f48e98e52980629fcfc42958673182b00d71e13633c51f25bedb0ae6367471b74dd9d04e38")), sig, 48_i64)), "wrong digest fails");
+}
+
+test pk_adapter_ecdsa_rfc6979_sign {
+    string priv = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721";
+    u8[] digest = Hex("af2bdbe1aa9b6ec1e2ade1d694f41fc71a831d0268e9891562113d8a62add1bf");
+    Assert.Equal<string>(Hx(SignEcdsaP256(Hex(priv), digest)),
+        "efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", "RFC 6979 A.2.5 sample r||s");
+    Assert.Equal<string>(Hx(SignEcdsaP256Der(Hex(priv), digest)),
+        "3046022100efd48b2aacb6a8fd1140dd9cd45e81d69d2c877b56aaf991c34d0ea84eaf3716022100f7cb1c942d657c41d436c7a1b6e29f65f3e900dbb9aff4064dc4ab2f843acda8", "RFC 6979 A.2.5 sample DER");
+}
+
+test pk_adapter_ecdsa_p256_sha384_verify {
+    u8[] pk = Hex("04d63608003535c4d39df8f9701fa882afac050f2e734bc79e4ee020a332b405937ba6d7d8bbc748a2300f347979ac2a7be48a31395bdf8ae9310425981c144105");
+    u8[] sig = Hex("304502207862b58610ffa727275c33a720bdc6ea57bd1e4567047b4aa530474c60d98ad8022100c4ced26c793bc5be6cec9ffa960cc50689926ec476b9c735dedef2ce9bfa0ef1");
+    Assert.True(Ok(Ecdsa.VerifyDer(pk, Hex("bb2549a0ee1dcda943b1d3f48e98e52980629fcfc42958673182b00d71e13633c51f25bedb0ae6367471b74dd9d04e38"), sig)), "P-256 with SHA-384 digest verifies");
+    Assert.True(Ok(VerifyEcdsaP256Message(pk, RsaHash::Sha384(), Msg(), sig)), "message form");
+    Assert.False(Ok(VerifyEcdsaP256Message(pk, RsaHash::Sha256(), Msg(), sig)), "wrong hash fails");
+    Assert.False(Ok(VerifyEcdsaP256Message(pk, RsaHash::Sha384(), Msg(), Flip(sig))), "tampered signature fails");
+}
+
+test pk_adapter_ecdsa_sign_roundtrip {
+    string priv = "c9afa9d845ba75166b5c215767b1d6934e50c3db36e89b127b8a622b120f6721";
+    string pk = "0460fed4ba255a9d31c961eb74c6356d68c049b8923b61fa6ce669622e60f29fb67903fe1008b8bc99a41ae9e95628bc64f2f1b20c2d7e9f5177a3c294d4462299";
+    Result<u8[], PkError> sig = SignEcdsaP256MessageDer(Hex(priv), Msg());
+    match sig {
+        Result::Error(_) => Assert.Fail("sign failed"),
+        Result::Ok(der) => Assert.True(Ok(VerifyEcdsaP256Message(Hex(pk), RsaHash::Sha256(), Msg(), der)), "sign then verify"),
+    };
+    Result<u8[], PkError> sig384 = SignEcdsaP256Sha384Der(Hex(priv), Hex("bb2549a0ee1dcda943b1d3f48e98e52980629fcfc42958673182b00d71e13633c51f25bedb0ae6367471b74dd9d04e38"));
+    match sig384 {
+        Result::Error(_) => Assert.Fail("sign384 failed"),
+        Result::Ok(der384) => Assert.True(Ok(Ecdsa.VerifyDer(Hex(pk), Hex("bb2549a0ee1dcda943b1d3f48e98e52980629fcfc42958673182b00d71e13633c51f25bedb0ae6367471b74dd9d04e38"), der384)), "SHA-384 sign then verify"),
+    };
+}

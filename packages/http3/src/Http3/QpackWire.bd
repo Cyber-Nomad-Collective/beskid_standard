@@ -1,0 +1,142 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+use Http2.HpackHuffman;
+use Http2.HpackInteger;
+use Codec.Mem;
+
+// RFC 9204 section 4.1: prefixed integers and string literals with an N-bit
+// prefix, shared with HPACK (RFC 7541 sections 5.1, 5.2 and Appendix B
+// Huffman code), plus the encoder and decoder stream instructions
+// (sections 4.3 and 4.4).
+//
+// Readers return `next` >= 0 on success, Truncated() when more input is
+// needed, and Malformed() for an encoding that can never become valid.
+
+pub i64 Truncated() { return -1_i64; }
+pub i64 Malformed() { return -2_i64; }
+
+/// A decoded integer and the offset after it (or a negative status).
+pub type QInt { pub i64 value, pub i64 next, }
+/// A decoded string literal and the offset after it (or a negative status).
+pub type QStr { pub u8[] bytes, pub i64 next, }
+
+/// Reads an integer whose prefix is the low `prefixBits` bits of src[offset].
+pub QInt ReadInt(u8[] src, i64 offset, i64 prefixBits) {
+    Result<Decoded,HpackError> decoded = HpackInteger.DecodeInteger(src, offset, prefixBits);
+    return match decoded {
+        Result::Ok(d) => QInt { value: d.value, next: d.next },
+        Result::Error(e) => QInt { value: 0_i64, next: IntFailure(e) },
+    };
+}
+
+i64 IntFailure(HpackError e) {
+    return match e {
+        HpackError::Truncated() => Truncated(),
+        _ => Malformed(),
+    };
+}
+
+/// Appends an integer with an N-bit prefix below the `flags` bits.
+pub u8[] WriteInt(mut u8[] out, u8 flags, i64 prefixBits, i64 value) {
+    return HpackInteger.EncodeInteger(out, flags, prefixBits, value);
+}
+
+/// Reads a string literal whose Huffman flag is the bit just above the
+/// `prefixBits`-bit length prefix. Longer than `maxLength` is Malformed.
+pub QStr ReadStr(HuffmanTables tables, u8[] src, i64 offset, i64 prefixBits, i64 maxLength) {
+    if offset >= Slice.Len(src) { return QStr { bytes: Slice.New(0_i64), next: Truncated() }; }
+    bool huffman = (i64(src[offset]) & (1_i64 << prefixBits)) != 0_i64;
+    QInt length = ReadInt(src, offset, prefixBits);
+    if length.next < 0_i64 { return QStr { bytes: Slice.New(0_i64), next: length.next }; }
+    i64 count = length.value;
+    i64 start = length.next;
+    if count > maxLength { return QStr { bytes: Slice.New(0_i64), next: Malformed() }; }
+    if count > Slice.Len(src) - start { return QStr { bytes: Slice.New(0_i64), next: Truncated() }; }
+    if huffman {
+        Result<u8[],HpackError> decoded = HpackHuffman.HuffmanDecode(tables, src, start, count, maxLength);
+        return match decoded {
+            Result::Ok(bytes) => QStr { bytes: bytes, next: start + count },
+            Result::Error(_) => QStr { bytes: Slice.New(0_i64), next: Malformed() },
+        };
+    }
+    u8[] raw = Mem.Zeroed(count);
+    if count > 0_i64 { Mem.Copy(raw, 0_i64, src, start, count); }
+    return QStr { bytes: raw, next: start + count };
+}
+
+/// Appends a string literal; `flags` holds the bits above the Huffman flag.
+pub u8[] WriteStr(HuffmanTables tables, mut u8[] out, u8 flags, i64 prefixBits, u8[] data, bool huffman) {
+    if huffman {
+        u8 h = u8((1_i64 << prefixBits) & 255_i64);
+        out = HpackInteger.EncodeInteger(out, flags | h, prefixBits, HpackHuffman.HuffmanEncodedLength(tables, data));
+        return HpackHuffman.HuffmanEncode(tables, out, data);
+    }
+    out = HpackInteger.EncodeInteger(out, flags, prefixBits, Slice.Len(data));
+    return Mem.Join(out, data, 0_i64, Slice.Len(data));
+}
+
+// Encoder stream instructions (section 4.3).
+
+/// Set Dynamic Table Capacity: 001xxxxx.
+pub u8[] SetCapacity(mut u8[] out, i64 capacity) { return WriteInt(out, 32_u8, 5_i64, capacity); }
+
+/// Insert With Name Reference: 1Txxxxxx (T = static), then the value.
+pub u8[] InsertWithNameRef(HuffmanTables tables, mut u8[] out, bool isStatic, i64 index, u8[] value, bool huffman) {
+    mut u8 flags = 128_u8;
+    if isStatic { flags = 192_u8; }
+    out = WriteInt(out, flags, 6_i64, index);
+    return WriteStr(tables, out, 0_u8, 7_i64, value, huffman);
+}
+
+/// Insert With Literal Name: 01Hxxxxx name, then the value.
+pub u8[] InsertWithLiteralName(HuffmanTables tables, mut u8[] out, u8[] name, u8[] value, bool huffman) {
+    out = WriteStr(tables, out, 64_u8, 5_i64, name, huffman);
+    return WriteStr(tables, out, 0_u8, 7_i64, value, huffman);
+}
+
+/// Duplicate: 000xxxxx with a relative index.
+pub u8[] Duplicate(mut u8[] out, i64 relativeIndex) { return WriteInt(out, 0_u8, 5_i64, relativeIndex); }
+
+// Decoder stream instructions (section 4.4).
+
+/// Section Acknowledgment: 1xxxxxxx stream id.
+pub u8[] SectionAck(mut u8[] out, i64 streamId) { return WriteInt(out, 128_u8, 7_i64, streamId); }
+
+/// Stream Cancellation: 01xxxxxx stream id.
+pub u8[] StreamCancel(mut u8[] out, i64 streamId) { return WriteInt(out, 64_u8, 6_i64, streamId); }
+
+/// Insert Count Increment: 00xxxxxx.
+pub u8[] InsertCountIncrement(mut u8[] out, i64 increment) { return WriteInt(out, 0_u8, 6_i64, increment); }
+
+// Field section prefix (section 4.5.1).
+
+/// Encoded Required Insert Count (section 4.5.1.1).
+pub i64 EncodeInsertCount(i64 requiredInsertCount, i64 maxEntries) {
+    if requiredInsertCount == 0_i64 { return 0_i64; }
+    return (requiredInsertCount % (2_i64 * maxEntries)) + 1_i64;
+}
+
+/// Decodes the Required Insert Count; -1 when the encoding is invalid.
+pub i64 DecodeInsertCount(i64 encoded, i64 maxEntries, i64 totalInserts) {
+    if encoded == 0_i64 { return 0_i64; }
+    i64 fullRange = 2_i64 * maxEntries;
+    if encoded > fullRange { return -1_i64; }
+    i64 maxValue = totalInserts + maxEntries;
+    i64 maxWrapped = (maxValue / fullRange) * fullRange;
+    mut i64 required = maxWrapped + encoded - 1_i64;
+    if required > maxValue {
+        if required <= fullRange { return -1_i64; }
+        required = required - fullRange;
+    }
+    if required == 0_i64 { return -1_i64; }
+    return required;
+}
+
+/// Appends the prefix for `requiredInsertCount` and `base`.
+pub u8[] WritePrefix(mut u8[] out, i64 requiredInsertCount, i64 base, i64 maxEntries) {
+    out = WriteInt(out, 0_u8, 8_i64, EncodeInsertCount(requiredInsertCount, maxEntries));
+    if base >= requiredInsertCount { return WriteInt(out, 0_u8, 7_i64, base - requiredInsertCount); }
+    return WriteInt(out, 128_u8, 7_i64, requiredInsertCount - base - 1_i64);
+}

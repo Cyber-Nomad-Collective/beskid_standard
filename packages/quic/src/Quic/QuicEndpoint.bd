@@ -1,0 +1,576 @@
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Time.Instant;
+use Crypto.Entropy;
+use Crypto.Hmac;
+use Network.Errors;
+use Network.Types;
+use Network.Udp.UdpSocket;
+use Quic.QuicConfig;
+use Quic.QuicConnection;
+use Quic.QuicErrors;
+use Quic.QuicPacket;
+use Quic.QuicProtection;
+use Quic.QuicWire;
+use Codec.Mem;
+
+// A QUIC endpoint: one UDP socket, connections demultiplexed by destination connection ID,
+// a driver fiber (`Start`) that processes received datagrams, runs timers and sends, and a
+// receiver fiber that only waits for datagrams and queues them for the driver. Application
+// calls (Connect, Accept, stream reads and writes) only change connection state and poll it
+// with short sleeps until their timeout (milliseconds, -1 for none); they never touch the
+// socket. No channels are used.
+//
+// The receiver waits without a deadline. A receive with a deadline can lose a datagram the
+// runtime already took from the socket when the deadline wins the race (COMPILER-GAPS
+// WEB7); with millisecond driver waits that dropped a large share of loopback datagrams.
+
+// n indices: 0 stop request, 1 driver running, 2 network errors, 3 datagrams received,
+// 4 datagrams sent, 5 Retry packets sent, 6 driver steps, 7 receives completed,
+// 8 send errors, 9 next inbox index, 10 receiver running.
+pub type Endpoint {
+    pub bool isServer,
+    UdpSocket socket,
+    QuicConfig config,
+    i64[] n,
+    Connection[] conns,
+    SocketAddress[] peers,
+    i64[] used,
+    u8[] retryKey,
+    /// Datagrams queued by the receiver fiber; the driver consumes them from n[9].
+    Datagram[] inbox,
+}
+
+i64 PollMillis() { return 1_i64; }
+i64 DriverWaitMillis() { return 1_i64; }
+
+pub i64 NowNanos() {
+    Instant now = Time.MonotonicNow();
+    return now.nanos;
+}
+
+/// Absolute monotonic deadline (ns) for a timeout in milliseconds; a negative timeout never expires.
+pub i64 DeadlineIn(i64 timeoutMillis) {
+    if timeoutMillis < 0_i64 { return 9223372036854775807_i64; }
+    return NowNanos() + timeoutMillis * 1000000_i64;
+}
+
+bool Expired(i64 deadline) { return NowNanos() >= deadline; }
+
+unit Nap() {
+    match Time.Sleep(Time.FromMilliseconds(PollMillis())) { Result::Ok(_) => (), Result::Error(_) => (), };
+    return;
+}
+
+/// Binds an endpoint. Servers accept connections; clients use `Connect`.
+pub Result<Endpoint, QuicError> Bind(SocketAddress local, QuicConfig config, bool isServer) {
+    if !QuicConfig.IsValid(config) { return Result::Error(QuicError::InvalidArgument()); }
+    return match UdpSocket.Bind(local) {
+        Result::Error(e) => Result::Error(QuicError::Network(e)),
+        Result::Ok(socket) => Result::Ok(Make(socket, config, isServer)),
+    };
+}
+
+Endpoint Make(UdpSocket socket, QuicConfig config, bool isServer) {
+    mut Connection[] conns = Array.Empty<Connection>();
+    mut SocketAddress[] peers = Array.Empty<SocketAddress>();
+    mut i64[] used = Array.Empty<i64>();
+    u8[] key = match Entropy.Bytes(32_i64) { Result::Ok(k) => k, Result::Error(_) => Mem.Zeroed(32_i64), };
+    return Endpoint {
+        isServer: isServer, socket: socket, config: config,
+        n: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64],
+        conns: conns, peers: peers, used: used, retryKey: key, inbox: Array.Empty<Datagram>(),
+    };
+}
+
+pub Result<SocketAddress, QuicError> LocalAddress(Endpoint ep) {
+    UdpSocket socket = ep.socket;
+    return match socket.LocalAddress() {
+        Result::Ok(a) => Result::Ok(a),
+        Result::Error(e) => Result::Error(QuicError::Network(e)),
+    };
+}
+
+// ------------------------------------------------------------ driver
+
+/// Spawns the driver fiber (which runs the receiver fiber). Call `Stop` and join the fiber
+/// to shut down.
+pub Fiber<unit> Start(Endpoint ep) {
+    ep.n[1] = 1_i64;
+    return spawn (() => Run(ep));
+}
+
+/// Asks the driver to stop; open connections are abandoned and the socket is closed.
+pub unit Stop(Endpoint ep) { ep.n[0] = 1_i64; return; }
+
+pub i64 DatagramsReceived(Endpoint ep) { return ep.n[3]; }
+pub i64 DatagramsSent(Endpoint ep) { return ep.n[4]; }
+pub i64 RetriesSent(Endpoint ep) { return ep.n[5]; }
+/// Driver diagnostics by n index (see the comment on Endpoint).
+pub i64 Diagnostic(Endpoint ep, i64 index) { return ep.n[index]; }
+
+unit Run(Endpoint ep) {
+    ep.n[1] = 2_i64;
+    ep.n[10] = 1_i64;
+    Fiber<unit> receiver = spawn (() => Receive(ep));
+    while ep.n[0] == 0_i64 {
+        Step(ep);
+    }
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(ep.used) {
+        if ep.used[i] == 1_i64 {
+            Connection c = ep.conns[i];
+            QuicConnection.Abandon(c);
+        }
+        i = i + 1_i64;
+    }
+    UdpSocket socket = ep.socket;
+    match socket.Close() { Result::Ok(_) => (), Result::Error(_) => (), };
+    // Closing the socket ends the receiver's pending wait.
+    match receiver.Join() { Result::Ok(_) => (), Result::Error(_) => (), };
+    ep.n[1] = 0_i64;
+    return;
+}
+
+// The receiver fiber: waits for datagrams without a deadline and queues them.
+unit Receive(Endpoint ep) {
+    UdpSocket socket = ep.socket;
+    while ep.n[10] == 1_i64 {
+        Result<Datagram, NetworkError> received = socket.ReceiveFrom(1500_i64, Option.Empty<Deadline>());
+        match received {
+            Result::Ok(d) => { Enqueue(ep, d); },
+            Result::Error(e) => { OnReceiveError(ep, e); },
+        };
+    }
+    return;
+}
+
+unit Enqueue(Endpoint ep, Datagram d) {
+    mut Datagram[] inbox = ep.inbox;
+    Array.Append<Datagram>(inbox, d);
+    ep.inbox = inbox;
+    ep.n[7] = ep.n[7] + 1_i64;
+    return;
+}
+
+unit OnReceiveError(Endpoint ep, NetworkError e) {
+    match e {
+        NetworkError::Closed => { ep.n[10] = 0_i64; },
+        NetworkError::Cancelled => { ep.n[10] = 0_i64; },
+        _ => { ep.n[2] = ep.n[2] + 1_i64; Nap(); },
+    };
+    return;
+}
+
+i64 WaitNanos(Endpoint ep, i64 now) {
+    mut i64 wait = DriverWaitMillis() * 1000000_i64;
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(ep.used) {
+        if ep.used[i] == 1_i64 {
+            Connection c = ep.conns[i];
+            i64 t = QuicConnection.NextTimeout(c, now);
+            if t >= 0_i64 && t - now < wait { wait = t - now; }
+        }
+        i = i + 1_i64;
+    }
+    if wait < 100000_i64 { wait = 100000_i64; }
+    return wait;
+}
+
+/// One driver iteration: queued datagrams, timers, sends, then a short sleep (at most
+/// DriverWaitMillis, less when a connection timer is due earlier).
+pub unit Step(Endpoint ep) {
+    ep.n[6] = ep.n[6] + 1_i64;
+    DrainInbox(ep);
+    Service(ep);
+    if ep.n[9] < Array.Len<Datagram>(ep.inbox) { return; }
+    i64 wait = WaitNanos(ep, NowNanos());
+    match Time.Sleep(Time.FromNanoseconds(wait)) { Result::Ok(_) => (), Result::Error(_) => (), };
+    return;
+}
+
+// Dispatches queued datagrams. Sends may yield to the receiver fiber, which can append
+// more; the queue is reset only when everything queued was consumed.
+unit DrainInbox(Endpoint ep) {
+    while ep.n[9] < Array.Len<Datagram>(ep.inbox) {
+        Datagram d = ep.inbox[ep.n[9]];
+        ep.n[9] = ep.n[9] + 1_i64;
+        Dispatch(ep, d);
+    }
+    ep.inbox = Array.Empty<Datagram>();
+    ep.n[9] = 0_i64;
+    return;
+}
+
+/// Runs due timers and sends whatever every connection has queued.
+unit Service(Endpoint ep) {
+    i64 now = NowNanos();
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(ep.used) {
+        if ep.used[i] == 1_i64 {
+            Connection c = ep.conns[i];
+            i64 t = QuicConnection.NextTimeout(c, now);
+            if t >= 0_i64 && t <= now { QuicConnection.OnTimeout(c, now); }
+            Flush(ep, i, now);
+        }
+        i = i + 1_i64;
+    }
+    return;
+}
+
+unit Flush(Endpoint ep, i64 slot, i64 now) {
+    Connection c = ep.conns[slot];
+    SocketAddress peer = ep.peers[slot];
+    UdpSocket socket = ep.socket;
+    mut i64 sent = 0_i64;
+    mut i64 length = QuicConnection.BuildDatagram(c, now);
+    while length > 0_i64 && sent < 16_i64 {
+        u8[] datagram = QuicWire.CopyOf(c.out, 0_i64, length);
+        match socket.SendTo(datagram, peer, Option.Empty<Deadline>()) { Result::Ok(_) => (), Result::Error(_) => { ep.n[8] = ep.n[8] + 1_i64; }, };
+        ep.n[4] = ep.n[4] + 1_i64;
+        sent = sent + 1_i64;
+        length = QuicConnection.BuildDatagram(c, now);
+    }
+    return;
+}
+
+bool SameAddress(SocketAddress a, SocketAddress b) {
+    return QuicWire.Equal(AddressBytes(a), AddressBytes(b));
+}
+
+u8[] AddressBytes(SocketAddress a) {
+    IpAddress ip = a.address;
+    Port port = a.port;
+    i64 p = port.Value();
+    return match ip {
+        IpAddress::V4(x, y, z, w) => V4Bytes(x, y, z, w, p),
+        IpAddress::V6(x, y, z, w) => V6Bytes(x, y, z, w, p),
+    };
+}
+
+u8[] V4Bytes(u8 x, u8 y, u8 z, u8 w, i64 p) {
+    u8[] out = Mem.Zeroed(7_i64);
+    out[0] = 4_u8;
+    out[1] = x;
+    out[2] = y;
+    out[3] = z;
+    out[4] = w;
+    out[5] = u8((p >> 8_i64) & 255_i64);
+    out[6] = u8(p & 255_i64);
+    return out;
+}
+
+u8[] V6Bytes(u32 x, u32 y, u32 z, u32 w, i64 p) {
+    u8[] out = Mem.Zeroed(19_i64);
+    out[0] = 6_u8;
+    PutWord(out, 1_i64, x);
+    PutWord(out, 5_i64, y);
+    PutWord(out, 9_i64, z);
+    PutWord(out, 13_i64, w);
+    out[17] = u8(p >> 8_i64);
+    out[18] = u8(p & 255_i64);
+    return out;
+}
+
+unit PutWord(u8[] out, i64 at, u32 v) {
+    out[at] = u8(v >> 24_u32);
+    out[at + 1_i64] = u8((v >> 16_u32) & 255_u32);
+    out[at + 2_i64] = u8((v >> 8_u32) & 255_u32);
+    out[at + 3_i64] = u8(v & 255_u32);
+    return;
+}
+
+i64 FindByCid(Endpoint ep, u8[] dcid, SocketAddress from) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(ep.used) {
+        if ep.used[i] == 1_i64 {
+            Connection c = ep.conns[i];
+            if QuicWire.Equal(c.scid, dcid) { return i; }
+            // Client Initials sent before the server's first reply still carry the original ID.
+            if ep.isServer && QuicWire.Equal(QuicConnection.OriginalDcid(c), dcid) && SameAddress(ep.peers[i], from) { return i; }
+        }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+unit Dispatch(Endpoint ep, Datagram d) {
+    u8[] payload = d.payload;
+    i64 length = Slice.Len(payload);
+    ep.n[3] = ep.n[3] + 1_i64;
+    if d.truncated || length == 0_i64 { return; }
+    u8[] dcid = QuicPacket.PeekDcid(payload, 0_i64, length, 8_i64);
+    i64 now = NowNanos();
+    mut i64 slot = FindByCid(ep, dcid, d.source);
+    if slot < 0_i64 && ep.isServer { slot = AcceptInitial(ep, payload, length, d.source, now); }
+    if slot < 0_i64 { return; }
+    Connection c = ep.conns[slot];
+    QuicConnection.OnDatagram(c, payload, length, now);
+    Flush(ep, slot, now);
+    return;
+}
+
+// A new connection for a valid client Initial (RFC 9000 sections 7, 8.1 and 14.1), or a
+// Version Negotiation / Retry answer. Returns the slot or -1.
+i64 AcceptInitial(Endpoint ep, u8[] payload, i64 length, SocketAddress from, i64 now) {
+    Header h = QuicPacket.ParseHeader(payload, 0_i64, length, 8_i64);
+    if h.error != 0_i64 { return -1_i64; }
+    if h.kind == QuicPacket.KindUnsupportedVersion() {
+        if length >= 1200_i64 { SendRaw(ep, QuicPacket.VersionNegotiation(h.dcid, h.scid, 0x2a_i64), from); }
+        return -1_i64;
+    }
+    if h.kind != QuicPacket.KindInitial() || length < 1200_i64 || Slice.Len(h.dcid) < 8_i64 { return -1_i64; }
+    mut u8[] odcid = h.dcid;
+    mut u8[] retryScid = Slice.New(0_i64);
+    if ep.config.requireRetry {
+        if Slice.Len(h.token) == 0_i64 {
+            u8[] newScid = match Entropy.Bytes(8_i64) { Result::Ok(b) => b, Result::Error(_) => Mem.Zeroed(8_i64), };
+            SendRaw(ep, QuicProtection.BuildRetry(h.dcid, h.scid, newScid, MakeToken(ep, h.dcid, from)), from);
+            ep.n[5] = ep.n[5] + 1_i64;
+            return -1_i64;
+        }
+        odcid = TokenOdcid(ep, h.token, from);
+        if Slice.Len(odcid) == 0_i64 { return -1_i64; }
+        retryScid = h.dcid;
+    }
+    if ActiveConnections(ep) >= QuicConfig.MaxConnections() { return -1_i64; }
+    Connection c = QuicConnection.NewServer(ep.config, h.dcid, h.scid, odcid, retryScid, now);
+    return AddConnection(ep, c, from);
+}
+
+i64 ActiveConnections(Endpoint ep) {
+    mut i64 n = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(ep.used) { n = n + ep.used[i]; i = i + 1_i64; }
+    return n;
+}
+
+i64 AddConnection(Endpoint ep, Connection c, SocketAddress peer) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(ep.used) {
+        if ep.used[i] == 0_i64 {
+            ep.conns[i] = c;
+            ep.peers[i] = peer;
+            ep.used[i] = 1_i64;
+            return i;
+        }
+        i = i + 1_i64;
+    }
+    Array.Append<Connection>(ep.conns, c);
+    Array.Append<SocketAddress>(ep.peers, peer);
+    Array.Append<i64>(ep.used, 1_i64);
+    return i;
+}
+
+unit SendRaw(Endpoint ep, u8[] datagram, SocketAddress to) {
+    UdpSocket socket = ep.socket;
+    match socket.SendTo(datagram, to, Option.Empty<Deadline>()) { Result::Ok(_) => (), Result::Error(_) => { ep.n[8] = ep.n[8] + 1_i64; }, };
+    ep.n[4] = ep.n[4] + 1_i64;
+    return;
+}
+
+// Retry token: ODCID length, ODCID, 16-byte HMAC-SHA256 tag over the client address and ODCID.
+u8[] TokenTag(Endpoint ep, u8[] odcid, SocketAddress from) {
+    u8[] address = AddressBytes(from);
+    i64 al = Slice.Len(address);
+    u8[] input = Mem.Zeroed(al + Slice.Len(odcid));
+    Mem.Copy(input, 0_i64, address, 0_i64, al);
+    Mem.Copy(input, al, odcid, 0_i64, Slice.Len(odcid));
+    u8[] mac = Hmac.Compute(HashAlgorithm::Sha256, ep.retryKey, input);
+    return QuicWire.CopyOf(mac, 0_i64, 16_i64);
+}
+
+u8[] MakeToken(Endpoint ep, u8[] odcid, SocketAddress from) {
+    i64 ol = Slice.Len(odcid);
+    u8[] token = Mem.Zeroed(1_i64 + ol + 16_i64);
+    token[0] = u8(ol);
+    Mem.Copy(token, 1_i64, odcid, 0_i64, ol);
+    Mem.Copy(token, 1_i64 + ol, TokenTag(ep, odcid, from), 0_i64, 16_i64);
+    return token;
+}
+
+u8[] TokenOdcid(Endpoint ep, u8[] token, SocketAddress from) {
+    i64 n = Slice.Len(token);
+    if n < 17_i64 { return Slice.New(0_i64); }
+    i64 ol = i64(token[0]);
+    if ol > 20_i64 || n != 1_i64 + ol + 16_i64 { return Slice.New(0_i64); }
+    u8[] odcid = QuicWire.CopyOf(token, 1_i64, ol);
+    if !QuicWire.SameBytes(TokenTag(ep, odcid, from), 0_i64, token, 1_i64 + ol, 16_i64) { return Slice.New(0_i64); }
+    return odcid;
+}
+
+// ------------------------------------------------------------ application API
+
+Connection ConnAt(Endpoint ep, i64 handle) { return ep.conns[handle]; }
+
+bool ValidHandle(Endpoint ep, i64 handle) {
+    return handle >= 0_i64 && handle < Array.Len<i64>(ep.used) && ep.used[handle] == 1_i64;
+}
+
+/// Opens a client connection to `remote` and waits until the handshake completes.
+/// Returns a connection handle for the stream calls.
+pub Result<i64, QuicError> Connect(Endpoint ep, SocketAddress remote, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    if ep.isServer { return Result::Error(QuicError::InvalidArgument()); }
+    if ActiveConnections(ep) >= QuicConfig.MaxConnections() { return Result::Error(QuicError::LimitExceeded()); }
+    Connection c = QuicConnection.NewClient(ep.config, NowNanos());
+    i64 handle = AddConnection(ep, c, remote);
+    while !QuicConnection.IsEstablished(c) {
+        if QuicConnection.IsClosingOrClosed(c) { return Result::Error(QuicConnection.Error(c)); }
+        if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+        Nap();
+    }
+    return Result::Ok(handle);
+}
+
+/// Waits for the next established server connection not yet accepted.
+pub Result<i64, QuicError> Accept(Endpoint ep, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    if !ep.isServer { return Result::Error(QuicError::InvalidArgument()); }
+    while !Expired(deadline) {
+        mut i64 i = 0_i64;
+        while i < Array.Len<i64>(ep.used) {
+            if ep.used[i] == 1_i64 {
+                Connection c = ep.conns[i];
+                if QuicConnection.IsEstablished(c) && !QuicConnection.Accepted(c) {
+                    QuicConnection.MarkAccepted(c);
+                    return Result::Ok(i);
+                }
+            }
+            i = i + 1_i64;
+        }
+        Nap();
+    }
+    return Result::Error(QuicError::TimedOut());
+}
+
+/// Negotiated ALPN protocol of a connection.
+pub string Alpn(Endpoint ep, i64 handle) {
+    if !ValidHandle(ep, handle) { return ""; }
+    return QuicConnection.Alpn(ConnAt(ep, handle));
+}
+
+/// The connection behind a handle (for inspection).
+pub Connection ConnectionOf(Endpoint ep, i64 handle) { return ConnAt(ep, handle); }
+
+Result<unit, QuicError> Usable(Endpoint ep, i64 handle) {
+    if !ValidHandle(ep, handle) { return Result::Error(QuicError::InvalidArgument()); }
+    Connection c = ConnAt(ep, handle);
+    if QuicConnection.IsClosingOrClosed(c) { return Result::Error(QuicConnection.Error(c)); }
+    return Result::Ok(());
+}
+
+/// Opens a stream (waits for stream credit until the deadline). Returns the stream id.
+pub Result<i64, QuicError> OpenStream(Endpoint ep, i64 handle, bool bidi, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    while true {
+        Usable(ep, handle)?;
+        i64 id = QuicConnection.OpenStream(ConnAt(ep, handle), bidi);
+        if id >= 0_i64 { return Result::Ok(id); }
+        if Expired(deadline) { return Result::Error(QuicError::LimitExceeded()); }
+        Nap();
+    }
+    return Result::Error(QuicError::Closed());
+}
+
+/// Waits for a stream opened by the peer. Returns its id.
+pub Result<i64, QuicError> AcceptStream(Endpoint ep, i64 handle, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    while true {
+        Usable(ep, handle)?;
+        i64 id = QuicConnection.AcceptStream(ConnAt(ep, handle));
+        if id >= 0_i64 { return Result::Ok(id); }
+        if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+        Nap();
+    }
+    return Result::Error(QuicError::Closed());
+}
+
+/// Writes all of data[offset..offset+count) to a stream, waiting for buffer space.
+pub Result<unit, QuicError> Write(Endpoint ep, i64 handle, i64 stream, u8[] data, i64 offset, i64 count, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    mut i64 done = 0_i64;
+    while done < count {
+        Usable(ep, handle)?;
+        i64 n = QuicConnection.StreamWrite(ConnAt(ep, handle), stream, data, offset + done, count - done);
+        if n < 0_i64 { return Result::Error(QuicError::StreamState()); }
+        done = done + n;
+        if done < count {
+            if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+            Nap();
+        }
+    }
+    return Result::Ok(());
+}
+
+/// Reads up to `count` bytes; returns 0 at the end of the stream. Waits for data.
+pub Result<i64, QuicError> Read(Endpoint ep, i64 handle, i64 stream, u8[] buffer, i64 offset, i64 count, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    while true {
+        Usable(ep, handle)?;
+        Connection c = ConnAt(ep, handle);
+        i64 n = QuicConnection.StreamRead(c, stream, buffer, offset, count);
+        if n == -2_i64 { return Result::Error(QuicError::StreamReset(QuicConnection.StreamResetCode(c, stream))); }
+        if n < 0_i64 { return Result::Error(QuicError::StreamState()); }
+        if n > 0_i64 || QuicConnection.StreamAtEnd(c, stream) || count == 0_i64 { return Result::Ok(n); }
+        if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+        Nap();
+    }
+    return Result::Error(QuicError::Closed());
+}
+
+/// Ends the sending direction of a stream (FIN).
+pub Result<unit, QuicError> Finish(Endpoint ep, i64 handle, i64 stream) {
+    Usable(ep, handle)?;
+    if !QuicConnection.StreamFinish(ConnAt(ep, handle), stream) { return Result::Error(QuicError::StreamState()); }
+    return Result::Ok(());
+}
+
+/// Abandons the sending direction with an application error code (RESET_STREAM).
+pub Result<unit, QuicError> Reset(Endpoint ep, i64 handle, i64 stream, i64 code) {
+    Usable(ep, handle)?;
+    if !QuicConnection.StreamReset(ConnAt(ep, handle), stream, code) { return Result::Error(QuicError::StreamState()); }
+    return Result::Ok(());
+}
+
+/// Asks the peer to stop sending on a stream (STOP_SENDING).
+pub Result<unit, QuicError> StopSending(Endpoint ep, i64 handle, i64 stream, i64 code) {
+    Usable(ep, handle)?;
+    if !QuicConnection.StreamStopSending(ConnAt(ep, handle), stream, code) { return Result::Error(QuicError::StreamState()); }
+    return Result::Ok(());
+}
+
+/// The peer's RESET_STREAM code for `stream`, or -1 (not reset, unknown handle or stream).
+pub i64 PeerResetCode(Endpoint ep, i64 handle, i64 stream) {
+    if !ValidHandle(ep, handle) { return -1_i64; }
+    return QuicConnection.StreamResetCode(ConnAt(ep, handle), stream);
+}
+
+/// The peer's STOP_SENDING code for `stream`, or -1 (not received, unknown handle or stream).
+pub i64 PeerStopCode(Endpoint ep, i64 handle, i64 stream) {
+    if !ValidHandle(ep, handle) { return -1_i64; }
+    return QuicConnection.StreamPeerStopCode(ConnAt(ep, handle), stream);
+}
+
+/// Closes a connection with an application error code and waits (until the deadline) for the
+/// closing period to end; the handle is released afterwards.
+pub Result<unit, QuicError> Close(Endpoint ep, i64 handle, i64 code, i64 timeoutMillis) {
+    i64 deadline = DeadlineIn(timeoutMillis);
+    if !ValidHandle(ep, handle) { return Result::Error(QuicError::InvalidArgument()); }
+    Connection c = ConnAt(ep, handle);
+    QuicConnection.Close(c, code, NowNanos());
+    while !QuicConnection.IsClosed(c) && !Expired(deadline) { Nap(); }
+    ep.used[handle] = 0_i64;
+    return Result::Ok(());
+}
+
+/// Why a connection ended (QuicError::Closed while it is open).
+pub QuicError ConnectionError(Endpoint ep, i64 handle) {
+    if !ValidHandle(ep, handle) { return QuicError::InvalidArgument(); }
+    return QuicConnection.Error(ConnAt(ep, handle));
+}

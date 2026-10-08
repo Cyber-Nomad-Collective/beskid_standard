@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
+  when two versions grow from one base. `Array.Append` grows storage in place
+  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
+  only when the version owns the storage tip and copies the prefix otherwise.
+
 ### Added
 
 - Add `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`
@@ -59,6 +66,24 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Document the 0.5.2 compiler and runtime limits that shape these APIs, and
   how to test a modified Corelib with a released binary.
 
+- Add the networking protocol packages to the corelib aggregate:
+  `corelib_uri`, `corelib_codec`, `corelib_connect`, `corelib_crypto`,
+  `corelib_x509`, `corelib_tls`, `corelib_http2`, `corelib_websocket`,
+  `corelib_quic`, `corelib_http3`, and `corelib_web` (moved from `protocols/`
+  to `packages/`, each with a README). Each package depends on Foundation and
+  on the exact sibling packages it imports; tests depend on the aggregate.
+  Requires compiler 0.5.3, which grants corelib authority per service file.
+  Program notes, compiler gap log, rulings, and repros are in
+  `docs/networking/`.
+- Select an in-process OpenSSL 3 provider in `corelib_crypto` (ruling R27):
+  `libcrypto.so.3` is an optional extern contract (compiler 0.5.3), so the
+  aggregate still loads on hosts without OpenSSL 3. One-shot SHA-2, HMAC,
+  AES-GCM and ChaCha20-Poly1305 use EVP when it is available and passes a
+  known-answer self-test; otherwise, or with `BESKID_CRYPTO_PROVIDER=pure`,
+  the CLIF kernels run. The opt-in `crypto-openssl` package is removed.
+- Fix QUIC loss of datagrams on deadline-bounded receives (WEB7): the endpoint
+  receives on a dedicated fiber without a deadline, and PTO probes carry
+  in-flight flow-control credit frames.
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent
@@ -146,6 +171,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Fix QUIC loopback datagram loss (WEB7): the `QuicEndpoint` receiver fiber now
+  waits without a deadline, because a timed-out runtime receive can drop a datagram
+  that was already read. A PTO probe also carries the in-flight credit frames
+  (MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS) again. The new `QuicCreditLoss` test
+  checks this in memory with lost credit frames.
+- `Crypto.Entropy` AOT link on macOS: compiler 0.5.3 links `libc.so.6` as
+  `-lc`, so the libc link shim in the web interop script is removed (WEB4).
 - Validate a request's `Host` field as soon as its header completes, before
   waiting for or interpreting the body framing.
 - Reject HTTP header control and non-ASCII octets during parsing and serialization, including HTAB before OWS trimming.

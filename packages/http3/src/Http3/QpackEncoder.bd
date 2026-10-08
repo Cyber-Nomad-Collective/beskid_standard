@@ -1,0 +1,277 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Http2.Hpack;
+use Http2.HpackHuffman;
+use Http3.H3Errors;
+use Http3.QpackStatic;
+use Http3.QpackTable;
+use Http3.QpackWire;
+use Codec.Mem;
+
+// RFC 9204 encoder. The default policy uses the static table and literals
+// only. With `dynamic` enabled (and a non-zero peer
+// SETTINGS_QPACK_MAX_TABLE_CAPACITY) it inserts fields on the encoder
+// stream and references an entry only after the decoder acknowledged it,
+// so field sections never block. Entries referenced by unacknowledged
+// sections, or not yet acknowledged, are never evicted.
+
+/// Encoder policy: dynamic table use, Huffman coding, and the largest table
+/// capacity the encoder sets (capped by the peer's maximum).
+pub type QpackPolicy { pub bool dynamic, pub bool huffman, pub i64 capacity, }
+
+/// Static table and literals only, Huffman when shorter.
+pub QpackPolicy DefaultPolicy() { return QpackPolicy { dynamic: false, huffman: true, capacity: 0_i64 }; }
+/// Dynamic table up to `capacity` octets, Huffman when shorter.
+pub QpackPolicy DynamicPolicy(i64 capacity) { return QpackPolicy { dynamic: true, huffman: true, capacity: capacity }; }
+
+pub type QEncoder {
+    pub DynTable table,
+    pub HeaderField[] statics,
+    pub HuffmanTables huffman,
+    pub QpackPolicy policy,
+    // Unparsed tail of the decoder stream.
+    pub u8[] pending,
+    // Encoder stream bytes not yet sent.
+    pub u8[] output,
+    // Outstanding (unacknowledged) sections with dynamic references.
+    pub i64[] secStream,
+    pub i64[] secRequired,
+    pub i64[] secMinRef,
+    // [0] known received count, [1] sticky error code, [2] peer blocked
+    // streams, [3] peer settings applied (0/1).
+    pub i64[] st,
+}
+
+pub QEncoder New(QpackPolicy policy) {
+    return QEncoder {
+        table: QpackTable.New(0_i64), statics: QpackStatic.StaticEntries(), huffman: HpackHuffman.NewHuffmanTables(), policy: policy,
+        pending: Slice.New(0_i64), output: Slice.New(0_i64),
+        secStream: Array.Empty<i64>(), secRequired: Array.Empty<i64>(), secMinRef: Array.Empty<i64>(),
+        st: [0_i64, 0_i64, 0_i64, 0_i64],
+    };
+}
+
+/// Applies the peer's SETTINGS_QPACK_MAX_TABLE_CAPACITY and
+/// SETTINGS_QPACK_BLOCKED_STREAMS. With a dynamic policy this emits Set
+/// Dynamic Table Capacity on the encoder stream.
+pub unit ApplyPeerSettings(mut QEncoder e, i64 maxTableCapacity, i64 blockedStreams) {
+    e.table.maxCapacity = maxTableCapacity;
+    e.st[2] = blockedStreams;
+    e.st[3] = 1_i64;
+    QpackPolicy policy = e.policy;
+    if policy.dynamic && maxTableCapacity > 0_i64 {
+        mut i64 capacity = policy.capacity;
+        if capacity > maxTableCapacity { capacity = maxTableCapacity; }
+        if capacity > 0_i64 && QpackTable.SetCapacity(e.table, capacity) { e.output = QpackWire.SetCapacity(e.output, capacity); }
+    }
+    return;
+}
+
+/// Encoder stream bytes to send; the buffer is cleared.
+pub u8[] TakeOutput(mut QEncoder e) {
+    u8[] out = e.output;
+    e.output = Slice.New(0_i64);
+    return out;
+}
+
+/// Known Received Count (section 2.1.4).
+pub i64 KnownReceived(QEncoder e) { return e.st[0]; }
+
+/// Number of field sections awaiting acknowledgment.
+pub i64 Outstanding(QEncoder e) { return Array.Len<i64>(e.secStream); }
+
+bool UseHuffman(QEncoder e, u8[] data) {
+    QpackPolicy policy = e.policy;
+    if !policy.huffman { return false; }
+    return HpackHuffman.HuffmanEncodedLength(e.huffman, data) < Slice.Len(data);
+}
+
+// Absolute indexes below this may be evicted.
+i64 EvictionLimit(QEncoder e) {
+    mut i64 limit = e.st[0];
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(e.secMinRef) {
+        if e.secMinRef[i] < limit { limit = e.secMinRef[i]; }
+        i = i + 1_i64;
+    }
+    return limit;
+}
+
+// Inserts `field` on the encoder stream when the policy and table allow it.
+unit MaybeInsert(mut QEncoder e, HeaderField field) {
+    QpackPolicy policy = e.policy;
+    if !policy.dynamic || field.sensitive { return; }
+    i64 size = Hpack.FieldSize(field);
+    if size * 2_i64 > e.table.capacity { return; }
+    if QpackTable.FindExact(e.table, field) >= 0_i64 { return; }
+    if !QpackTable.CanMakeRoom(e.table, size, EvictionLimit(e)) { return; }
+    i64 staticName = QpackStatic.FindName(e.statics, field);
+    bool huffman = UseHuffman(e, field.value);
+    if staticName >= 0_i64 {
+        e.output = QpackWire.InsertWithNameRef(e.huffman, e.output, true, staticName, field.value, huffman);
+    } else {
+        e.output = QpackWire.InsertWithLiteralName(e.huffman, e.output, field.name, field.value, huffman && UseHuffman(e, field.name));
+    }
+    bool inserted = QpackTable.Insert(e.table, field);
+    return;
+}
+
+// Appends a literal field line: with a static name reference when the name
+// is in the static table, else with dynamic relative name index
+// `relative` (>= 0), else with a literal name. The N bit marks sensitive fields.
+u8[] AppendLiteral(QEncoder e, mut u8[] lines, HeaderField field, i64 relative) {
+    mut i64 never = 0_i64;
+    if field.sensitive { never = 1_i64; }
+    bool huffman = UseHuffman(e, field.value) && !field.sensitive;
+    i64 staticName = QpackStatic.FindName(e.statics, field);
+    if staticName >= 0_i64 {
+        lines = QpackWire.WriteInt(lines, u8(80_i64 + never * 32_i64), 4_i64, staticName);
+        return QpackWire.WriteStr(e.huffman, lines, 0_u8, 7_i64, field.value, huffman);
+    }
+    if relative >= 0_i64 {
+        lines = QpackWire.WriteInt(lines, u8(64_i64 + never * 32_i64), 4_i64, relative);
+        return QpackWire.WriteStr(e.huffman, lines, 0_u8, 7_i64, field.value, huffman);
+    }
+    bool nameHuffman = UseHuffman(e, field.name);
+    lines = QpackWire.WriteStr(e.huffman, lines, u8(32_i64 + never * 16_i64), 3_i64, field.name, nameHuffman);
+    return QpackWire.WriteStr(e.huffman, lines, 0_u8, 7_i64, field.value, huffman);
+}
+
+/// Encodes one field section for `streamId` (the HEADERS frame payload).
+pub u8[] EncodeSection(mut QEncoder e, i64 streamId, HeaderField[] fields) {
+    i64 base = e.st[0];
+    i64 drainLimit = QpackTable.DrainingLimit(e.table);
+    QpackPolicy policy = e.policy;
+    mut u8[] lines = Slice.New(0_i64);
+    mut i64 required = 0_i64;
+    mut i64 minRef = base;
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        i64 exact = QpackStatic.FindExact(e.statics, field);
+        mut i64 dynamicExact = -1_i64;
+        mut i64 dynamicName = -1_i64;
+        if policy.dynamic && !field.sensitive {
+            i64 found = QpackTable.FindExact(e.table, field);
+            if found >= drainLimit && found < base { dynamicExact = found; }
+        }
+        if policy.dynamic {
+            i64 named = QpackTable.FindName(e.table, field);
+            if named >= drainLimit && named < base { dynamicName = named; }
+        }
+        if exact >= 0_i64 && !field.sensitive {
+            lines = QpackWire.WriteInt(lines, 192_u8, 6_i64, exact);
+        } else {
+            if dynamicExact >= 0_i64 {
+                lines = QpackWire.WriteInt(lines, 128_u8, 6_i64, base - 1_i64 - dynamicExact);
+                if dynamicExact + 1_i64 > required { required = dynamicExact + 1_i64; }
+                if dynamicExact < minRef { minRef = dynamicExact; }
+            } else {
+                if dynamicName >= 0_i64 && QpackStatic.FindName(e.statics, field) < 0_i64 {
+                    if dynamicName + 1_i64 > required { required = dynamicName + 1_i64; }
+                    if dynamicName < minRef { minRef = dynamicName; }
+                    lines = AppendLiteral(e, lines, field, base - 1_i64 - dynamicName);
+                } else {
+                    lines = AppendLiteral(e, lines, field, -1_i64);
+                }
+                MaybeInsert(e, field);
+            }
+        }
+        i = i + 1_i64;
+    }
+    mut u8[] out = Slice.New(0_i64);
+    mut i64 sectionBase = base;
+    if required == 0_i64 { sectionBase = 0_i64; }
+    out = QpackWire.WritePrefix(out, required, sectionBase, QpackTable.MaxEntries(e.table));
+    out = Mem.Join(out, lines, 0_i64, Slice.Len(lines));
+    if required > 0_i64 {
+        mut i64[] ids = e.secStream;
+        mut i64[] reqs = e.secRequired;
+        mut i64[] mins = e.secMinRef;
+        Array.Append<i64>(ids, streamId);
+        Array.Append<i64>(reqs, required);
+        Array.Append<i64>(mins, minRef);
+        e.secStream = ids;
+        e.secRequired = reqs;
+        e.secMinRef = mins;
+    }
+    return out;
+}
+
+i64 Fail(QEncoder e) {
+    if e.st[1] == 0_i64 { e.st[1] = H3Errors.QpackDecoderStreamError(); }
+    return e.st[1];
+}
+
+// Removes outstanding section `at`.
+unit RemoveSection(mut QEncoder e, i64 at) {
+    mut i64[] ids = Array.Empty<i64>();
+    mut i64[] reqs = Array.Empty<i64>();
+    mut i64[] mins = Array.Empty<i64>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(e.secStream) {
+        if i != at {
+            Array.Append<i64>(ids, e.secStream[i]);
+            Array.Append<i64>(reqs, e.secRequired[i]);
+            Array.Append<i64>(mins, e.secMinRef[i]);
+        }
+        i = i + 1_i64;
+    }
+    e.secStream = ids;
+    e.secRequired = reqs;
+    e.secMinRef = mins;
+    return;
+}
+
+i64 FirstSection(QEncoder e, i64 streamId) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(e.secStream) {
+        if e.secStream[i] == streamId { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+/// Processes decoder stream bytes. Returns 0 or QPACK_DECODER_STREAM_ERROR.
+pub i64 OnDecoderStream(mut QEncoder e, u8[] data) {
+    if e.st[1] != 0_i64 { return e.st[1]; }
+    i64 na = Slice.Len(e.pending);
+    i64 nb = Slice.Len(data);
+    u8[] buf = Mem.Zeroed(na + nb);
+    if na > 0_i64 { Mem.Copy(buf, 0_i64, e.pending, 0_i64, na); }
+    if nb > 0_i64 { Mem.Copy(buf, na, data, 0_i64, nb); }
+    i64 count = na + nb;
+    mut i64 pos = 0_i64;
+    mut bool more = true;
+    while more && pos < count {
+        i64 b = i64(buf[pos]);
+        mut i64 prefix = 6_i64;
+        if (b & 128_i64) != 0_i64 { prefix = 7_i64; }
+        QInt n = QpackWire.ReadInt(buf, pos, prefix);
+        if n.next == QpackWire.Malformed() { return Fail(e); }
+        if n.next < 0_i64 {
+            more = false;
+        } else {
+            pos = n.next;
+            if (b & 128_i64) != 0_i64 {
+                i64 at = FirstSection(e, n.value);
+                if at < 0_i64 { return Fail(e); }
+                if e.secRequired[at] > e.st[0] { e.st[0] = e.secRequired[at]; }
+                RemoveSection(e, at);
+            } else {
+                if (b & 64_i64) != 0_i64 {
+                    mut i64 at = FirstSection(e, n.value);
+                    while at >= 0_i64 { RemoveSection(e, at); at = FirstSection(e, n.value); }
+                } else {
+                    if n.value == 0_i64 || e.st[0] + n.value > QpackTable.InsertCount(e.table) { return Fail(e); }
+                    e.st[0] = e.st[0] + n.value;
+                }
+            }
+        }
+    }
+    if count - pos > 16_i64 { return Fail(e); }
+    u8[] rest = Mem.Zeroed(count - pos);
+    if count > pos { Mem.Copy(rest, 0_i64, buf, pos, count - pos); }
+    e.pending = rest;
+    return 0_i64;
+}

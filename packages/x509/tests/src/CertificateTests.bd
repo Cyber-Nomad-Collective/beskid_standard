@@ -1,0 +1,84 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use X509.Certificate;
+use X509.Names;
+use TestSupport;
+
+unit CheckRsaLeaf() {
+    Certificate c = TestSupport.Cert("rsa-leaf.pem");
+    Assert.Equal<i64>(c.version, 3_i64, "v3");
+    Assert.True(c.subject.commonName == "www.example.test", "subject CN");
+    Assert.True(c.issuer.commonName == "Beskid Test RSA Intermediate", "issuer CN");
+    Assert.True(c.issuer.organization == "Beskid Test", "issuer O");
+    Assert.True(c.issuer.country == "PL", "issuer C");
+    Assert.Equal<i64>(c.notBefore, 1735689600_i64, "notBefore 2025-01-01");
+    Assert.Equal<i64>(c.notAfter, 1893456000_i64, "notAfter 2030-01-01");
+    PublicKeyInfo key = c.publicKey;
+    Assert.True(Certificate.IsKeyAlgorithm(key.algorithm, KeyAlgorithm::Rsa), "rsa key");
+    Assert.Equal<i64>(Slice.Len(key.rsaModulus), 256_i64, "2048-bit modulus");
+    Assert.Equal<i64>(Slice.Len(key.rsaExponent), 3_i64, "e = 65537");
+    SignatureAlgorithm alg = c.signatureAlgorithm;
+    Assert.True(Certificate.SchemeName(alg.scheme) == "sha256WithRSAEncryption", "alg");
+    Extensions ext = c.extensions;
+    Assert.True(ext.hasBasicConstraints && !ext.isCa, "not CA");
+    Assert.True(ext.hasKeyUsage, "ku");
+    Assert.Equal<i64>(ext.keyUsage, Certificate.KeyUsageDigitalSignature() | Certificate.KeyUsageKeyEncipherment(), "ku bits");
+    Assert.True(ext.hasExtKeyUsage && ext.ekuServerAuth && !ext.ekuClientAuth, "eku");
+    Assert.Equal<i64>(Array.Len<string>(ext.dnsNames), 2_i64, "two dns");
+    Assert.True(ext.dnsNames[1] == "*.api.example.test", "wildcard san");
+    Assert.Equal<i64>(Array.Len<IpBytes>(ext.ipAddresses), 2_i64, "two ips");
+    IpBytes v4 = ext.ipAddresses[0];
+    Assert.Equal<i64>(Slice.Len(v4.bytes), 4_i64, "v4");
+    Assert.True(v4.bytes[3] == 10_u8, "192.0.2.10");
+    Assert.Equal<i64>(Slice.Len(ext.subjectKeyId), 20_i64, "ski");
+    Assert.Equal<i64>(Slice.Len(ext.authorityKeyId), 20_i64, "aki");
+    Assert.Equal<i64>(Slice.Len(c.signature), 256_i64, "rsa signature");
+    return;
+}
+
+unit CheckCaAndEc() {
+    Certificate root = TestSupport.Cert("ec-root.pem");
+    Assert.True(Certificate.IsSelfIssued(root), "self issued");
+    Assert.True(root.extensions.isCa, "CA");
+    Assert.Equal<i64>(root.extensions.pathLen, -1_i64, "no pathlen");
+    Assert.True(Certificate.IsKeyAlgorithm(root.publicKey.algorithm, KeyAlgorithm::EcP256), "P-256");
+    Assert.Equal<i64>(Slice.Len(root.publicKey.keyBytes), 65_i64, "point");
+    Certificate inter = TestSupport.Cert("ec-int.pem");
+    Assert.True(Certificate.SchemeName(inter.signatureAlgorithm.scheme) == "ecdsa-with-SHA384", "sha384");
+    Assert.True(Names.Equal(inter.issuer, root.subject), "issuer links");
+    Certificate rint = TestSupport.Cert("rsa-int.pem");
+    Assert.Equal<i64>(rint.extensions.pathLen, 0_i64, "pathlen 0");
+    Assert.Equal<i64>(rint.extensions.keyUsage, Certificate.KeyUsageKeyCertSign() | Certificate.KeyUsageCrlSign(), "ca ku");
+    return;
+}
+
+unit CheckPssAndSha512() {
+    Certificate pss = TestSupport.Cert("rsa-leafpss.pem");
+    SignatureAlgorithm alg = pss.signatureAlgorithm;
+    Assert.True(Certificate.SchemeName(alg.scheme) == "RSASSA-PSS", "pss");
+    Assert.Equal<i64>(alg.pssHashBits, 256_i64, "sha256");
+    Assert.Equal<i64>(alg.pssSaltLength, 32_i64, "salt");
+    Certificate s512 = TestSupport.Cert("rsa-leaf512.pem");
+    Assert.True(Certificate.SchemeName(s512.signatureAlgorithm.scheme) == "sha512WithRSAEncryption", "sha512");
+    return;
+}
+
+unit CheckNameConstraints() {
+    Certificate nc = TestSupport.Cert("ec-nc.pem");
+    NameConstraints c = nc.extensions.nameConstraints;
+    Assert.True(c.present, "present");
+    Assert.Equal<i64>(Array.Len<string>(c.permittedDns), 1_i64, "one permitted");
+    Assert.True(c.permittedDns[0] == "allowed.test", "permitted");
+    Assert.True(c.excludedDns[0] == "bad.allowed.test", "excluded");
+    Assert.False(c.hasUnsupportedForm, "dns only");
+    return;
+}
+
+test parses_fixture_certificates {
+    CheckRsaLeaf();
+    CheckCaAndEc();
+    CheckPssAndSha512();
+    CheckNameConstraints();
+}
+

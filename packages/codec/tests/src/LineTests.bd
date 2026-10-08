@@ -1,0 +1,53 @@
+use Testing.Assert;
+use Core.Results;
+use Codec.Errors;
+use Codec.Hex;
+use Codec.Line;
+use Core.Bytes.Slice;
+
+i64 End(string hex, i64 max) {
+    Result<i64, CodecError> r = Line.FindLineEnd(Hex.Of(hex), 0_i64, Slice.Len(Hex.Of(hex)), max);
+    return match r { Result::Ok(v) => v, Result::Error(e) => -1000_i64 - Errors.Code(e), };
+}
+
+test finds_first_crlf {
+    Assert.Equal<i64>(End("41 42 0d 0a", 10_i64), 2_i64, "simple");
+    Assert.Equal<i64>(End("0d 0a", 10_i64), 0_i64, "empty line");
+    Assert.Equal<i64>(End("41 0d 0a 42 0d 0a", 10_i64), 1_i64, "first of two");
+}
+
+test incomplete_returns_minus_one {
+    Assert.Equal<i64>(End("", 10_i64), -1_i64, "empty window");
+    Assert.Equal<i64>(End("41 42", 10_i64), -1_i64, "no terminator");
+    Assert.Equal<i64>(End("41 42 0d", 10_i64), -1_i64, "CR pending");
+}
+
+test bare_lf_and_bare_cr_rejected {
+    Assert.Equal<i64>(End("41 0a", 10_i64), -1005_i64, "bare LF");
+    Assert.Equal<i64>(End("0a", 10_i64), -1005_i64, "leading LF");
+    Assert.Equal<i64>(End("41 0d 42 0d 0a", 10_i64), -1005_i64, "CR then other");
+}
+
+test limit_applies_to_content_bytes {
+    Assert.Equal<i64>(End("41 42 43 0d 0a", 3_i64), 3_i64, "exactly at limit");
+    Assert.Equal<i64>(End("41 42 43 44 0d 0a", 3_i64), -1003_i64, "one over");
+    Assert.Equal<i64>(End("41 42 43 44", 3_i64), -1003_i64, "over before terminator arrives");
+    Assert.Equal<i64>(End("41 42 43", 3_i64), -1_i64, "at limit, waiting");
+    Assert.Equal<i64>(End("41 42 43 0d", 3_i64), -1_i64, "at limit, CR pending");
+    Assert.Equal<i64>(End("0d 0a", 0_i64), 0_i64, "limit 0 empty line");
+    Assert.Equal<i64>(End("41 0d 0a", 0_i64), -1003_i64, "limit 0 with content");
+}
+
+test window_start_and_bad_window {
+    u8[] b = Hex.Of("ff ff 41 0d 0a");
+    Result<i64, CodecError> r = Line.FindLineEnd(b, 2_i64, 5_i64, 8_i64);
+    match r {
+        Result::Ok(v) => { Assert.Equal<i64>(v, 3_i64, "absolute index"); },
+        Result::Error(_) => { Assert.Fail("scan"); },
+    };
+    Result<i64, CodecError> bad = Line.FindLineEnd(b, 2_i64, 9_i64, 8_i64);
+    match bad {
+        Result::Ok(_) => { Assert.Fail("bad window accepted"); },
+        Result::Error(e) => { Assert.Equal<i64>(Errors.Code(e), 6_i64, "invalid value"); },
+    };
+}

@@ -1,0 +1,138 @@
+// Ranges, stream reassembly with bounded buffers, flow control and stream states.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Codec.Hex;
+use Quic.QuicRanges;
+use Quic.QuicStream;
+use Quic.QuicWire;
+
+test ranges_merge_split_and_bound {
+    i64[] r = QuicRanges.New(3_i64);
+    Assert.True(QuicRanges.Add(r, 10_i64, 20_i64), "first");
+    Assert.True(QuicRanges.Add(r, 30_i64, 40_i64), "second");
+    Assert.True(QuicRanges.Add(r, 0_i64, 5_i64), "third");
+    Assert.False(QuicRanges.Add(r, 50_i64, 60_i64), "full");
+    Assert.True(QuicRanges.Add(r, 20_i64, 30_i64), "adjacent merge");
+    Assert.Equal<i64>(QuicRanges.Count(r), 2_i64, "merged into two");
+    Assert.Equal<i64>(QuicRanges.ContiguousEnd(r, 12_i64), 40_i64, "contiguous");
+    Assert.True(QuicRanges.Add(r, 3_i64, 11_i64), "bridge");
+    Assert.Equal<i64>(QuicRanges.Count(r), 1_i64, "single range");
+    Assert.True(QuicRanges.Remove(r, 15_i64, 18_i64), "split");
+    Assert.Equal<i64>(QuicRanges.Count(r), 2_i64, "two after split");
+    Assert.False(QuicRanges.Contains(r, 16_i64), "hole");
+    Assert.True(QuicRanges.Contains(r, 18_i64), "after hole");
+    QuicRanges.DropBelow(r, 17_i64);
+    Assert.Equal<i64>(QuicRanges.Lo(r, 0_i64), 18_i64, "dropped below");
+    QuicRanges.AddEvicting(r, 100_i64, 101_i64);
+    QuicRanges.AddEvicting(r, 200_i64, 201_i64);
+    QuicRanges.AddEvicting(r, 300_i64, 301_i64);
+    Assert.Equal<i64>(QuicRanges.Max(r), 301_i64, "evicting add keeps newest");
+    Assert.False(QuicRanges.Contains(r, 18_i64), "lowest evicted");
+}
+
+test stream_ids_and_reassembly_in_order {
+    Assert.Equal<i64>(QuicStream.IdOf(0_i64, false, false), 0_i64, "client bidi 0");
+    Assert.Equal<i64>(QuicStream.IdOf(1_i64, true, true), 7_i64, "server uni 1");
+    Assert.True(QuicStream.IsServerInitiated(5_i64), "5 server");
+    Assert.True(QuicStream.IsUnidirectional(2_i64), "2 uni");
+    Assert.False(QuicStream.CanSend(3_i64, false), "client cannot send on server uni");
+    Assert.True(QuicStream.CanReceive(3_i64, false), "client receives server uni");
+    Stream st = QuicStream.New(0_i64, 0_i64, 16_i64, 0_i64);
+    u8[] data = Hex.Of("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
+    Assert.Equal<i64>(QuicStream.OnData(st, 4_i64, data, 4_i64, 4_i64, false), 8_i64, "out of order grows highest");
+    Assert.Equal<i64>(QuicStream.Readable(st), 0_i64, "gap blocks reading");
+    Assert.Equal<i64>(QuicStream.OnData(st, 0_i64, data, 0_i64, 6_i64, false), 0_i64, "overlap fills");
+    Assert.Equal<i64>(QuicStream.Readable(st), 8_i64, "contiguous");
+    u8[] out = Slice.New(32_i64);
+    Assert.Equal<i64>(QuicStream.ReadInto(st, out, 0_i64, 5_i64), 5_i64, "partial read");
+    Assert.Equal<i64>(QuicStream.ReadInto(st, out, 5_i64, 100_i64), 3_i64, "rest");
+    Assert.Equal<string>(Hex.Encode(QuicWire.CopyOf(out, 0_i64, 8_i64)), "0001020304050607", "ordered bytes");
+    Assert.Equal<i64>(QuicStream.RecvLimit(st), 24_i64, "window slid after reading half");
+    Assert.True((QuicStream.PendingFlags(st) & QuicStream.FlagMaxStreamData()) != 0_i64, "MAX_STREAM_DATA due");
+    // Wrap around the 16-byte ring.
+    Assert.Equal<i64>(QuicStream.OnData(st, 8_i64, data, 8_i64, 16_i64, true), 16_i64, "wrapping write with fin");
+    Assert.Equal<i64>(QuicStream.RecvState(st), QuicStream.RecvDataRecvd(), "all data received");
+    Assert.Equal<i64>(QuicStream.ReadInto(st, out, 0_i64, 32_i64), 16_i64, "wrapped read");
+    Assert.Equal<string>(Hex.Encode(QuicWire.CopyOf(out, 0_i64, 16_i64)), "08090a0b0c0d0e0f1011121314151617", "wrapped bytes");
+    Assert.True(QuicStream.AtEnd(st), "end of stream");
+    Assert.Equal<i64>(QuicStream.RecvState(st), QuicStream.RecvDataRead(), "data read");
+}
+
+test stream_receive_rejects_flow_and_final_size_violations {
+    u8[] data = Slice.New(64_i64);
+    Stream st = QuicStream.New(0_i64, 0_i64, 16_i64, 0_i64);
+    Assert.Equal<i64>(QuicStream.OnData(st, 10_i64, data, 0_i64, 7_i64, false), -3_i64, "beyond MAX_STREAM_DATA");
+    Assert.Equal<i64>(QuicStream.OnData(st, 0_i64, data, 0_i64, 10_i64, true), 10_i64, "fin at 10");
+    Assert.Equal<i64>(QuicStream.OnData(st, 8_i64, data, 0_i64, 4_i64, false), -6_i64, "data beyond final size");
+    Assert.Equal<i64>(QuicStream.OnData(st, 0_i64, data, 0_i64, 9_i64, true), -6_i64, "changed final size");
+    Assert.Equal<i64>(QuicStream.OnReset(st, 7_i64, 11_i64), -6_i64, "reset with other final size");
+    Assert.Equal<i64>(QuicStream.OnReset(st, 7_i64, 10_i64), 0_i64, "reset with same final size");
+    Assert.Equal<i64>(QuicStream.RecvState(st), QuicStream.RecvResetRecvd(), "reset received");
+    Assert.Equal<i64>(QuicStream.PeerResetCodeOf(st), 7_i64, "code");
+    Stream other = QuicStream.New(4_i64, 0_i64, 16_i64, 0_i64);
+    Assert.Equal<i64>(QuicStream.OnData(other, 0_i64, data, 0_i64, 12_i64, false), 12_i64, "data");
+    Assert.Equal<i64>(QuicStream.OnData(other, 0_i64, data, 0_i64, 4_i64, true), -6_i64, "fin below received data");
+}
+
+test stream_send_flow_control_loss_and_ack {
+    Stream st = QuicStream.New(0_i64, 8_i64, 0_i64, 6_i64);
+    u8[] data = Hex.Of("6162636465666768696a");
+    Assert.Equal<i64>(QuicStream.Write(st, data, 0_i64, 10_i64), 8_i64, "send buffer bound");
+    Assert.Equal<i64>(QuicStream.SendSpace(st), 0_i64, "full");
+    i64[] c = [0_i64, 0_i64, 0_i64, 0_i64];
+    Assert.True(QuicStream.NextChunk(st, 100_i64, 100_i64, c), "chunk");
+    Assert.Equal<i64>(c[1], 6_i64, "limited by MAX_STREAM_DATA");
+    QuicStream.OnChunkSent(st, c[0], c[1], false);
+    Assert.False(QuicStream.NextChunk(st, 100_i64, 100_i64, c), "blocked");
+    Assert.True((QuicStream.PendingFlags(st) & QuicStream.FlagBlocked()) != 0_i64, "STREAM_DATA_BLOCKED due");
+    QuicStream.OnMaxStreamData(st, 100_i64);
+    Assert.True(QuicStream.NextChunk(st, 1_i64, 100_i64, c), "room-limited chunk");
+    Assert.Equal<i64>(c[0], 6_i64, "continues at 6");
+    Assert.Equal<i64>(c[1], 1_i64, "one byte");
+    QuicStream.OnChunkSent(st, 6_i64, 1_i64, false);
+    QuicStream.OnChunkLost(st, 0_i64, 6_i64, false);
+    QuicStream.OnChunkAcked(st, 2_i64, 2_i64, false);
+    Assert.True(QuicStream.NextChunk(st, 100_i64, 100_i64, c), "retransmission first");
+    Assert.Equal<i64>(c[0], 0_i64, "lost offset");
+    Assert.Equal<i64>(c[1], 2_i64, "stops before acked bytes");
+    Assert.Equal<i64>(c[3], 0_i64, "not new data");
+    QuicStream.OnChunkSent(st, 0_i64, 2_i64, false);
+    Assert.True(QuicStream.NextChunk(st, 100_i64, 100_i64, c), "rest of lost range");
+    Assert.Equal<i64>(c[0], 4_i64, "after acked");
+    QuicStream.OnChunkSent(st, 4_i64, 2_i64, false);
+    QuicStream.OnChunkAcked(st, 0_i64, 2_i64, false);
+    Assert.Equal<i64>(QuicStream.SendSpace(st), 4_i64, "acked prefix freed");
+    Assert.Equal<i64>(QuicStream.Write(st, data, 8_i64, 2_i64), 2_i64, "more data");
+    Assert.True(QuicStream.Finish(st), "finish");
+    Assert.Equal<i64>(QuicStream.Write(st, data, 0_i64, 1_i64), -1_i64, "no write after finish");
+    Assert.True(QuicStream.NextChunk(st, 100_i64, 100_i64, c), "tail with fin");
+    Assert.Equal<i64>(c[0], 7_i64, "tail offset");
+    Assert.Equal<i64>(c[1], 3_i64, "tail length");
+    Assert.Equal<i64>(c[2], 1_i64, "fin");
+    u8[] pkt = Slice.New(8_i64);
+    Writer w = QuicWire.NewWriter(pkt, 0_i64, 8_i64);
+    QuicStream.CopyOut(st, w, 7_i64, 3_i64);
+    Assert.Equal<string>(Hex.Encode(QuicWire.CopyOf(pkt, 0_i64, 3_i64)), "68696a", "wrapped ring copy");
+    QuicStream.OnChunkSent(st, 7_i64, 3_i64, true);
+    Assert.Equal<i64>(QuicStream.SendState(st), QuicStream.SendDataSent(), "data sent");
+    QuicStream.OnChunkAcked(st, 4_i64, 6_i64, true);
+    Assert.Equal<i64>(QuicStream.SendState(st), QuicStream.SendDataRecvd(), "all acknowledged");
+    Stream r = QuicStream.New(4_i64, 8_i64, 0_i64, 100_i64);
+    QuicStream.OnStopSending(r, 9_i64);
+    Assert.Equal<i64>(QuicStream.SendState(r), QuicStream.SendResetSent(), "STOP_SENDING answered by reset");
+    Assert.Equal<i64>(QuicStream.ResetCodeOf(r), 9_i64, "same code");
+}
+
+// RESET_STREAM and STOP_SENDING codes are -1 until sent or received (0 is a valid code).
+test stream_error_codes_start_unset {
+    Stream st = QuicStream.New(0_i64, 16_i64, 16_i64, 16_i64);
+    Assert.Equal<i64>(QuicStream.PeerResetCodeOf(st), -1_i64, "no peer reset");
+    Assert.Equal<i64>(QuicStream.PeerStopCodeOf(st), -1_i64, "no peer stop");
+    Assert.Equal<i64>(QuicStream.ResetCodeOf(st), -1_i64, "no local reset");
+    Assert.Equal<i64>(QuicStream.StopCodeOf(st), -1_i64, "no local stop");
+    QuicStream.OnStopSending(st, 0_i64);
+    Assert.Equal<i64>(QuicStream.PeerStopCodeOf(st), 0_i64, "peer stop with code 0");
+    Assert.Equal<i64>(QuicStream.ResetCodeOf(st), 0_i64, "answered with RESET_STREAM 0");
+    Assert.Equal<i64>(QuicStream.OnReset(st, 0_i64, 0_i64), 0_i64, "peer reset with code 0");
+    Assert.Equal<i64>(QuicStream.PeerResetCodeOf(st), 0_i64, "peer reset code 0");
+}

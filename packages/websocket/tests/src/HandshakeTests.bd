@@ -1,0 +1,208 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use WebSocket.WsErrors;
+use WebSocket.WsHandshake;
+
+string SampleKey() { return "dGhlIHNhbXBsZSBub25jZQ=="; }
+string SampleAccept() { return "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="; }
+
+WsHeader H(string name, string value) { return WsHeader { name: name, value: value }; }
+
+WsHeader[] Hs(WsHeader a, WsHeader b, WsHeader c) {
+    mut WsHeader[] out = Array.Empty<WsHeader>();
+    Array.Append<WsHeader>(out, a);
+    Array.Append<WsHeader>(out, b);
+    Array.Append<WsHeader>(out, c);
+    return out;
+}
+
+WsHeader[] With(WsHeader[] base, WsHeader extra) {
+    mut WsHeader[] out = Array.Empty<WsHeader>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<WsHeader>(base) { Array.Append<WsHeader>(out, base[i]); i = i + 1_i64; }
+    Array.Append<WsHeader>(out, extra);
+    return out;
+}
+
+WsHeader[] GoodResponse() { return Hs(H("upgrade", "websocket"), H("connection", "Upgrade"), H("sec-websocket-accept", SampleAccept())); }
+
+string[] None() { return Array.Empty<string>(); }
+string[] Chat() { return ["chat", "superchat"]; }
+
+// 0 on success, otherwise Code * 100 + Detail.
+i64 Resp(i64 status, WsHeader[] headers, string[] offered) {
+    return match WsHandshake.ValidateServerResponse(status, headers, SampleKey(), offered) {
+        Result::Ok(_) => 0_i64,
+        Result::Error(e) => WsErrors.Code(e) * 100_i64 + WsErrors.Detail(e),
+    };
+}
+
+string Chosen(WsHeader[] headers, string[] offered) {
+    return match WsHandshake.ValidateServerResponse(101_i64, headers, SampleKey(), offered) {
+        Result::Ok(p) => p,
+        Result::Error(_) => "<error>",
+    };
+}
+
+i64 Fails(i64 reason) { return 700_i64 + reason; }
+
+test accept_key_rfc_example {
+    Assert.True(WsHandshake.AcceptKey(SampleKey()) == SampleAccept(), "RFC 6455 section 1.3 accept value");
+    Assert.True(WsHandshake.ValidKey(SampleKey()), "sample key is valid");
+}
+
+test new_key_is_valid_and_fresh {
+    string a = match WsHandshake.NewKey() { Result::Ok(k) => k, Result::Error(_) => "", };
+    string b = match WsHandshake.NewKey() { Result::Ok(k) => k, Result::Error(_) => "", };
+    Assert.True(WsHandshake.ValidKey(a), "fresh key valid");
+    Assert.True(a != b, "keys differ");
+    Assert.False(WsHandshake.ValidKey("dGhlIHNhbXBsZSBub25jZQ"), "short");
+    Assert.False(WsHandshake.ValidKey("dGhlIHNhbXBsZSBub25jZR=="), "non-canonical padding bits");
+    Assert.False(WsHandshake.ValidKey("dGhlIHNhbXBsZSBub25j!!=="), "bad alphabet");
+}
+
+test response_accepts_valid {
+    Assert.Equal<i64>(Resp(101_i64, GoodResponse(), None()), 0_i64, "valid 101");
+    Assert.True(Chosen(GoodResponse(), None()) == "", "no protocol");
+    Assert.True(Chosen(With(GoodResponse(), H("sec-websocket-protocol", "superchat")), Chat()) == "superchat", "chosen protocol");
+    Assert.Equal<i64>(Resp(101_i64, Hs(H("upgrade", "WebSocket"), H("connection", "keep-alive, upgrade"), H("sec-websocket-accept", SampleAccept())), None()), 0_i64, "case-insensitive tokens");
+}
+
+test response_rejects_invalid {
+    Assert.Equal<i64>(Resp(200_i64, GoodResponse(), None()), 800_i64 + 200_i64, "not 101");
+    Assert.Equal<i64>(Resp(101_i64, Hs(H("upgrade", "h2c"), H("connection", "Upgrade"), H("sec-websocket-accept", SampleAccept())), None()), Fails(3_i64), "wrong upgrade");
+    Assert.Equal<i64>(Resp(101_i64, Hs(H("upgrade", "websocket"), H("connection", "close"), H("sec-websocket-accept", SampleAccept())), None()), Fails(4_i64), "no upgrade in connection");
+    Assert.Equal<i64>(Resp(101_i64, Hs(H("upgrade", "websocket"), H("connection", "Upgrade"), H("sec-websocket-accept", "AAAAAAAAAAAAAAAAAAAAAAAAAAA=")), None()), Fails(5_i64), "wrong accept");
+    Assert.Equal<i64>(Resp(101_i64, With(GoodResponse(), H("sec-websocket-accept", SampleAccept())), None()), Fails(5_i64), "duplicate accept");
+    Assert.Equal<i64>(Resp(101_i64, With(GoodResponse(), H("sec-websocket-extensions", "permessage-deflate")), None()), Fails(6_i64), "extension not offered");
+    Assert.Equal<i64>(Resp(101_i64, With(GoodResponse(), H("sec-websocket-protocol", "chat")), None()), Fails(7_i64), "protocol not offered");
+    Assert.Equal<i64>(Resp(101_i64, With(GoodResponse(), H("sec-websocket-protocol", "chat, superchat")), Chat()), Fails(7_i64), "server returned a list");
+    Assert.Equal<i64>(Resp(101_i64, With(GoodResponse(), H("sec-websocket-protocol", "Chat")), Chat()), Fails(7_i64), "protocol names are case-sensitive");
+}
+
+i64 HeaderErr(string line) {
+    return match WsHandshake.ParseHeaderLine(Convert.StringToBytes(line)) {
+        Result::Ok(_) => 0_i64,
+        Result::Error(e) => WsErrors.Detail(e),
+    };
+}
+
+test header_lines {
+    WsHeader h = match WsHandshake.ParseHeaderLine(Convert.StringToBytes("Sec-WebSocket-Key:   abc  ")) { Result::Ok(v) => v, Result::Error(_) => H("", ""), };
+    Assert.True(h.name == "sec-websocket-key", "lowercased name");
+    Assert.True(h.value == "abc", "trimmed value");
+    Assert.Equal<i64>(HeaderErr("Host : x"), 2_i64, "space before colon");
+    Assert.Equal<i64>(HeaderErr(" folded"), 2_i64, "obs-fold");
+    Assert.Equal<i64>(HeaderErr("NoColon"), 2_i64, "no colon");
+    Assert.Equal<i64>(HeaderErr(": x"), 2_i64, "empty name");
+    Assert.Equal<i64>(HeaderErr("X: a" + String.FromUtf8CodeUnits([1_u8])), 2_i64, "control byte");
+    Assert.Equal<i64>(HeaderErr("X:"), 0_i64, "empty value ok");
+}
+
+i64 Status(string line) {
+    return match WsHandshake.ParseStatusLine(Convert.StringToBytes(line)) { Result::Ok(s) => s, Result::Error(_) => -1_i64, };
+}
+
+string Target(string line) {
+    return match WsHandshake.ParseRequestLine(Convert.StringToBytes(line)) { Result::Ok(t) => t, Result::Error(_) => "<error>", };
+}
+
+test start_lines {
+    Assert.Equal<i64>(Status("HTTP/1.1 101 Switching Protocols"), 101_i64, "101");
+    Assert.Equal<i64>(Status("HTTP/1.1 101 "), 101_i64, "empty reason");
+    Assert.Equal<i64>(Status("HTTP/1.0 101 Switching"), -1_i64, "HTTP/1.0");
+    Assert.Equal<i64>(Status("HTTP/1.1 10x Switching"), -1_i64, "bad digit");
+    Assert.Equal<i64>(Status("HTTP/1.1 101"), -1_i64, "no SP");
+    Assert.True(Target("GET /chat?x=1 HTTP/1.1") == "/chat?x=1", "origin-form");
+    Assert.True(Target("POST /chat HTTP/1.1") == "<error>", "POST");
+    Assert.True(Target("GET chat HTTP/1.1") == "<error>", "not origin-form");
+    Assert.True(Target("GET /a b HTTP/1.1") == "<error>", "space in target");
+    Assert.True(Target("GET /a#f HTTP/1.1") == "<error>", "fragment");
+    Assert.True(Target("GET /chat HTTP/1.0") == "<error>", "HTTP/1.0");
+}
+
+WsHeader[] GoodRequest() {
+    mut WsHeader[] out = Hs(H("host", "server.example.com"), H("upgrade", "websocket"), H("connection", "Upgrade"));
+    Array.Append<WsHeader>(out, H("sec-websocket-key", SampleKey()));
+    Array.Append<WsHeader>(out, H("sec-websocket-version", "13"));
+    Array.Append<WsHeader>(out, H("origin", "http://example.com"));
+    Array.Append<WsHeader>(out, H("sec-websocket-protocol", "chat, superchat"));
+    return out;
+}
+
+i64 Req(WsHeader[] headers) {
+    return match WsHandshake.ValidateClientRequest("/chat", headers) {
+        Result::Ok(_) => 0_i64,
+        Result::Error(e) => WsErrors.Code(e) * 100_i64 + WsErrors.Detail(e),
+    };
+}
+
+// The good request with header `name` dropped.
+WsHeader[] Without(string name) {
+    WsHeader[] base = GoodRequest();
+    mut WsHeader[] out = Array.Empty<WsHeader>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<WsHeader>(base) {
+        WsHeader h = base[i];
+        if h.name != name { Array.Append<WsHeader>(out, h); }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+test server_validates_request {
+    UpgradeRequest r = match WsHandshake.ValidateClientRequest("/chat", GoodRequest()) {
+        Result::Ok(v) => v,
+        Result::Error(_) => UpgradeRequest { resource: "", hostHeader: "", key: "", origin: "", protocols: None() },
+    };
+    Assert.True(r.resource == "/chat", "resource");
+    Assert.True(r.origin == "http://example.com", "origin");
+    Assert.Equal<i64>(Array.Len<string>(r.protocols), 2_i64, "two protocols");
+    Assert.True(WsHandshake.ChooseProtocol(r.protocols, ["superchat", "chat"]) == "superchat", "server preference");
+    Assert.True(WsHandshake.ChooseProtocol(r.protocols, ["mqtt"]) == "", "no overlap");
+}
+
+test server_rejects_request {
+    Assert.Equal<i64>(Req(Without("host")), Fails(9_i64), "no host");
+    Assert.Equal<i64>(Req(With(GoodRequest(), H("host", "other"))), Fails(9_i64), "two hosts");
+    Assert.Equal<i64>(Req(Without("upgrade")), Fails(3_i64), "no upgrade");
+    Assert.Equal<i64>(Req(Without("connection")), Fails(4_i64), "no connection");
+    Assert.Equal<i64>(Req(Without("sec-websocket-version")), Fails(11_i64), "no version");
+    Assert.Equal<i64>(Req(With(Without("sec-websocket-version"), H("sec-websocket-version", "8"))), Fails(11_i64), "version 8");
+    Assert.Equal<i64>(Req(Without("sec-websocket-key")), Fails(10_i64), "no key");
+    Assert.Equal<i64>(Req(With(Without("sec-websocket-key"), H("sec-websocket-key", "abc"))), Fails(10_i64), "bad key");
+    Assert.Equal<i64>(Req(With(GoodRequest(), H("transfer-encoding", "chunked"))), Fails(15_i64), "body");
+    Assert.Equal<i64>(Req(With(GoodRequest(), H("sec-websocket-protocol", "a b"))), Fails(14_i64), "bad protocol token");
+}
+
+bool StartsWith(u8[] bytes, string prefix) {
+    u8[] p = Convert.StringToBytes(prefix);
+    if Slice.Len(bytes) < Slice.Len(p) { return false; }
+    return Slice.Compare(Slice.SubSlice(bytes, 0_i64, Slice.Len(p)), p) == 0_i64;
+}
+
+bool Has(u8[] bytes, string needle) {
+    string text = String.FromUtf8CodeUnits(bytes);
+    return String.Contains(text, needle);
+}
+
+test serialized_heads {
+    u8[] req = match WsHandshake.ClientRequest("/chat", "server.example.com", SampleKey(), Chat(), "http://example.com") { Result::Ok(b) => b, Result::Error(_) => Slice.New(0_i64), };
+    Assert.True(StartsWith(req, "GET /chat HTTP/1.1"), "request line");
+    Assert.True(Has(req, "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ=="), "key");
+    Assert.True(Has(req, "Sec-WebSocket-Version: 13"), "version");
+    Assert.True(Has(req, "Sec-WebSocket-Protocol: chat, superchat"), "protocols");
+    Assert.True(Has(req, "Origin: http://example.com"), "origin");
+    Assert.False(Has(req, "Extensions"), "never offers extensions");
+    u8[] ok = WsHandshake.ServerAccept(SampleKey(), "chat");
+    Assert.True(StartsWith(ok, "HTTP/1.1 101 Switching Protocols"), "101");
+    Assert.True(Has(ok, "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo="), "accept");
+    Assert.True(Has(ok, "Sec-WebSocket-Protocol: chat"), "protocol");
+    Assert.True(StartsWith(WsHandshake.ServerReject(WsError::HandshakeFailed(11_i64)), "HTTP/1.1 426 Upgrade Required"), "426");
+    Assert.True(Has(WsHandshake.ServerReject(WsError::HandshakeFailed(11_i64)), "Sec-WebSocket-Version: 13"), "426 version");
+    Assert.True(StartsWith(WsHandshake.ServerReject(WsError::HandshakeFailed(10_i64)), "HTTP/1.1 400 Bad Request"), "400");
+}

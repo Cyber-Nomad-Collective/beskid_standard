@@ -1,0 +1,135 @@
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Environment;
+use Core.FS;
+use Core.IO;
+use Core.IO.IoError;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Time.TimerError;
+use Codec.Hex;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Network.Types;
+use Testing.Assert;
+use Tls;
+use Tls.PeerKeys;
+use Tls.Suites;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsStream;
+
+// Beskid TLS server for `openssl s_client` (driven by tests/interop/run.sh). Accepts one
+// connection, reads one chunk, echoes it, then closes with close_notify.
+// Environment: TLS_INTEROP_PORT, TLS_INTEROP_GROUPS ("29", "23", or "23" only to force HRR),
+// TLS_INTEROP_ALPN (server-supported protocol, optional).
+
+unit Expect(i64 actual, string what) {
+    if actual != 0_i64 { Assert.Fail(what + ": code " + Dec2(actual)); }
+    return;
+}
+
+string Dec2(i64 v) {
+    if v < 0_i64 { return "-" + Dec2(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec2(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+i64 EnvInt(string name, i64 fallback) {
+    Option<string> v = Environment.TryGet(name);
+    string text = Option.UnwrapOr<string>(v, "");
+    i64 n = String.Len(text);
+    if n == 0_i64 { return fallback; }
+    mut i64 value = 0_i64;
+    mut i64 i = 0_i64;
+    while i < n { value = value * 10_i64 + (i64(String.ByteAt(text, i)) - 48_i64); i = i + 1_i64; }
+    return value;
+}
+
+Option<Deadline> Soon() {
+    Result<Deadline, TimerError> d = Deadline.After(Time.FromMilliseconds(60000_i64));
+    return match d { Result::Ok(v) => Option.FromValue<Deadline>(v), Result::Error(_) => Option.Empty<Deadline>(), };
+}
+
+i64 Run() {
+    i64 port = EnvInt("TLS_INTEROP_PORT", 44331_i64);
+    i64 group = EnvInt("TLS_INTEROP_GROUP", 29_i64);
+    string alpn = Option.UnwrapOr<string>(Environment.TryGet("TLS_INTEROP_ALPN"), "");
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    TlsServerConfig s = TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key);
+    s.groups = [group];
+    if String.Len(alpn) > 0_i64 {
+        mut string[] supported = Array.Empty<string>();
+        Array.Append<string>(supported, alpn);
+        s.alpn = supported;
+    }
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(u8((port >> 8_i64) & 255_i64), u8(port & 255_i64)) };
+    Result<TcpListener, NetworkError> bound = TcpListener.Bind(bindAddress, 4_i64);
+    match bound {
+        Result::Error(_) => { return 1_i64; },
+        Result::Ok(listener) => {
+            string ready = Option.UnwrapOr<string>(Environment.TryGet("TLS_INTEROP_READY"), "");
+            if String.Len(ready) > 0_i64 { FS.WriteAllText(ready, "ready"); }
+            Result<TcpStream, NetworkError> accepted = listener.Accept(Soon());
+            listener.Close();
+            match accepted {
+                Result::Error(_) => { return 2_i64; },
+                Result::Ok(tcp) => {
+                    Result<TlsStream, TlsError> tls = Tls.Accept(tcp, s, Soon());
+                    match tls {
+                        Result::Error(e) => { return TlsErrors.Code(e); },
+                        Result::Ok(stream) => {
+                            u8[] buf = Slice.New(256_i64);
+                            Result<i64, IoError> n = stream.Read(buf, 0_i64, 256_i64);
+                            i64 got = match n { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+                            if got <= 0_i64 { stream.Close(); return 3_i64; }
+                            Result<unit, IoError> w = IO.WriteAll(stream, buf, 0_i64, got);
+                            stream.Close();
+                            return match w { Result::Ok(_) => 0_i64, Result::Error(_) => 4_i64, };
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+unit RunInto(i64[] code) { code[0] = Run(); return; }
+
+// Network operations run inside a spawned fiber.
+test interop_server_for_openssl_s_client {
+    i64[] code = [-1_i64];
+    Fiber<unit> f = spawn (() => RunInto(code));
+    f.Join();
+    Expect(code[0], "Beskid server serves one openssl s_client connection");
+}
+// Test fixtures generated with openssl (see tests/interop/certs). Test-only keys.
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] RootCertDer() {
+    string s = "3082019b30820141a00302010202143cc5b42faaa832daa7def808045536bbb6ddf944300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a301b3119301706035504030c104265736b6964205465737420526f6f743059301306072a8648ce3d020106082a8648ce3d030107034200048f4684a2e70c8677b376730c494a3546e98fb943810d320fcfffa26392a5110bc6e1f045"
+        + "ac328a4017509ec27c8201c8e65d18f99bafb9e40ef52c7821d5d50aa3633061301d0603551d0e0416041446dda763d1978ccc27a6f76bd7519ff9619f4eb7301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300f0603"
+        + "551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d040302034800304502200c22ab56867a1fda253fb2c517682802dd87d91a6f152a0fd8ff2c4572d11bb2022100e8f98b28d498dfc5f8aae457d71cd4f433"
+        + "94ab8ac6d6ca6d526e21bc35bd1e7a"
+        ;
+    return Hex.Of(s);
+}

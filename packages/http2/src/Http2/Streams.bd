@@ -1,0 +1,99 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Http2.Hpack;
+
+// RFC 9113 section 5.1 stream states and per-stream bookkeeping.
+
+pub i64 Idle() { return 0_i64; }
+pub i64 ReservedLocal() { return 1_i64; }
+pub i64 ReservedRemote() { return 2_i64; }
+pub i64 Open() { return 3_i64; }
+pub i64 HalfClosedLocal() { return 4_i64; }
+pub i64 HalfClosedRemote() { return 5_i64; }
+pub i64 Closed() { return 6_i64; }
+
+// One stream. Fields are updated in place by the connection.
+pub type StreamState {
+    pub i64 id,
+    pub i64 state,
+    // Flow-control windows: what this endpoint may send, and what the peer may still send.
+    pub i64 sendWindow,
+    pub i64 recvWindow,
+    // Received final header section (empty until it arrives) and trailers.
+    pub HeaderField[] headers,
+    pub HeaderField[] trailers,
+    pub bool hasHeaders,
+    // Received body and its declared content-length (-1 when absent).
+    pub u8[] body,
+    pub i64 contentLength,
+    pub i64 received,
+    // Outgoing body: `outBody[outOffset..]` is still to send; `outPending` is
+    // true until the frame carrying END_STREAM was written.
+    pub u8[] outBody,
+    pub i64 outOffset,
+    pub bool outPending,
+    // RST_STREAM code (-1 none) and who sent it.
+    pub i64 resetCode,
+    pub bool resetByPeer,
+    // The stream was above the peer's GOAWAY last-stream-id.
+    pub bool refusedByGoAway,
+    // Server: the request was passed to the handler. Client/server: no body is expected.
+    pub bool handled,
+    pub bool headRequest,
+    pub bool bodyTooLarge,
+}
+
+pub StreamState New(i64 id, i64 sendWindow, i64 recvWindow) {
+    return StreamState {
+        id: id, state: Idle(), sendWindow: sendWindow, recvWindow: recvWindow,
+        headers: Array.Empty<HeaderField>(), trailers: Array.Empty<HeaderField>(), hasHeaders: false,
+        body: Slice.New(0_i64), contentLength: -1_i64, received: 0_i64,
+        outBody: Slice.New(0_i64), outOffset: 0_i64, outPending: false,
+        resetCode: -1_i64, resetByPeer: false, refusedByGoAway: false,
+        handled: false, headRequest: false, bodyTooLarge: false,
+    };
+}
+
+// The stream may still carry frames from the peer (open or half-closed local).
+pub bool RemoteOpen(StreamState s) { return s.state == Open() || s.state == HalfClosedLocal(); }
+// This endpoint may still send on the stream (open or half-closed remote).
+pub bool LocalOpen(StreamState s) { return s.state == Open() || s.state == HalfClosedRemote(); }
+pub bool IsClosed(StreamState s) { return s.state == Closed(); }
+
+// HEADERS sent or received on an idle stream.
+pub unit Opened(StreamState s, bool endStreamSent, bool endStreamReceived) {
+    s.state = Open();
+    if endStreamSent { s.state = HalfClosedLocal(); }
+    if endStreamReceived { s.state = HalfClosedRemote(); }
+    return;
+}
+
+// END_STREAM sent.
+pub unit LocalEnded(StreamState s) {
+    if s.state == Open() { s.state = HalfClosedLocal(); return; }
+    if s.state == HalfClosedRemote() { s.state = Closed(); }
+    return;
+}
+
+// END_STREAM received.
+pub unit RemoteEnded(StreamState s) {
+    if s.state == Open() { s.state = HalfClosedRemote(); return; }
+    if s.state == HalfClosedLocal() { s.state = Closed(); }
+    return;
+}
+
+// RST_STREAM sent or received.
+pub unit Reset(StreamState s, i64 code, bool byPeer) {
+    s.state = Closed();
+    s.resetCode = code;
+    s.resetByPeer = byPeer;
+    s.outPending = false;
+    return;
+}
+
+// The peer finished sending on this stream (END_STREAM received, or reset).
+pub bool RemoteDone(StreamState s) {
+    return s.state == HalfClosedRemote() || s.state == Closed();
+}
+
+pub i64 OutRemaining(StreamState s) { return Slice.Len(s.outBody) - s.outOffset; }

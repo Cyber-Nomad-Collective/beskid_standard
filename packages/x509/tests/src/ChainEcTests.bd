@@ -1,0 +1,33 @@
+use Testing.Assert;
+use Core.Collections.Array;
+use X509.Certificate;
+use X509.Verify;
+use X509.X509Errors;
+use TestSupport;
+
+string Run(string leafName, Certificate[] intermediates, string serverName) {
+    Certificate leaf = TestSupport.Cert(leafName);
+    X509Error e = Verify.Check(leaf, intermediates, TestSupport.TestRoots(), Verify.ServerOptions(TestSupport.Now(), serverName));
+    return X509Errors.Name(e);
+}
+
+test ec_chains {
+    Certificate[] ints = TestSupport.One(TestSupport.Cert("ec-int.pem"));
+    Assert.True(Run("ec-leaf.pem", ints, "www.example.test") == "None", "valid P-256 chain, SHA-384 intermediate");
+    Assert.True(Run("ec-leaf.pem", ints, "2001:db8::1") == "None", "IPv6 SAN");
+    Assert.True(Run("ec-expired.pem", ints, "leaf.example.test") == "Expired", "expired leaf");
+    Assert.True(Run("ec-client.pem", ints, "client.example.test") == "BadExtendedKeyUsage", "clientAuth only");
+    Certificate[] noca = TestSupport.Two(TestSupport.Cert("ec-noca.pem"), TestSupport.Cert("ec-int.pem"));
+    Assert.True(Run("ec-nocaleaf.pem", noca, "leaf.example.test") == "NotCa", "non-CA intermediate");
+    Certificate[] nc = TestSupport.One(TestSupport.Cert("ec-nc.pem"));
+    Assert.True(Run("ec-ncok.pem", nc, "www.allowed.test") == "None", "permitted subtree");
+    Assert.True(Run("ec-ncbad.pem", nc, "www.evil.test") == "NameConstraintViolation", "outside permitted");
+    Assert.True(Run("ec-ncexcl.pem", nc, "x.bad.allowed.test") == "NameConstraintViolation", "excluded subtree");
+    Assert.True(Run("ec-leaf.pem", Array.Empty<Certificate>(), "") == "UnknownIssuer", "no intermediate");
+    Certificate leaf = TestSupport.Cert("ec-leaf.pem");
+    VerifyOptions none = Verify.WithMaxIntermediates(Verify.ServerOptions(TestSupport.Now(), ""), 0_i64);
+    Assert.True(X509Errors.Name(Verify.Check(leaf, ints, TestSupport.TestRoots(), none)) == "ChainTooLong", "depth bound");
+    // After 2030-01-01 the leaf has expired.
+    VerifyOptions later = Verify.ServerOptions(1900000000_i64, "www.example.test");
+    Assert.True(X509Errors.Name(Verify.Check(leaf, ints, TestSupport.TestRoots(), later)) == "Expired", "time is a parameter");
+}

@@ -1,0 +1,82 @@
+// In-memory client/server connections exchanging datagrams with a simulated clock.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.String;
+use Quic.QuicConfig;
+use Quic.QuicConnection;
+use Quic.QuicPacket;
+use Quic.QuicWire;
+
+string[] Protocols() { return ["hq-interop", "h3"]; }
+
+Connection Server(QuicConfig cfg, Connection client, i64 now) {
+    Header h = QuicPacket.ParseHeader(client.out, 0_i64, 1200_i64, 0_i64);
+    return QuicConnection.NewServer(cfg, h.dcid, h.scid, h.dcid, Slice.New(0_i64), now);
+}
+
+// Moves every datagram `from` has to send into `to`; returns how many were moved.
+i64 Pump(Connection from, Connection to, i64 now) {
+    mut i64 moved = 0_i64;
+    mut i64 length = QuicConnection.BuildDatagram(from, now);
+    while length > 0_i64 && moved < 64_i64 {
+        u8[] copy = QuicWire.CopyOf(from.out, 0_i64, length);
+        QuicConnection.OnDatagram(to, copy, length, now);
+        moved = moved + 1_i64;
+        length = QuicConnection.BuildDatagram(from, now);
+    }
+    return moved;
+}
+
+i64 Exchange(Connection a, Connection b, i64 now) {
+    mut i64 rounds = 0_i64;
+    mut i64 total = 1_i64;
+    while total > 0_i64 && rounds < 20_i64 {
+        total = Pump(a, b, now) + Pump(b, a, now);
+        rounds = rounds + 1_i64;
+    }
+    return rounds;
+}
+
+u8[] Bytes(string text) {
+    u8[] out = Slice.New(String.Len(text));
+    mut i64 i = 0_i64;
+    while i < Slice.Len(out) { out[i] = String.ByteAt(text, i); i = i + 1_i64; }
+    return out;
+}
+
+test handshake_and_stream_echo_in_memory {
+    QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(Protocols(), 0_i64);
+    mut i64 now = 1000000000_i64;
+    Connection client = QuicConnection.NewClient(cfg, now);
+    Assert.Equal<i64>(QuicConnection.BuildDatagram(client, now), 1200_i64, "padded client Initial");
+    Connection server = Server(cfg, client, now);
+    QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, 1200_i64), 1200_i64, now);
+    Exchange(server, client, now);
+    Assert.True(QuicConnection.IsEstablished(client), "client established");
+    Assert.True(QuicConnection.IsEstablished(server), "server established");
+    Assert.True(QuicConnection.IsHandshakeConfirmed(client), "client confirmed by HANDSHAKE_DONE");
+    Assert.Equal<string>(QuicConnection.Alpn(client), "hq-interop", "ALPN");
+    i64 id = QuicConnection.OpenStream(client, true);
+    Assert.Equal<i64>(id, 0_i64, "first client bidi stream");
+    u8[] hello = Bytes("hello quic");
+    Assert.Equal<i64>(QuicConnection.StreamWrite(client, id, hello, 0_i64, 10_i64), 10_i64, "buffered");
+    Assert.True(QuicConnection.StreamFinish(client, id), "fin");
+    now = now + 1000000_i64;
+    Exchange(client, server, now);
+    i64 accepted = QuicConnection.AcceptStream(server);
+    Assert.Equal<i64>(accepted, 0_i64, "server accepts stream 0");
+    u8[] got = Slice.New(64_i64);
+    Assert.Equal<i64>(QuicConnection.StreamRead(server, accepted, got, 0_i64, 64_i64), 10_i64, "server reads");
+    Assert.True(QuicConnection.StreamAtEnd(server, accepted), "fin received");
+    Assert.Equal<i64>(QuicConnection.StreamWrite(server, accepted, got, 0_i64, 10_i64), 10_i64, "echo");
+    QuicConnection.StreamFinish(server, accepted);
+    now = now + 1000000_i64;
+    Exchange(server, client, now);
+    u8[] back = Slice.New(64_i64);
+    Assert.Equal<i64>(QuicConnection.StreamRead(client, id, back, 0_i64, 64_i64), 10_i64, "client reads echo");
+    Assert.True(QuicWire.Equal(QuicWire.CopyOf(back, 0_i64, 10_i64), hello), "echo matches");
+    Assert.True(QuicConnection.StreamAtEnd(client, id), "echo fin");
+    QuicConnection.Close(client, 0_i64, now);
+    Exchange(client, server, now);
+    Assert.True(QuicConnection.IsClosingOrClosed(server), "server draining after CONNECTION_CLOSE");
+}

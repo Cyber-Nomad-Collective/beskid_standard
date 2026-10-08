@@ -1,0 +1,141 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+use Http2.HpackHuffman;
+use Http2.HpackInteger;
+use Http2.HpackString;
+use Http2.HpackTable;
+
+// RFC 7541 header block encoding. The output is deterministic: a full match
+// in the static then dynamic table is sent as an indexed field; otherwise a
+// literal uses the lowest matching name index, or a literal name.
+
+/// When string literals are Huffman-coded.
+pub enum HuffmanMode { Never(), Always(), WhenShorter(), }
+
+/// Encoder policy. `tableSize` is the initial dynamic table maximum, which
+/// must equal the peer's acknowledged SETTINGS_HEADER_TABLE_SIZE (4096 by
+/// default). Fields named in `neverIndexNames`, fields marked sensitive, and
+/// `cookie` values shorter than `shortCookieLength` octets are sent as
+/// never-indexed literals (section 7.1.3). With `indexing` false, other
+/// literals are sent without indexing and the dynamic table stays empty.
+pub type EncoderPolicy {
+    pub i64 tableSize,
+    pub HuffmanMode huffman,
+    pub bool indexing,
+    pub string[] neverIndexNames,
+    pub i64 shortCookieLength,
+}
+
+pub EncoderPolicy DefaultEncoderPolicy() {
+    return EncoderPolicy {
+        tableSize: Hpack.DefaultTableSize(),
+        huffman: HuffmanMode::WhenShorter,
+        indexing: true,
+        neverIndexNames: ["authorization", "proxy-authorization"],
+        shortCookieLength: 20_i64,
+    };
+}
+
+pub type Encoder {
+    pub DynamicTable table,
+    pub StaticTable statics,
+    pub HuffmanTables huffman,
+    pub EncoderPolicy policy,
+    pub i64 neverIndexCount,
+    pub bool updatePending,
+    pub i64 updateMinimum,
+}
+
+pub Result<Encoder,HpackError> NewEncoder(EncoderPolicy policy) {
+    if policy.tableSize < 0_i64 || policy.tableSize > Hpack.MaxInteger() { return Result::Error(HpackError::InvalidLimit(policy.tableSize)); }
+    return Result::Ok(Encoder {
+        table: HpackTable.NewDynamicTable(policy.tableSize),
+        statics: HpackTable.NewStaticTable(),
+        huffman: HpackHuffman.NewHuffmanTables(),
+        policy: policy,
+        neverIndexCount: Array.Len<string>(policy.neverIndexNames),
+        updatePending: false,
+        updateMinimum: policy.tableSize,
+    });
+}
+
+/// Sets a new dynamic table maximum, for example after the peer changed
+/// SETTINGS_HEADER_TABLE_SIZE (pass the smaller of that value and the local
+/// preference). The next block starts with the size update(s) of section 4.2.
+pub Result<unit,HpackError> SetMaxTableSize(mut Encoder encoder, i64 size) {
+    if size < 0_i64 || size > Hpack.MaxInteger() { return Result::Error(HpackError::InvalidLimit(size)); }
+    if !encoder.updatePending || size < encoder.updateMinimum { encoder.updateMinimum = size; }
+    encoder.updatePending = true;
+    HpackTable.DynamicResize(encoder.table, size);
+    return Result::Ok(());
+}
+
+/// Current dynamic table size in octets.
+pub i64 EncoderTableSize(Encoder encoder) { return encoder.table.size; }
+/// Number of dynamic table entries.
+pub i64 EncoderTableCount(Encoder encoder) { return HpackTable.DynamicCount(encoder.table); }
+
+bool NeverIndex(Encoder encoder, HeaderField field) {
+    if field.sensitive { return true; }
+    if Hpack.NameIs(field, "cookie") && Slice.Len(field.value) < encoder.policy.shortCookieLength { return true; }
+    mut i64 i = 0_i64;
+    while i < encoder.neverIndexCount {
+        if Hpack.NameIs(field, Array.Get<string>(encoder.policy.neverIndexNames, i)) { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+bool UseHuffman(Encoder encoder, u8[] data) {
+    // Bind first: matching on a nested field path is an ICE in 0.5.2 (COMPILER-GAPS.md).
+    HuffmanMode mode = encoder.policy.huffman;
+    return match mode {
+        HuffmanMode::Never => false,
+        HuffmanMode::Always => true,
+        HuffmanMode::WhenShorter => HpackHuffman.HuffmanEncodedLength(encoder.huffman, data) < Slice.Len(data),
+    };
+}
+
+u8[] AppendString(Encoder encoder, mut u8[] out, u8[] data) {
+    return HpackString.EncodeString(encoder.huffman, out, data, UseHuffman(encoder, data));
+}
+
+/// Encodes one header list into one header block.
+pub u8[] Encode(mut Encoder encoder, HeaderField[] fields) {
+    mut u8[] out = [];
+    if encoder.updatePending {
+        if encoder.updateMinimum < encoder.table.maxSize { out = HpackInteger.EncodeInteger(out, 32_u8, 5_i64, encoder.updateMinimum); }
+        out = HpackInteger.EncodeInteger(out, 32_u8, 5_i64, encoder.table.maxSize);
+        encoder.updatePending = false;
+        encoder.updateMinimum = encoder.table.maxSize;
+    }
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        out = EncodeField(encoder, out, Array.Get<HeaderField>(fields, i));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+u8[] EncodeField(mut Encoder encoder, mut u8[] out, HeaderField field) {
+    bool never = NeverIndex(encoder, field);
+    if !never {
+        i64 full = HpackTable.FindField(encoder.statics, encoder.table, field);
+        if full > 0_i64 { return HpackInteger.EncodeInteger(out, 128_u8, 7_i64, full); }
+    }
+    i64 nameIndex = HpackTable.FindName(encoder.statics, encoder.table, field.name);
+    bool indexing = !never && encoder.policy.indexing;
+    if never {
+        out = HpackInteger.EncodeInteger(out, 16_u8, 4_i64, nameIndex);
+    } else {
+        if indexing { out = HpackInteger.EncodeInteger(out, 64_u8, 6_i64, nameIndex); }
+        else { out = HpackInteger.EncodeInteger(out, 0_u8, 4_i64, nameIndex); }
+    }
+    if nameIndex == 0_i64 { out = AppendString(encoder, out, field.name); }
+    out = AppendString(encoder, out, field.value);
+    if indexing { HpackTable.DynamicInsert(encoder.table, field); }
+    return out;
+}

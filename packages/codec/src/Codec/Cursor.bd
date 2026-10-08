@@ -1,0 +1,187 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Codec.Be;
+use Codec.Errors;
+use Codec.Line;
+use Codec.Varint;
+
+/// A bounds-checked forward cursor over the range [start, stop) of a byte array.
+/// A failed read leaves the position unchanged. Reads copy; the source is never aliased.
+pub type Cursor {
+    u8[] buf,
+    i64 pos,
+    i64 stop,
+    pub i64 Position() { return DoPosition(this); }
+    pub i64 Remaining() { return DoRemaining(this); }
+    pub bool IsEnd() { return DoIsEnd(this); }
+    // Fails with Truncated unless `count` more bytes are available (InvalidValue when negative).
+    pub Result<unit, CodecError> Need(i64 count) { return DoNeed(this, count); }
+    // Reads a big-endian unsigned integer of `width` (1..8) bytes.
+    pub Result<i64, CodecError> Uint(i64 width) { return DoUint(this, width); }
+    pub Result<i64, CodecError> U8() { return DoU8(this); }
+    pub Result<i64, CodecError> U16() { return DoU16(this); }
+    pub Result<i64, CodecError> U24() { return DoU24(this); }
+    pub Result<i64, CodecError> U32() { return DoU32(this); }
+    pub Result<i64, CodecError> U48() { return DoU48(this); }
+    pub Result<i64, CodecError> U64() { return DoU64(this); }
+    // Reads a QUIC variable-length integer.
+    pub Result<i64, CodecError> QuicVarint() { return DoQuicVarint(this); }
+    // Returns the next byte without consuming it.
+    pub Result<i64, CodecError> Peek8() { return DoPeek8(this); }
+    // Consumes and copies `count` bytes.
+    pub Result<u8[], CodecError> Bytes(i64 count) { return DoBytes(this, count); }
+    pub Result<unit, CodecError> Skip(i64 count) { return DoSkip(this, count); }
+    // Consumes `count` bytes and returns a cursor bounded to exactly those bytes.
+    pub Result<Cursor, CodecError> Sub(i64 count) { return DoSub(this, count); }
+    // Consumes and copies everything that is left.
+    pub u8[] Rest() { return DoRest(this); }
+    // Consumes one CRLF-terminated line (at most `maxLength` content bytes) and returns it
+    // without the terminator. Truncated when no complete line is available.
+    pub Result<u8[], CodecError> ReadLine(i64 maxLength) { return DoReadLine(this, maxLength); }
+    // Fails with LimitExceeded unless the cursor is exhausted.
+    pub Result<unit, CodecError> ExpectEnd() { return DoExpectEnd(this); }
+}
+
+// Free-function bodies: methods may not call sibling methods in 0.5.2 (see COMPILER-GAPS.md).
+i64 DoPosition(Cursor self) {
+    return self.pos;
+}
+
+i64 DoRemaining(Cursor self) {
+    return self.stop - self.pos;
+}
+
+bool DoIsEnd(Cursor self) {
+    return self.pos >= self.stop;
+}
+
+Result<unit, CodecError> DoNeed(Cursor self, i64 count) {
+        if count < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
+        if count > self.stop - self.pos { return Result::Error(CodecError::Truncated()); }
+        return Result::Ok(());
+    }
+
+Result<i64, CodecError> DoUint(Cursor self, i64 width) {
+        Result<unit, CodecError> ok = DoNeed(self, width);
+        match ok {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        Result<i64, CodecError> value = Be.ReadUint(self.buf, self.pos, width);
+        match value {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(v) => { self.pos = self.pos + width; return Result::Ok(v); },
+        };
+    }
+
+Result<i64, CodecError> DoU8(Cursor self) {
+    return DoUint(self, 1_i64);
+}
+
+Result<i64, CodecError> DoU16(Cursor self) {
+    return DoUint(self, 2_i64);
+}
+
+Result<i64, CodecError> DoU24(Cursor self) {
+    return DoUint(self, 3_i64);
+}
+
+Result<i64, CodecError> DoU32(Cursor self) {
+    return DoUint(self, 4_i64);
+}
+
+Result<i64, CodecError> DoU48(Cursor self) {
+    return DoUint(self, 6_i64);
+}
+
+Result<i64, CodecError> DoU64(Cursor self) {
+    return DoUint(self, 8_i64);
+}
+
+Result<i64, CodecError> DoQuicVarint(Cursor self) {
+        if self.pos >= self.stop { return Result::Error(CodecError::Truncated()); }
+        i64 length = Varint.LengthFromFirstByte(self.buf[self.pos]);
+        Result<unit, CodecError> ok = DoNeed(self, length);
+        match ok {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        Result<Varint.Varint, CodecError> value = Varint.Read(self.buf, self.pos);
+        match value {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(v) => { self.pos = self.pos + length; return Result::Ok(v.value); },
+        };
+    }
+
+Result<i64, CodecError> DoPeek8(Cursor self) {
+        if self.pos >= self.stop { return Result::Error(CodecError::Truncated()); }
+        return Result::Ok(i64(self.buf[self.pos]));
+    }
+
+Result<u8[], CodecError> DoBytes(Cursor self, i64 count) {
+        Result<unit, CodecError> ok = DoNeed(self, count);
+        match ok {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        u8[] out = Slice.SubSlice(self.buf, self.pos, count);
+        self.pos = self.pos + count;
+        return Result::Ok(out);
+    }
+
+Result<unit, CodecError> DoSkip(Cursor self, i64 count) {
+        Result<unit, CodecError> ok = DoNeed(self, count);
+        match ok {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        self.pos = self.pos + count;
+        return Result::Ok(());
+    }
+
+Result<Cursor, CodecError> DoSub(Cursor self, i64 count) {
+        Result<unit, CodecError> ok = DoNeed(self, count);
+        match ok {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => {},
+        };
+        Cursor inner = Cursor { buf: self.buf, pos: self.pos, stop: self.pos + count };
+        self.pos = self.pos + count;
+        return Result::Ok(inner);
+    }
+
+u8[] DoRest(Cursor self) {
+        u8[] out = Slice.SubSlice(self.buf, self.pos, self.stop - self.pos);
+        self.pos = self.stop;
+        return out;
+    }
+
+Result<u8[], CodecError> DoReadLine(Cursor self, i64 maxLength) {
+        Result<i64, CodecError> found = Line.FindLineEnd(self.buf, self.pos, self.stop, maxLength);
+        match found {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(cr) => {
+                if cr < 0_i64 { return Result::Error(CodecError::Truncated()); }
+                u8[] out = Slice.SubSlice(self.buf, self.pos, cr - self.pos);
+                self.pos = cr + 2_i64;
+                return Result::Ok(out);
+            },
+        };
+    }
+
+Result<unit, CodecError> DoExpectEnd(Cursor self) {
+        if self.pos != self.stop { return Result::Error(CodecError::LimitExceeded()); }
+        return Result::Ok(());
+    }
+
+
+/// A cursor over the whole array.
+pub Cursor New(u8[] buf) {
+    return Cursor { buf: buf, pos: 0_i64, stop: Slice.Len(buf) };
+}
+
+/// A cursor over `count` bytes starting at `offset`.
+pub Result<Cursor, CodecError> Range(u8[] buf, i64 offset, i64 count) {
+    if !Slice.IsValidRange(Slice.Len(buf), offset, count) { return Result::Error(CodecError::InvalidValue()); }
+    return Result::Ok(Cursor { buf: buf, pos: offset, stop: offset + count });
+}

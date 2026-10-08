@@ -1,0 +1,90 @@
+// NewReno congestion control (RFC 9002 section 7 and appendix B). State lives in one i64
+// array: [window, bytesInFlight, ssthresh, recoveryStartTime, maxDatagramSize, ecnCe].
+// Times are monotonic nanoseconds; -1 means "no recovery period yet".
+
+pub i64 InitialWindow(i64 maxDatagram) {
+    i64 a = 10_i64 * maxDatagram;
+    mut i64 b = 2_i64 * maxDatagram;
+    if b < 14720_i64 { b = 14720_i64; }
+    if a < b { return a; }
+    return b;
+}
+
+pub i64 MinimumWindow(i64 maxDatagram) { return 2_i64 * maxDatagram; }
+pub i64 LossReductionPercent() { return 50_i64; }
+pub i64 PersistentCongestionThreshold() { return 3_i64; }
+
+pub i64[] New(i64 maxDatagram) {
+    i64[] cc = [0_i64, 0_i64, 9223372036854775807_i64, -1_i64, 0_i64, 0_i64];
+    cc[0] = InitialWindow(maxDatagram);
+    cc[4] = maxDatagram;
+    return cc;
+}
+
+pub i64 Window(i64[] cc) { return cc[0]; }
+pub i64 BytesInFlight(i64[] cc) { return cc[1]; }
+pub i64 Ssthresh(i64[] cc) { return cc[2]; }
+pub bool InSlowStart(i64[] cc) { return cc[0] < cc[2]; }
+
+/// True when `bytes` more may be put in flight.
+pub bool CanSend(i64[] cc, i64 bytes) { return cc[1] + bytes <= cc[0]; }
+/// Remaining congestion window.
+pub i64 Available(i64[] cc) {
+    i64 n = cc[0] - cc[1];
+    if n < 0_i64 { return 0_i64; }
+    return n;
+}
+
+pub unit OnPacketSent(i64[] cc, i64 bytes) { cc[1] = cc[1] + bytes; return; }
+
+/// Removes bytes from flight without a congestion response (discarded keys, abandoned spaces).
+pub unit RemoveFromFlight(i64[] cc, i64 bytes) {
+    cc[1] = cc[1] - bytes;
+    if cc[1] < 0_i64 { cc[1] = 0_i64; }
+    return;
+}
+
+bool InRecovery(i64[] cc, i64 sentTime) { return cc[3] >= 0_i64 && sentTime <= cc[3]; }
+
+/// An in-flight packet was acknowledged (appendix B.5). `appLimited` skips window growth.
+pub unit OnPacketAcked(i64[] cc, i64 bytes, i64 sentTime, bool appLimited) {
+    RemoveFromFlight(cc, bytes);
+    if InRecovery(cc, sentTime) || appLimited { return; }
+    if cc[0] < cc[2] {
+        cc[0] = cc[0] + bytes;
+        return;
+    }
+    cc[0] = cc[0] + (cc[4] * bytes) / cc[0];
+    return;
+}
+
+/// Enters recovery once per round trip (appendix B.6).
+pub unit OnCongestionEvent(i64[] cc, i64 sentTime, i64 now) {
+    if InRecovery(cc, sentTime) { return; }
+    cc[3] = now;
+    cc[2] = (cc[0] * LossReductionPercent()) / 100_i64;
+    i64 minimum = MinimumWindow(cc[4]);
+    if cc[2] < minimum { cc[2] = minimum; }
+    cc[0] = cc[2];
+    return;
+}
+
+/// Lost in-flight packets: removes them from flight and reacts once to the newest loss.
+pub unit OnPacketsLost(i64[] cc, i64 lostBytes, i64 largestLostSentTime, i64 now, bool persistent) {
+    RemoveFromFlight(cc, lostBytes);
+    OnCongestionEvent(cc, largestLostSentTime, now);
+    if persistent {
+        cc[0] = MinimumWindow(cc[4]);
+        cc[3] = -1_i64;
+    }
+    return;
+}
+
+/// ECN-CE count increase reported in an ACK (appendix B.7).
+pub unit OnEcnCe(i64[] cc, i64 ceCount, i64 largestAckedSentTime, i64 now) {
+    if ceCount > cc[5] {
+        cc[5] = ceCount;
+        OnCongestionEvent(cc, largestAckedSentTime, now);
+    }
+    return;
+}

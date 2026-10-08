@@ -1,6 +1,19 @@
 # Compiler remediation plan for the canary gaps
 
-Root causes and proposed fixes for the gaps in the [compiler fix list](./Compiler-Fix-List.md), traced in the 0.5.3 compiler source (`beskid_compiler` commit `45ac84fe`, Corelib `82ecd75`) and confirmed with small probe programs on a 0.5.3 build. Paths are relative to the compiler's `crates/` directory unless noted. No fix below has been implemented or compiled yet; each needs its test before it lands.
+Root causes and proposed fixes for the gaps in the [compiler fix list](./Compiler-Fix-List.md), traced in the 0.5.3 compiler source (`beskid_compiler` commit `45ac84fe`, Corelib `82ecd75`) and confirmed with small probe programs on a 0.5.3 build. Paths are relative to the compiler's `crates/` directory unless noted. See [Status](#status) for what is implemented.
+
+## Status
+
+Implemented on a local compiler branch based on 0.5.3 (`45ac84fe`), not yet published; Corelib side on this branch. Each fix has a compiler regression test, and the full `corelib_tests` suite and every canary were run with the rebuilt compiler and runtime kits.
+
+| Canary | Status |
+|--------|--------|
+| `ParameterShadowsField`, `EmptyConcat`, `MinI64Interpolation`, `BoolInterpolation`, `FieldOnCall`, `GenericLocal`, `InlineEnumArgument`, `ThisMethodCall`, `TimeToUtc`, `CallInArrayLiteral`, `EnumArrayLiteral` | Fixed in the compiler (`TimeToUtc` also needs the Corelib `Time.bd` patch shipped with that compiler build). |
+| `NestedField` | Generic owners fixed in the compiler; `value.time.hour` works because `Date`, `TimeOfDay`, and `DateTime` now declare their fields `pub`. Chained projections keep hiding non-`pub` fields of other units, as the compiler's own tests require. |
+| `BulkArgs`, `ContractDispatch` | Open: no policy decision needed, larger changes. |
+| `FloatToIntCast`, `QualifiedGenericCall`, `FloatInterpolation`, `StringOrdering`, `LambdaCall` | Open: need a decision (NaN/overflow semantics, absolute-path policy) or an OpenSpec/ABI change. |
+
+The same branch also fixes two test failures that 0.5.3 itself has: a static collection test that predates `Storage.AppendAt`, and the `corelib_mvp` fixture lock that predates the networking packages (nine tests). Eight HTTP tests exceed their target execution budget on 0.5.3 with or without these changes.
 
 ## How the failures arise
 

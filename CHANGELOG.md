@@ -6,6 +6,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Fixed
+
+- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
+  when two versions grow from one base. `Array.Append` grows storage in place
+  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
+  only when the version owns the storage tip and copies the prefix otherwise.
+
 ### Added
 
 - Add the networking protocol packages to the corelib aggregate:

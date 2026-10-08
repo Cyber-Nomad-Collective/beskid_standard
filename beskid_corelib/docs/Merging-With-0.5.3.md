@@ -5,7 +5,7 @@ This branch (`claude/clever-planck-08gn1w`, PR #11 and its follow-ups) was writt
 ## Status and decisions
 
 - **Targets.** This branch and PR #11 target `main` (the v0.6 line). 0.5.3 is a frozen patch release, so this branch's breaking changes (typed `CollectionError`, removed `Query.Operators.Map`/`Filter`/`FoldI64`) do not go into it. Branch `0.5.3` (`82ecd75`) is merged into this branch with `Storage.AppendAt` as the single append path for persistent collections; the v0.6 session merges 0.5.3 into `main`.
-- **Toolchain.** 0.5.2 is no longer supported on this line. Validation waits for the published 0.5.3 release: every target one at a time, every canary, and a re-measure of `StringBuilder`, `Join`, and `Replace` against a byte buffer. Urgent targets can be run on the 0.5.3 builder on request. The compiler is not built in Corelib sessions.
+- **Toolchain.** 0.5.2 is no longer supported on this line. This branch is validated with a 0.5.3 CLI and runtime kits built from compiler `45ac84fe` (Corelib `82ecd75`): every `corelib_tests` target, one at a time, and every canary. The published 0.5.3 release replaces that local build once it is out, and `StringBuilder`, `Join`, and `Replace` still need a re-measure against a byte buffer.
 - **Persistence.** `List`, `Stack`, `Queue`, `Set`, and `Map` are persistent: pops and dequeues leave shared storage alone, removals and overwrites copy through `Storage.CopyWithout` and `Storage.CopyRange`, and `CollectionsPersistenceTests` covers every branch shape. `HashTable`, `StringMap`, `I64Map`, and `PriorityQueue` are single-owner values.
 - **Consolidation.** Each feature duplicated across the two lines (table under [Duplicated features to consolidate](#duplicated-features-to-consolidate)) gets one small PR into `main`, branched from this branch after 0.5.3 is merged there, and validated with the affected package targets.
 
@@ -17,7 +17,7 @@ This branch (`claude/clever-planck-08gn1w`, PR #11 and its follow-ups) was writt
 
 ## Differential against the 0.5.3 line (superrepo `5703ca76`)
 
-Superrepo `5703ca76` pins compiler `42d9f8cc` (tip of `0.5.3`, 28 commits after `v0.5.2`), which pins this repository at `91324fe` (tip of `0.5.3`). The common base with this branch is `7e3da7e`. This comparison is static: no 0.5.3 compiler binary has been released and it was not built, so neither line's tests were run against the other's compiler.
+Superrepo `5703ca76` pins compiler `42d9f8cc` (tip of `0.5.3`, 28 commits after `v0.5.2`), which pins this repository at `91324fe` (tip of `0.5.3`). The common base with this branch is `7e3da7e`. The comparison below was first made statically; the merged branch has since been run on a local 0.5.3 build (see [Status and decisions](#status-and-decisions)).
 
 ### What a merge does
 
@@ -27,7 +27,7 @@ None of 0.5.3's packages uses `List`, `Map`, `Set`, `Queue`, `Stack`, `StringBui
 
 ### Compiler gaps: 0.5.3 fixes none of the 19 canaries
 
-The 0.5.3 compiler commits cover optional externs, typed CLIF blocks, keyword-prefixed identifiers, geometric array growth, GC heap reuse, a network deadline race, and soname linking. None touches lambdas, contract dispatch, `this.Method()`, generic locals, `match` lowering, field access, array literals, casts, interpolation, or string concatenation, and `Time.bd` is unchanged at `91324fe`, so the `mut` patch still applies. 0.5.3's own gap log (`docs/networking/COMPILER-GAPS.md`, `packages/uri/COMPILER-GAPS.md`) independently reproduces `ThisMethodCall`, `FieldOnCall`, the array-literal ICEs, and `EmptyConcat` on the 0.5.3 compiler, and lists further gaps this branch did not hit (blocks as expressions, `mut` fields, conversion arguments, same-leaf imports, multi-line `///` comments). Every workaround in [Writing Corelib within the compiler's limits](./Authoring-Limits.md) therefore stays in place after the merge; run the canaries against a 0.5.3 build to confirm. The gaps target the v0.6 compiler.
+The 0.5.3 compiler commits cover optional externs, typed CLIF blocks, keyword-prefixed identifiers, geometric array growth, GC heap reuse, a network deadline race, and soname linking. None touches lambdas, contract dispatch, `this.Method()`, generic locals, `match` lowering, field access, array literals, casts, interpolation, or string concatenation, and `Time.bd` is unchanged at `91324fe`, so the `mut` patch still applies. 0.5.3's own gap log (`docs/networking/COMPILER-GAPS.md`, `packages/uri/COMPILER-GAPS.md`) independently reproduces `ThisMethodCall`, `FieldOnCall`, the array-literal ICEs, and `EmptyConcat` on the 0.5.3 compiler, and lists further gaps this branch did not hit (blocks as expressions, `mut` fields, conversion arguments, same-leaf imports, multi-line `///` comments). Every workaround in [Writing Corelib within the compiler's limits](./Authoring-Limits.md) therefore stays in place after the merge. Confirmed on a 0.5.3 build (compiler `45ac84fe`): all 19 canaries still reproduce. The gaps target the v0.6 compiler.
 
 ### Runtime changes that affect this branch
 

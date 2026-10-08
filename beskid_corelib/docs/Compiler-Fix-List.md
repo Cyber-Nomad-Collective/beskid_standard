@@ -17,7 +17,7 @@ The runner prints `REPRODUCES` or `FIXED` per canary. Run it from an installed C
 | 1 | `ContractDispatch` | Contract methods cannot be called on a `where T: Contract` generic. | Per-key-type `StringMap`/`I64Map`; generic `Equatable`/`Hashable` collections. |
 | 2 | `ThisMethodCall` | `this.Method()` inside a method ICEs. | Methods that cannot share logic with siblings (each `Ansi` builder method builds its own sequence; the free functions now delegate to the methods) and the module-function indirection in `StringBuilder`. |
 | 2 | `GenericLocal` | Locals of a type-parameter type ICE. | One-element `T[]` holders (`PriorityQueue.SwapItems`), inlined expressions. |
-| 2 | `MatchSelf` | `match` yielding `self` or a generic value in a method ICEs. | `HashTable.GetOr` and `List.RemoveFirstIn` indirections. |
+| 2 | `InlineEnumArgument` | An enum variant passed directly as a method argument (`h.Pick(Option::None)`) ICEs. | Binding the variant to a local first. |
 | 2 | `NestedField` | `this.inner.count` through a generic field and `value.time.hour` through module types ICE. | `HashTable.Size`, local copies in `Calendar`. |
 | 2 | `QualifiedGenericCall` | `Core.Collections.Queue.New<i64>()` ICEs. | Module imports for every generic call. |
 | 2 | `FieldOnCall` | `Make().x` ICEs. | Temporary locals. |

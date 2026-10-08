@@ -11,7 +11,8 @@ Corelib code must compile and run on the released toolchain, 0.5.3 or later; 0.5
 | Generic methods | Methods cannot declare their own type parameters; methods of a generic type cannot mention `T` in a function type. | Module-level generic functions. |
 | Locals of a type-parameter type | `T value = ...;` inside generic code ICEs. | Inline the expression, or hold the value in a one-element `T[]` (see `PriorityQueue.SwapItems`). |
 | Method calling a method on `this` | `this.Append(...)` inside a method ICEs. | Methods delegate to private module functions taking the receiver. |
-| `match` yielding `self` or a generic value inside a method | ICE. | Move the logic into a module function that uses `if` and early `return`. |
+| Enum variant passed directly as a method argument | `h.Pick(Option::None)` ICEs. | Bind the variant to a local first. |
+| `T` as the bare return type of a generic type's method | `pub T Get()` on `Box<T>` reports `unknown type T`; `Option<T>` and `Result<T, E>` work. | Module-level generic functions (`HashTable.GetOr`). |
 | Nested field access through a struct field | `value.time.hour` and `this.table.count` ICE. | Copy the inner struct to a local first, or read through an accessor function. |
 | Field access on a call result | `Calendar.AddDays(d, 1).day` ICEs. | Bind the result to a local first. |
 | Fully qualified generic calls | `Core.Collections.Queue.New<i64>()` ICEs. | `use Core.Collections.Queue;` and call `Queue.New<i64>()`. |
@@ -28,6 +29,7 @@ Corelib code must compile and run on the released toolchain, 0.5.3 or later; 0.5
 ## Semantics to keep in mind
 
 - **Integer literals default to `i32`.** `-9223372036854775807 - 1` evaluates as `i32`, and match arms mixing `0` with an `i64` call fail to lower (`InvalidMatchArms`). Suffix large or arm-result literals with `_i64`.
+- **The method receiver is `this`.** `self` is not declared in methods (corelib once used it as a legacy alias); write `this` and `this.field`.
 - **`==` on user structs compares identity**, not fields. Primitives and strings compare by value.
 - **Strings have no ordering operators and `char` has no `==`.** Use `String.Compare`, `String.Less`, and byte values.
 - **No `^` operator** and `>>` is arithmetic. Use `Hash.Xor` and `Hash.ShiftRightLogical`.

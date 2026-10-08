@@ -1,22 +1,35 @@
-/// Fiber handle runtime tests.
+/// Fiber handle runtime tests, exercised through the public Fiber API only.
 use Concurrency.Fiber;
 use Concurrency.FiberError;
 use Core.Results;
 use Testing.Assert;
 
-test invalid_fiber_join_returns_a_panicked_error {
-    Fiber<i64> fiber = Fiber<i64> { handle: -1_i64 };
+i64 ProduceValue() {
+    return 42_i64;
+}
+
+test spawned_fiber_join_returns_its_value {
+    Fiber<i64> fiber = spawn ProduceValue();
     Core.Results.Result<i64, FiberError> result = fiber.Join();
     match result {
-        Result::Ok(_) => Assert.True(false, "invalid Fiber.Join must not return a value"),
-        Result::Error(FiberError::Panicked(_, _)) => Assert.True(true, "invalid Fiber.Join is reported as panicked"),
-        Result::Error(_) => Assert.True(false, "invalid Fiber.Join must use the panicked status"),
+        Result::Ok(value) => Assert.True(value == 42_i64, "Fiber.Join returns the typed terminal value"),
+        Result::Error(_) => Assert.True(false, "a completed fiber must join with a value"),
     };
 }
 
-test invalid_fiber_cancel_and_detach_are_safe_no_ops {
-    Fiber<i64> fiber = Fiber<i64> { handle: -1_i64 };
+test repeated_cancel_then_join_is_safe {
+    Fiber<i64> fiber = spawn ProduceValue();
     fiber.Cancel();
     fiber.Cancel();
+    Core.Results.Result<i64, FiberError> result = fiber.Join();
+    match result {
+        Result::Ok(value) => Assert.True(value == 42_i64, "a fiber that finished before cancellation keeps its value"),
+        Result::Error(FiberError::Cancelled(_, _)) => Assert.True(true, "a cancelled fiber joins as cancelled"),
+        Result::Error(_) => Assert.True(false, "cancellation must not produce another error kind"),
+    };
+}
+
+test detach_relinquishes_the_join_obligation {
+    Fiber<i64> fiber = spawn ProduceValue();
     fiber.Detach();
 }

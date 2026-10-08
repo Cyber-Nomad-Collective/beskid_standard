@@ -17,7 +17,7 @@ Other modules (`Core.Collections.*`, `Query.*`, `Core.FS`, `Core.Path`, …) shi
 - Query: [Query](./Query/README.md)
 - Testing: [Testing](./Testing/README.md)
 - Console and ANSI: [Console](./Console/README.md)
-- Contributors: [Writing Corelib within the compiler's limits](./Authoring-Limits.md), the [compiler fix list](./Compiler-Fix-List.md), and [merging with the 0.5.3 line](./Merging-With-0.5.3.md)
+- Contributors: [Writing Corelib within the compiler's limits](./Authoring-Limits.md), the [compiler fix list](./Compiler-Fix-List.md), the [compiler remediation plan](./Compiler-Remediation.md), and [merging with the 0.5.3 line](./Merging-With-0.5.3.md)
 
 ## Relationship to tooling
 

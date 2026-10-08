@@ -6,7 +6,7 @@ Every gap below has a canary in `beskid_corelib/tests/canaries/`: a small test t
 beskid_corelib/tests/canaries/run.sh /path/to/beskid
 ```
 
-The runner prints `REPRODUCES` or `FIXED` per canary. Run it from an installed Corelib or a copy of the working tree (see [Writing Corelib within the compiler's limits](./Authoring-Limits.md)). All 19 reproduce on the released 0.5.2 binary and on the 0.5.3 compiler (built from compiler `45ac84fe`, Corelib `82ecd75`); the gaps target the v0.6 compiler.
+The runner prints `REPRODUCES` or `FIXED` per canary. Run it from an installed Corelib or a copy of the working tree (see [Writing Corelib within the compiler's limits](./Authoring-Limits.md)). All 19 reproduce on the released 0.5.2 binary and on the 0.5.3 compiler (built from compiler `45ac84fe`, Corelib `82ecd75`); the gaps target the v0.6 compiler. Root causes and proposed fixes are in the [compiler remediation plan](./Compiler-Remediation.md).
 
 ## Ordered by Corelib impact
 

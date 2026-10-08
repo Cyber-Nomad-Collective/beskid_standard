@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Runs every compiler-gap canary and reports which still reproduce.
 # Usage: run.sh [path-to-beskid]   (defaults to `beskid` on PATH)
-# Run from a Corelib tree the compiler trusts (an installed bundle, or a copy with a recomputed
-# .beskid-bundle.sha256 marker); see docs/Authoring-Limits-0.5.2.md.
+# Run from an installed Corelib or a copy of the working tree (never a git checkout); see
+# docs/Authoring-Limits.md.
 set -u
 BESKID="${1:-beskid}"
 cd "$(dirname "$0")"

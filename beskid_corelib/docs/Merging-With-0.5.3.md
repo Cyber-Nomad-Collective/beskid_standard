@@ -2,6 +2,13 @@
 
 This branch (`claude/clever-planck-08gn1w`, PR #11 and its follow-ups) was written and tested against the released 0.5.2 compiler. Some of the same features already exist on the 0.5.3 line. This guide is for whoever reconciles the two: what this branch adds or changes, which files will conflict, what behavior each test pins, and how to pick one implementation per feature without leaving two.
 
+## Status and decisions
+
+- **Targets.** This branch and PR #11 target `main` (the v0.6 line). 0.5.3 is a frozen patch release, so this branch's breaking changes (typed `CollectionError`, removed `Query.Operators.Map`/`Filter`/`FoldI64`) do not go into it. Branch `0.5.3` (`82ecd75`) is merged into this branch with `Storage.AppendAt` as the single append path for persistent collections; the v0.6 session merges 0.5.3 into `main`.
+- **Toolchain.** 0.5.2 is no longer supported on this line. Validation waits for the published 0.5.3 release: every target one at a time, every canary, and a re-measure of `StringBuilder`, `Join`, and `Replace` against a byte buffer. Urgent targets can be run on the 0.5.3 builder on request. The compiler is not built in Corelib sessions.
+- **Persistence.** `List`, `Stack`, `Queue`, `Set`, and `Map` are persistent: pops and dequeues leave shared storage alone, removals and overwrites copy through `Storage.CopyWithout` and `Storage.CopyPrefix`, and `CollectionsPersistenceTests` covers every branch shape. `HashTable`, `StringMap`, `I64Map`, and `PriorityQueue` are single-owner values.
+- **Consolidation.** Each feature duplicated across the two lines (table under [Duplicated features to consolidate](#duplicated-features-to-consolidate)) gets one small PR into `main`, branched from this branch after 0.5.3 is merged there, and validated with the affected package targets.
+
 ## Ground rules
 
 - **One implementation per feature.** When 0.5.3 already has a module that this branch also adds (for example a TOML or URL parser), keep exactly one and delete the other along with its exports, docs, and tests that only exercised it. Do not keep both behind different names.
@@ -20,13 +27,13 @@ None of 0.5.3's packages uses `List`, `Map`, `Set`, `Queue`, `Stack`, `StringBui
 
 ### Compiler gaps: 0.5.3 fixes none of the 19 canaries
 
-The 0.5.3 compiler commits cover optional externs, typed CLIF blocks, keyword-prefixed identifiers, geometric array growth, GC heap reuse, a network deadline race, and soname linking. None touches lambdas, contract dispatch, `this.Method()`, generic locals, `match` lowering, field access, array literals, casts, interpolation, or string concatenation, and `Time.bd` is unchanged at `91324fe`, so the `mut` patch still applies. 0.5.3's own gap log (`docs/networking/COMPILER-GAPS.md`, `packages/uri/COMPILER-GAPS.md`) independently reproduces `ThisMethodCall`, `FieldOnCall`, the array-literal ICEs, and `EmptyConcat` on the 0.5.3 compiler, and lists further gaps this branch did not hit (blocks as expressions, `mut` fields, conversion arguments, same-leaf imports, multi-line `///` comments). Every workaround in [Writing Corelib for the 0.5.2 compiler](./Authoring-Limits-0.5.2.md) therefore stays in place after the merge; run the canaries against a 0.5.3 build to confirm.
+The 0.5.3 compiler commits cover optional externs, typed CLIF blocks, keyword-prefixed identifiers, geometric array growth, GC heap reuse, a network deadline race, and soname linking. None touches lambdas, contract dispatch, `this.Method()`, generic locals, `match` lowering, field access, array literals, casts, interpolation, or string concatenation, and `Time.bd` is unchanged at `91324fe`, so the `mut` patch still applies. 0.5.3's own gap log (`docs/networking/COMPILER-GAPS.md`, `packages/uri/COMPILER-GAPS.md`) independently reproduces `ThisMethodCall`, `FieldOnCall`, the array-literal ICEs, and `EmptyConcat` on the 0.5.3 compiler, and lists further gaps this branch did not hit (blocks as expressions, `mut` fields, conversion arguments, same-leaf imports, multi-line `///` comments). Every workaround in [Writing Corelib within the compiler's limits](./Authoring-Limits.md) therefore stays in place after the merge; run the canaries against a 0.5.3 build to confirm. The gaps target the v0.6 compiler.
 
 ### Runtime changes that affect this branch
 
-- **Array growth is geometric and in place.** On 0.5.3, `Array.Append` doubles capacity and, when capacity remains, stores in place, so every handle to the same array sees the new length. On 0.5.2 every append copied. This branch's collection code copies before mutating (`CopyPrefix`, fresh `Empty` plus `Append` in `Insert`, `Set`, `RemoveAt`, `Concat`, `Slice`, `ToArray`), so its values stay persistent. The pre-existing `List.Push`, `Queue`, `Stack`, and `Set` append to the shared storage handle: after `a = l.Push(1); b = l.Push(2);`, `a` and `b` can share storage, and `a`'s element can be overwritten. Decide whether these types are persistent or single-owner before 0.5.3 ships, and add a branching test either way.
+- **Array growth is geometric and in place.** On 0.5.3, `Array.Append` doubles capacity and, when capacity remains, stores in place, so every handle to the same array sees the new length. On 0.5.2 every append copied. This branch's collection code copies before mutating (`CopyPrefix`, fresh `Empty` plus `Append` in `Insert`, `Set`, `RemoveAt`, `Concat`, `Slice`, `ToArray`), so its values stay persistent. The pre-existing `List.Push`, `Queue`, `Stack`, and `Set` appended to the shared storage handle, so branching one version overwrote another; 0.5.3 fixed that with `Storage.AppendAt` (`82ecd75`), and this branch extends it to pops, removals, and overwrites (see [Status and decisions](#status-and-decisions)).
 - **Byte buffers become cheap.** The 0.5.2 finding that `u8[]` growth is slower than string concatenation was caused by the copying append. Once 0.5.3 is the floor, re-measure `StringBuilder` and `Join`/`Replace`/`Repeat` with a `u8[]` buffer (or `Array.Zeroed`) and switch if faster.
-- **Service authority is per file.** Compiler commit `88522d60` trusts a service source that sits at its canonical path and is byte-identical to the embedded copy; the bundle hash is only an install check. A Corelib copy with extra or changed non-service files keeps its intrinsics, so the copy-and-refingerprint procedure under [Validating a merge](#validating-a-merge) is only needed for 0.5.2.
+- **Service authority is per file.** Compiler commit `88522d60` trusts a service source that sits at its canonical path and is byte-identical to the embedded copy; the bundle hash is only an install check. A Corelib copy with extra or changed non-service files keeps its intrinsics, so a copy of the tree no longer needs a recomputed marker.
 
 ### Duplicated features to consolidate
 
@@ -62,7 +69,7 @@ Types are declared inside their module file, so from another package they are wr
 | Colors and capabilities | M `Ansi/Sgr.bd`, `Console/Capabilities.bd` | `ForegroundArgsFor`, `BackgroundArgsFor`, `NearestBasicIndex`, `CubeLevel`, `FromEnvironment`, `TerminalEnvironment`, `ProbeEnvironment` | `ConsoleAnsiColorModesTests` |
 | Controls | A `Console/Controls/Table.bd`; M `Panel.bd` | `Table.*`; `Panel.BodyLines`, multi-line `Render`/`Measure` | `ConsoleControlsTableTests` |
 | Builders | M `Ansi/Cursor.bd`, `Erase.bd`, `Osc.bd`, `Screen.bd`, `InputMode.bd` | unchanged API; free functions now delegate to methods | all `ConsoleAnsi*` targets |
-| Compiler gaps | A `tests/canaries/*`, `docs/0.5.3-Compiler-Fix-List.md`, `docs/patches/0.5.3-time-mut.patch` | runnable canaries | `canaries/run.sh` |
+| Compiler gaps | A `tests/canaries/*`, `docs/Compiler-Fix-List.md`, `docs/patches/time-mut.patch` | runnable canaries | `canaries/run.sh` |
 
 ## Expected conflict points
 
@@ -83,13 +90,13 @@ These are deliberate changes from 0.5.2 behavior; confirm or revert each explici
 5. **`Url.hostname`**: named so because `host` is a reserved word.
 6. **Typed collection errors (breaking)**: `List.Get`, `Map.Get`, `Queue.Peek`, and `Stack.Peek` return `Result<_, CollectionError>` instead of `Result<_, string>`. Callers that match `Result::Error(_)` are unaffected; callers that annotate `Result<T, string>` or read the message must switch to `CollectionError`. No caller in Corelib, the compiler repository, or `beskid_templates` depended on the strings at the time of this change.
 
-## After the 0.5.3 compiler lands
+## After the next compiler lands
 
-1. Apply `docs/patches/0.5.3-time-mut.patch` and rebuild the compiler from that Corelib commit (`Time.bd` is embedded).
-2. Run `beskid_corelib/tests/canaries/run.sh <beskid>` and, for every canary that reports `FIXED`, remove the workaround named in `docs/0.5.3-Compiler-Fix-List.md` (for example `String.Concat` guards once `EmptyConcat` passes, `Number.FormatI64` routing once `MinI64Interpolation` passes, and the one-element `T[]` holders once `GenericLocal` passes).
+1. Apply `docs/patches/time-mut.patch` and rebuild the compiler from that Corelib commit (`Time.bd` is embedded).
+2. Run `beskid_corelib/tests/canaries/run.sh <beskid>` and, for every canary that reports `FIXED`, remove the workaround named in `docs/Compiler-Fix-List.md` (for example `String.Concat` guards once `EmptyConcat` passes, `Number.FormatI64` routing once `MinI64Interpolation` passes, and the one-element `T[]` holders once `GenericLocal` passes).
 3. When `LambdaCall` and `ContractDispatch` pass, add comparator overloads to `Sort`, predicate overloads to `Query.Operators`, and generic hashed maps, then retire the per-key-type `StringMap`/`I64Map` only after their tests pass against the generic replacement.
-4. Update `docs/Authoring-Limits-0.5.2.md` (or retire it) once its gaps are closed.
+4. Update `docs/Authoring-Limits.md` as its gaps close.
 
 ## Validating a merge
 
-The released-binary procedure used for this branch: copy the tree without `.git`, `obj`, and `Project.lock` files; write a recomputed `.beskid-bundle.sha256`; run `beskid test --project beskid_corelib/tests/corelib_tests --target <name>` for each target listed above. With a 0.5.3 compiler built from the merged Corelib commit, the bundle is trusted directly. Targets have a 120-second budget; split large test files (as the TOML tests are) rather than raising it.
+With the published 0.5.3 compiler, copy the tree without `.git` and run `beskid test --project beskid_corelib/tests/corelib_tests --target <name>` for each target listed above, one at a time; per-file service authority means the copy needs no recomputed marker. Runtime kits built for 0.5.2 must be rebuilt (`beskid runtime-kit build-native-host`). Targets have a 120-second budget; split large test files (as the TOML tests are) rather than raising it.

@@ -1,12 +1,12 @@
-# 0.5.3 compiler fix list
+# Compiler fix list
 
-Every gap below has a canary in `beskid_corelib/tests/canaries/`: a small test that asserts the correct behavior, so it fails on 0.5.2 and passes once the gap is fixed. Run them all with:
+Every gap below has a canary in `beskid_corelib/tests/canaries/`: a small test that asserts the correct behavior, so it fails while the gap is open and passes once it is fixed. Run them all with:
 
 ```sh
 beskid_corelib/tests/canaries/run.sh /path/to/beskid
 ```
 
-The runner prints `REPRODUCES` or `FIXED` per canary. Run it from a Corelib tree the compiler trusts (see [Writing Corelib for the 0.5.2 compiler](./Authoring-Limits-0.5.2.md)). On the released 0.5.2 binary all 19 reproduce.
+The runner prints `REPRODUCES` or `FIXED` per canary. Run it from an installed Corelib or a copy of the working tree (see [Writing Corelib within the compiler's limits](./Authoring-Limits.md)). All 19 reproduce on the released 0.5.2 binary. The 0.5.3 compiler changes none of the affected lowering paths, so they are expected to reproduce there too; the gaps target the v0.6 compiler.
 
 ## Ordered by Corelib impact
 
@@ -31,10 +31,10 @@ The runner prints `REPRODUCES` or `FIXED` per canary. Run it from a Corelib tree
 
 ## Corelib fix that ships with the compiler build
 
-`TimeToUtc`: `Core.Time.ToUtcDateTime` and its helpers assign to locals that are not declared `mut`, so any caller fails analysis. The fix is [`patches/0.5.3-time-mut.patch`](./patches/0.5.3-time-mut.patch) (only `mut` keywords). `Time.bd` is embedded into the compiler from the Corelib submodule, so apply the patch and rebuild the compiler from the same commit. Applied alone, a 0.5.2 binary stops trusting `Time.bd` and every intrinsic-using Time caller fails.
+`TimeToUtc`: `Core.Time.ToUtcDateTime` and its helpers assign to locals that are not declared `mut`, so any caller fails analysis. The fix is [`patches/time-mut.patch`](./patches/time-mut.patch) (only `mut` keywords). `Time.bd` is embedded into the compiler from the Corelib submodule, so apply the patch and rebuild the compiler from the same commit. Applied alone, the released compiler stops trusting `Time.bd` (service authority needs byte identity with the embedded copy) and every intrinsic-using Time caller fails. `Time.bd` is unchanged in 0.5.3, so the patch still applies.
 
 ```sh
-git apply beskid_corelib/docs/patches/0.5.3-time-mut.patch
+git apply beskid_corelib/docs/patches/time-mut.patch
 ```
 
-Verified on a patched copy: the `TimeToUtc` canary passes, and `SystemTimeTests` and the network targets fail on 0.5.2 exactly as described.
+Verified on a patched copy with 0.5.2: the `TimeToUtc` canary passes, and `SystemTimeTests` and the network targets fail exactly as described.

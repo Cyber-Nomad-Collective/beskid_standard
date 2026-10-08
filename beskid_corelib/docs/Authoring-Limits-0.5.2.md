@@ -49,3 +49,5 @@ Corelib code must compile and run on the released toolchain. These are the gaps 
 ## Testing a modified Corelib with a released binary
 
 The compiler grants intrinsic access only to a Corelib bundle whose `.beskid-bundle.sha256` matches the SHA-256 of the whole tree, and only to service files byte-identical to the copies embedded in the compiler (for example `Core/String/Core.bd`, `Core/Path/Path.bd`, `Core/Time/Time.bd`, and `Testing/Assert.bd`). New behavior therefore goes into new files, never into those service files. To test, copy the working tree without `.git`, `obj`, and `Project.lock` files, write a recomputed marker, and run `beskid test` from the copy. Never point `BESKID_CORELIB_ROOT` at a git checkout: 0.5.2 treats a marked directory as a managed install and replaces it with the embedded bundle.
+
+The 0.5.3 compiler grants service authority per file instead (a service file is trusted when it is at its canonical path and byte-identical to the embedded copy), so with 0.5.3 the marker no longer has to match the whole tree.

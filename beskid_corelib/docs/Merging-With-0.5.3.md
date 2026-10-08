@@ -8,6 +8,39 @@ This branch (`claude/clever-planck-08gn1w`, PR #11 and its follow-ups) was writt
 - **Tests are the specification.** Each module below lists its test targets. Before deleting either implementation, run the surviving one against *both* test sets. A failure is either a real bug or a documented behavior difference that needs an explicit decision (see [Behavior decisions](#behavior-decisions)).
 - **Compiler-embedded files.** The compiler embeds some Corelib files byte-for-byte from the submodule (`Core/Time/Time.bd`, `Core/String/Core.bd`, `Core/Path/Path.bd`, `Testing/Assert.bd`, the `Platform/*` and `Runtime/*` sources, and others listed in `beskid_abi/src/runtime_source/sources.rs`). This branch does not modify any of them. Change those files only together with a compiler rebuild from the same Corelib commit.
 
+## Differential against the 0.5.3 line (superrepo `5703ca76`)
+
+Superrepo `5703ca76` pins compiler `42d9f8cc` (tip of `0.5.3`, 28 commits after `v0.5.2`), which pins this repository at `91324fe` (tip of `0.5.3`). The common base with this branch is `7e3da7e`. This comparison is static: no 0.5.3 compiler binary has been released and it was not built, so neither line's tests were run against the other's compiler.
+
+### What a merge does
+
+A trial `git merge origin/0.5.3` into this branch conflicts only in `CHANGELOG.md`, where both lines add entries under `[Unreleased]`; keep both lists. Everything else merges cleanly because the lines touch disjoint files. 0.5.3 adds eleven packages (`uri`, `codec`, `connect`, `crypto`, `x509`, `tls`, `http2`, `websocket`, `quic`, `http3`, `web`), registers them in `beskid_corelib/corelib.bproj`, adds `docs/networking/`, and changes two foundation files: `Core/Collections/Array.bd` and `Core/Bytes/Slice.bd`. This branch modifies neither file nor any other compiler-embedded file.
+
+None of 0.5.3's packages uses `List`, `Map`, `Set`, `Queue`, `Stack`, `StringBuilder`, or `Query.Operators`, so this branch's breaking changes (typed `CollectionError`, `StringBuilder` field rename, removed `Map`/`Filter`/`FoldI64`) do not affect them. Every `Core.String` member they call still exists here.
+
+### Compiler gaps: 0.5.3 fixes none of the 19 canaries
+
+The 0.5.3 compiler commits cover optional externs, typed CLIF blocks, keyword-prefixed identifiers, geometric array growth, GC heap reuse, a network deadline race, and soname linking. None touches lambdas, contract dispatch, `this.Method()`, generic locals, `match` lowering, field access, array literals, casts, interpolation, or string concatenation, and `Time.bd` is unchanged at `91324fe`, so the `mut` patch still applies. 0.5.3's own gap log (`docs/networking/COMPILER-GAPS.md`, `packages/uri/COMPILER-GAPS.md`) independently reproduces `ThisMethodCall`, `FieldOnCall`, the array-literal ICEs, and `EmptyConcat` on the 0.5.3 compiler, and lists further gaps this branch did not hit (blocks as expressions, `mut` fields, conversion arguments, same-leaf imports, multi-line `///` comments). Every workaround in [Writing Corelib for the 0.5.2 compiler](./Authoring-Limits-0.5.2.md) therefore stays in place after the merge; run the canaries against a 0.5.3 build to confirm.
+
+### Runtime changes that affect this branch
+
+- **Array growth is geometric and in place.** On 0.5.3, `Array.Append` doubles capacity and, when capacity remains, stores in place, so every handle to the same array sees the new length. On 0.5.2 every append copied. This branch's collection code copies before mutating (`CopyPrefix`, fresh `Empty` plus `Append` in `Insert`, `Set`, `RemoveAt`, `Concat`, `Slice`, `ToArray`), so its values stay persistent. The pre-existing `List.Push`, `Queue`, `Stack`, and `Set` append to the shared storage handle: after `a = l.Push(1); b = l.Push(2);`, `a` and `b` can share storage, and `a`'s element can be overwritten. Decide whether these types are persistent or single-owner before 0.5.3 ships, and add a branching test either way.
+- **Byte buffers become cheap.** The 0.5.2 finding that `u8[]` growth is slower than string concatenation was caused by the copying append. Once 0.5.3 is the floor, re-measure `StringBuilder` and `Join`/`Replace`/`Repeat` with a `u8[]` buffer (or `Array.Zeroed`) and switch if faster.
+- **Service authority is per file.** Compiler commit `88522d60` trusts a service source that sits at its canonical path and is byte-identical to the embedded copy; the bundle hash is only an install check. A Corelib copy with extra or changed non-service files keeps its intrinsics, so the copy-and-refingerprint procedure under [Validating a merge](#validating-a-merge) is only needed for 0.5.2.
+
+### Duplicated features to consolidate
+
+| Feature | 0.5.3 | This branch | Keep |
+|---------|-------|-------------|------|
+| URI parsing, formatting, resolution, dot segments, percent coding | `packages/uri` (`Uri.Parse`, `Format`, `Resolve`, `Normalize`, `Pct`; strict RFC 3986 with IPv4/IPv6/IPvFuture validation, normalization, 62 tests; used by `http3`, `websocket`, `web`) | `Core.Text.Url` (lenient, 4 tests, no callers) | **`packages/uri`.** Port `QueryParams` and `+`-as-space form decoding (with the `url_percent_coding_and_queries` cases) into it, then delete `Core/Text/Url.bd`, `docs/Core/Text/Url.md`, and the `url_*` tests. |
+| Decimal formatting of `i64` | `Uri.Chars.DecimalText`, `Http2.Mapping.DecimalText`, `Http3.H3Mapping.DecimalText`, `X509.Der.Decimal` (wrong for negatives) | `Number.FormatI64` (full range) | `Number.FormatI64`. |
+| ASCII case mapping | `Uri.Chars.LowerAscii`/`UpperAscii`, `X509.Certificate.Lower`, `Http.Codec.LowerAscii` | `String.ToLowerAscii`/`ToUpperAscii` | `Core.String`. |
+| Prefix test, empty-safe concatenation | private `StartsWith` in `Mapping.bd`/`H3Mapping.bd`; `Uri.Chars.Cat`, `X509.Names.Join` | `String.StartsWith`, `String.Concat` | `Core.String`. |
+| Civil-date arithmetic | `X509.Der.IsLeap`, `DaysInMonth`, `DaysFromCivil` | `Calendar.IsLeapYear`, `DaysInMonth`, `DaysFromCivil` (cycle-swept) | `Core.Time.Calendar`. |
+| Hex text codec | `Codec.Hex.Encode`/`Decode` | existing `Core.Encoding.Hex` | `Core.Encoding.Hex`; `Codec.Hex` wraps it. |
+
+No 0.5.3 package overlaps JSON, TOML, CSV, SemVer, Glob, hashing, sorting, priority queues, paths, `Testing.Expect`, or the console work. 0.5.3's streaming UTF-8 validator (`WebSocket.WsUtf8`) could later back `Core.Encoding.Utf8.IsValid`.
+
 ## Per-module inventory
 
 Types are declared inside their module file, so from another package they are written `Module.Type` (for example `Toml.TomlValue`).

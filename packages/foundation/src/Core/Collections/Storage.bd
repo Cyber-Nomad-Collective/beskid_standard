@@ -1,45 +1,70 @@
-/// Append for persistent collections that share backing storage.
+/// Copying and appending for persistent collections that share backing storage.
 /// @tier(supported)
+/// `Array.Append` grows in place when capacity allows and element writes are visible through every
+/// handle, so a persistent value never writes to storage it may share with another version. It
+/// appends through `AppendAt` and builds every other change into fresh storage with the copiers
+/// below, each of which makes one sized allocation.
 use Core.Collections.Array;
 
 /// Returns storage holding the first `logicalEnd` elements of `storage` followed by `value`.
 /// Appends in place only when the caller owns the tip (`Len(storage) == logicalEnd`);
 /// otherwise another version already grew this storage, so the prefix is copied first.
-/// `Array.Append` grows in place when capacity allows, so persistent values must not
-/// append to storage they share with a newer version.
 pub T[] AppendAt<T>(T[] storage, i64 logicalEnd, T value) {
     if Array.Len<T>(storage) == logicalEnd {
         mut T[] grown = storage;
         Array.Append<T>(grown, value);
         return grown;
     }
-    mut T[] copied = CopyPrefix<T>(storage, logicalEnd);
+    mut T[] copied = CopyRange<T>(storage, 0, logicalEnd);
     Array.Append<T>(copied, value);
     return copied;
 }
 
-/// Returns fresh storage holding the first `count` elements of `storage`. Persistent values copy
-/// through this before any in-place write, so the result never aliases `storage`.
-pub T[] CopyPrefix<T>(T[] storage, i64 count) {
-    mut T[] copied = Array.Empty<T>();
+/// Returns fresh storage holding the `count` elements of `storage` that start at `start`.
+pub T[] CopyRange<T>(T[] storage, i64 start, i64 count) {
+    T[] copied = Array.Zeroed<T>(count);
+    Array.CopyRange<T>(copied, 0, storage, start, count);
+    return copied;
+}
+
+/// Returns fresh storage holding the first `count` elements of `storage` except the one at
+/// `index`.
+pub T[] CopyWithout<T>(T[] storage, i64 count, i64 index) {
+    T[] copied = Array.Zeroed<T>(count - 1);
+    Array.CopyRange<T>(copied, 0, storage, 0, index);
+    Array.CopyRange<T>(copied, index, storage, index + 1, count - index - 1);
+    return copied;
+}
+
+/// Returns fresh storage holding the first `leftCount` elements of `left` followed by the first
+/// `rightCount` elements of `right`.
+pub T[] Concat<T>(T[] left, i64 leftCount, T[] right, i64 rightCount) {
+    T[] copied = Array.Zeroed<T>(leftCount + rightCount);
+    Array.CopyRange<T>(copied, 0, left, 0, leftCount);
+    Array.CopyRange<T>(copied, leftCount, right, 0, rightCount);
+    return copied;
+}
+
+/// Returns fresh storage holding the first `count` elements of `storage` in reverse order.
+pub T[] Reversed<T>(T[] storage, i64 count) {
+    mut T[] copied = Array.Zeroed<T>(count);
     mut i64 index = 0;
     while index < count {
-        Array.Append<T>(copied, Array.Get<T>(storage, index));
+        copied = Array.Set<T>(copied, index, Array.Get<T>(storage, count - 1 - index));
         index = index + 1;
     }
     return copied;
 }
 
-/// Returns fresh storage holding the first `count` elements of `storage` except the one at
-/// `index`. Removal from a persistent value copies through this instead of shifting in place.
-pub T[] CopyWithout<T>(T[] storage, i64 count, i64 index) {
-    mut T[] copied = Array.Empty<T>();
-    mut i64 position = 0;
-    while position < count {
-        if position != index {
-            Array.Append<T>(copied, Array.Get<T>(storage, position));
+/// Index of the first of the first `count` elements of `storage` equal to `value` under `==`, or
+/// `-1`.
+pub i64 IndexOf<T>(T[] storage, i64 count, T value) {
+    mut i64 index = 0;
+    while index < count {
+        if Array.Get<T>(storage, index) == value {
+            return index;
         }
-        position = position + 1;
+        index = index + 1;
     }
-    return copied;
+    return -1;
 }

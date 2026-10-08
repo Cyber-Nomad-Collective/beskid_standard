@@ -7,6 +7,7 @@
 /// text); multi-line arrays with trailing commas; and inline tables. Duplicate keys and table
 /// redefinitions are errors. Tables keep keys in document order.
 use Core.Collections.Array;
+use Core.Collections.Storage;
 use Core.Encoding.Utf8;
 use Core.Optional.Option;
 use Core.Results;
@@ -551,17 +552,6 @@ Result<ValueStep, TomlError> ParseValue(string text, i64 at, i64 depth) {
 // Tree construction
 // ---------------------------------------------------------------------------------------------
 
-i64 FindKey(string[] keys, string key) {
-    mut i64 i = 0;
-    while i < Array.Len<string>(keys) {
-        if Array.Get<string>(keys, i) == key {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
-}
-
 bool IsTable(TomlValue value) {
     return match value {
         TomlValue::Table(_, _) => true,
@@ -597,7 +587,7 @@ Result<TomlValue, TomlError> Put(TomlValue node, string[] path, i64 from, TomlVa
         },
         TomlValue::Table(keys, values) => {
             string key = Array.Get<string>(path, from);
-            i64 index = FindKey(keys, key);
+            i64 index = Storage.IndexOf<string>(keys, Array.Len<string>(keys), key);
             bool isLast = from + 1 == Array.Len<string>(path);
             if isLast {
                 if mode == 0 {
@@ -665,21 +655,6 @@ Result<TomlValue, TomlError> Put(TomlValue node, string[] path, i64 from, TomlVa
     return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(offset));
 }
 
-string[] Concatenate(string[] head, string[] tail) {
-    mut string[] result = Array.Empty<string>();
-    mut i64 i = 0;
-    while i < Array.Len<string>(head) {
-        result = Array.Append<string>(result, Array.Get<string>(head, i));
-        i = i + 1;
-    }
-    i = 0;
-    while i < Array.Len<string>(tail) {
-        result = Array.Append<string>(result, Array.Get<string>(tail, i));
-        i = i + 1;
-    }
-    return result;
-}
-
 // ---------------------------------------------------------------------------------------------
 // Documents
 // ---------------------------------------------------------------------------------------------
@@ -738,7 +713,7 @@ pub Result<TomlValue, TomlError> Parse(string text) {
             return Result<TomlValue, TomlError>::Error(TomlError::UnexpectedCharacter(eq));
         }
         ValueStep value = ParseValue(text, SkipSpaces(text, eq + 1), 0)?;
-        root = Put(root, Concatenate(header, key.path), 0, value.value, 0, i)?;
+        root = Put(root, Storage.Concat<string>(header, Array.Len<string>(header), key.path, Array.Len<string>(key.path)), 0, value.value, 0, i)?;
         i = EndOfLine(text, value.next)?;
     }
     return Result<TomlValue, TomlError>::Ok(root);
@@ -752,7 +727,7 @@ pub Result<TomlValue, TomlError> Parse(string text) {
 pub Option<TomlValue> Get(TomlValue table, string key) {
     match table {
         TomlValue::Table(keys, values) => {
-            i64 index = FindKey(keys, key);
+            i64 index = Storage.IndexOf<string>(keys, Array.Len<string>(keys), key);
             if index < 0 {
                 return Option::None;
             }

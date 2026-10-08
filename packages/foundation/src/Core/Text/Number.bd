@@ -1,0 +1,427 @@
+/// Core.Text.Number — decimal and hexadecimal parsing, f64 formatting, and checked f64 to i64
+/// conversion, written in plain Beskid.
+/// @tier(supported)
+/// Parsing accepts ASCII only: an optional `+` or `-`, then digits; no surrounding whitespace.
+/// `ParseF64` and the f64 formatters are accurate to about 15 significant digits but are not
+/// correctly rounded, so text round trips of arbitrary doubles are not guaranteed.
+use Core.Math;
+use Core.Results;
+use Core.String.Core;
+use Core.String.Transform;
+use Core.Text.NumberError;
+
+bool IsDigit(u8 b) {
+    return b >= 48 && b <= 57;
+}
+
+i64 DigitValue(u8 b) {
+    return i64(b) - 48;
+}
+
+/// Hex digit value of `b`, or `-1` when `b` is not `0-9`, `a-f`, or `A-F`.
+i64 HexValue(u8 b) {
+    if b >= 48 && b <= 57 {
+        return i64(b) - 48;
+    }
+    if b >= 97 && b <= 102 {
+        return i64(b) - 87;
+    }
+    if b >= 65 && b <= 70 {
+        return i64(b) - 55;
+    }
+    return -1;
+}
+
+/// The smallest `i64` (`-2^63`).
+pub i64 MinI64() {
+    return -9223372036854775807_i64 - 1_i64;
+}
+
+/// The largest `i64` (`2^63 - 1`).
+pub i64 MaxI64() {
+    return 9223372036854775807_i64;
+}
+
+/// Parses a base-10 `i64` such as `-42` or `+7`. The full `i64` range is accepted.
+pub Result<i64, NumberError> ParseI64(string text) {
+    i64 len = Core.Len(text);
+    if len == 0 {
+        return Result<i64, NumberError>::Error(NumberError::Empty);
+    }
+    mut i64 i = 0;
+    mut bool negative = false;
+    u8 first = Core.ByteAt(text, 0);
+    if first == 45 || first == 43 {
+        negative = first == 45;
+        i = 1;
+    }
+    if i == len {
+        return Result<i64, NumberError>::Error(NumberError::Empty);
+    }
+    // Accumulate as a negative value so `-2^63` parses without overflow.
+    i64 limit = MinI64() / 10;
+    mut i64 acc = 0;
+    while i < len {
+        u8 b = Core.ByteAt(text, i);
+        if !IsDigit(b) {
+            return Result<i64, NumberError>::Error(NumberError::InvalidCharacter(i));
+        }
+        i64 d = DigitValue(b);
+        if acc < limit || (acc == limit && d > 8) {
+            return Result<i64, NumberError>::Error(NumberError::Overflow);
+        }
+        acc = acc * 10 - d;
+        i = i + 1;
+    }
+    if negative {
+        return Result<i64, NumberError>::Ok(acc);
+    }
+    if acc == MinI64() {
+        return Result<i64, NumberError>::Error(NumberError::Overflow);
+    }
+    return Result<i64, NumberError>::Ok(0 - acc);
+}
+
+/// Parses a non-negative hexadecimal `i64` with an optional `0x`/`0X` prefix, such as `ff` or
+/// `0x7FFF`. Values above `2^63 - 1` report `Overflow`.
+pub Result<i64, NumberError> ParseHex(string text) {
+    i64 len = Core.Len(text);
+    mut i64 i = 0;
+    if len >= 2 && Core.ByteAt(text, 0) == 48 && (Core.ByteAt(text, 1) == 120 || Core.ByteAt(text, 1) == 88) {
+        i = 2;
+    }
+    if i == len {
+        return Result<i64, NumberError>::Error(NumberError::Empty);
+    }
+    i64 limit = MaxI64() / 16;
+    mut i64 acc = 0;
+    while i < len {
+        i64 d = HexValue(Core.ByteAt(text, i));
+        if d < 0 {
+            return Result<i64, NumberError>::Error(NumberError::InvalidCharacter(i));
+        }
+        if acc > limit {
+            return Result<i64, NumberError>::Error(NumberError::Overflow);
+        }
+        acc = acc * 16 + d;
+        i = i + 1;
+    }
+    return Result<i64, NumberError>::Ok(acc);
+}
+
+/// `10^exponent` as an f64, for any integer exponent (`0` gives `1.0`).
+pub f64 Pow10(i64 exponent) {
+    mut f64 result = 1.0;
+    mut i64 i = 0;
+    if exponent >= 0 {
+        while i < exponent {
+            result = result * 10.0;
+            i = i + 1;
+            if !IsFinite(result) {
+                break;
+            }
+        }
+        return result;
+    }
+    mut f64 divisor = 1.0;
+    while i < 0 - exponent {
+        divisor = divisor * 10.0;
+        i = i + 1;
+        if !IsFinite(divisor) {
+            return 0.0;
+        }
+    }
+    return result / divisor;
+}
+
+/// Parses a decimal floating-point value: optional sign, digits with an optional fraction, and an
+/// optional `e`/`E` exponent, such as `-1.25`, `.5`, `3.`, or `6.02e23`. `NaN` and infinities are
+/// rejected; magnitudes beyond the f64 range become infinite.
+pub Result<f64, NumberError> ParseF64(string text) {
+    i64 len = Core.Len(text);
+    if len == 0 {
+        return Result<f64, NumberError>::Error(NumberError::Empty);
+    }
+    mut i64 i = 0;
+    mut bool negative = false;
+    u8 first = Core.ByteAt(text, 0);
+    if first == 45 || first == 43 {
+        negative = first == 45;
+        i = 1;
+    }
+    mut f64 mantissa = 0.0;
+    mut i64 digits = 0;
+    mut i64 scale = 0;
+    while i < len && IsDigit(Core.ByteAt(text, i)) {
+        mantissa = mantissa * 10.0 + f64(DigitValue(Core.ByteAt(text, i)));
+        digits = digits + 1;
+        i = i + 1;
+    }
+    if i < len && Core.ByteAt(text, i) == 46 {
+        i = i + 1;
+        while i < len && IsDigit(Core.ByteAt(text, i)) {
+            mantissa = mantissa * 10.0 + f64(DigitValue(Core.ByteAt(text, i)));
+            digits = digits + 1;
+            scale = scale - 1;
+            i = i + 1;
+        }
+    }
+    if digits == 0 {
+        if i < len {
+            return Result<f64, NumberError>::Error(NumberError::InvalidCharacter(i));
+        }
+        return Result<f64, NumberError>::Error(NumberError::Empty);
+    }
+    if i < len && (Core.ByteAt(text, i) == 101 || Core.ByteAt(text, i) == 69) {
+        i = i + 1;
+        mut bool expNegative = false;
+        if i < len && (Core.ByteAt(text, i) == 45 || Core.ByteAt(text, i) == 43) {
+            expNegative = Core.ByteAt(text, i) == 45;
+            i = i + 1;
+        }
+        if i == len {
+            return Result<f64, NumberError>::Error(NumberError::InvalidCharacter(i));
+        }
+        mut i64 exponent = 0;
+        while i < len && IsDigit(Core.ByteAt(text, i)) {
+            if exponent < 100000 {
+                exponent = exponent * 10 + DigitValue(Core.ByteAt(text, i));
+            }
+            i = i + 1;
+        }
+        if expNegative {
+            scale = scale - exponent;
+        } else {
+            scale = scale + exponent;
+        }
+    }
+    if i < len {
+        return Result<f64, NumberError>::Error(NumberError::InvalidCharacter(i));
+    }
+    mut f64 value = mantissa;
+    if scale > 0 {
+        value = mantissa * Pow10(scale);
+    }
+    if scale < 0 {
+        // Split very small scales so the divisor itself never overflows to infinity.
+        if scale < -300 {
+            value = mantissa / Pow10(300);
+            value = value / Pow10(0 - scale - 300);
+        } else {
+            value = mantissa / Pow10(0 - scale);
+        }
+    }
+    if negative {
+        value = 0.0 - value;
+    }
+    return Result<f64, NumberError>::Ok(value);
+}
+
+/// Returns true when `value` is neither NaN nor infinite.
+pub bool IsFinite(f64 value) {
+    // NaN fails `==`; infinities give NaN for `inf - inf`.
+    return value == value && value - value == 0.0;
+}
+
+/// Truncates `value` toward zero into an `i64`.
+/// Reports `NotFinite` for NaN or infinities and `Overflow` outside `[-2^63, 2^63)`.
+pub Result<i64, NumberError> TruncateToI64(f64 value) {
+    if !IsFinite(value) {
+        return Result<i64, NumberError>::Error(NumberError::NotFinite);
+    }
+    mut bool negative = value < 0.0;
+    mut f64 magnitude = value;
+    if negative {
+        magnitude = 0.0 - value;
+    }
+    magnitude = Math.Floor(magnitude);
+    f64 twoPow63 = 9223372036854775807.0;
+    if magnitude >= twoPow63 {
+        if negative && magnitude == twoPow63 {
+            return Result<i64, NumberError>::Ok(MinI64());
+        }
+        return Result<i64, NumberError>::Error(NumberError::Overflow);
+    }
+    // Greedy binary decomposition: every `remaining - bit` subtraction is exact because
+    // `remaining` stays in `[bit, 2 * bit)` whenever the bit is taken.
+    mut f64 remaining = magnitude;
+    mut i64 acc = 0;
+    mut i64 k = 62;
+    while k >= 0 {
+        i64 bitValue = 1_i64 << k;
+        f64 bit = f64(bitValue);
+        if remaining >= bit {
+            acc = acc + bitValue;
+            remaining = remaining - bit;
+        }
+        k = k - 1;
+    }
+    if negative {
+        return Result<i64, NumberError>::Ok(0 - acc);
+    }
+    return Result<i64, NumberError>::Ok(acc);
+}
+
+/// Rounds `value` to the nearest `i64`, ties away from zero, with the same failures as
+/// `TruncateToI64`.
+pub Result<i64, NumberError> RoundToI64(f64 value) {
+    if !IsFinite(value) {
+        return Result<i64, NumberError>::Error(NumberError::NotFinite);
+    }
+    if value < 0.0 {
+        return TruncateToI64(value - 0.5);
+    }
+    return TruncateToI64(value + 0.5);
+}
+
+/// Formats `value` in lowercase hexadecimal without a prefix. Negative values print their
+/// 64-bit two's-complement form (16 digits).
+pub string FormatHex(i64 value) {
+    if value == 0 {
+        return "0";
+    }
+    string digits = "0123456789abcdef";
+    mut string result = "";
+    mut i64 remaining = value;
+    mut i64 emitted = 0;
+    while remaining != 0 && emitted < 16 {
+        i64 nibble = remaining & 15;
+        result = Transform.Concat(Core.SubSlice(digits, nibble, 1), result);
+        remaining = remaining >> 4;
+        emitted = emitted + 1;
+        if value < 0 && emitted == 16 {
+            break;
+        }
+    }
+    return result;
+}
+
+/// Formats a non-negative integral f64 below `2^63` as decimal digits.
+string IntegralDigits(f64 integral) {
+    return match TruncateToI64(integral) {
+        Result::Ok(whole) => "${whole}",
+        Result::Error(_) => "0",
+    };
+}
+
+/// Formats `value` with exactly `decimals` fractional digits (clamped to `0..=15`), rounding
+/// half away from zero, such as `FormatFixed(3.14159, 2) == "3.14"`.
+/// NaN prints `NaN`, infinities print `Infinity`/`-Infinity`, and magnitudes of `2^63` or more
+/// fall back to `FormatGeneral`.
+pub string FormatFixed(f64 value, i64 decimals) {
+    if value != value {
+        return "NaN";
+    }
+    if !IsFinite(value) {
+        if value < 0.0 {
+            return "-Infinity";
+        }
+        return "Infinity";
+    }
+    mut i64 places = decimals;
+    if places < 0 {
+        places = 0;
+    }
+    if places > 15 {
+        places = 15;
+    }
+    bool negative = value < 0.0;
+    mut f64 magnitude = value;
+    if negative {
+        magnitude = 0.0 - value;
+    }
+    if magnitude >= 9000000000000000000.0 {
+        return FormatGeneral(value);
+    }
+    f64 factor = Pow10(places);
+    mut f64 whole = Math.Floor(magnitude);
+    mut f64 fraction = Math.Round((magnitude - whole) * factor);
+    if fraction >= factor {
+        whole = whole + 1.0;
+        fraction = fraction - factor;
+    }
+    mut string text = IntegralDigits(whole);
+    if places > 0 {
+        string fractionDigits = Transform.PadLeft(IntegralDigits(fraction), places, "0");
+        text = text + "." + fractionDigits;
+    }
+    if negative && (whole > 0.0 || fraction > 0.0) {
+        return "-" + text;
+    }
+    return text;
+}
+
+/// Removes trailing zeros after a decimal point, and the point itself when nothing remains.
+string TrimFraction(string text) {
+    if Core.IndexOfFrom(text, 0, ".") < 0 {
+        return text;
+    }
+    mut i64 end = Core.Len(text);
+    while end > 0 && Core.ByteAt(text, end - 1) == 48 {
+        end = end - 1;
+    }
+    if end > 0 && Core.ByteAt(text, end - 1) == 46 {
+        end = end - 1;
+    }
+    return Core.SubSlice(text, 0, end);
+}
+
+/// Formats `value` compactly with up to 15 significant digits: plain decimal notation for
+/// magnitudes in `[1e-5, 1e15)` and `d.ddde±x` scientific notation otherwise, with trailing
+/// zeros removed. Integral values print without a fraction (`2.0` prints `2`).
+pub string FormatGeneral(f64 value) {
+    if value != value {
+        return "NaN";
+    }
+    if !IsFinite(value) {
+        if value < 0.0 {
+            return "-Infinity";
+        }
+        return "Infinity";
+    }
+    if value == 0.0 {
+        return "0";
+    }
+    bool negative = value < 0.0;
+    mut f64 magnitude = value;
+    if negative {
+        magnitude = 0.0 - value;
+    }
+    mut i64 exponent = match TruncateToI64(Math.Floor(Math.Log10(magnitude))) {
+        Result::Ok(e) => e,
+        Result::Error(_) => 0,
+    };
+    // Correct libm rounding at exact powers of ten.
+    if Pow10(exponent) > magnitude {
+        exponent = exponent - 1;
+    }
+    if Pow10(exponent + 1) <= magnitude {
+        exponent = exponent + 1;
+    }
+    mut string text = "";
+    if exponent >= -5 && exponent < 15 {
+        mut i64 places = 14 - exponent;
+        if places > 15 {
+            places = 15;
+        }
+        text = TrimFraction(FormatFixed(magnitude, places));
+    } else {
+        f64 mantissa = magnitude / Pow10(exponent);
+        mut string digits = TrimFraction(FormatFixed(mantissa, 14));
+        mut i64 shown = exponent;
+        // Rounding the mantissa can carry it up to 10.
+        if Core.Len(digits) >= 2 && Core.SubSlice(digits, 0, 2) == "10" {
+            digits = TrimFraction(FormatFixed(mantissa / 10.0, 14));
+            shown = shown + 1;
+        }
+        if shown < 0 {
+            text = digits + "e-" + "${0 - shown}";
+        } else {
+            text = digits + "e+" + "${shown}";
+        }
+    }
+    if negative {
+        return "-" + text;
+    }
+    return text;
+}

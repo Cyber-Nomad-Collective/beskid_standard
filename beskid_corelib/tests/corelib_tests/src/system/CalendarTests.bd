@@ -1,0 +1,103 @@
+/// Core.Time.Calendar tests.
+
+use Testing.Expect;
+use Core.Results;
+use Core.Time.Calendar;
+use Core.Time.Date;
+use Core.Time.Instant;
+use Core.Time.TimeError;
+
+Date D(i64 year, i64 month, i64 day) {
+    return Date { year: year, month: month, day: day };
+}
+
+string DateText(Date date) {
+    return Calendar.FormatDate(date);
+}
+
+i64 NanosOr(Result<Instant, TimeError> parsed) {
+    return match parsed {
+        Result::Ok(instant) => instant.nanos,
+        Result::Error(_) => -1_i64,
+    };
+}
+
+string FailureOf(Result<Instant, TimeError> parsed) {
+    return match parsed {
+        Result::Ok(_) => "ok",
+        Result::Error(error) => match error {
+            TimeError::InvalidFormat(_) => "format",
+            TimeError::OutOfRange(field) => field,
+        },
+    };
+}
+
+test calendar_days_round_trip {
+    Expect.EqualI64(Calendar.DaysFromCivil(1970, 1, 1), 0, "epoch");
+    Expect.EqualI64(Calendar.DaysFromCivil(2000, 3, 1), 11017, "2000-03-01");
+    Expect.EqualI64(Calendar.DaysFromCivil(1969, 12, 31), -1, "day before epoch");
+    Expect.EqualString(DateText(Calendar.CivilFromDays(11016)), "2000-02-29", "leap day");
+    Expect.EqualString(DateText(Calendar.CivilFromDays(-719468)), "0000-03-01", "era boundary");
+    Expect.EqualString(DateText(Calendar.CivilFromDays(Calendar.DaysFromCivil(-44, 3, 15))), "-0044-03-15", "negative year");
+}
+
+test calendar_leap_years_and_validity {
+    Expect.EqualBool(Calendar.IsLeapYear(2000), true, "divisible by 400");
+    Expect.EqualBool(Calendar.IsLeapYear(1900), false, "century");
+    Expect.EqualBool(Calendar.IsLeapYear(2024), true, "every fourth");
+    Expect.EqualBool(Calendar.IsLeapYear(-4), true, "proleptic negative");
+    Expect.EqualBool(Calendar.IsValidDate(2023, 2, 29), false, "no Feb 29 in 2023");
+    Expect.EqualBool(Calendar.IsValidDate(2024, 2, 29), true, "Feb 29 in 2024");
+    Expect.EqualI64(Calendar.DaysInMonth(2024, 13), 0, "invalid month");
+}
+
+test calendar_weekday_and_day_of_year {
+    Expect.EqualI64(Calendar.IsoWeekday(D(1970, 1, 1)), 4, "Thursday");
+    Expect.EqualI64(Calendar.IsoWeekday(D(2026, 10, 6)), 2, "Tuesday");
+    Expect.EqualI64(Calendar.IsoWeekday(D(1969, 12, 28)), 7, "Sunday before epoch");
+    Expect.EqualI64(Calendar.DayOfYear(D(2024, 12, 31)), 366, "leap year end");
+    Expect.EqualI64(Calendar.DayOfYear(D(2023, 3, 1)), 60, "March 1st common year");
+}
+
+test calendar_arithmetic {
+    Expect.EqualString(DateText(Calendar.AddDays(D(2024, 2, 28), 2)), "2024-03-01", "across leap day");
+    Expect.EqualString(DateText(Calendar.AddDays(D(2024, 1, 1), -1)), "2023-12-31", "backwards");
+    Expect.EqualString(DateText(Calendar.AddMonths(D(2024, 1, 31), 1)), "2024-02-29", "clamp to leap February");
+    Expect.EqualString(DateText(Calendar.AddMonths(D(2024, 3, 15), -15)), "2022-12-15", "negative months");
+    Expect.EqualString(DateText(Calendar.AddYears(D(2024, 2, 29), 1)), "2025-02-28", "leap day clamps");
+    Expect.EqualI64(Calendar.DaysBetween(D(2024, 1, 1), D(2025, 1, 1)), 366, "leap year length");
+    Expect.EqualI64(Calendar.CompareDates(D(2024, 1, 1), D(2023, 12, 31)), 1, "after");
+    Expect.EqualI64(Calendar.CompareDates(D(2024, 1, 1), D(2024, 1, 1)), 0, "equal");
+}
+
+test calendar_format_instant {
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: 0 }), "1970-01-01T00:00:00Z", "epoch");
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: 1500000000 }), "1970-01-01T00:00:01.500Z", "milliseconds");
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: -1 }), "1969-12-31T23:59:59.999999999Z", "nanoseconds before epoch");
+    Expect.EqualString(Calendar.FormatDate(D(12345, 1, 2)), "+12345-01-02", "expanded year");
+}
+
+test calendar_parse_instant {
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-01T00:00:00Z")), 0, "epoch");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-01T01:00:00+01:00")), 0, "positive offset");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1969-12-31 19:00:00.25-05:00")), 250000000, "space, fraction, negative offset");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-02")), 86400000000000_i64, "date only");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-01t00:00:00.000000001z")), 1, "lowercase separators");
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: NanosOr(Calendar.ParseInstant("2026-10-06T12:30:00Z")) }), "2026-10-06T12:30:00Z", "round trip");
+}
+
+test calendar_parse_failures {
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-02-29T00:00:00Z")), "day", "invalid day");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-13-01")), "month", "invalid month");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T24:00:00Z")), "hour", "hour 24");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T00:00:60Z")), "second", "leap second rejected");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T00:00:00")), "format", "missing zone");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T00:00:00.Z")), "format", "empty fraction");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023/01/01")), "format", "wrong separator");
+}
+
+test calendar_parse_date {
+    Result<Date, TimeError> parsed = Calendar.ParseDate("2024-02-29");
+    Expect.IsOk<Date, TimeError>(parsed, "valid date");
+    Expect.IsError<Date, TimeError>(Calendar.ParseDate("2024-02-29T00:00:00Z"), "date only");
+}

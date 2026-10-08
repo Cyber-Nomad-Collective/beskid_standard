@@ -1,0 +1,54 @@
+/// Core.Path.Lexical tests.
+
+use Testing.Expect;
+use Core.Optional.Option;
+use Core.Path.Lexical;
+
+string RelativeOr(Option<string> value, string fallback) {
+    return match value {
+        Option::Some(path) => path,
+        Option::None => fallback,
+    };
+}
+
+test path_normalize {
+    Expect.EqualString(Lexical.Normalize("/a//b/./c/"), "/a/b/c", "collapse and drop dots");
+    Expect.EqualString(Lexical.Normalize("a/b/../c"), "a/c", "resolve parent");
+    Expect.EqualString(Lexical.Normalize("/../a"), "/a", "rooted path stays under root");
+    Expect.EqualString(Lexical.Normalize("../../a/.."), "../..", "relative keeps leading parents");
+    Expect.EqualString(Lexical.Normalize("a/.."), ".", "empty relative is dot");
+    Expect.EqualString(Lexical.Normalize("/"), "/", "root");
+    Expect.EqualString(Lexical.Normalize(""), ".", "empty");
+}
+
+test path_segments_and_rooted {
+    Expect.EqualStringArray(Lexical.Segments("/a//b/./c"), ["a", "b", "c"], "segments");
+    Expect.EqualBool(Lexical.IsRooted("/x"), true, "rooted");
+    Expect.EqualBool(Lexical.IsRooted("x"), false, "relative");
+    Expect.EqualString(Lexical.ToForwardSlashes("a\\b\\c"), "a/b/c", "backslashes");
+}
+
+test path_join_all {
+    Expect.EqualString(Lexical.JoinAll(["src", "core", "../lib.bd"]), "src/lib.bd", "join and normalize");
+    Expect.EqualString(Lexical.JoinAll(["a", "/b", "c"]), "/b/c", "rooted part resets");
+    Expect.EqualString(Lexical.JoinAll(["", "x"]), "x", "empty parts skipped");
+}
+
+test path_relative {
+    Expect.EqualString(RelativeOr(Lexical.Relative("/a/b/c", "/a/d"), "?"), "../../d", "up and over");
+    Expect.EqualString(RelativeOr(Lexical.Relative("/a", "/a/b/c"), "?"), "b/c", "down");
+    Expect.EqualString(RelativeOr(Lexical.Relative("a/b", "a/b"), "?"), ".", "same");
+    Expect.EqualString(RelativeOr(Lexical.Relative("/a", "b"), "none"), "none", "mixed rootedness");
+    Expect.EqualString(RelativeOr(Lexical.Relative("../x", "y"), "none"), "none", "unresolvable parent");
+}
+
+test path_stem_and_parent {
+    Expect.EqualString(Lexical.Stem("dir/archive.tar.gz"), "archive.tar", "last extension");
+    Expect.EqualString(Lexical.Stem(".profile"), ".profile", "dotfile");
+    Expect.EqualString(Lexical.Stem("noext"), "noext", "no extension");
+    Expect.EqualString(Lexical.Parent("/a/b"), "/a", "parent");
+    Expect.EqualString(Lexical.Parent("/a"), "/", "parent of top level");
+    Expect.EqualString(Lexical.Parent("a"), ".", "parent of relative");
+    Expect.EqualString(Lexical.Parent("/"), "/", "root parent");
+    Expect.EqualString(Lexical.Parent(".."), "../..", "parent of parent");
+}

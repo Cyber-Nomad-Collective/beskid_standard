@@ -10,6 +10,8 @@
 | [Bytes](./Bytes.md) | `u8[]` slice helpers |
 | [Encoding](./Encoding.md) | UTF-8, hex, base64 codecs |
 | [Optional](./Optional.md) | `Option<T>` and `Some` / `None` |
+| [Number](./Text/Number.md) | Integer and float parsing, formatting, checked f64-to-i64 conversion |
+| [Json](./Json.md) | RFC 8259 parse, build, inspect, and serialize |
 
 ## OS runtime (foundation)
 
@@ -24,8 +26,9 @@ Higher-level modules (`FS`, `Path`, `Environment`, `Process`, `Time`, `Threading
 | [Output](./Output.md) | **`Write`**, **`WriteLine`** → stdout via syscall |
 | [Error](./Error.md) | **`Write`**, **`WriteLine`** → stderr via syscall |
 | [FS](./FS.md) | **`FsError`**, **`ReadAllText`**, **`WriteAllText`**, **`Exists`** |
-| [Path](./Path.md) | POSIX-oriented path composition helpers |
+| [Path](./Path.md) | POSIX-oriented path composition helpers and lexical normalization |
 | [Time](./Time.md) | **`Instant`**, **`Duration`**, UTC civil types |
+| [Calendar](./Calendar.md) | Constant-time date arithmetic, weekdays, RFC 3339 parse and format |
 | [Environment](./Environment.md) | Process environment helpers |
 | [Process](./Process.md) | Process id, exit, and spawn contracts |
 

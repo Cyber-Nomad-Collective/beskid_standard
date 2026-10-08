@@ -12,3 +12,8 @@ All receiver operations are defined on their owning public types. Modules retain
 - [Set](./Set.md) — unique values with linear membership.
 - [Queue](./Queue.md) — FIFO values.
 - [Stack](./Stack.md) — LIFO values.
+- [Sort](./Sort.md) — stable sorting, keyed ordering, and binary search.
+- [StringMap, I64Map, HashTable, Hash](./HashMaps.md) — hashed maps with expected O(1) operations.
+- [PriorityQueue](./PriorityQueue.md) — `i64`-priority min-heap.
+
+Index- and key-based failures in newer APIs use the typed `CollectionError` (`IndexOutOfRange(index, count)`, `KeyNotFound`, `Empty`).

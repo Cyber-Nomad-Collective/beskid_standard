@@ -6,6 +6,7 @@
 /// literals keep their brackets); scheme and hostname are not case-normalized.
 use Core.Collections.Array;
 use Core.Results;
+use Core.String.Ascii;
 use Core.String;
 use Core.Text.Number;
 
@@ -42,16 +43,8 @@ pub type QueryParam {
     string value,
 }
 
-bool IsAlpha(u8 b) {
-    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122);
-}
-
-bool IsDigit(u8 b) {
-    return b >= 48 && b <= 57;
-}
-
 bool IsSchemeByte(u8 b) {
-    return IsAlpha(b) || IsDigit(b) || b == 43 || b == 45 || b == 46;
+    return Ascii.IsAlphanumeric(b) || b == 43 || b == 45 || b == 46;
 }
 
 /// Byte offset of the first of `bytes` (given as a string of single-byte characters) at or after
@@ -82,7 +75,7 @@ pub Result<Url, UrlError> Parse(string text) {
     mut i64 i = 0;
     i64 colon = FindAny(text, 0, ":/?#");
     if colon < len && String.ByteAt(text, colon) == 58 && colon > 0 {
-        if !IsAlpha(String.ByteAt(text, 0)) {
+        if !Ascii.IsAlpha(String.ByteAt(text, 0)) {
             return Result<Url, UrlError>::Error(UrlError::InvalidScheme);
         }
         mut i64 k = 1;
@@ -206,19 +199,6 @@ pub string Format(Url url) {
     return text;
 }
 
-i64 HexDigit(u8 b) {
-    if b >= 48 && b <= 57 {
-        return i64(b) - 48;
-    }
-    if b >= 97 && b <= 102 {
-        return i64(b) - 87;
-    }
-    if b >= 65 && b <= 70 {
-        return i64(b) - 55;
-    }
-    return -1;
-}
-
 /// Decodes `%XX` escapes. When `plusIsSpace` is true (query strings in HTML forms), `+` decodes
 /// to a space.
 pub Result<string, UrlError> PercentDecode(string text, bool plusIsSpace) {
@@ -231,8 +211,8 @@ pub Result<string, UrlError> PercentDecode(string text, bool plusIsSpace) {
             if i + 2 >= len {
                 return Result<string, UrlError>::Error(UrlError::InvalidPercentEncoding);
             }
-            i64 high = HexDigit(String.ByteAt(text, i + 1));
-            i64 low = HexDigit(String.ByteAt(text, i + 2));
+            i64 high = Ascii.HexValue(String.ByteAt(text, i + 1));
+            i64 low = Ascii.HexValue(String.ByteAt(text, i + 2));
             if high < 0 || low < 0 {
                 return Result<string, UrlError>::Error(UrlError::InvalidPercentEncoding);
             }
@@ -251,7 +231,7 @@ pub Result<string, UrlError> PercentDecode(string text, bool plusIsSpace) {
 }
 
 bool IsUnreserved(u8 b) {
-    return IsAlpha(b) || IsDigit(b) || b == 45 || b == 46 || b == 95 || b == 126;
+    return Ascii.IsAlphanumeric(b) || b == 45 || b == 46 || b == 95 || b == 126;
 }
 
 /// Percent-encodes every byte except the unreserved set (`A-Z a-z 0-9 - . _ ~`) and the bytes of

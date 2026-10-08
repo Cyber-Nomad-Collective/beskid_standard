@@ -9,6 +9,7 @@
 use Core.Collections.Array;
 use Core.Optional.Option;
 use Core.Results;
+use Core.String.Ascii;
 use Core.String;
 use Core.Text.Number;
 
@@ -110,25 +111,12 @@ Result<i64, TomlError> EndOfLine(string text, i64 at) {
 }
 
 bool IsBareKeyByte(u8 b) {
-    return (b >= 65 && b <= 90) || (b >= 97 && b <= 122) || (b >= 48 && b <= 57) || b == 95 || b == 45;
+    return Ascii.IsAlphanumeric(b) || b == 95 || b == 45;
 }
 
 bool HasAt(string text, i64 at, string literal) {
     i64 n = String.Len(literal);
     return at + n <= String.Len(text) && String.SubSlice(text, at, n) == literal;
-}
-
-i64 HexValue(u8 b) {
-    if b >= 48 && b <= 57 {
-        return i64(b) - 48;
-    }
-    if b >= 97 && b <= 102 {
-        return i64(b) - 87;
-    }
-    if b >= 65 && b <= 70 {
-        return i64(b) - 55;
-    }
-    return -1;
 }
 
 u8[] AppendCodePoint(u8[] bytes, i64 cp) {
@@ -258,17 +246,8 @@ Result<TextStep, TomlError> BasicString(string text, i64 at) {
         if digits == 0 || i + 2 + digits > len {
             return Result<TextStep, TomlError>::Error(TomlError::InvalidEscape(i));
         }
-        mut i64 cp = 0;
-        mut i64 k = 0;
-        while k < digits {
-            i64 h = HexValue(String.ByteAt(text, i + 2 + k));
-            if h < 0 {
-                return Result<TextStep, TomlError>::Error(TomlError::InvalidEscape(i));
-            }
-            cp = cp * 16 + h;
-            k = k + 1;
-        }
-        if cp > 1114111 || (cp >= 55296 && cp <= 57343) {
+        i64 cp = Number.DigitsAt(text, i + 2, digits, 16);
+        if cp < 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343) {
             return Result<TextStep, TomlError>::Error(TomlError::InvalidEscape(i));
         }
         bytes = AppendCodePoint(bytes, cp);
@@ -369,10 +348,6 @@ bool IsTokenEnd(u8 b) {
     return b == 32 || b == 9 || b == 10 || b == 13 || b == 44 || b == 93 || b == 125 || b == 35;
 }
 
-bool IsDigitByte(u8 b) {
-    return b >= 48 && b <= 57;
-}
-
 /// Removes `_` separators, which must sit between two digits.
 Option<string> StripUnderscores(string token, bool hex) {
     i64 len = String.Len(token);
@@ -386,8 +361,8 @@ Option<string> StripUnderscores(string token, bool hex) {
             }
             u8 before = String.ByteAt(token, i - 1);
             u8 after = String.ByteAt(token, i + 1);
-            bool beforeOk = IsDigitByte(before) || (hex && HexValue(before) >= 0);
-            bool afterOk = IsDigitByte(after) || (hex && HexValue(after) >= 0);
+            bool beforeOk = Ascii.IsDigit(before) || (hex && Ascii.HexValue(before) >= 0);
+            bool afterOk = Ascii.IsDigit(after) || (hex && Ascii.HexValue(after) >= 0);
             if !beforeOk || !afterOk {
                 return Option::None;
             }
@@ -408,7 +383,7 @@ Result<i64, TomlError> RadixInteger(string digits, i64 radix, i64 at) {
     mut i64 acc = 0;
     mut i64 i = 0;
     while i < len {
-        i64 d = HexValue(String.ByteAt(digits, i));
+        i64 d = Ascii.HexValue(String.ByteAt(digits, i));
         if d < 0 || d >= radix || acc > limit {
             return Result<i64, TomlError>::Error(TomlError::InvalidNumber(at));
         }
@@ -424,9 +399,9 @@ Result<i64, TomlError> RadixInteger(string digits, i64 radix, i64 at) {
 bool LooksLikeDateTime(string token) {
     i64 len = String.Len(token);
     if len >= 10 && String.ByteAt(token, 4) == 45 && String.ByteAt(token, 7) == 45 {
-        return IsDigitByte(String.ByteAt(token, 0)) && IsDigitByte(String.ByteAt(token, 3)) && IsDigitByte(String.ByteAt(token, 5)) && IsDigitByte(String.ByteAt(token, 8));
+        return Ascii.IsDigit(String.ByteAt(token, 0)) && Ascii.IsDigit(String.ByteAt(token, 3)) && Ascii.IsDigit(String.ByteAt(token, 5)) && Ascii.IsDigit(String.ByteAt(token, 8));
     }
-    return len >= 8 && String.ByteAt(token, 2) == 58 && String.ByteAt(token, 5) == 58 && IsDigitByte(String.ByteAt(token, 0));
+    return len >= 8 && String.ByteAt(token, 2) == 58 && String.ByteAt(token, 5) == 58 && Ascii.IsDigit(String.ByteAt(token, 0));
 }
 
 Result<ValueStep, TomlError> Scalar(string text, i64 at) {
@@ -436,7 +411,7 @@ Result<ValueStep, TomlError> Scalar(string text, i64 at) {
         end = end + 1;
     }
     // A date and time may be separated by one space: `1979-05-27 07:32:00`.
-    if end - at == 10 && end + 3 < len && String.ByteAt(text, end) == 32 && IsDigitByte(String.ByteAt(text, end + 1)) && String.ByteAt(text, end + 3) == 58 {
+    if end - at == 10 && end + 3 < len && String.ByteAt(text, end) == 32 && Ascii.IsDigit(String.ByteAt(text, end + 1)) && String.ByteAt(text, end + 3) == 58 {
         end = end + 1;
         while end < len && !IsTokenEnd(String.ByteAt(text, end)) {
             end = end + 1;
@@ -493,7 +468,7 @@ Result<ValueStep, TomlError> Scalar(string text, i64 at) {
     if String.StartsWith(plain, "+") || String.StartsWith(plain, "-") {
         unsigned = String.SubSlice(plain, 1, String.Len(plain) - 1);
     }
-    if String.Len(unsigned) > 1 && String.ByteAt(unsigned, 0) == 48 && IsDigitByte(String.ByteAt(unsigned, 1)) {
+    if String.Len(unsigned) > 1 && String.ByteAt(unsigned, 0) == 48 && Ascii.IsDigit(String.ByteAt(unsigned, 1)) {
         return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
     }
     bool isFloat = String.Contains(unsigned, ".") || String.Contains(unsigned, "e") || String.Contains(unsigned, "E");
@@ -508,7 +483,7 @@ Result<ValueStep, TomlError> Scalar(string text, i64 at) {
         return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Integer(value), next: end });
     }
     i64 dot = String.IndexOf(unsigned, ".");
-    if dot >= 0 && (dot == 0 || dot + 1 >= String.Len(unsigned) || !IsDigitByte(String.ByteAt(unsigned, dot + 1))) {
+    if dot >= 0 && (dot == 0 || dot + 1 >= String.Len(unsigned) || !Ascii.IsDigit(String.ByteAt(unsigned, dot + 1))) {
         return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
     }
     f64 parsed = match Number.ParseF64(plain) {

@@ -12,6 +12,7 @@ use Core.Json.JsonError;
 use Core.Json.JsonValue;
 use Core.Optional.Option;
 use Core.Results;
+use Core.String.Ascii;
 use Core.String.Builder;
 use Core.String.Core;
 use Core.String.Utf8;
@@ -90,7 +91,7 @@ Result<ParseStep, JsonError> ParseValue(string text, i64 at, i64 depth) {
         TextStep decoded = ParseText(text, at)?;
         return Step(JsonValue::Text(decoded.text), decoded.next);
     }
-    if b == 45 || (b >= 48 && b <= 57) {
+    if b == 45 || Ascii.IsDigit(b) {
         return ParseNumber(text, at);
     }
     if HasLiteral(text, at, "true") {
@@ -105,10 +106,6 @@ Result<ParseStep, JsonError> ParseValue(string text, i64 at, i64 depth) {
     return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedCharacter(at));
 }
 
-bool IsDigitByte(u8 b) {
-    return b >= 48 && b <= 57;
-}
-
 /// Validates the JSON number grammar `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
 /// before converting the slice.
 Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
@@ -117,22 +114,22 @@ Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
     if Core.ByteAt(text, i) == 45 {
         i = i + 1;
     }
-    if i >= len || !IsDigitByte(Core.ByteAt(text, i)) {
+    if i >= len || !Ascii.IsDigit(Core.ByteAt(text, i)) {
         return Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(i));
     }
     if Core.ByteAt(text, i) == 48 {
         i = i + 1;
     } else {
-        while i < len && IsDigitByte(Core.ByteAt(text, i)) {
+        while i < len && Ascii.IsDigit(Core.ByteAt(text, i)) {
             i = i + 1;
         }
     }
     if i < len && Core.ByteAt(text, i) == 46 {
         i = i + 1;
-        if i >= len || !IsDigitByte(Core.ByteAt(text, i)) {
+        if i >= len || !Ascii.IsDigit(Core.ByteAt(text, i)) {
             return Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(i));
         }
-        while i < len && IsDigitByte(Core.ByteAt(text, i)) {
+        while i < len && Ascii.IsDigit(Core.ByteAt(text, i)) {
             i = i + 1;
         }
     }
@@ -141,10 +138,10 @@ Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
         if i < len && (Core.ByteAt(text, i) == 43 || Core.ByteAt(text, i) == 45) {
             i = i + 1;
         }
-        if i >= len || !IsDigitByte(Core.ByteAt(text, i)) {
+        if i >= len || !Ascii.IsDigit(Core.ByteAt(text, i)) {
             return Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(i));
         }
-        while i < len && IsDigitByte(Core.ByteAt(text, i)) {
+        while i < len && Ascii.IsDigit(Core.ByteAt(text, i)) {
             i = i + 1;
         }
     }
@@ -153,34 +150,6 @@ Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
         Result::Ok(value) => Step(JsonValue::Number(value), i),
         Result::Error(_) => Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(at)),
     };
-}
-
-/// Value of four hex digits at `at`, or `-1` when any is not a hex digit.
-i64 Hex4(string text, i64 at) {
-    if at + 4 > Core.Len(text) {
-        return -1;
-    }
-    mut i64 value = 0;
-    mut i64 i = 0;
-    while i < 4 {
-        u8 b = Core.ByteAt(text, at + i);
-        mut i64 digit = -1;
-        if b >= 48 && b <= 57 {
-            digit = i64(b) - 48;
-        }
-        if b >= 97 && b <= 102 {
-            digit = i64(b) - 87;
-        }
-        if b >= 65 && b <= 70 {
-            digit = i64(b) - 55;
-        }
-        if digit < 0 {
-            return -1;
-        }
-        value = value * 16 + digit;
-        i = i + 1;
-    }
-    return value;
 }
 
 /// Appends the UTF-8 encoding of scalar value `cp` (`0..=0x10FFFF`, not a surrogate).
@@ -257,7 +226,7 @@ Result<TextStep, JsonError> ParseText(string text, i64 at) {
         if e != 117 {
             return Result<TextStep, JsonError>::Error(JsonError::InvalidEscape(i));
         }
-        i64 unit = Hex4(text, i + 2);
+        i64 unit = Number.DigitsAt(text, i + 2, 4, 16);
         if unit < 0 {
             return Result<TextStep, JsonError>::Error(JsonError::InvalidEscape(i));
         }
@@ -269,7 +238,7 @@ Result<TextStep, JsonError> ParseText(string text, i64 at) {
             if !HasLiteral(text, i + 6, "\\u") {
                 return Result<TextStep, JsonError>::Error(JsonError::InvalidUnicode(i));
             }
-            i64 low = Hex4(text, i + 8);
+            i64 low = Number.DigitsAt(text, i + 8, 4, 16);
             if low < 56320 || low > 57343 {
                 return Result<TextStep, JsonError>::Error(JsonError::InvalidUnicode(i));
             }

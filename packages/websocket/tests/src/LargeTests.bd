@@ -1,0 +1,229 @@
+use Concurrency;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
+use Network.Types;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Testing.Assert;
+use WebSocket.WsErrors;
+use WebSocket.WsConnection;
+use WebSocket.WsTransport;
+
+// Loopback Beskid client <-> Beskid server over direct TCP (no resolver).
+
+SocketAddress Loopback4(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+// Server: echoes text and binary; records [0] messages echoed, [1] close code seen.
+unit EchoOnce(TcpListener listener, WsOptions options, i64[] seen) {
+    match listener.Accept(Within(5000_i64)) {
+        Result::Error(_) => { Assert.Fail("accept"); },
+        Result::Ok(stream) => { ServeEcho(stream, options, seen); },
+    };
+    return;
+}
+
+unit ServeEcho(TcpStream stream, WsOptions options, i64[] seen) {
+    match WsConnection.Accept(stream, options) {
+        Result::Error(_) => { Assert.Fail("server handshake"); },
+        Result::Ok(conn) => { EchoLoop(conn, seen); },
+    };
+    return;
+}
+
+unit EchoLoop(WsConnection conn, i64[] seen) {
+    mut bool running = true;
+    while running {
+        match conn.Receive() {
+            Result::Error(e) => { seen[1] = -WsErrors.Code(e); running = false; },
+            Result::Ok(message) => { running = Echo(conn, message, seen); },
+        };
+    }
+    return;
+}
+
+bool Echo(WsConnection conn, WsMessage message, i64[] seen) {
+    seen[0] = seen[0] + 1_i64;
+    return match message {
+        WsMessage::Text(text) => Sent(conn.SendText(text)),
+        WsMessage::Binary(data) => Sent(conn.SendBinary(data)),
+        WsMessage::Close(code, _) => MarkClosed(seen, code),
+    };
+}
+
+bool MarkClosed(i64[] seen, i64 code) { seen[1] = code; return false; }
+
+bool Sent(Result<unit, WsError> r) { return match r { Result::Ok(_) => true, Result::Error(_) => false, }; }
+
+string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+Result<WsConnection, WsError> Dial(SocketAddress address, WsOptions options) {
+    return match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(2000_i64)) {
+        Result::Error(_) => Result::Error(WsError::ConnectFailed()),
+        Result::Ok(stream) => WsConnection.ClientHandshake(WsTransport::Tcp(stream), "127.0.0.1:" + Dec(address.port.Value()), "/echo?x=1", options),
+    };
+}
+
+string TextOf(Result<WsMessage, WsError> r) {
+    return match r {
+        Result::Ok(m) => TextOfMessage(m),
+        Result::Error(e) => "<error " + Dec(WsErrors.Code(e)) + ">",
+    };
+}
+
+string TextOfMessage(WsMessage m) { return match m { WsMessage::Text(t) => t, _ => "<not text>", }; }
+
+u8[] BytesOf(Result<WsMessage, WsError> r) {
+    return match r {
+        Result::Ok(m) => BytesOfMessage(m),
+        Result::Error(_) => Slice.New(0_i64),
+    };
+}
+
+u8[] BytesOfMessage(WsMessage m) { return match m { WsMessage::Binary(b) => b, _ => Slice.New(0_i64), }; }
+
+u8[] Pattern(i64 n) {
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = u8((i * 7_i64 + 3_i64) & 255_i64); i = i + 1_i64; }
+    return out;
+}
+
+
+// Memory note: both peers share one process here, and the 0.5.2 runtime traps
+// (out_of_memory R1) once about 160 KiB of arrays are live, which a 64 KiB
+// message on both sides of one process exceeds. Loopback transfers therefore use
+// 32 KiB; the 64-bit length encoding is covered byte-exact in WsFrameTests and
+// by the out-of-process interop script.
+// Phase 1: client sends 32768 bytes (chunked masking path).
+// Phase 2: server sends 32768 bytes (header then payload, no frame copy).
+// Phase 3: a 2000-byte message over a 1024-byte server limit -> close 1009.
+
+i64 Sum(u8[] data) {
+    mut i64 s = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) { s = (s * 31_i64 + i64(data[i])) & 0xFFFFFFF_i64; i = i + 1_i64; }
+    return s;
+}
+
+unit LargeServer(TcpListener listener, i64 limit, i64[] seen) {
+    match listener.Accept(Within(5000_i64)) {
+        Result::Error(_) => { Assert.Fail("accept"); },
+        Result::Ok(stream) => { LargeServe(stream, limit, seen); },
+    };
+    return;
+}
+
+unit LargeServe(TcpStream stream, i64 limit, i64[] seen) {
+    WsOptions options = WsConnection.WithMaxMessageBytes(WsConnection.DefaultOptions(), limit);
+    match WsConnection.Accept(stream, options) {
+        Result::Error(_) => { Assert.Fail("server handshake"); },
+        Result::Ok(conn) => { LargeServeOn(conn, seen); },
+    };
+    return;
+}
+
+unit LargeServeOn(WsConnection conn, i64[] seen) {
+    match conn.Receive() {
+        Result::Error(e) => { seen[0] = -WsErrors.CloseCodeFor(e); },
+        Result::Ok(m) => {
+            seen[0] = Sum(BytesOfMessage(m));
+            Testing.Assert.CollectGarbage();
+            conn.SendBinary(Pattern(32768_i64));
+            conn.Close(1000_i64, "");
+        },
+    };
+    return;
+}
+
+i64 CloseOf(Result<WsMessage, WsError> r) {
+    return match r {
+        Result::Ok(m) => CloseOfMessage(m),
+        Result::Error(e) => -WsErrors.Code(e),
+    };
+}
+
+i64 CloseOfMessage(WsMessage m) { return match m { WsMessage::Close(code, _) => code, _ => 0_i64, }; }
+
+unit LargeClient(SocketAddress address) {
+    match Dial(address, WsConnection.DefaultOptions()) {
+        Result::Error(e) => { Assert.Equal<i64>(WsErrors.Code(e), 0_i64, "client handshake"); },
+        Result::Ok(conn) => { LargeOn(conn); },
+    };
+    return;
+}
+
+unit LargeOn(WsConnection conn) {
+    Assert.True(Sent(conn.SendBinary(Pattern(32768_i64))), "send 32 KiB");
+    Testing.Assert.CollectGarbage();
+    Assert.Equal<i64>(Sum(BytesOf(conn.Receive())), Sum(Pattern(32768_i64)), "32 KiB from the server");
+    Assert.Equal<i64>(CloseOf(conn.Receive()), 1000_i64, "server closes normally");
+    return;
+}
+
+unit TooBigOn(SocketAddress address) {
+    match Dial(address, WsConnection.DefaultOptions()) {
+        Result::Error(e) => { Assert.Equal<i64>(WsErrors.Code(e), 0_i64, "client handshake"); },
+        Result::Ok(conn) => {
+            Assert.True(Sent(conn.SendBinary(Pattern(2000_i64))), "send 2000 bytes");
+            Assert.Equal<i64>(CloseOf(conn.Receive()), 1009_i64, "server closes with 1009");
+        },
+    };
+    return;
+}
+
+unit RunLarge(i64 limit, i64 expected) {
+    match TcpListener.Bind(Loopback4(0_i64), 4_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => { LargeWith(listener, limit, expected); },
+    };
+    return;
+}
+
+unit LargeWith(TcpListener listener, i64 limit, i64 expected) {
+    match listener.LocalAddress() {
+        Result::Error(_) => { Assert.Fail("address"); },
+        Result::Ok(address) => {
+            SocketAddress target = address;
+            TcpListener l = listener;
+            i64 cap = limit;
+            i64[] seen = [0_i64];
+            Fiber<unit> server = spawn (() => LargeServer(l, cap, seen));
+            if limit > 1024_i64 { LargeClient(target); } else { TooBigOn(target); }
+            server.Join();
+            Assert.Equal<i64>(seen[0], expected, "server outcome");
+            l.Close();
+        },
+    };
+    return;
+}
+
+unit RunLargeTransfer() { RunLarge(32768_i64, Sum(Pattern(32768_i64))); return; }
+unit RunTooBig() { RunLarge(1024_i64, -1009_i64); return; }
+
+test loopback_32k_both_directions {
+    Fiber<unit> scenario = spawn RunLargeTransfer();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}
+
+test loopback_message_over_limit_closes_1009 {
+    Fiber<unit> scenario = spawn RunTooBig();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}

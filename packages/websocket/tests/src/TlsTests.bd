@@ -1,0 +1,201 @@
+use Concurrency;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
+use Codec.Hex;
+use Network.Types;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Testing.Assert;
+use Tls.PeerKeys;
+use Tls.TlsConfig;
+use X509.X509Errors;
+use WebSocket.WsErrors;
+use WebSocket.WsConnection;
+
+// wss loopback: Beskid TLS 1.3 server <-> Beskid client, test root trusted explicitly.
+
+SocketAddress Loopback4(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+TlsServerConfig ServerConfig() {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    return TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key);
+}
+
+WsOptions TrustOf(u8[] rootDer) {
+    Result<CertificateVerification, X509Error> v = TlsConfig.Anchors(TlsConfig.Chain1(rootDer));
+    return match v {
+        Result::Ok(verification) => WsConnection.WithTls(WsConnection.DefaultOptions(), verification),
+        Result::Error(_) => WsConnection.DefaultOptions(),
+    };
+}
+
+// i64[] result: [0] 0 untouched, 1 served ok, else 100 + WsErrors.Code of the server failure.
+unit EchoOnce(TcpListener listener, i64[] result) {
+    match listener.Accept(Within(20000_i64)) {
+        Result::Error(_) => { result[0] = 99_i64; },
+        Result::Ok(stream) => { ServeEcho(stream, result); },
+    };
+    return;
+}
+
+unit ServeEcho(TcpStream stream, i64[] result) {
+    match WsConnection.AcceptTls(stream, ServerConfig(), WsConnection.DefaultOptions()) {
+        Result::Error(e) => { result[0] = 100_i64 + WsErrors.Code(e); },
+        Result::Ok(conn) => { EchoLoop(conn); result[0] = 1_i64; },
+    };
+    return;
+}
+
+unit EchoLoop(WsConnection conn) {
+    mut bool running = true;
+    while running {
+        match conn.Receive() {
+            Result::Error(_) => { running = false; },
+            Result::Ok(message) => { running = Echo(conn, message); },
+        };
+    }
+    return;
+}
+
+bool Echo(WsConnection conn, WsMessage message) {
+    return match message {
+        WsMessage::Text(text) => Sent(conn.SendText(text)),
+        WsMessage::Binary(data) => Sent(conn.SendBinary(data)),
+        WsMessage::Close(_, _) => false,
+    };
+}
+
+bool Sent(Result<unit, WsError> r) { return match r { Result::Ok(_) => true, Result::Error(_) => false, }; }
+
+string Url(TcpListener listener, string hostName) {
+    return match listener.LocalAddress() {
+        Result::Ok(address) => "wss://" + hostName + ":" + Dec(address.port.Value()) + "/echo",
+        Result::Error(_) => "",
+    };
+}
+
+string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+string TextOf(Result<WsMessage, WsError> r) {
+    return match r {
+        Result::Ok(m) => match m { WsMessage::Text(t) => t, _ => "<not text>", },
+        Result::Error(_) => "<error>",
+    };
+}
+
+i64 BinaryLen(Result<WsMessage, WsError> r) {
+    return match r {
+        Result::Ok(m) => match m { WsMessage::Binary(b) => Slice.Len(b), _ => -1_i64, },
+        Result::Error(_) => -2_i64,
+    };
+}
+
+unit EchoScenario() {
+    match TcpListener.Bind(Loopback4(0_i64), 4_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => {
+            TcpListener l = listener;
+            i64[] result = [0_i64];
+            Fiber<unit> server = spawn (() => EchoOnce(l, result));
+            match WsConnection.Open(Url(l, "localhost"), TrustOf(RootCertDer())) {
+                Result::Error(e) => { Assert.Equal<i64>(WsErrors.Code(e) * 1000_i64 + WsErrors.Detail(e), 0_i64, "client open"); },
+                Result::Ok(conn) => {
+                    Assert.True(Sent(conn.SendText("hello wss")), "send text");
+                    Assert.True(TextOf(conn.Receive()) == "hello wss", "text echo");
+                    Assert.True(Sent(conn.SendBinary(Slice.New(3000_i64))), "send binary");
+                    Assert.Equal<i64>(BinaryLen(conn.Receive()), 3000_i64, "binary echo");
+                    Assert.True(Sent(conn.Close(1000_i64, "bye")), "close");
+                    Assert.Equal<i64>(conn.CloseCodeReceived(), 1000_i64, "server echoed 1000");
+                },
+            };
+            server.Join();
+            Assert.Equal<i64>(result[0], 1_i64, "server finished cleanly");
+            l.Close();
+        },
+    };
+    return;
+}
+
+test wss_echo_text_binary_close {
+    Fiber<unit> scenario = spawn EchoScenario();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}
+
+// A client that trusts only the other root must fail with a typed Tls error and the
+// server must see a failed handshake.
+unit UntrustedScenario() {
+    match TcpListener.Bind(Loopback4(0_i64), 4_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => {
+            TcpListener l = listener;
+            i64[] result = [0_i64];
+            Fiber<unit> server = spawn (() => EchoOnce(l, result));
+            match WsConnection.Open(Url(l, "localhost"), TrustOf(OtherRootDer())) {
+                Result::Ok(_) => { Assert.Fail("untrusted root must not connect"); },
+                Result::Error(e) => { Assert.Equal<i64>(WsErrors.Code(e), 15_i64, "typed Tls error"); },
+            };
+            server.Join();
+            Assert.True(result[0] >= 100_i64, "server handshake failed");
+            l.Close();
+        },
+    };
+    return;
+}
+
+test wss_untrusted_root_fails {
+    Fiber<unit> scenario = spawn UntrustedScenario();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}
+
+// Test fixtures generated with openssl (see tests/interop/certs). Test-only keys.
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] RootCertDer() {
+    string s = "3082019b30820141a00302010202143cc5b42faaa832daa7def808045536bbb6ddf944300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a301b3119301706035504030c104265736b6964205465737420526f6f743059301306072a8648ce3d020106082a8648ce3d030107034200048f4684a2e70c8677b376730c494a3546e98fb943810d320fcfffa26392a5110bc6e1f045"
+        + "ac328a4017509ec27c8201c8e65d18f99bafb9e40ef52c7821d5d50aa3633061301d0603551d0e0416041446dda763d1978ccc27a6f76bd7519ff9619f4eb7301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300f0603"
+        + "551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d040302034800304502200c22ab56867a1fda253fb2c517682802dd87d91a6f152a0fd8ff2c4572d11bb2022100e8f98b28d498dfc5f8aae457d71cd4f433"
+        + "94ab8ac6d6ca6d526e21bc35bd1e7a"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] OtherRootDer() {
+    string s = "3082019d30820143a003020102021422b448412db580482e90edb7c50dcdc35797077a300a06082a8648ce3d040302301c311a301806035504030c114265736b6964204f7468657220526f6f74301e170d3236313030353132343733385a170d33363130"
+        + "30323132343733385a301c311a301806035504030c114265736b6964204f7468657220526f6f743059301306072a8648ce3d020106082a8648ce3d03010703420004c67185df52c09306465e9498801541d5f92e7e28549f8663af21b5a31a4c0f1f49ca"
+        + "f5871f196a8fdde8c397df47df3a6482ee8a1ed203338906c625d601dc81a3633061301d0603551d0e041604145894b5a440564b4682c08196da0b47ff40569b5a301f0603551d230418301680145894b5a440564b4682c08196da0b47ff40569b5a300f"
+        + "0603551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d0403020348003045022011276a9734d15db15ee2adcf0bf128606a2566644b64bf3afacd8ae38d7cee58022100fcaaf51e97c30943c53aef2a2b4b31"
+        + "0b3ddb7e3e657a08cce286269c085c2ed4"
+        ;
+    return Hex.Of(s);
+}

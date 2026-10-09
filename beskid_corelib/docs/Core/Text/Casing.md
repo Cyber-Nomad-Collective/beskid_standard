@@ -7,14 +7,11 @@
 | Function | Signature | Behavior |
 |----------|-----------|----------|
 | `SnakeToPascal` | `string SnakeToPascal(string snake)` | `lower_run` → `LowerRun`. Underscores mark word boundaries. |
-| `PascalToSnake` | `string PascalToSnake(string pascal)` | `LowerRun` → `lower_run`. Uppercase letters become `_lower`. |
+| `ToSnake` | `string ToSnake(string text)` | `LowerRun` or `lowerRun` → `lower_run`. Each uppercase letter after the first character starts a new word. |
 | `SnakeToCamel` | `string SnakeToCamel(string snake)` | `lower_run` → `lowerRun`. Same as Pascal but lowercases the first character. |
-| `CamelToSnake` | `string CamelToSnake(string camel)` | `lowerRun` → `lower_run`. Uppercase letters become `_lower`. |
 | `CallableFromSnake` | `string CallableFromSnake(string snake, string prefix)` | `lower_run` with prefix `Parse` → `ParseLowerRun`. |
-| `IsAsciiLower` | `bool IsAsciiLower(u8 b)` | Checks ASCII `a`–`z`. |
-| `IsAsciiUpper` | `bool IsAsciiUpper(u8 b)` | Checks ASCII `A`–`Z`. |
-| `IsAsciiDigit` | `bool IsAsciiDigit(u8 b)` | Checks ASCII `0`–`9`. |
-| `IsSnakePartChar` | `bool IsSnakePartChar(u8 b, bool first)` | Validates a character for snake_case identifiers. |
+
+Byte classes (`IsUpper`, `IsLower`, `IsDigit`, `IsIdentifierByte`, and others) live in `Core.String.Ascii`.
 
 ## Conversion examples
 
@@ -22,13 +19,13 @@
 Casing.SnakeToPascal("parse_lower_run");
 // → "ParseLowerRun"
 
-Casing.PascalToSnake("ParseLowerRun");
+Casing.ToSnake("ParseLowerRun");
 // → "parse_lower_run"
 
 Casing.SnakeToCamel("parse_lower_run");
 // → "parseLowerRun"
 
-Casing.CamelToSnake("parseLowerRun");
+Casing.ToSnake("parseLowerRun");
 // → "parse_lower_run"
 
 Casing.CallableFromSnake("lower_run", "Parse");
@@ -48,12 +45,11 @@ string getter = Casing.CallableFromSnake(fieldName, "Get");
 **Validating identifier parts:**
 
 ```beskid
-bool validStart = Casing.IsSnakePartChar(byte, true);
-bool validBody = Casing.IsSnakePartChar(byte, false);
+bool validStart = Ascii.IsIdentifierByte(byte, true);
+bool validBody = Ascii.IsIdentifierByte(byte, false);
 ```
 
 ## Gotchas
 
-- ASCII-only. Non-ASCII characters pass through unmodified in `SnakeToPascal`/`PascalToSnake` — uppercase conversion relies on `b - 32` for `a`–`z` range only.
-- `CamelToSnake` and `PascalToSnake` have identical logic today (both split on uppercase). Use the one that matches your semantic intent.
+- ASCII-only. Bytes above 127 are dropped, because each output character goes through `String.CodeUnitChar`, which has no one-byte form for them.
 - Consecutive underscores in `SnakeToPascal` cause consecutive uppercase flips (each `_` sets `upperNext = true`), which may produce unexpected results for `__double_underscore` input.

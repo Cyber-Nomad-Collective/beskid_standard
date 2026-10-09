@@ -1,6 +1,7 @@
 /// Unordered set backed by a linear typed-array scan.
 /// @tier(supported)
 use Core.Collections.Array;
+use Core.Collections.Storage;
 
 pub type Set<T> {
     T[] storage,
@@ -27,10 +28,9 @@ pub type Set<T> {
 
     pub Set<T> Add(T value) {
         if Contains(value) {
-            return self;
+            return this;
         }
-        mut T[] nextStorage = storage;
-        Array.Append<T>(nextStorage, value);
+        T[] nextStorage = Storage.AppendAt<T>(storage, count, value);
         return Set<T> { storage: nextStorage, count: count + 1 };
     }
 
@@ -38,27 +38,16 @@ pub type Set<T> {
         mut i64 index = 0;
         while index < count {
             if Array.Get<T>(storage, index) == value {
-                mut i64 shift = index;
-                while shift + 1 < count {
-                    Array.Set<T>(storage, shift, Array.Get<T>(storage, shift + 1));
-                    shift = shift + 1;
-                }
-                return Set<T> { storage: Array.RemoveLast<T>(storage), count: count - 1 };
+                return Set<T> { storage: Storage.CopyWithout<T>(storage, count, index), count: count - 1 };
             }
             index = index + 1;
         }
-        return self;
+        return this;
     }
 
     /// Copies the members into a new array in insertion order.
     pub T[] ToArray() {
-        mut T[] copy = Array.Empty<T>();
-        mut i64 index = 0;
-        while index < this.count {
-            copy = Array.Append<T>(copy, Array.Get<T>(this.storage, index));
-            index = index + 1;
-        }
-        return copy;
+        return Storage.CopyRange<T>(this.storage, 0, this.count);
     }
 
     /// Members of this set followed by members of `other` that are not already present.
@@ -72,7 +61,7 @@ pub type Set<T> {
         mut i64 total = this.count;
         index = 0;
         while index < other.count {
-            if !ContainsIn<T>(this.storage, this.count, Array.Get<T>(other.storage, index)) {
+            if Storage.IndexOf<T>(this.storage, this.count, Array.Get<T>(other.storage, index)) < 0 {
                 merged = Array.Append<T>(merged, Array.Get<T>(other.storage, index));
                 total = total + 1;
             }
@@ -87,7 +76,7 @@ pub type Set<T> {
         mut i64 total = 0;
         mut i64 index = 0;
         while index < this.count {
-            if ContainsIn<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) {
+            if Storage.IndexOf<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) >= 0 {
                 kept = Array.Append<T>(kept, Array.Get<T>(this.storage, index));
                 total = total + 1;
             }
@@ -102,7 +91,7 @@ pub type Set<T> {
         mut i64 total = 0;
         mut i64 index = 0;
         while index < this.count {
-            if !ContainsIn<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) {
+            if Storage.IndexOf<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) < 0 {
                 kept = Array.Append<T>(kept, Array.Get<T>(this.storage, index));
                 total = total + 1;
             }
@@ -115,24 +104,13 @@ pub type Set<T> {
     pub bool IsSubsetOf(Set<T> other) {
         mut i64 index = 0;
         while index < this.count {
-            if !ContainsIn<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) {
+            if Storage.IndexOf<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) < 0 {
                 return false;
             }
             index = index + 1;
         }
         return true;
     }
-}
-
-bool ContainsIn<T>(T[] storage, i64 count, T value) {
-    mut i64 index = 0;
-    while index < count {
-        if Array.Get<T>(storage, index) == value {
-            return true;
-        }
-        index = index + 1;
-    }
-    return false;
 }
 
 pub Set<T> New<T>() {
@@ -145,7 +123,7 @@ pub Set<T> FromArray<T>(T[] values) {
     mut i64 total = 0;
     mut i64 index = 0;
     while index < Array.Len<T>(values) {
-        if !ContainsIn<T>(members, total, Array.Get<T>(values, index)) {
+        if Storage.IndexOf<T>(members, total, Array.Get<T>(values, index)) < 0 {
             members = Array.Append<T>(members, Array.Get<T>(values, index));
             total = total + 1;
         }

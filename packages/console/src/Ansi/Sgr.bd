@@ -2,6 +2,7 @@
 use Ansi.Escape;
 use Console.Capabilities;
 use Console.Capabilities.ColorModel;
+use Core.Math;
 
 pub type SgrBuilder {
     string openArgs,
@@ -81,71 +82,189 @@ pub string ApplyTo(SgrBuilder self, string text) {
     return "${prefix}${text}${reset}";
 }
 
+/// SGR foreground arguments for an RGB color under the probed stdout color model.
 pub string ForegroundColorArgs(i64 r, i64 g, i64 b) {
     Capabilities caps = Capabilities.ProbeStdout();
-    ColorModel model = Capabilities.EffectiveColorModel(caps);
-    return match model {
-        ColorModel::TrueColor => "38;2;${r};${g};${b}",
-        ColorModel::Indexed256 => "38;5;${RgbTo256Index(r, g, b)}",
-        _ => "${RgbToBasicForeground(r, g, b)}",
-    };
+    return ForegroundArgsFor(Capabilities.EffectiveColorModel(caps), r, g, b);
 }
 
+/// SGR background arguments for an RGB color under the probed stdout color model.
 pub string BackgroundColorArgs(i64 r, i64 g, i64 b) {
     Capabilities caps = Capabilities.ProbeStdout();
-    ColorModel model = Capabilities.EffectiveColorModel(caps);
+    return BackgroundArgsFor(Capabilities.EffectiveColorModel(caps), r, g, b);
+}
+
+/// SGR foreground arguments for `model`: `38;2;r;g;b`, `38;5;n`, or the nearest of the 16 or 8
+/// basic colors (`30`-`37`, `90`-`97`). Channels are clamped to `0..=255`.
+pub string ForegroundArgsFor(ColorModel model, i64 r, i64 g, i64 b) {
+    i64 cr = Math.Clamp(r, 0, 255);
+    i64 cg = Math.Clamp(g, 0, 255);
+    i64 cb = Math.Clamp(b, 0, 255);
     return match model {
-        ColorModel::TrueColor => "48;2;${r};${g};${b}",
-        ColorModel::Indexed256 => "48;5;${RgbTo256Index(r, g, b)}",
-        _ => "${RgbToBasicBackground(r, g, b)}",
+        ColorModel::TrueColor => "38;2;${cr};${cg};${cb}",
+        ColorModel::Indexed256 => "38;5;${RgbTo256Index(cr, cg, cb)}",
+        ColorModel::Basic16 => "${RgbToBasicForeground(cr, cg, cb)}",
+        ColorModel::Basic8 => "${30 + NearestBasicIndex(cr, cg, cb, 8)}",
     };
 }
 
-pub i64 RgbTo256Index(i64 r, i64 g, i64 b) {
-    i64 ri = ClampChannelBucket(r);
-    i64 gi = ClampChannelBucket(g);
-    i64 bi = ClampChannelBucket(b);
-    if ri == gi && gi == bi {
-        if ri < 8 {
-            return 16;
-        }
-        if ri > 248 {
-            return 231;
-        }
-        return 232 + ri / 10;
-    }
-    return 16 + 36 * ri + 6 * gi + bi;
+/// SGR background arguments for `model`, mirroring `ForegroundArgsFor` (`48;...`, `40`-`47`,
+/// `100`-`107`).
+pub string BackgroundArgsFor(ColorModel model, i64 r, i64 g, i64 b) {
+    i64 cr = Math.Clamp(r, 0, 255);
+    i64 cg = Math.Clamp(g, 0, 255);
+    i64 cb = Math.Clamp(b, 0, 255);
+    return match model {
+        ColorModel::TrueColor => "48;2;${cr};${cg};${cb}",
+        ColorModel::Indexed256 => "48;5;${RgbTo256Index(cr, cg, cb)}",
+        ColorModel::Basic16 => "${RgbToBasicBackground(cr, cg, cb)}",
+        ColorModel::Basic8 => "${40 + NearestBasicIndex(cr, cg, cb, 8)}",
+    };
 }
 
-pub i64 RgbToBasicForeground(i64 r, i64 g, i64 b) {
-    i64 index = DominantChannelIndex(r, g, b);
-    return 30 + index;
-}
-
-pub i64 RgbToBasicBackground(i64 r, i64 g, i64 b) {
-    i64 index = DominantChannelIndex(r, g, b);
-    return 40 + index;
-}
-
-pub i64 ClampChannelBucket(i64 channel) {
-    if channel < 0 {
+/// The xterm 6x6x6 cube level index (`0..=5`) nearest to `channel`; levels are
+/// 0, 95, 135, 175, 215, 255.
+pub i64 CubeLevel(i64 channel) {
+    i64 c = Math.Clamp(channel, 0, 255);
+    if c < 48 {
         return 0;
     }
-    if channel > 255 {
-        return 5;
-    }
-    return channel / 51;
-}
-
-pub i64 DominantChannelIndex(i64 r, i64 g, i64 b) {
-    if r >= g && r >= b {
+    if c < 115 {
         return 1;
     }
-    if g >= r && g >= b {
-        return 2;
+    return (c - 35) / 40;
+}
+
+i64 CubeValue(i64 level) {
+    if level == 0 {
+        return 0;
     }
-    if b >= r && b >= g {
-        return 4;
+    return 55 + level * 40;
+}
+
+i64 DistanceSquared(i64 r1, i64 g1, i64 b1, i64 r2, i64 g2, i64 b2) {
+    i64 dr = r1 - r2;
+    i64 dg = g1 - g2;
+    i64 db = b1 - b2;
+    return dr * dr + dg * dg + db * db;
+}
+
+/// Nearest xterm 256-color index: the closer of the 6x6x6 cube color (16-231) and the 24-step
+/// gray ramp (232-255, values 8, 18, ..., 238).
+pub i64 RgbTo256Index(i64 r, i64 g, i64 b) {
+    i64 cr = Math.Clamp(r, 0, 255);
+    i64 cg = Math.Clamp(g, 0, 255);
+    i64 cb = Math.Clamp(b, 0, 255);
+    i64 lr = CubeLevel(cr);
+    i64 lg = CubeLevel(cg);
+    i64 lb = CubeLevel(cb);
+    i64 cubeIndex = 16 + 36 * lr + 6 * lg + lb;
+    i64 cubeDistance = DistanceSquared(cr, cg, cb, CubeValue(lr), CubeValue(lg), CubeValue(lb));
+    i64 average = (cr + cg + cb) / 3;
+    mut i64 grayStep = (average - 3) / 10;
+    if average < 3 {
+        grayStep = 0;
     }
-    return 7;
+    if grayStep > 23 {
+        grayStep = 23;
+    }
+    i64 grayValue = 8 + grayStep * 10;
+    i64 grayDistance = DistanceSquared(cr, cg, cb, grayValue, grayValue, grayValue);
+    if grayDistance < cubeDistance {
+        return 232 + grayStep;
+    }
+    return cubeIndex;
+}
+
+/// Red channel of the xterm default palette entry `index` (`0..=15`).
+i64 PaletteRed(i64 index) {
+    if index == 1 || index == 3 || index == 5 {
+        return 205;
+    }
+    if index == 7 {
+        return 229;
+    }
+    if index == 8 {
+        return 127;
+    }
+    if index == 12 {
+        return 92;
+    }
+    if index == 9 || index == 11 || index == 13 || index == 15 {
+        return 255;
+    }
+    return 0;
+}
+
+i64 PaletteGreen(i64 index) {
+    if index == 2 || index == 3 || index == 6 {
+        return 205;
+    }
+    if index == 7 {
+        return 229;
+    }
+    if index == 8 {
+        return 127;
+    }
+    if index == 12 {
+        return 92;
+    }
+    if index == 10 || index == 11 || index == 14 || index == 15 {
+        return 255;
+    }
+    return 0;
+}
+
+i64 PaletteBlue(i64 index) {
+    if index == 4 {
+        return 238;
+    }
+    if index == 5 || index == 6 {
+        return 205;
+    }
+    if index == 7 {
+        return 229;
+    }
+    if index == 8 {
+        return 127;
+    }
+    if index == 12 || index == 13 || index == 14 || index == 15 {
+        return 255;
+    }
+    return 0;
+}
+
+/// Index (`0..count`) of the xterm default palette color nearest to `(r, g, b)`, searching the
+/// first `count` entries (8 for the basic colors, 16 including the bright ones).
+pub i64 NearestBasicIndex(i64 r, i64 g, i64 b, i64 count) {
+    mut i64 best = 0;
+    mut i64 bestDistance = DistanceSquared(r, g, b, PaletteRed(0), PaletteGreen(0), PaletteBlue(0));
+    mut i64 index = 1;
+    while index < count {
+        i64 distance = DistanceSquared(r, g, b, PaletteRed(index), PaletteGreen(index), PaletteBlue(index));
+        if distance < bestDistance {
+            best = index;
+            bestDistance = distance;
+        }
+        index = index + 1;
+    }
+    return best;
+}
+
+/// Nearest 16-color foreground code: `30`-`37`, or `90`-`97` for bright colors.
+pub i64 RgbToBasicForeground(i64 r, i64 g, i64 b) {
+    i64 index = NearestBasicIndex(Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(b, 0, 255), 16);
+    if index < 8 {
+        return 30 + index;
+    }
+    return 90 + index - 8;
+}
+
+/// Nearest 16-color background code: `40`-`47`, or `100`-`107` for bright colors.
+pub i64 RgbToBasicBackground(i64 r, i64 g, i64 b) {
+    i64 index = NearestBasicIndex(Math.Clamp(r, 0, 255), Math.Clamp(g, 0, 255), Math.Clamp(b, 0, 255), 16);
+    if index < 8 {
+        return 40 + index;
+    }
+    return 100 + index - 8;
 }

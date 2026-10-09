@@ -1,0 +1,125 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Codec.Hex;
+use Http2.Hpack;
+use Http3.QpackDecoder;
+use Http3.QpackEncoder;
+use Http3.QpackTable;
+use Http3.QpackWire;
+
+// RFC 9204 Appendix B, byte-exact.
+
+unit ExpectHex(u8[] actual, string expected, string because) {
+    Assert.Equal<string>(Hex.Encode(actual), expected, because);
+    return;
+}
+
+unit ExpectField(HeaderField[] fields, i64 index, string name, string value) {
+    HeaderField field = Array.Get<HeaderField>(fields, index);
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)), "name of " + name);
+    Assert.True(Hpack.BytesEqual(field.value, Convert.StringToBytes(value)), "value of " + name);
+    return;
+}
+
+QpackPolicy Plain(bool dynamic, i64 capacity) { return QpackPolicy { dynamic: dynamic, huffman: false, capacity: capacity }; }
+
+test qpack_b1_literal_with_name_reference {
+    mut QDecoder d = QpackDecoder.New(220_i64, 1_i64);
+    SectionResult r = QpackDecoder.DecodeSection(d, 0_i64, Hex.Of("0000510b2f696e6465782e68746d6c"));
+    Assert.Equal<i64>(r.status, QpackDecoder.Decoded(), "decoded");
+    Assert.Equal<i64>(Array.Len<HeaderField>(r.fields), 1_i64, "one field");
+    ExpectField(r.fields, 0_i64, ":path", "/index.html");
+    ExpectHex(QpackDecoder.TakeOutput(d), "", "no decoder instruction");
+    mut QEncoder e = QpackEncoder.New(Plain(false, 0_i64));
+    mut HeaderField[] fields = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(fields, Hpack.Field(":path", "/index.html"));
+    ExpectHex(QpackEncoder.EncodeSection(e, 0_i64, fields), "0000510b2f696e6465782e68746d6c", "encoder output");
+}
+
+test qpack_b2_to_b5_decoder {
+    mut QDecoder d = QpackDecoder.New(220_i64, 1_i64);
+    // B.2
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468")), 0_i64, "b2 encoder stream");
+    Assert.Equal<i64>(d.table.size, 106_i64, "b2 size");
+    SectionResult s4 = QpackDecoder.DecodeSection(d, 4_i64, Hex.Of("03811011"));
+    Assert.Equal<i64>(s4.status, QpackDecoder.Decoded(), "b2 decoded");
+    ExpectField(s4.fields, 0_i64, ":authority", "www.example.com");
+    ExpectField(s4.fields, 1_i64, ":path", "/sample/path");
+    QpackDecoder.FlushInsertCount(d);
+    ExpectHex(QpackDecoder.TakeOutput(d), "84", "b2 section ack");
+    // B.3
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("4a637573746f6d2d6b65790c637573746f6d2d76616c7565")), 0_i64, "b3 encoder stream");
+    Assert.Equal<i64>(d.table.size, 160_i64, "b3 size");
+    QpackDecoder.FlushInsertCount(d);
+    ExpectHex(QpackDecoder.TakeOutput(d), "01", "b3 insert count increment");
+    // B.4: the section arrives before the Duplicate and blocks, then is cancelled.
+    SectionResult s8 = QpackDecoder.DecodeSection(d, 8_i64, Hex.Of("050080c181"));
+    Assert.Equal<i64>(s8.status, QpackDecoder.Blocked(), "b4 blocked");
+    Assert.Equal<i64>(QpackDecoder.BlockedCount(d), 1_i64, "b4 one blocked");
+    QpackDecoder.CancelStream(d, 8_i64, true);
+    ExpectHex(QpackDecoder.TakeOutput(d), "48", "b4 stream cancellation");
+    Assert.Equal<i64>(QpackDecoder.BlockedCount(d), 0_i64, "b4 unblocked");
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("02")), 0_i64, "b4 duplicate");
+    Assert.Equal<i64>(d.table.size, 217_i64, "b4 size");
+    SectionResult again = QpackDecoder.DecodeSection(d, 8_i64, Hex.Of("050080c181"));
+    Assert.Equal<i64>(again.status, QpackDecoder.Decoded(), "b4 decodes once unblocked");
+    ExpectField(again.fields, 0_i64, ":authority", "www.example.com");
+    ExpectField(again.fields, 1_i64, ":path", "/");
+    ExpectField(again.fields, 2_i64, "custom-key", "custom-value");
+    // B.5
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("810d637573746f6d2d76616c756532")), 0_i64, "b5 encoder stream");
+    Assert.Equal<i64>(d.table.size, 215_i64, "b5 size");
+    Assert.Equal<i64>(QpackTable.Dropped(d.table), 1_i64, "b5 evicted entry 0");
+    Assert.Equal<i64>(QpackTable.InsertCount(d.table), 5_i64, "b5 insert count");
+    HeaderField newest = QpackTable.Get(d.table, 4_i64);
+    Assert.True(Hpack.BytesEqual(newest.value, Convert.StringToBytes("custom-value2")), "b5 entry 4");
+}
+
+test qpack_b_instruction_encoding {
+    QEncoder e = QpackEncoder.New(Plain(false, 0_i64));
+    mut u8[] enc = QpackWire.SetCapacity(Hex.Of(""), 220_i64);
+    enc = QpackWire.InsertWithNameRef(e.huffman, enc, true, 0_i64, Convert.StringToBytes("www.example.com"), false);
+    enc = QpackWire.InsertWithNameRef(e.huffman, enc, true, 1_i64, Convert.StringToBytes("/sample/path"), false);
+    ExpectHex(enc, "3fbd01c00f7777772e6578616d706c652e636f6dc10c2f73616d706c652f70617468", "b2 encoder stream");
+    ExpectHex(QpackWire.InsertWithLiteralName(e.huffman, Hex.Of(""), Convert.StringToBytes("custom-key"), Convert.StringToBytes("custom-value"), false),
+        "4a637573746f6d2d6b65790c637573746f6d2d76616c7565", "b3 insert with literal name");
+    ExpectHex(QpackWire.Duplicate(Hex.Of(""), 2_i64), "02", "b4 duplicate");
+    ExpectHex(QpackWire.InsertWithNameRef(e.huffman, Hex.Of(""), false, 1_i64, Convert.StringToBytes("custom-value2"), false), "810d637573746f6d2d76616c756532", "b5 insert");
+    ExpectHex(QpackWire.SectionAck(Hex.Of(""), 4_i64), "84", "section ack");
+    ExpectHex(QpackWire.InsertCountIncrement(Hex.Of(""), 1_i64), "01", "increment");
+    ExpectHex(QpackWire.StreamCancel(Hex.Of(""), 8_i64), "48", "cancel");
+    ExpectHex(QpackWire.WritePrefix(Hex.Of(""), 2_i64, 0_i64, 6_i64), "0381", "b2 prefix");
+    ExpectHex(QpackWire.WritePrefix(Hex.Of(""), 4_i64, 4_i64, 6_i64), "0500", "b4 prefix");
+    Assert.Equal<i64>(QpackWire.DecodeInsertCount(3_i64, 6_i64, 2_i64), 2_i64, "b2 required insert count");
+    Assert.Equal<i64>(QpackWire.DecodeInsertCount(5_i64, 6_i64, 3_i64), 4_i64, "b4 required insert count");
+    // Wrap: 13 inserts so far, encoded 3 means 14 (MaxEntries 6, FullRange 12).
+    Assert.Equal<i64>(QpackWire.DecodeInsertCount(3_i64, 6_i64, 13_i64), 14_i64, "wrapped count");
+    Assert.Equal<i64>(QpackWire.EncodeInsertCount(14_i64, 6_i64), 3_i64, "wrapped encode");
+}
+
+test qpack_encoder_decoder_dynamic_round_trip {
+    mut QEncoder e = QpackEncoder.New(Plain(true, 220_i64));
+    mut QDecoder d = QpackDecoder.New(220_i64, 0_i64);
+    QpackEncoder.ApplyPeerSettings(e, 220_i64, 0_i64);
+    mut HeaderField[] fields = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(fields, Hpack.Field(":authority", "www.example.com"));
+    Array.Append<HeaderField>(fields, Hpack.Field(":path", "/"));
+    u8[] first = QpackEncoder.EncodeSection(e, 0_i64, fields);
+    ExpectHex(first, "0000500f7777772e6578616d706c652e636f6dc1", "first section uses literals");
+    ExpectHex(QpackEncoder.TakeOutput(e), "3fbd01c00f7777772e6578616d706c652e636f6d", "capacity and insert");
+    Assert.Equal<i64>(QpackDecoder.OnEncoderStream(d, Hex.Of("3fbd01c00f7777772e6578616d706c652e636f6d")), 0_i64, "decoder applies inserts");
+    SectionResult r1 = QpackDecoder.DecodeSection(d, 0_i64, first);
+    Assert.Equal<i64>(r1.status, QpackDecoder.Decoded(), "first decoded");
+    QpackDecoder.FlushInsertCount(d);
+    Assert.Equal<i64>(QpackEncoder.OnDecoderStream(e, QpackDecoder.TakeOutput(d)), 0_i64, "increment accepted");
+    Assert.Equal<i64>(QpackEncoder.KnownReceived(e), 1_i64, "known received");
+    u8[] second = QpackEncoder.EncodeSection(e, 4_i64, fields);
+    ExpectHex(second, "020080c1", "second section indexes the dynamic entry");
+    Assert.Equal<i64>(QpackEncoder.Outstanding(e), 1_i64, "outstanding section");
+    SectionResult r2 = QpackDecoder.DecodeSection(d, 4_i64, second);
+    Assert.Equal<i64>(r2.status, QpackDecoder.Decoded(), "second decoded");
+    ExpectField(r2.fields, 0_i64, ":authority", "www.example.com");
+    Assert.Equal<i64>(QpackEncoder.OnDecoderStream(e, QpackDecoder.TakeOutput(d)), 0_i64, "ack accepted");
+    Assert.Equal<i64>(QpackEncoder.Outstanding(e), 0_i64, "acknowledged");
+}

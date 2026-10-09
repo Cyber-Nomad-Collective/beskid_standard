@@ -1,0 +1,871 @@
+/// Core.Text.Toml — TOML 1.0 documents parsed into a `TomlValue` tree.
+/// @tier(supported)
+/// Supported: comments; bare, quoted, and dotted keys; `[table]` and `[[array.of.tables]]`
+/// headers; basic, literal, and multi-line strings with every escape (`\uXXXX`, `\UXXXXXXXX`,
+/// line-ending backslashes); integers with `_` separators and `0x`/`0o`/`0b` prefixes;
+/// floats including `inf` and `nan`; booleans; dates and times (validated loosely and kept as
+/// text); multi-line arrays with trailing commas; and inline tables. Duplicate keys and table
+/// redefinitions are errors. Tables keep keys in document order.
+use Core.Collections.Array;
+use Core.Collections.Storage;
+use Core.Encoding.Utf8;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String.Ascii;
+use Core.String;
+use Core.Text.Number;
+
+/// A TOML value. Tables hold parallel key and value arrays in document order.
+pub enum TomlValue {
+    Text(string value),
+    Integer(i64 value),
+    Float(f64 value),
+    Bool(bool value),
+    DateTime(string value),
+    List(TomlValue[] items),
+    Table(string[] keys, TomlValue[] values),
+}
+
+/// Parse failures with the byte offset where parsing stopped.
+pub enum TomlError {
+    UnexpectedCharacter(i64 offset),
+    UnexpectedEnd(i64 offset),
+    UnterminatedString(i64 offset),
+    InvalidEscape(i64 offset),
+    InvalidNumber(i64 offset),
+    DuplicateKey(i64 offset),
+    InvalidTable(i64 offset),
+}
+
+pub type ValueStep {
+    TomlValue value,
+    i64 next,
+}
+
+pub type KeyStep {
+    string[] path,
+    i64 next,
+}
+
+pub type TextStep {
+    string text,
+    i64 next,
+}
+
+/// An empty table.
+pub TomlValue EmptyTable() {
+    return TomlValue::Table(Array.Empty<string>(), Array.Empty<TomlValue>());
+}
+
+// ---------------------------------------------------------------------------------------------
+// Lexical helpers
+// ---------------------------------------------------------------------------------------------
+
+i64 SkipSpaces(string text, i64 at) {
+    i64 len = String.Len(text);
+    mut i64 i = at;
+    while i < len && (String.ByteAt(text, i) == 32 || String.ByteAt(text, i) == 9) {
+        i = i + 1;
+    }
+    return i;
+}
+
+/// Skips spaces, tabs, line breaks, and comments (inside arrays).
+i64 SkipBlank(string text, i64 at) {
+    i64 len = String.Len(text);
+    mut i64 i = at;
+    while i < len {
+        u8 b = String.ByteAt(text, i);
+        if Ascii.IsWhitespace(b) {
+            i = i + 1;
+            continue;
+        }
+        if b == 35 {
+            while i < len && String.ByteAt(text, i) != 10 {
+                i = i + 1;
+            }
+            continue;
+        }
+        break;
+    }
+    return i;
+}
+
+/// After a value or header: optional spaces and comment, then a line break or the end.
+Result<i64, TomlError> EndOfLine(string text, i64 at) {
+    i64 len = String.Len(text);
+    mut i64 i = SkipSpaces(text, at);
+    if i < len && String.ByteAt(text, i) == 35 {
+        while i < len && String.ByteAt(text, i) != 10 {
+            i = i + 1;
+        }
+    }
+    if i >= len {
+        return Result<i64, TomlError>::Ok(i);
+    }
+    if String.ByteAt(text, i) == 13 && i + 1 < len && String.ByteAt(text, i + 1) == 10 {
+        return Result<i64, TomlError>::Ok(i + 2);
+    }
+    if String.ByteAt(text, i) == 10 {
+        return Result<i64, TomlError>::Ok(i + 1);
+    }
+    return Result<i64, TomlError>::Error(TomlError::UnexpectedCharacter(i));
+}
+
+bool IsBareKeyByte(u8 b) {
+    return Ascii.IsAlphanumeric(b) || b == 95 || b == 45;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Strings
+// ---------------------------------------------------------------------------------------------
+
+/// Basic string (`"..."`) or multi-line basic string (`"""..."""`) starting at `at`.
+Result<TextStep, TomlError> BasicString(string text, i64 at) {
+    i64 len = String.Len(text);
+    bool multi = String.StartsWithAt(text, at, "\"\"\"");
+    mut i64 i = at + 1;
+    if multi {
+        i = at + 3;
+        // A line break right after the opening delimiter is trimmed.
+        if String.StartsWithAt(text, i, String.FromAscii(13) + String.Newline()) {
+            i = i + 2;
+        } else {
+            if i < len && String.ByteAt(text, i) == 10 {
+                i = i + 1;
+            }
+        }
+    }
+    mut u8[] bytes = Array.Empty<u8>();
+    while i < len {
+        u8 b = String.ByteAt(text, i);
+        if b == 34 {
+            if !multi {
+                return Result<TextStep, TomlError>::Ok(TextStep { text: String.FromUtf8CodeUnits(bytes), next: i + 1 });
+            }
+            if String.StartsWithAt(text, i, "\"\"\"") {
+                // Up to two extra quotes may close the string ("""a"""" is `a"`).
+                mut i64 end = i + 3;
+                mut i64 extra = 0;
+                while extra < 2 && end < len && String.ByteAt(text, end) == 34 {
+                    bytes = Array.Append<u8>(bytes, u8(34));
+                    end = end + 1;
+                    extra = extra + 1;
+                }
+                return Result<TextStep, TomlError>::Ok(TextStep { text: String.FromUtf8CodeUnits(bytes), next: end });
+            }
+            bytes = Array.Append<u8>(bytes, b);
+            i = i + 1;
+            continue;
+        }
+        if b == 10 && !multi {
+            return Result<TextStep, TomlError>::Error(TomlError::UnterminatedString(at));
+        }
+        if b != 92 {
+            bytes = Array.Append<u8>(bytes, b);
+            i = i + 1;
+            continue;
+        }
+        if i + 1 >= len {
+            return Result<TextStep, TomlError>::Error(TomlError::UnterminatedString(at));
+        }
+        u8 e = String.ByteAt(text, i + 1);
+        if multi && (e == 10 || e == 13 || e == 32 || e == 9) {
+            // Line-ending backslash: skip whitespace and line breaks up to the next content.
+            mut i64 j = i + 1;
+            while j < len && (String.ByteAt(text, j) == 32 || String.ByteAt(text, j) == 9) {
+                j = j + 1;
+            }
+            if j < len && (String.ByteAt(text, j) == 10 || String.ByteAt(text, j) == 13) {
+                while j < len && (String.ByteAt(text, j) == 32 || String.ByteAt(text, j) == 9 || String.ByteAt(text, j) == 10 || String.ByteAt(text, j) == 13) {
+                    j = j + 1;
+                }
+                i = j;
+                continue;
+            }
+            return Result<TextStep, TomlError>::Error(TomlError::InvalidEscape(i));
+        }
+        mut i64 simple = -1;
+        if e == 34 || e == 92 {
+            simple = i64(e);
+        }
+        if e == 98 {
+            simple = 8;
+        }
+        if e == 116 {
+            simple = 9;
+        }
+        if e == 110 {
+            simple = 10;
+        }
+        if e == 102 {
+            simple = 12;
+        }
+        if e == 114 {
+            simple = 13;
+        }
+        if simple >= 0 {
+            bytes = Array.Append<u8>(bytes, u8(simple));
+            i = i + 2;
+            continue;
+        }
+        mut i64 digits = 0;
+        if e == 117 {
+            digits = 4;
+        }
+        if e == 85 {
+            digits = 8;
+        }
+        if digits == 0 || i + 2 + digits > len {
+            return Result<TextStep, TomlError>::Error(TomlError::InvalidEscape(i));
+        }
+        i64 cp = Number.DigitsAt(text, i + 2, digits, 16);
+        if cp < 0 || cp > 1114111 || (cp >= 55296 && cp <= 57343) {
+            return Result<TextStep, TomlError>::Error(TomlError::InvalidEscape(i));
+        }
+        bytes = Utf8.AppendCodePoint(bytes, cp);
+        i = i + 2 + digits;
+    }
+    return Result<TextStep, TomlError>::Error(TomlError::UnterminatedString(at));
+}
+
+/// Literal string (`'...'`) or multi-line literal string (`'''...'''`) starting at `at`.
+Result<TextStep, TomlError> LiteralString(string text, i64 at) {
+    i64 len = String.Len(text);
+    bool multi = String.StartsWithAt(text, at, "'''");
+    if !multi {
+        mut i64 i = at + 1;
+        while i < len {
+            u8 b = String.ByteAt(text, i);
+            if b == 39 {
+                return Result<TextStep, TomlError>::Ok(TextStep { text: String.SubSlice(text, at + 1, i - at - 1), next: i + 1 });
+            }
+            if b == 10 {
+                return Result<TextStep, TomlError>::Error(TomlError::UnterminatedString(at));
+            }
+            i = i + 1;
+        }
+        return Result<TextStep, TomlError>::Error(TomlError::UnterminatedString(at));
+    }
+    mut i64 start = at + 3;
+    if String.StartsWithAt(text, start, String.FromAscii(13) + String.Newline()) {
+        start = start + 2;
+    } else {
+        if start < len && String.ByteAt(text, start) == 10 {
+            start = start + 1;
+        }
+    }
+    mut i64 i = start;
+    while i < len {
+        if String.StartsWithAt(text, i, "'''") {
+            mut i64 end = i + 3;
+            while end < len && end - i < 5 && String.ByteAt(text, end) == 39 {
+                end = end + 1;
+            }
+            return Result<TextStep, TomlError>::Ok(TextStep { text: String.SubSlice(text, start, end - 3 - start), next: end });
+        }
+        i = i + 1;
+    }
+    return Result<TextStep, TomlError>::Error(TomlError::UnterminatedString(at));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Keys
+// ---------------------------------------------------------------------------------------------
+
+Result<KeyStep, TomlError> ParseKey(string text, i64 at) {
+    i64 len = String.Len(text);
+    mut string[] path = Array.Empty<string>();
+    mut i64 i = SkipSpaces(text, at);
+    while true {
+        if i >= len {
+            return Result<KeyStep, TomlError>::Error(TomlError::UnexpectedEnd(i));
+        }
+        u8 b = String.ByteAt(text, i);
+        if b == 34 {
+            TextStep quoted = BasicString(text, i)?;
+            path = Array.Append<string>(path, quoted.text);
+            i = quoted.next;
+        } else {
+            if b == 39 {
+                TextStep literal = LiteralString(text, i)?;
+                path = Array.Append<string>(path, literal.text);
+                i = literal.next;
+            } else {
+                mut i64 end = i;
+                while end < len && IsBareKeyByte(String.ByteAt(text, end)) {
+                    end = end + 1;
+                }
+                if end == i {
+                    return Result<KeyStep, TomlError>::Error(TomlError::UnexpectedCharacter(i));
+                }
+                path = Array.Append<string>(path, String.SubSlice(text, i, end - i));
+                i = end;
+            }
+        }
+        i = SkipSpaces(text, i);
+        if i < len && String.ByteAt(text, i) == 46 {
+            i = SkipSpaces(text, i + 1);
+            continue;
+        }
+        break;
+    }
+    return Result<KeyStep, TomlError>::Ok(KeyStep { path: path, next: i });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Scalars
+// ---------------------------------------------------------------------------------------------
+
+bool IsTokenEnd(u8 b) {
+    return b == 32 || b == 9 || b == 10 || b == 13 || b == 44 || b == 93 || b == 125 || b == 35;
+}
+
+/// Removes `_` separators, which must sit between two digits.
+Option<string> StripUnderscores(string token, bool hex) {
+    i64 len = String.Len(token);
+    mut string out = "";
+    mut i64 i = 0;
+    while i < len {
+        u8 b = String.ByteAt(token, i);
+        if b == 95 {
+            if i == 0 || i + 1 >= len {
+                return Option::None;
+            }
+            u8 before = String.ByteAt(token, i - 1);
+            u8 after = String.ByteAt(token, i + 1);
+            bool beforeOk = Ascii.IsDigit(before) || (hex && Ascii.HexValue(before) >= 0);
+            bool afterOk = Ascii.IsDigit(after) || (hex && Ascii.HexValue(after) >= 0);
+            if !beforeOk || !afterOk {
+                return Option::None;
+            }
+        } else {
+            out = String.Concat(out, String.SubSlice(token, i, 1));
+        }
+        i = i + 1;
+    }
+    return Option::Some(out);
+}
+
+Result<i64, TomlError> RadixInteger(string digits, i64 radix, i64 at) {
+    i64 len = String.Len(digits);
+    if len == 0 {
+        return Result<i64, TomlError>::Error(TomlError::InvalidNumber(at));
+    }
+    i64 limit = Number.MaxI64() / radix;
+    mut i64 acc = 0;
+    mut i64 i = 0;
+    while i < len {
+        i64 d = Ascii.HexValue(String.ByteAt(digits, i));
+        if d < 0 || d >= radix || acc > limit {
+            return Result<i64, TomlError>::Error(TomlError::InvalidNumber(at));
+        }
+        acc = acc * radix + d;
+        if acc < 0 {
+            return Result<i64, TomlError>::Error(TomlError::InvalidNumber(at));
+        }
+        i = i + 1;
+    }
+    return Result<i64, TomlError>::Ok(acc);
+}
+
+bool LooksLikeDateTime(string token) {
+    i64 len = String.Len(token);
+    if len >= 10 && String.ByteAt(token, 4) == 45 && String.ByteAt(token, 7) == 45 {
+        return Ascii.IsDigit(String.ByteAt(token, 0)) && Ascii.IsDigit(String.ByteAt(token, 3)) && Ascii.IsDigit(String.ByteAt(token, 5)) && Ascii.IsDigit(String.ByteAt(token, 8));
+    }
+    return len >= 8 && String.ByteAt(token, 2) == 58 && String.ByteAt(token, 5) == 58 && Ascii.IsDigit(String.ByteAt(token, 0));
+}
+
+Result<ValueStep, TomlError> Scalar(string text, i64 at) {
+    i64 len = String.Len(text);
+    mut i64 end = at;
+    while end < len && !IsTokenEnd(String.ByteAt(text, end)) {
+        end = end + 1;
+    }
+    // A date and time may be separated by one space: `1979-05-27 07:32:00`.
+    if end - at == 10 && end + 3 < len && String.ByteAt(text, end) == 32 && Ascii.IsDigit(String.ByteAt(text, end + 1)) && String.ByteAt(text, end + 3) == 58 {
+        end = end + 1;
+        while end < len && !IsTokenEnd(String.ByteAt(text, end)) {
+            end = end + 1;
+        }
+    }
+    if end == at {
+        return Result<ValueStep, TomlError>::Error(TomlError::UnexpectedCharacter(at));
+    }
+    string token = String.SubSlice(text, at, end - at);
+    if token == "true" {
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Bool(true), next: end });
+    }
+    if token == "false" {
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Bool(false), next: end });
+    }
+    if LooksLikeDateTime(token) {
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::DateTime(token), next: end });
+    }
+    if token == "inf" || token == "+inf" || token == "-inf" || token == "nan" || token == "+nan" || token == "-nan" {
+        f64 zero = 0.0;
+        mut f64 special = zero / zero;
+        if String.EndsWith(token, "inf") {
+            special = 1.0 / zero;
+            if String.StartsWith(token, "-") {
+                special = -1.0 / zero;
+            }
+        }
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Float(special), next: end });
+    }
+    if String.StartsWith(token, "0x") || String.StartsWith(token, "0o") || String.StartsWith(token, "0b") {
+        string body = String.SubSlice(token, 2, String.Len(token) - 2);
+        mut i64 radix = 16;
+        if String.StartsWith(token, "0o") {
+            radix = 8;
+        }
+        if String.StartsWith(token, "0b") {
+            radix = 2;
+        }
+        string digits = match StripUnderscores(body, radix == 16) {
+            Option::Some(d) => d,
+            Option::None => "",
+        };
+        i64 value = RadixInteger(digits, radix, at)?;
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Integer(value), next: end });
+    }
+    string plain = match StripUnderscores(token, false) {
+        Option::Some(d) => d,
+        Option::None => "",
+    };
+    if String.Len(plain) == 0 {
+        return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
+    }
+    mut string unsigned = plain;
+    if String.StartsWith(plain, "+") || String.StartsWith(plain, "-") {
+        unsigned = String.SubSlice(plain, 1, String.Len(plain) - 1);
+    }
+    if String.Len(unsigned) > 1 && String.ByteAt(unsigned, 0) == 48 && Ascii.IsDigit(String.ByteAt(unsigned, 1)) {
+        return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
+    }
+    bool isFloat = String.Contains(unsigned, ".") || String.Contains(unsigned, "e") || String.Contains(unsigned, "E");
+    if !isFloat {
+        i64 value = match Number.ParseI64(plain) {
+            Result::Ok(v) => v,
+            Result::Error(_) => -1_i64,
+        };
+        if value == -1 && plain != "-1" {
+            return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
+        }
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Integer(value), next: end });
+    }
+    i64 dot = String.IndexOf(unsigned, ".");
+    if dot >= 0 && (dot == 0 || dot + 1 >= String.Len(unsigned) || !Ascii.IsDigit(String.ByteAt(unsigned, dot + 1))) {
+        return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
+    }
+    f64 parsed = match Number.ParseF64(plain) {
+        Result::Ok(v) => v,
+        Result::Error(_) => 0.0,
+    };
+    if !Number.IsFinite(parsed) && !String.Contains(plain, "e") && !String.Contains(plain, "E") {
+        return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
+    }
+    bool parsedOk = match Number.ParseF64(plain) {
+        Result::Ok(_) => true,
+        Result::Error(_) => false,
+    };
+    if !parsedOk {
+        return Result<ValueStep, TomlError>::Error(TomlError::InvalidNumber(at));
+    }
+    return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Float(parsed), next: end });
+}
+
+// ---------------------------------------------------------------------------------------------
+// Values
+// ---------------------------------------------------------------------------------------------
+
+Result<ValueStep, TomlError> ParseValue(string text, i64 at, i64 depth) {
+    i64 len = String.Len(text);
+    if at >= len {
+        return Result<ValueStep, TomlError>::Error(TomlError::UnexpectedEnd(at));
+    }
+    if depth > 128 {
+        return Result<ValueStep, TomlError>::Error(TomlError::InvalidTable(at));
+    }
+    u8 b = String.ByteAt(text, at);
+    if b == 34 {
+        TextStep basic = BasicString(text, at)?;
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Text(basic.text), next: basic.next });
+    }
+    if b == 39 {
+        TextStep literal = LiteralString(text, at)?;
+        return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::Text(literal.text), next: literal.next });
+    }
+    if b == 91 {
+        mut TomlValue[] items = Array.Empty<TomlValue>();
+        mut i64 i = SkipBlank(text, at + 1);
+        while true {
+            if i >= len {
+                return Result<ValueStep, TomlError>::Error(TomlError::UnexpectedEnd(i));
+            }
+            if String.ByteAt(text, i) == 93 {
+                return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::List(items), next: i + 1 });
+            }
+            ValueStep item = ParseValue(text, i, depth + 1)?;
+            items = Array.Append<TomlValue>(items, item.value);
+            i = SkipBlank(text, item.next);
+            if i < len && String.ByteAt(text, i) == 44 {
+                i = SkipBlank(text, i + 1);
+                continue;
+            }
+            if i < len && String.ByteAt(text, i) == 93 {
+                return Result<ValueStep, TomlError>::Ok(ValueStep { value: TomlValue::List(items), next: i + 1 });
+            }
+            return Result<ValueStep, TomlError>::Error(TomlError::UnexpectedCharacter(i));
+        }
+    }
+    if b == 123 {
+        mut TomlValue table = EmptyTable();
+        mut i64 i = SkipSpaces(text, at + 1);
+        if i < len && String.ByteAt(text, i) == 125 {
+            return Result<ValueStep, TomlError>::Ok(ValueStep { value: table, next: i + 1 });
+        }
+        while true {
+            KeyStep key = ParseKey(text, i)?;
+            i = SkipSpaces(text, key.next);
+            if i >= len || String.ByteAt(text, i) != 61 {
+                return Result<ValueStep, TomlError>::Error(TomlError::UnexpectedCharacter(i));
+            }
+            ValueStep member = ParseValue(text, SkipSpaces(text, i + 1), depth + 1)?;
+            table = Put(table, key.path, 0, member.value, 0, i)?;
+            i = SkipSpaces(text, member.next);
+            if i < len && String.ByteAt(text, i) == 44 {
+                i = SkipSpaces(text, i + 1);
+                continue;
+            }
+            if i < len && String.ByteAt(text, i) == 125 {
+                return Result<ValueStep, TomlError>::Ok(ValueStep { value: table, next: i + 1 });
+            }
+            return Result<ValueStep, TomlError>::Error(TomlError::UnexpectedCharacter(i));
+        }
+    }
+    return Scalar(text, at);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Tree construction
+// ---------------------------------------------------------------------------------------------
+
+bool IsTable(TomlValue value) {
+    return match value {
+        TomlValue::Table(_, _) => true,
+        _ => false,
+    };
+}
+
+bool IsList(TomlValue value) {
+    return match value {
+        TomlValue::List(_) => true,
+        _ => false,
+    };
+}
+
+TomlValue[] ReplaceValue(TomlValue[] values, i64 index, TomlValue value) {
+    mut TomlValue[] next = values;
+    next = Array.Set<TomlValue>(next, index, value);
+    return next;
+}
+
+/// Places `value` at `path[from..]` under `node`. `mode` 0 sets a key (duplicates are errors),
+/// 1 ensures a table for a `[header]`, 2 appends a table for an `[[array]]` header. Walking
+/// through an array of tables descends into its last element.
+Result<TomlValue, TomlError> Put(TomlValue node, string[] path, i64 from, TomlValue value, i64 mode, i64 offset) {
+    match node {
+        TomlValue::List(items) => {
+            i64 count = Array.Len<TomlValue>(items);
+            if count == 0 || !IsTable(Array.Get<TomlValue>(items, count - 1)) {
+                return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(offset));
+            }
+            TomlValue last = Put(Array.Get<TomlValue>(items, count - 1), path, from, value, mode, offset)?;
+            return Result<TomlValue, TomlError>::Ok(TomlValue::List(ReplaceValue(items, count - 1, last)));
+        },
+        TomlValue::Table(keys, values) => {
+            string key = Array.Get<string>(path, from);
+            i64 index = Storage.IndexOf<string>(keys, Array.Len<string>(keys), key);
+            bool isLast = from + 1 == Array.Len<string>(path);
+            if isLast {
+                if mode == 0 {
+                    if index >= 0 {
+                        return Result<TomlValue, TomlError>::Error(TomlError::DuplicateKey(offset));
+                    }
+                    mut string[] nextKeys = keys;
+                    mut TomlValue[] nextValues = values;
+                    nextKeys = Array.Append<string>(nextKeys, key);
+                    nextValues = Array.Append<TomlValue>(nextValues, value);
+                    return Result<TomlValue, TomlError>::Ok(TomlValue::Table(nextKeys, nextValues));
+                }
+                if mode == 1 {
+                    if index < 0 {
+                        mut string[] nextKeys = keys;
+                        mut TomlValue[] nextValues = values;
+                        nextKeys = Array.Append<string>(nextKeys, key);
+                        nextValues = Array.Append<TomlValue>(nextValues, EmptyTable());
+                        return Result<TomlValue, TomlError>::Ok(TomlValue::Table(nextKeys, nextValues));
+                    }
+                    if IsTable(Array.Get<TomlValue>(values, index)) {
+                        return Result<TomlValue, TomlError>::Ok(node);
+                    }
+                    return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(offset));
+                }
+                if index < 0 {
+                    mut TomlValue[] fresh = Array.Empty<TomlValue>();
+                    fresh = Array.Append<TomlValue>(fresh, EmptyTable());
+                    mut string[] nextKeys = keys;
+                    mut TomlValue[] nextValues = values;
+                    nextKeys = Array.Append<string>(nextKeys, key);
+                    nextValues = Array.Append<TomlValue>(nextValues, TomlValue::List(fresh));
+                    return Result<TomlValue, TomlError>::Ok(TomlValue::Table(nextKeys, nextValues));
+                }
+                match Array.Get<TomlValue>(values, index) {
+                    TomlValue::List(existing) => {
+                        mut TomlValue[] grown = existing;
+                        grown = Array.Append<TomlValue>(grown, EmptyTable());
+                        return Result<TomlValue, TomlError>::Ok(TomlValue::Table(keys, ReplaceValue(values, index, TomlValue::List(grown))));
+                    },
+                    _ => {
+                        return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(offset));
+                    },
+                };
+            }
+            if index < 0 {
+                TomlValue child = Put(EmptyTable(), path, from + 1, value, mode, offset)?;
+                mut string[] nextKeys = keys;
+                mut TomlValue[] nextValues = values;
+                nextKeys = Array.Append<string>(nextKeys, key);
+                nextValues = Array.Append<TomlValue>(nextValues, child);
+                return Result<TomlValue, TomlError>::Ok(TomlValue::Table(nextKeys, nextValues));
+            }
+            TomlValue existingChild = Array.Get<TomlValue>(values, index);
+            if !IsTable(existingChild) && !IsList(existingChild) {
+                return Result<TomlValue, TomlError>::Error(TomlError::DuplicateKey(offset));
+            }
+            TomlValue updated = Put(existingChild, path, from + 1, value, mode, offset)?;
+            return Result<TomlValue, TomlError>::Ok(TomlValue::Table(keys, ReplaceValue(values, index, updated)));
+        },
+        _ => {
+            return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(offset));
+        },
+    };
+    return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(offset));
+}
+
+// ---------------------------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------------------------
+
+/// Parses a TOML document into its root table.
+pub Result<TomlValue, TomlError> Parse(string text) {
+    i64 len = String.Len(text);
+    string separator = String.FromAscii(31);
+    mut TomlValue root = EmptyTable();
+    mut string[] header = Array.Empty<string>();
+    mut string[] defined = Array.Empty<string>();
+    mut i64 i = 0;
+    while true {
+        i = SkipBlank(text, i);
+        if i >= len {
+            break;
+        }
+        u8 b = String.ByteAt(text, i);
+        if b == 91 {
+            bool arrayTable = i + 1 < len && String.ByteAt(text, i + 1) == 91;
+            mut i64 start = i + 1;
+            if arrayTable {
+                start = i + 2;
+            }
+            KeyStep key = ParseKey(text, start)?;
+            mut i64 close = key.next;
+            if close >= len || String.ByteAt(text, close) != 93 {
+                return Result<TomlValue, TomlError>::Error(TomlError::UnexpectedCharacter(close));
+            }
+            close = close + 1;
+            if arrayTable {
+                if close >= len || String.ByteAt(text, close) != 93 {
+                    return Result<TomlValue, TomlError>::Error(TomlError::UnexpectedCharacter(close));
+                }
+                close = close + 1;
+                root = Put(root, key.path, 0, EmptyTable(), 2, i)?;
+            } else {
+                string joined = String.Join(key.path, separator);
+                mut i64 d = 0;
+                while d < Array.Len<string>(defined) {
+                    if Array.Get<string>(defined, d) == joined {
+                        return Result<TomlValue, TomlError>::Error(TomlError::InvalidTable(i));
+                    }
+                    d = d + 1;
+                }
+                defined = Array.Append<string>(defined, joined);
+                root = Put(root, key.path, 0, EmptyTable(), 1, i)?;
+            }
+            header = key.path;
+            i = EndOfLine(text, close)?;
+            continue;
+        }
+        KeyStep key = ParseKey(text, i)?;
+        mut i64 eq = key.next;
+        if eq >= len || String.ByteAt(text, eq) != 61 {
+            return Result<TomlValue, TomlError>::Error(TomlError::UnexpectedCharacter(eq));
+        }
+        ValueStep value = ParseValue(text, SkipSpaces(text, eq + 1), 0)?;
+        root = Put(root, Storage.Concat<string>(header, Array.Len<string>(header), key.path, Array.Len<string>(key.path)), 0, value.value, 0, i)?;
+        i = EndOfLine(text, value.next)?;
+    }
+    return Result<TomlValue, TomlError>::Ok(root);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Access
+// ---------------------------------------------------------------------------------------------
+
+/// The value of `key` in a table, or `None`.
+pub Option<TomlValue> Get(TomlValue table, string key) {
+    match table {
+        TomlValue::Table(keys, values) => {
+            i64 index = Storage.IndexOf<string>(keys, Array.Len<string>(keys), key);
+            if index < 0 {
+                return Option::None;
+            }
+            return Option::Some(Array.Get<TomlValue>(values, index));
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}
+
+/// The value at a dotted path of bare keys (`"package.version"`), or `None`.
+pub Option<TomlValue> GetPath(TomlValue table, string dottedPath) {
+    string[] parts = String.Split(dottedPath, ".");
+    mut TomlValue current = table;
+    mut i64 i = 0;
+    while i < Array.Len<string>(parts) {
+        Option<TomlValue> next = Get(current, Array.Get<string>(parts, i));
+        match next {
+            Option::Some(found) => {
+                current = found;
+            },
+            Option::None => {
+                return Option::None;
+            },
+        };
+        i = i + 1;
+    }
+    return Option::Some(current);
+}
+
+/// Keys of a table in document order; empty for other values.
+pub string[] Keys(TomlValue table) {
+    match table {
+        TomlValue::Table(keys, _) => {
+            return keys;
+        },
+        _ => {
+            return Array.Empty<string>();
+        },
+    };
+    return Array.Empty<string>();
+}
+
+/// Element count of an array or key count of a table; `0` otherwise.
+pub i64 Length(TomlValue value) {
+    match value {
+        TomlValue::List(items) => {
+            return Array.Len<TomlValue>(items);
+        },
+        TomlValue::Table(keys, _) => {
+            return Array.Len<string>(keys);
+        },
+        _ => {
+            return 0;
+        },
+    };
+    return 0;
+}
+
+/// Array element at `index`, or `None`.
+pub Option<TomlValue> At(TomlValue value, i64 index) {
+    match value {
+        TomlValue::List(items) => {
+            if index < 0 || index >= Array.Len<TomlValue>(items) {
+                return Option::None;
+            }
+            return Option::Some(Array.Get<TomlValue>(items, index));
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}
+
+/// String payload, or `None`.
+pub Option<string> AsText(TomlValue value) {
+    match value {
+        TomlValue::Text(text) => {
+            return Option::Some(text);
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}
+
+/// Integer payload, or `None`.
+pub Option<i64> AsInteger(TomlValue value) {
+    match value {
+        TomlValue::Integer(number) => {
+            return Option::Some(number);
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}
+
+/// Float payload (integers are not converted), or `None`.
+pub Option<f64> AsFloat(TomlValue value) {
+    match value {
+        TomlValue::Float(number) => {
+            return Option::Some(number);
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}
+
+/// Boolean payload, or `None`.
+pub Option<bool> AsBool(TomlValue value) {
+    match value {
+        TomlValue::Bool(flag) => {
+            return Option::Some(flag);
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}
+
+/// Date/time text, or `None`.
+pub Option<string> AsDateTime(TomlValue value) {
+    match value {
+        TomlValue::DateTime(text) => {
+            return Option::Some(text);
+        },
+        _ => {
+            return Option::None;
+        },
+    };
+    return Option::None;
+}

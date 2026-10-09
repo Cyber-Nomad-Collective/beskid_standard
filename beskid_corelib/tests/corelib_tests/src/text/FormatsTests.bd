@@ -1,0 +1,279 @@
+/// SemVer, Glob, CSV, and URL tests.
+
+use Testing.Expect;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Core.Text.Csv;
+use Core.Text.Glob;
+use Core.Text.SemVer;
+use Core.Text.Url;
+
+// ---------------------------------------------------------------------------------------------
+// SemVer
+// ---------------------------------------------------------------------------------------------
+
+SemVer.Version V(string text) {
+    return match SemVer.Parse(text) {
+        Result::Ok(v) => v,
+        Result::Error(_) => SemVer.Of(999, 999, 999),
+    };
+}
+
+bool Sat(string version, string requirement) {
+    return match SemVer.Satisfies(V(version), requirement) {
+        Result::Ok(ok) => ok,
+        Result::Error(_) => false,
+    };
+}
+
+string SemVerFailure(string text) {
+    return match SemVer.Parse(text) {
+        Result::Ok(_) => "ok",
+        Result::Error(error) => match error {
+            SemVer.SemVerError::Empty => "empty",
+            SemVer.SemVerError::MissingComponent => "missing",
+            SemVer.SemVerError::InvalidNumber => "number",
+            SemVer.SemVerError::LeadingZero => "leading-zero",
+            SemVer.SemVerError::InvalidIdentifier => "identifier",
+            SemVer.SemVerError::InvalidRequirement => "requirement",
+        },
+    };
+}
+
+test semver_parse_and_format {
+    SemVer.Version v = V("1.2.3-rc.1+build.7");
+    Expect.EqualI64(v.major, 1, "major");
+    Expect.EqualI64(v.patch, 3, "patch");
+    Expect.EqualStringArray(v.prerelease, ["rc", "1"], "prerelease identifiers");
+    Expect.EqualString(v.build, "build.7", "build metadata");
+    Expect.EqualString(SemVer.Format(v), "1.2.3-rc.1+build.7", "round trip");
+    Expect.EqualString(SemVerFailure(""), "empty", "empty");
+    Expect.EqualString(SemVerFailure("1.2"), "missing", "two components");
+    Expect.EqualString(SemVerFailure("01.2.3"), "leading-zero", "leading zero");
+    Expect.EqualString(SemVerFailure("1.2.3-01"), "leading-zero", "numeric prerelease leading zero");
+    Expect.EqualString(SemVerFailure("1.2.3-a..b"), "identifier", "empty identifier");
+    Expect.EqualString(SemVerFailure("1.x.3"), "number", "non-numeric component");
+}
+
+test semver_precedence_follows_the_specification {
+    string[] ordered = ["1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-alpha.beta", "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc.1", "1.0.0", "1.0.1", "1.1.0", "2.0.0"];
+    mut i64 i = 1;
+    while i < Array.Len<string>(ordered) {
+        Expect.EqualI64(SemVer.Compare(V(Array.Get<string>(ordered, i - 1)), V(Array.Get<string>(ordered, i))), -1, Array.Get<string>(ordered, i));
+        i = i + 1;
+    }
+    Expect.EqualI64(SemVer.Compare(V("1.0.0+a"), V("1.0.0+b")), 0, "build metadata ignored");
+}
+
+test semver_bumps {
+    Expect.EqualString(SemVer.Format(SemVer.BumpMajor(V("1.4.2"))), "2.0.0", "major");
+    Expect.EqualString(SemVer.Format(SemVer.BumpMinor(V("1.4.2"))), "1.5.0", "minor");
+    Expect.EqualString(SemVer.Format(SemVer.BumpPatch(V("1.4.2"))), "1.4.3", "patch");
+    Expect.EqualString(SemVer.Format(SemVer.BumpPatch(V("1.4.2-rc.1"))), "1.4.2", "patch releases a prerelease");
+}
+
+test semver_requirements {
+    Expect.EqualBool(Sat("1.4.0", "^1.2.3"), true, "caret same major");
+    Expect.EqualBool(Sat("2.0.0", "^1.2.3"), false, "caret excludes next major");
+    Expect.EqualBool(Sat("0.2.5", "^0.2.3"), true, "caret 0.x keeps minor");
+    Expect.EqualBool(Sat("0.3.0", "^0.2.3"), false, "caret 0.x excludes next minor");
+    Expect.EqualBool(Sat("0.0.4", "^0.0.3"), false, "caret 0.0.x is exact patch");
+    Expect.EqualBool(Sat("1.2.9", "~1.2.3"), true, "tilde same minor");
+    Expect.EqualBool(Sat("1.3.0", "~1.2.3"), false, "tilde excludes next minor");
+    Expect.EqualBool(Sat("1.5.0", ">=1.2.0 <2.0.0"), true, "range");
+    Expect.EqualBool(Sat("2.0.0", ">=1.2.0 <2.0.0"), false, "range upper exclusive");
+    Expect.EqualBool(Sat("1.9.9", "1.x"), true, "x wildcard");
+    Expect.EqualBool(Sat("1.2.7", "1.2"), true, "partial version is a range");
+    Expect.EqualBool(Sat("3.0.0", "*"), true, "star");
+    Expect.EqualBool(Sat("3.2.0", "1.x || >=3.1.0"), true, "alternatives");
+    Expect.EqualBool(Sat("2.5.0", "1.x || >=3.1.0"), false, "no alternative matches");
+    Expect.EqualBool(Sat("1.2.3", "=1.2.3"), true, "exact");
+    Expect.EqualBool(Sat("1.2.4", ">= 1.2.3"), true, "operator followed by space");
+}
+
+test semver_prerelease_requirements {
+    Expect.EqualBool(Sat("2.0.0-rc.1", "^1.2.3"), false, "next major prerelease excluded");
+    Expect.EqualBool(Sat("1.3.0-beta", ">=1.2.0"), false, "prerelease needs an opt-in");
+    Expect.EqualBool(Sat("1.2.3-rc.2", ">=1.2.3-rc.1"), true, "same-core prerelease opted in");
+    Expect.EqualBool(Sat("1.2.4-rc.1", ">=1.2.3-rc.1"), false, "other-core prerelease not opted in");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Glob
+// ---------------------------------------------------------------------------------------------
+
+test glob_plain_matching {
+    Expect.EqualBool(Glob.Match("*.bd", "main.bd"), true, "star suffix");
+    Expect.EqualBool(Glob.Match("*.bd", "dir/main.bd"), true, "plain star crosses slashes");
+    Expect.EqualBool(Glob.Match("ma?n.bd", "main.bd"), true, "question mark");
+    Expect.EqualBool(Glob.Match("[mn]ain", "nain"), true, "set");
+    Expect.EqualBool(Glob.Match("[a-c]x", "dx"), false, "range miss");
+    Expect.EqualBool(Glob.Match("[!a-c]x", "dx"), true, "negated range");
+    Expect.EqualBool(Glob.Match("\\*lit", "*lit"), true, "escaped star");
+    Expect.EqualBool(Glob.Match("\\*lit", "xlit"), false, "escaped star is literal");
+    Expect.EqualBool(Glob.Match("a*b*c", "aXXbYYc"), true, "multiple stars");
+    Expect.EqualBool(Glob.Match("a*b*c", "aXXbYY"), false, "missing tail");
+    Expect.EqualBool(Glob.Match("", ""), true, "empty matches empty");
+    Expect.EqualBool(Glob.Match("[]]", "]"), true, "leading bracket is a member");
+}
+
+test glob_path_matching {
+    Expect.EqualBool(Glob.MatchPath("src/*.bd", "src/a.bd"), true, "one segment");
+    Expect.EqualBool(Glob.MatchPath("src/*.bd", "src/x/a.bd"), false, "star stays in its segment");
+    Expect.EqualBool(Glob.MatchPath("src/**/*.bd", "src/a.bd"), true, "double star matches zero segments");
+    Expect.EqualBool(Glob.MatchPath("src/**/*.bd", "src/x/y/a.bd"), true, "double star spans segments");
+    Expect.EqualBool(Glob.MatchPath("**", "any/thing"), true, "bare double star");
+    Expect.EqualBool(Glob.MatchPath("a?c", "a/c"), false, "question mark never matches slash");
+    Expect.EqualBool(Glob.HasWildcards("src/*.bd"), true, "has wildcards");
+    Expect.EqualBool(Glob.HasWildcards("src\\*.bd"), false, "escaped wildcard only");
+}
+
+// ---------------------------------------------------------------------------------------------
+// CSV
+// ---------------------------------------------------------------------------------------------
+
+Csv.CsvRow[] Rows(string text) {
+    return match Csv.Parse(text) {
+        Result::Ok(rows) => rows,
+        Result::Error(_) => Array.Empty<Csv.CsvRow>(),
+    };
+}
+
+string[] FieldsAt(Csv.CsvRow[] rows, i64 index) {
+    Csv.CsvRow row = Array.Get<Csv.CsvRow>(rows, index);
+    return row.fields;
+}
+
+string CsvFailure(string text) {
+    return match Csv.Parse(text) {
+        Result::Ok(_) => "ok",
+        Result::Error(error) => match error {
+            Csv.CsvError::UnterminatedQuote(o) => "unterminated@" + "${o}",
+            Csv.CsvError::UnexpectedQuote(o) => "unexpected@" + "${o}",
+        },
+    };
+}
+
+test csv_parse_rfc4180 {
+    string crlf = String.FromAscii(13) + String.Newline();
+    Csv.CsvRow[] rows = Rows("name,qty" + crlf + "\"Smith, J\",3" + crlf + "\"say \"\"hi\"\"\",\"line" + String.Newline() + "break\"" + crlf);
+    Expect.EqualI64(Array.Len<Csv.CsvRow>(rows), 3, "three records; final line break optional");
+    Expect.EqualStringArray(FieldsAt(rows, 0), ["name", "qty"], "header");
+    Expect.EqualStringArray(FieldsAt(rows, 1), ["Smith, J", "3"], "quoted comma");
+    Expect.EqualString(Array.Get<string>(FieldsAt(rows, 2), 0), "say \"hi\"", "doubled quotes");
+    Expect.EqualString(Array.Get<string>(FieldsAt(rows, 2), 1), "line" + String.Newline() + "break", "quoted line break");
+}
+
+test csv_edge_shapes {
+    Expect.EqualI64(Array.Len<Csv.CsvRow>(Rows("")), 0, "empty input has no records");
+    Expect.EqualStringArray(FieldsAt(Rows("a,,"), 0), ["a", "", ""], "empty fields kept");
+    Expect.EqualI64(Array.Len<Csv.CsvRow>(Rows("a" + String.Newline() + String.Newline() + "b")), 3, "blank middle line is a record");
+    Expect.EqualString(CsvFailure("\"open"), "unterminated@0", "unterminated quote");
+    Expect.EqualString(CsvFailure("a\"b"), "unexpected@1", "quote inside unquoted field");
+    Expect.EqualString(CsvFailure("\"a\"b"), "unexpected@3", "text after closing quote");
+}
+
+test csv_custom_delimiter_and_format {
+    Csv.CsvRow[] rows = match Csv.ParseWith("a;b" + String.Newline() + "c;d", 59) {
+        Result::Ok(r) => r,
+        Result::Error(_) => Array.Empty<Csv.CsvRow>(),
+    };
+    Expect.EqualStringArray(FieldsAt(rows, 1), ["c", "d"], "semicolon delimiter");
+    mut Csv.CsvRow[] out = Array.Empty<Csv.CsvRow>();
+    out = Array.Append<Csv.CsvRow>(out, Csv.Row(["plain", "with,comma", "q\"uote"]));
+    string crlf = String.FromAscii(13) + String.Newline();
+    Expect.EqualString(Csv.Format(out), "plain,\"with,comma\",\"q\"\"uote\"" + crlf, "quotes only when needed");
+    Expect.EqualString(Csv.FormatWith(out, 59, String.Newline()), "plain;with,comma;\"q\"\"uote\"" + String.Newline(), "custom delimiter");
+    Csv.CsvRow[] back = Rows(Csv.Format(out));
+    Expect.EqualStringArray(FieldsAt(back, 0), ["plain", "with,comma", "q\"uote"], "format/parse round trip");
+}
+
+// ---------------------------------------------------------------------------------------------
+// URL
+// ---------------------------------------------------------------------------------------------
+
+Url.Url U(string text) {
+    return match Url.Parse(text) {
+        Result::Ok(url) => url,
+        Result::Error(_) => U("invalid:"),
+    };
+}
+
+string Decoded(string text) {
+    return match Url.PercentDecode(text, true) {
+        Result::Ok(value) => value,
+        Result::Error(_) => "<error>",
+    };
+}
+
+test url_parse_components {
+    Url.Url u = U("https://user:pw@example.com:8443/a/b?q=1&r=2#top");
+    Expect.EqualString(u.scheme, "https", "scheme");
+    Expect.EqualString(u.userInfo, "user:pw", "userinfo");
+    Expect.EqualString(u.hostname, "example.com", "host");
+    Expect.EqualI64(u.port, 8443, "port");
+    Expect.EqualString(u.path, "/a/b", "path");
+    Expect.EqualString(u.query, "q=1&r=2", "query");
+    Expect.EqualString(u.fragment, "top", "fragment");
+    Expect.EqualString(Url.Format(u), "https://user:pw@example.com:8443/a/b?q=1&r=2#top", "round trip");
+}
+
+test url_other_shapes {
+    Url.Url ipv6 = U("http://[::1]:80/x");
+    Expect.EqualString(ipv6.hostname, "[::1]", "IPv6 host keeps brackets");
+    Expect.EqualI64(ipv6.port, 80, "IPv6 port");
+    Url.Url mail = U("mailto:someone@example.com");
+    Expect.EqualBool(mail.hasAuthority, false, "no authority");
+    Expect.EqualString(mail.path, "someone@example.com", "opaque path");
+    Url.Url relative = U("../img.png?v=2");
+    Expect.EqualString(relative.scheme, "", "relative has no scheme");
+    Expect.EqualString(relative.path, "../img.png", "relative path");
+    Url.Url noPort = U("http://h/");
+    Expect.EqualI64(noPort.port, -1, "absent port");
+    Url.Url emptyQuery = U("http://h/p?");
+    Expect.EqualBool(emptyQuery.hasQuery, true, "empty query is present");
+    Url.Url badScheme = U("1http://x");
+    Expect.EqualString(badScheme.scheme, "invalid", "scheme must start with a letter");
+    Url.Url badPort = U("http://h:99999/");
+    Expect.EqualString(badPort.scheme, "invalid", "port out of range");
+}
+
+test url_percent_coding_and_queries {
+    Expect.EqualString(Decoded("a%20b+c%2Fd"), "a b c/d", "decode with plus as space");
+    Expect.EqualString(Decoded("%zz"), "<error>", "invalid escape");
+    Expect.EqualString(Url.PercentEncode("a b/c~", "/"), "a%20b/c~", "encode keeps unreserved and kept bytes");
+    Url.QueryParam[] params = match Url.QueryParams("name=J%C3%B6rg&flag&empty=&x=1+2") {
+        Result::Ok(p) => p,
+        Result::Error(_) => Array.Empty<Url.QueryParam>(),
+    };
+    Expect.EqualI64(Array.Len<Url.QueryParam>(params), 4, "four parameters");
+    Url.QueryParam first = Array.Get<Url.QueryParam>(params, 0);
+    Expect.EqualI64(String.Len(first.value), 5, "UTF-8 value decoded to five bytes");
+    Url.QueryParam flag = Array.Get<Url.QueryParam>(params, 1);
+    Expect.EqualString(flag.value, "", "flag without value");
+    Url.QueryParam last = Array.Get<Url.QueryParam>(params, 3);
+    Expect.EqualString(last.value, "1 2", "plus decodes to space");
+}
+
+string Resolved(string reference) {
+    Url.Url baseUrl = U("http://a/b/c/d;p?q");
+    return Url.Format(Url.Resolve(baseUrl, U(reference)));
+}
+
+test url_resolve_rfc3986_examples {
+    Expect.EqualString(Resolved("g"), "http://a/b/c/g", "sibling");
+    Expect.EqualString(Resolved("./g"), "http://a/b/c/g", "dot");
+    Expect.EqualString(Resolved("g/"), "http://a/b/c/g/", "trailing slash");
+    Expect.EqualString(Resolved("/g"), "http://a/g", "absolute path");
+    Expect.EqualString(Resolved("//g"), "http://g", "network path");
+    Expect.EqualString(Resolved("?y"), "http://a/b/c/d;p?y", "query only");
+    Expect.EqualString(Resolved("#s"), "http://a/b/c/d;p?q#s", "fragment only");
+    Expect.EqualString(Resolved("../g"), "http://a/b/g", "parent");
+    Expect.EqualString(Resolved("../../g"), "http://a/g", "grandparent");
+    Expect.EqualString(Resolved("../../../g"), "http://a/g", "above root clamps");
+    Expect.EqualString(Resolved("g;x=1/../y"), "http://a/b/c/y", "dot segments inside");
+    Expect.EqualString(Resolved("https://other/x"), "https://other/x", "absolute reference");
+    Expect.EqualString(Url.RemoveDotSegments("/a/b/c/./../../g"), "/a/g", "remove dot segments");
+}

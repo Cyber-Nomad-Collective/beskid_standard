@@ -3,6 +3,8 @@
 pub mod Core.Collections.Map.MapEntry;
 
 use Core.Collections.Array;
+use Core.Collections.CollectionError;
+use Core.Collections.Storage;
 use Core.Collections.Map.MapEntry;
 use Core.Optional.Option;
 use Core.Results;
@@ -25,18 +27,19 @@ pub type Map<TKey, TValue> {
             MapEntry<TKey, TValue> entry = Array.Get<MapEntry<TKey, TValue>>(entries, index);
             if entry.key == key {
                 MapEntry<TKey, TValue> updated = MapEntry<TKey, TValue> { key: key, value: value };
-                Array.Set<MapEntry<TKey, TValue>>(entries, index, updated);
-                return self;
+                mut MapEntry<TKey, TValue>[] replaced = Storage.CopyRange<MapEntry<TKey, TValue>>(entries, 0, count);
+                replaced = Array.Set<MapEntry<TKey, TValue>>(replaced, index, updated);
+                return Map<TKey, TValue> { entries: replaced, count: count };
             }
             index = index + 1;
         }
         MapEntry<TKey, TValue> fresh = MapEntry<TKey, TValue> { key: key, value: value };
-        mut MapEntry<TKey, TValue>[] nextEntries = entries;
-        Array.Append<MapEntry<TKey, TValue>>(nextEntries, fresh);
+        MapEntry<TKey, TValue>[] nextEntries = Storage.AppendAt<MapEntry<TKey, TValue>>(entries, count, fresh);
         return Map<TKey, TValue> { entries: nextEntries, count: count + 1 };
     }
 
-    pub Result<TValue, string> Get(TKey key) {
+    /// Returns the value for `key`, or `KeyNotFound`.
+    pub Result<TValue, CollectionError> Get(TKey key) {
         mut i64 index = 0;
         while index < count {
             MapEntry<TKey, TValue> entry = Array.Get<MapEntry<TKey, TValue>>(entries, index);
@@ -45,7 +48,7 @@ pub type Map<TKey, TValue> {
             }
             index = index + 1;
         }
-        return Result::Error("key not found");
+        return Result::Error(CollectionError::KeyNotFound);
     }
 
     pub bool ContainsKey(TKey key) {
@@ -63,19 +66,14 @@ pub type Map<TKey, TValue> {
         mut i64 index = 0;
         while index < count {
             if Array.Get<MapEntry<TKey, TValue>>(entries, index).key == key {
-                mut i64 shift = index;
-                while shift + 1 < count {
-                    Array.Set<MapEntry<TKey, TValue>>(entries, shift, Array.Get<MapEntry<TKey, TValue>>(entries, shift + 1));
-                    shift = shift + 1;
-                }
                 return Map<TKey, TValue> {
-                    entries: Array.RemoveLast<MapEntry<TKey, TValue>>(entries),
+                    entries: Storage.CopyWithout<MapEntry<TKey, TValue>>(entries, count, index),
                     count: count - 1,
                 };
             }
             index = index + 1;
         }
-        return self;
+        return this;
     }
 
     /// Returns the value for `key`, or `None` when absent.
@@ -128,13 +126,7 @@ pub type Map<TKey, TValue> {
 
     /// Returns a copy of the entries in the same order as `Keys()`.
     pub MapEntry<TKey, TValue>[] Entries() {
-        mut MapEntry<TKey, TValue>[] copy = Array.Empty<MapEntry<TKey, TValue>>();
-        mut i64 index = 0;
-        while index < this.count {
-            copy = Array.Append<MapEntry<TKey, TValue>>(copy, Array.Get<MapEntry<TKey, TValue>>(this.entries, index));
-            index = index + 1;
-        }
-        return copy;
+        return Storage.CopyRange<MapEntry<TKey, TValue>>(this.entries, 0, this.count);
     }
 
     /// Returns an empty map.

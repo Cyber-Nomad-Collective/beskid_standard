@@ -1,0 +1,54 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+
+// RFC 7541 section 5.1 prefix integers with an N-bit prefix (1..8).
+
+/// A decoded value and the offset of the first octet after it.
+pub type Decoded { pub i64 value, pub i64 next, }
+
+i64 PrefixMask(i64 prefixBits) { return (1_i64 << prefixBits) - 1_i64; }
+
+/// Decodes the integer whose prefix is the low `prefixBits` bits of src[offset].
+/// Values above MaxInteger() and encodings longer than five continuation
+/// octets are IntegerOverflow; a missing octet is Truncated.
+pub Result<Decoded,HpackError> DecodeInteger(u8[] src, i64 offset, i64 prefixBits) {
+    i64 count = Slice.Len(src);
+    if offset < 0_i64 || offset >= count { return Result::Error(HpackError::Truncated); }
+    i64 mask = PrefixMask(prefixBits);
+    mut i64 value = i64(src[offset]) & mask;
+    if value < mask { return Result::Ok(Decoded { value: value, next: offset + 1_i64 }); }
+    mut i64 cursor = offset + 1_i64;
+    mut i64 shift = 0_i64;
+    while true {
+        if cursor >= count { return Result::Error(HpackError::Truncated); }
+        if shift > 28_i64 { return Result::Error(HpackError::IntegerOverflow); }
+        i64 octet = i64(src[cursor]);
+        cursor = cursor + 1_i64;
+        value = value + ((octet & 127_i64) << shift);
+        if value > MaxInteger() { return Result::Error(HpackError::IntegerOverflow); }
+        if (octet & 128_i64) == 0_i64 { return Result::Ok(Decoded { value: value, next: cursor }); }
+        shift = shift + 7_i64;
+    }
+    return Result::Error(HpackError::IntegerOverflow);
+}
+
+/// Appends `value` with an N-bit prefix; `flags` holds the representation bits
+/// above the prefix. Returns the grown buffer (Array.Append may reallocate).
+/// The caller keeps 0 <= value <= MaxInteger().
+pub u8[] EncodeInteger(mut u8[] out, u8 flags, i64 prefixBits, i64 value) {
+    i64 mask = PrefixMask(prefixBits);
+    if value < mask {
+        Array.Append<u8>(out, flags | u8(value));
+        return out;
+    }
+    Array.Append<u8>(out, flags | u8(mask));
+    mut i64 rest = value - mask;
+    while rest >= 128_i64 {
+        Array.Append<u8>(out, u8((rest % 128_i64) + 128_i64));
+        rest = rest / 128_i64;
+    }
+    Array.Append<u8>(out, u8(rest));
+    return out;
+}

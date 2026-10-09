@@ -1,0 +1,536 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Http2.Hpack;
+use Http3.H3Errors;
+use Http3.H3Frame;
+use Http3.H3Mapping;
+use Http3.H3Quic;
+use Http3.H3Settings;
+use Http3.QpackDecoder;
+use Http3.QpackEncoder;
+use Codec.Mem;
+
+// RFC 9114 connection logic shared by client and server: the control
+// stream with SETTINGS, the QPACK encoder/decoder streams, peer
+// unidirectional stream types and critical-stream rules, request stream
+// framing (HEADERS, DATA, trailers), and GOAWAY. Nothing blocks: Pump reads
+// whatever the transport has, advances every stream, and flushes QPACK
+// instructions. Client and server APIs sit on top (H3Client, H3Server).
+
+/// Connection configuration (local SETTINGS and limits).
+pub type H3Config {
+    // SETTINGS_QPACK_MAX_TABLE_CAPACITY offered to the peer encoder.
+    pub i64 maxTableCapacity,
+    // SETTINGS_QPACK_BLOCKED_STREAMS offered to the peer encoder.
+    pub i64 blockedStreams,
+    // SETTINGS_MAX_FIELD_SECTION_SIZE (-1: not sent, unlimited).
+    pub i64 maxFieldSectionSize,
+    // Largest message body accepted (bodies are buffered in Request/Response).
+    pub i64 maxBodyBytes,
+    // Encoder policy (default: static table and literals only).
+    pub QpackPolicy policy,
+    // :scheme for origin-form request targets.
+    pub string scheme,
+}
+
+pub H3Config DefaultConfig() {
+    return H3Config { maxTableCapacity: 4096_i64, blockedStreams: 16_i64, maxFieldSectionSize: 16384_i64, maxBodyBytes: 65536_i64, policy: QpackEncoder.DefaultPolicy(), scheme: "https" };
+}
+
+/// One request stream. Phases: 0 awaiting HEADERS, 1 HEADERS received
+/// (DATA allowed), 2 trailers received, 3 complete, 4 failed.
+pub type H3Req {
+    pub i64 id,
+    pub u8[] inbuf,
+    pub HeaderField[] headers,
+    pub HeaderField[] trailers,
+    pub u8[] body,
+    // [0] phase, [1] error code, [2] content-length (-1), [3] opened locally,
+    // [4] HEADERS blocked on QPACK, [5] handed to the application,
+    // [6] a field section referenced the dynamic table.
+    pub i64[] st,
+}
+
+/// One peer unidirectional stream: its type (-1 until read, -2 ignored).
+pub type H3Uni { pub i64 id, pub i64 kind, pub u8[] head, }
+
+pub type H3Conn {
+    pub QuicLink link,
+    pub bool isServer,
+    pub H3Config config,
+    pub QEncoder encoder,
+    pub QDecoder decoder,
+    pub SettingValues peer,
+    pub u8[] controlIn,
+    pub H3Req[] requests,
+    pub H3Uni[] unis,
+    // [0] local control, [1] local encoder, [2] local decoder stream ids;
+    // [3] peer control, [4] peer encoder, [5] peer decoder (-1 until seen);
+    // [6] SETTINGS received; [7] GOAWAY id received (-1); [8] GOAWAY id sent
+    // (-1); [9] close code (-1 open); [10] transport streams examined;
+    // [11] highest peer request stream id accepted (-1); [12] MAX_PUSH_ID
+    // received (-1).
+    pub i64[] st,
+}
+
+pub i64 StreamTypeControl() { return 0_i64; }
+pub i64 StreamTypePush() { return 1_i64; }
+pub i64 StreamTypeEncoder() { return 2_i64; }
+pub i64 StreamTypeDecoder() { return 3_i64; }
+
+/// Largest control or HEADERS frame payload accepted.
+pub i64 MaxFramePayload() { return 65536_i64; }
+
+SettingValues LocalSettings(H3Config config) {
+    return SettingValues { maxTableCapacity: config.maxTableCapacity, maxFieldSectionSize: config.maxFieldSectionSize, blockedStreams: config.blockedStreams };
+}
+
+/// Opens the connection: control stream with SETTINGS, then the QPACK
+/// encoder and decoder streams (sections 6.2.1, 3.2 of RFC 9204).
+pub H3Conn Open(QuicLink link, bool isServer, H3Config config) {
+    mut QDecoder decoder = QpackDecoder.New(config.maxTableCapacity, config.blockedStreams);
+    QpackDecoder.SetMaxFieldSectionSize(decoder, config.maxFieldSectionSize);
+    mut i64[] st = [-1_i64, -1_i64, -1_i64, -1_i64, -1_i64, -1_i64, 0_i64, -1_i64, -1_i64, -1_i64, 0_i64, -1_i64, -1_i64];
+    H3Conn conn = H3Conn {
+        link: link, isServer: isServer, config: config, encoder: QpackEncoder.New(config.policy), decoder: decoder,
+        peer: H3Settings.Defaults(), controlIn: Slice.New(0_i64), requests: Array.Empty<H3Req>(), unis: Array.Empty<H3Uni>(), st: st,
+    };
+    i64 control = H3Quic.OpenUni(link);
+    i64 encoderStream = H3Quic.OpenUni(link);
+    i64 decoderStream = H3Quic.OpenUni(link);
+    conn.st[0] = control;
+    conn.st[1] = encoderStream;
+    conn.st[2] = decoderStream;
+    mut u8[] first = H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeControl());
+    first = H3Frame.AppendFrame(first, H3Frame.TypeSettings(), H3Settings.Encode(LocalSettings(config)));
+    bool sent = H3Quic.Write(link, control, first, false);
+    bool sentEncoder = H3Quic.Write(link, encoderStream, H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeEncoder()), false);
+    bool sentDecoder = H3Quic.Write(link, decoderStream, H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeDecoder()), false);
+    if !sent || !sentEncoder || !sentDecoder { conn.st[9] = H3Errors.InternalError(); }
+    return conn;
+}
+
+/// The connection error code, or -1 while usable.
+pub i64 ErrorCode(H3Conn conn) {
+    if conn.st[9] >= 0_i64 { return conn.st[9]; }
+    if H3Quic.IsClosed(conn.link) { return H3Quic.CloseCode(conn.link); }
+    return -1_i64;
+}
+
+/// The peer's SETTINGS arrived.
+pub bool PeerSettingsReceived(H3Conn conn) { return conn.st[6] == 1_i64; }
+
+/// GOAWAY id received from the peer, or -1.
+pub i64 GoawayReceived(H3Conn conn) { return conn.st[7]; }
+
+/// Closes the connection with `code` (a connection error, section 8).
+pub unit Fail(H3Conn conn, i64 code) {
+    if conn.st[9] < 0_i64 {
+        conn.st[9] = code;
+        H3Quic.Close(conn.link, code);
+    }
+    return;
+}
+
+/// Index of request stream `id`, or -1.
+pub i64 FindRequest(H3Conn conn, i64 id) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<H3Req>(conn.requests) {
+        H3Req req = Array.Get<H3Req>(conn.requests, i);
+        if req.id == id { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+/// Adds a request stream record.
+pub H3Req AddRequest(mut H3Conn conn, i64 id, bool local) {
+    mut i64 opened = 0_i64;
+    if local { opened = 1_i64; }
+    mut i64[] st = [0_i64, 0_i64, -1_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+    st[3] = opened;
+    H3Req req = H3Req { id: id, inbuf: Slice.New(0_i64), headers: Array.Empty<HeaderField>(), trailers: Array.Empty<HeaderField>(), body: Slice.New(0_i64), st: st };
+    mut H3Req[] list = conn.requests;
+    Array.Append<H3Req>(list, req);
+    conn.requests = list;
+    return req;
+}
+
+/// Fails one request stream with `code`: RESET_STREAM and STOP_SENDING, and
+/// QPACK Stream Cancellation when its section was not processed.
+pub unit FailStream(H3Conn conn, H3Req req, i64 code) {
+    if req.st[0] >= 3_i64 { return; }
+    req.st[0] = 4_i64;
+    req.st[1] = code;
+    H3Quic.Reset(conn.link, req.id, code);
+    H3Quic.StopSending(conn.link, req.id, code);
+    if req.st[4] == 1_i64 {
+        QpackDecoder.CancelStream(conn.decoder, req.id, true);
+        req.st[4] = 0_i64;
+    }
+    return;
+}
+
+/// Encodes a field section and writes it as a HEADERS frame (QPACK
+/// encoder stream data is flushed first).
+pub u8[] HeadersFrame(mut H3Conn conn, i64 streamId, HeaderField[] fields, mut u8[] out) {
+    u8[] section = QpackEncoder.EncodeSection(conn.encoder, streamId, fields);
+    FlushQpack(conn);
+    return H3Frame.AppendFrame(out, H3Frame.TypeHeaders(), section);
+}
+
+/// Largest DATA frame payload written. Kept at 4 KiB so neither side ever
+/// builds an array near the 0.5.2 runtime's large-array limit (COMPILER-GAPS
+/// HQ3): receive buffers then stay below ~12 KiB.
+pub i64 DataChunk() { return 4096_i64; }
+
+/// Writes a whole message (HEADERS, DATA in 4 KiB frames, optional
+/// trailers) to `streamId` and finishes the stream.
+pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] body, HeaderField[] trailers) {
+    mut u8[] out = HeadersFrame(conn, streamId, fields, Slice.New(0_i64));
+    if !H3Quic.Write(conn.link, streamId, out, false) { return false; }
+    i64 total = Slice.Len(body);
+    mut i64 at = 0_i64;
+    while at < total {
+        mut i64 chunk = total - at;
+        if chunk > DataChunk() { chunk = DataChunk(); }
+        mut u8[] frame = H3Frame.AppendVarint(Slice.New(0_i64), H3Frame.TypeData());
+        frame = H3Frame.AppendVarint(frame, chunk);
+        i64 head = Slice.Len(frame);
+        u8[] data = Mem.Zeroed(head + chunk);
+        Mem.Copy(data, 0_i64, frame, 0_i64, head);
+        Mem.Copy(data, head, body, at, chunk);
+        if !H3Quic.Write(conn.link, streamId, data, false) { return false; }
+        at = at + chunk;
+    }
+    mut u8[] tail = Slice.New(0_i64);
+    if Array.Len<HeaderField>(trailers) > 0_i64 { tail = HeadersFrame(conn, streamId, trailers, tail); }
+    return H3Quic.Write(conn.link, streamId, tail, true);
+}
+
+/// Sends pending QPACK encoder and decoder stream instructions.
+pub unit FlushQpack(mut H3Conn conn) {
+    QpackDecoder.FlushInsertCount(conn.decoder);
+    u8[] encoderBytes = QpackEncoder.TakeOutput(conn.encoder);
+    if Slice.Len(encoderBytes) > 0_i64 { bool ok = H3Quic.Write(conn.link, conn.st[1], encoderBytes, false); }
+    u8[] decoderBytes = QpackDecoder.TakeOutput(conn.decoder);
+    if Slice.Len(decoderBytes) > 0_i64 { bool ok2 = H3Quic.Write(conn.link, conn.st[2], decoderBytes, false); }
+    return;
+}
+
+/// Sends GOAWAY with `id` on the control stream (section 5.2). The id may
+/// only decrease across GOAWAY frames.
+pub bool SendGoaway(mut H3Conn conn, i64 id) {
+    if conn.st[8] >= 0_i64 && id > conn.st[8] { return false; }
+    conn.st[8] = id;
+    u8[] frame = H3Frame.AppendFrame(Slice.New(0_i64), H3Frame.TypeGoaway(), H3Frame.AppendVarint(Slice.New(0_i64), id));
+    return H3Quic.Write(conn.link, conn.st[0], frame, false);
+}
+
+// Discovers new peer-initiated streams.
+unit Discover(mut H3Conn conn) {
+    i64 count = H3Quic.StreamCount(conn.link);
+    while conn.st[10] < count {
+        i64 id = H3Quic.StreamAt(conn.link, conn.st[10]);
+        conn.st[10] = conn.st[10] + 1_i64;
+        if H3Quic.IsPeerInitiated(conn.link, id) {
+            if H3Quic.IsUnidirectional(id) {
+                mut H3Uni[] list = conn.unis;
+                Array.Append<H3Uni>(list, H3Uni { id: id, kind: -1_i64, head: Slice.New(0_i64) });
+                conn.unis = list;
+            } else {
+                if !conn.isServer {
+                    // Servers never open bidirectional streams (section 6.1).
+                    Fail(conn, H3Errors.StreamCreationError());
+                    return;
+                }
+                H3Req req = AddRequest(conn, id, false);
+                if conn.st[8] >= 0_i64 && id >= conn.st[8] {
+                    FailStream(conn, req, H3Errors.RequestRejected());
+                } else {
+                    if id > conn.st[11] { conn.st[11] = id; }
+                }
+            }
+        }
+    }
+    return;
+}
+
+u8[] Concat(u8[] a, i64 from, u8[] b) {
+    i64 na = Slice.Len(a) - from;
+    i64 nb = Slice.Len(b);
+    u8[] out = Mem.Zeroed(na + nb);
+    if na > 0_i64 { Mem.Copy(out, 0_i64, a, from, na); }
+    if nb > 0_i64 { Mem.Copy(out, na, b, 0_i64, nb); }
+    return out;
+}
+
+// Handles one control frame. Returns 0 or a connection error code.
+i64 ControlFrame(mut H3Conn conn, u8[] buf, FrameHead head) {
+    i64 frameType = head.frameType;
+    if conn.st[6] == 0_i64 {
+        if frameType != H3Frame.TypeSettings() { return H3Errors.MissingSettings(); }
+        SettingsResult decoded = H3Settings.Decode(buf, head.start, head.length);
+        if decoded.code != 0_i64 { return decoded.code; }
+        SettingValues peer = decoded.settings;
+        conn.peer = peer;
+        conn.st[6] = 1_i64;
+        QpackEncoder.ApplyPeerSettings(conn.encoder, peer.maxTableCapacity, peer.blockedStreams);
+        return 0_i64;
+    }
+    i64 allowed = H3Frame.CheckAllowed(H3Frame.KindControl(), frameType, conn.isServer);
+    if allowed != 0_i64 { return allowed; }
+    if frameType == H3Frame.TypeSettings() { return H3Errors.FrameUnexpected(); }
+    if frameType == H3Frame.TypeGoaway() || frameType == H3Frame.TypeMaxPushId() || frameType == H3Frame.TypeCancelPush() {
+        i64 value = H3Frame.SingleVarint(buf, head.start, head.length);
+        if value < 0_i64 { return H3Errors.FrameError(); }
+        if frameType == H3Frame.TypeGoaway() { return OnGoaway(conn, value); }
+        if frameType == H3Frame.TypeMaxPushId() {
+            if value < conn.st[12] { return H3Errors.IdError(); }
+            conn.st[12] = value;
+            return 0_i64;
+        }
+        // CANCEL_PUSH: this endpoint never promises or accepts pushes.
+        if conn.isServer && value <= conn.st[12] { return 0_i64; }
+        return H3Errors.IdError();
+    }
+    return 0_i64;
+}
+
+// GOAWAY (section 5.2): a client gets a client-initiated bidirectional
+// stream id; ids never increase. Requests at or above it were not
+// processed and fail with H3_REQUEST_REJECTED (safe to retry).
+i64 OnGoaway(mut H3Conn conn, i64 id) {
+    if !conn.isServer && (id % 4_i64) != 0_i64 { return H3Errors.IdError(); }
+    if conn.st[7] >= 0_i64 && id > conn.st[7] { return H3Errors.IdError(); }
+    conn.st[7] = id;
+    if !conn.isServer {
+        mut i64 i = 0_i64;
+        while i < Array.Len<H3Req>(conn.requests) {
+            H3Req req = Array.Get<H3Req>(conn.requests, i);
+            if req.id >= id && req.st[0] < 3_i64 {
+                req.st[0] = 4_i64;
+                req.st[1] = H3Errors.RequestRejected();
+                H3Quic.Reset(conn.link, req.id, H3Errors.RequestCancelled());
+            }
+            i = i + 1_i64;
+        }
+    }
+    return 0_i64;
+}
+
+// Parses buffered control stream bytes.
+i64 PumpControl(mut H3Conn conn, u8[] data) {
+    u8[] buf = Concat(conn.controlIn, 0_i64, data);
+    i64 end = Slice.Len(buf);
+    mut i64 pos = 0_i64;
+    while pos < end {
+        FrameHead head = H3Frame.ReadFrame(buf, pos, end, MaxFramePayload());
+        if head.status == H3Frame.NeedMore() {
+            conn.controlIn = Concat(buf, pos, Slice.New(0_i64));
+            return 0_i64;
+        }
+        if head.status != H3Frame.Complete() { return head.status; }
+        i64 code = ControlFrame(conn, buf, head);
+        if code != 0_i64 { return code; }
+        pos = head.next;
+    }
+    conn.controlIn = Slice.New(0_i64);
+    return 0_i64;
+}
+
+// Reads one peer unidirectional stream. Returns 0 or a connection error.
+i64 PumpUni(mut H3Conn conn, H3Uni uni) {
+    u8[] data = H3Quic.Read(conn.link, uni.id, 65536_i64);
+    mut u8[] rest = data;
+    if uni.kind == -1_i64 {
+        u8[] head = Concat(uni.head, 0_i64, data);
+        i64 kind = H3Frame.VarintAt(head, 0_i64, Slice.Len(head));
+        if kind < 0_i64 {
+            uni.head = head;
+            if H3Quic.IsFinished(conn.link, uni.id) { uni.kind = -2_i64; }
+            return 0_i64;
+        }
+        rest = Concat(head, H3Frame.VarintLength(head[0]), Slice.New(0_i64));
+        uni.head = Slice.New(0_i64);
+        mut i64 slot = -1_i64;
+        if kind == StreamTypeControl() { slot = 3_i64; }
+        if kind == StreamTypeEncoder() { slot = 4_i64; }
+        if kind == StreamTypeDecoder() { slot = 5_i64; }
+        if kind == StreamTypePush() {
+            // Push is never enabled: a server cannot receive push streams and
+            // a client never sent MAX_PUSH_ID (sections 4.6, 6.2.2).
+            if conn.isServer { return H3Errors.StreamCreationError(); }
+            return H3Errors.IdError();
+        }
+        if slot < 0_i64 {
+            // Unknown or reserved stream type: ignore it (section 6.2).
+            uni.kind = -2_i64;
+            H3Quic.StopSending(conn.link, uni.id, H3Errors.StreamCreationError());
+            return 0_i64;
+        }
+        if conn.st[slot] >= 0_i64 { return H3Errors.StreamCreationError(); }
+        conn.st[slot] = uni.id;
+        uni.kind = kind;
+    }
+    if uni.kind == -2_i64 { return 0_i64; }
+    mut i64 code = 0_i64;
+    if Slice.Len(rest) > 0_i64 {
+        if uni.kind == StreamTypeControl() { code = PumpControl(conn, rest); }
+        if uni.kind == StreamTypeEncoder() { code = QpackDecoder.OnEncoderStream(conn.decoder, rest); }
+        if uni.kind == StreamTypeDecoder() { code = QpackEncoder.OnDecoderStream(conn.encoder, rest); }
+    }
+    if code != 0_i64 { return code; }
+    if H3Quic.IsFinished(conn.link, uni.id) || H3Quic.PeerResetCode(conn.link, uni.id) >= 0_i64 { return H3Errors.ClosedCriticalStream(); }
+    return 0_i64;
+}
+
+// Handles a decoded HEADERS section on a request stream.
+// Returns 0, a negative stream error (-code), or a connection error code.
+i64 OnSection(H3Conn conn, H3Req req, HeaderField[] fields) {
+    i64 phase = req.st[0];
+    if phase == 0_i64 {
+        if conn.isServer {
+            if H3Mapping.ValidateRequest(fields) != 0_i64 { return 0_i64 - H3Errors.MessageError(); }
+        } else {
+            if H3Mapping.ValidateResponse(fields) != 0_i64 { return 0_i64 - H3Errors.MessageError(); }
+            i64 status = H3Mapping.StatusOf(fields);
+            // Interim responses (1xx) are skipped; the final one follows.
+            if status < 200_i64 { return 0_i64; }
+        }
+        i64 declared = H3Mapping.ContentLength(fields);
+        if declared == -2_i64 { return 0_i64 - H3Errors.MessageError(); }
+        req.st[2] = declared;
+        req.headers = fields;
+        req.st[0] = 1_i64;
+        return 0_i64;
+    }
+    if phase == 1_i64 {
+        if H3Mapping.ValidateTrailers(fields) != 0_i64 { return 0_i64 - H3Errors.MessageError(); }
+        req.trailers = fields;
+        req.st[0] = 2_i64;
+        return 0_i64;
+    }
+    return H3Errors.FrameUnexpected();
+}
+
+// Appends a DATA payload to the request body.
+i64 OnData(H3Conn conn, H3Req req, u8[] buf, FrameHead head) {
+    if req.st[0] != 1_i64 { return H3Errors.FrameUnexpected(); }
+    H3Config config = conn.config;
+    if Slice.Len(req.body) + head.length > config.maxBodyBytes { return 0_i64 - H3Errors.ExcessiveLoad(); }
+    if req.st[2] >= 0_i64 && Slice.Len(req.body) + head.length > req.st[2] { return 0_i64 - H3Errors.MessageError(); }
+    req.body = AppendRange(req.body, buf, head.start, head.length);
+    return 0_i64;
+}
+
+u8[] Payload(u8[] buf, FrameHead head) { return H3Frame.Payload(buf, head); }
+
+// a followed by b[from .. from+count), in one allocation.
+u8[] AppendRange(u8[] a, u8[] b, i64 from, i64 count) {
+    i64 na = Slice.Len(a);
+    u8[] out = Mem.Zeroed(na + count);
+    if na > 0_i64 { Mem.Copy(out, 0_i64, a, 0_i64, na); }
+    if count > 0_i64 { Mem.Copy(out, na, b, from, count); }
+    return out;
+}
+
+// Advances one request stream. Returns 0 or a connection error code.
+i64 PumpRequest(mut H3Conn conn, H3Req req) {
+    if req.st[0] >= 3_i64 { return 0_i64; }
+    i64 reset = H3Quic.PeerResetCode(conn.link, req.id);
+    if reset >= 0_i64 {
+        FailStream(conn, req, reset);
+        return 0_i64;
+    }
+    u8[] data = H3Quic.Read(conn.link, req.id, 65536_i64);
+    if Slice.Len(data) > 0_i64 { req.inbuf = Concat(req.inbuf, 0_i64, data); }
+    u8[] buf = req.inbuf;
+    i64 end = Slice.Len(buf);
+    mut i64 pos = 0_i64;
+    mut bool more = true;
+    while more && pos < end {
+        FrameHead head = H3Frame.ReadFrame(buf, pos, end, MaxFramePayload());
+        if head.status == H3Frame.NeedMore() {
+            more = false;
+        } else {
+            if head.status != H3Frame.Complete() {
+                FailStream(conn, req, head.status);
+                return 0_i64;
+            }
+            i64 frameType = head.frameType;
+            i64 allowed = H3Frame.CheckAllowed(H3Frame.KindRequest(), frameType, conn.isServer);
+            if allowed != 0_i64 { return allowed; }
+            mut i64 code = 0_i64;
+            if frameType == H3Frame.TypeHeaders() {
+                u8[] section = Payload(buf, head);
+                if QpackDecoder.RequiredInsertCount(conn.decoder, section) > 0_i64 { req.st[6] = 1_i64; }
+                SectionResult decoded = QpackDecoder.DecodeSection(conn.decoder, req.id, section);
+                if decoded.status == QpackDecoder.Blocked() {
+                    req.st[4] = 1_i64;
+                    more = false;
+                } else {
+                    req.st[4] = 0_i64;
+                    if decoded.status == QpackDecoder.Failed() { return decoded.code; }
+                    if decoded.status == QpackDecoder.TooLarge() { code = 0_i64 - decoded.code; } else { code = OnSection(conn, req, decoded.fields); }
+                }
+            } else {
+                if frameType == H3Frame.TypeData() { code = OnData(conn, req, buf, head); }
+                // PUSH_PROMISE: no MAX_PUSH_ID was sent, so every push id is invalid.
+                if frameType == H3Frame.TypePushPromise() { return H3Errors.IdError(); }
+            }
+            if code > 0_i64 { return code; }
+            if code < 0_i64 {
+                FailStream(conn, req, 0_i64 - code);
+                return 0_i64;
+            }
+            if more { pos = head.next; }
+        }
+    }
+    if pos > 0_i64 { req.inbuf = Concat(buf, pos, Slice.New(0_i64)); }
+    if req.st[4] == 0_i64 && H3Quic.IsFinished(conn.link, req.id) {
+        if Slice.Len(req.inbuf) > 0_i64 { return H3Errors.FrameError(); }
+        if req.st[0] == 0_i64 {
+            FailStream(conn, req, H3Errors.RequestIncomplete());
+            return 0_i64;
+        }
+        if req.st[2] >= 0_i64 && req.st[2] != Slice.Len(req.body) {
+            FailStream(conn, req, H3Errors.MessageError());
+            return 0_i64;
+        }
+        req.st[0] = 3_i64;
+    }
+    return 0_i64;
+}
+
+/// Reads everything the transport has, advances all streams, and sends
+/// pending QPACK instructions. Returns 0 or the connection error code
+/// (after closing the connection with it).
+pub i64 Pump(mut H3Conn conn) {
+    i64 existing = ErrorCode(conn);
+    if existing >= 0_i64 { return existing; }
+    Discover(conn);
+    if conn.st[9] >= 0_i64 { return conn.st[9]; }
+    mut i64 i = 0_i64;
+    while i < Array.Len<H3Uni>(conn.unis) {
+        H3Uni uni = Array.Get<H3Uni>(conn.unis, i);
+        i64 code = PumpUni(conn, uni);
+        if code != 0_i64 {
+            Fail(conn, code);
+            return code;
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while i < Array.Len<H3Req>(conn.requests) {
+        H3Req req = Array.Get<H3Req>(conn.requests, i);
+        i64 code = PumpRequest(conn, req);
+        if code != 0_i64 {
+            Fail(conn, code);
+            return code;
+        }
+        i = i + 1_i64;
+    }
+    FlushQpack(conn);
+    return 0_i64;
+}

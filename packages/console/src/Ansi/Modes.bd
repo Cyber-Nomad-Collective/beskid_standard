@@ -1,0 +1,78 @@
+/// Ansi.Modes — terminal mode toggles, cursor shape, and OSC extensions not covered by the
+/// screen and cursor builders.
+/// @tier(supported)
+/// Every function returns the raw sequence without capability gating, like `Escape.Csi`; wrap
+/// it in `Escape.WhenEnabled` before writing to a stream that may not be a terminal.
+use Ansi.Escape;
+use Core.Encoding.Base64;
+use Core.Results;
+use Core.String;
+
+/// DECSCUSR cursor shapes (`CSI n SP q`).
+pub enum CursorStyle {
+    Default,
+    BlinkingBlock,
+    SteadyBlock,
+    BlinkingUnderline,
+    SteadyUnderline,
+    BlinkingBar,
+    SteadyBar,
+}
+
+i64 CursorStyleCode(CursorStyle style) {
+    return match style {
+        CursorStyle::Default => 0_i64,
+        CursorStyle::BlinkingBlock => 1_i64,
+        CursorStyle::SteadyBlock => 2_i64,
+        CursorStyle::BlinkingUnderline => 3_i64,
+        CursorStyle::SteadyUnderline => 4_i64,
+        CursorStyle::BlinkingBar => 5_i64,
+        CursorStyle::SteadyBar => 6_i64,
+    };
+}
+
+/// Sets the cursor shape.
+pub string CursorShape(CursorStyle style) {
+    return Escape.Csi("${CursorStyleCode(style)} ", "q");
+}
+
+/// Begins (`true`) or ends (`false`) a synchronized update (mode 2026), so the terminal paints
+/// the whole frame at once instead of showing partial redraws.
+pub string SynchronizedOutput(bool enable) {
+    return Escape.PrivateMode("2026", enable);
+}
+
+/// Enables or disables bracketed paste (mode 2004): pasted text arrives wrapped in
+/// `ESC [ 200 ~` and `ESC [ 201 ~` so it can be told apart from typing.
+pub string BracketedPaste(bool enable) {
+    return Escape.PrivateMode("2004", enable);
+}
+
+/// Enables or disables focus reporting (mode 1004): the terminal sends `ESC [ I` on focus and
+/// `ESC [ O` on blur.
+pub string FocusReporting(bool enable) {
+    return Escape.PrivateMode("1004", enable);
+}
+
+/// Wraps `label` in an OSC 8 hyperlink with an explicit `id`, so terminals underline every
+/// segment of one link together even when it spans lines or is interrupted by other output.
+pub string HyperlinkWithId(string id, string uri, string label) {
+    string open = Escape.OscSequence("8;id=" + id + ";" + uri);
+    string close = Escape.OscSequence("8;;");
+    return open + label + close;
+}
+
+/// OSC 52 request that sets the system clipboard to `text` (base64-encoded payload). Many
+/// terminals ignore or confirm clipboard writes for security; this only builds the request.
+pub string SetClipboard(string text) {
+    string payload = match Base64.EncodeToBytes(text) {
+        Result::Ok(bytes) => String.FromUtf8CodeUnits(bytes),
+        Result::Error(_) => "",
+    };
+    return Escape.OscSequence("52;c;" + payload);
+}
+
+/// OSC 9 desktop notification (supported by iTerm2, Windows Terminal, and others).
+pub string Notify(string message) {
+    return Escape.OscSequence("9;" + message);
+}

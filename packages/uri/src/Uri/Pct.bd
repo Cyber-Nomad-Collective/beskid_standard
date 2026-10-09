@@ -1,0 +1,144 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Uri.Chars;
+use Uri.Errors;
+
+// Strict percent-encoding (RFC 3986 section 2.1).
+
+/// Fails with InvalidPercentEncoding(index) on a `%` not followed by two hex digits.
+pub Result<unit, UriError> Validate(string text) {
+    i64 n = String.Len(text);
+    mut i64 i = 0_i64;
+    while i < n {
+        if Chars.B(text, i) == 37_i64 {
+            if i + 2_i64 >= n {
+                return Result::Error(UriError::InvalidPercentEncoding(i));
+            }
+            if !Chars.IsHex(Chars.B(text, i + 1_i64)) || !Chars.IsHex(Chars.B(text, i + 2_i64)) {
+                return Result::Error(UriError::InvalidPercentEncoding(i));
+            }
+            i = i + 3_i64;
+        } else {
+            i = i + 1_i64;
+        }
+    }
+    return Result::Ok(());
+}
+
+/// Decodes every `%XX` into its octet; other bytes are copied. Strict: malformed escapes fail.
+pub Result<u8[], UriError> Decode(string text) {
+    Result<unit, UriError> ok = Validate(text);
+    match ok {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => {},
+    };
+    i64 n = String.Len(text);
+    mut i64 count = 0_i64;
+    mut i64 i = 0_i64;
+    while i < n {
+        if Chars.B(text, i) == 37_i64 { i = i + 3_i64; } else { i = i + 1_i64; }
+        count = count + 1_i64;
+    }
+    u8[] out = Slice.New(count);
+    mut i64 at = 0_i64;
+    i = 0_i64;
+    while i < n {
+        i64 c = Chars.B(text, i);
+        if c == 37_i64 {
+            out[at] = u8(Chars.HexValue(Chars.B(text, i + 1_i64)) * 16_i64 + Chars.HexValue(Chars.B(text, i + 2_i64)));
+            i = i + 3_i64;
+        } else {
+            out[at] = u8(c);
+            i = i + 1_i64;
+        }
+        at = at + 1_i64;
+    }
+    return Result::Ok(out);
+}
+
+/// Decodes and interprets the octets as UTF-8 text.
+pub Result<string, UriError> DecodeString(string text) {
+    Result<u8[], UriError> bytes = Decode(text);
+    return match bytes {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(data) => Result::Ok(String.FromUtf8CodeUnits(data)),
+    };
+}
+
+string HexPair(i64 value) {
+    return "%" + String.SubSlice("0123456789ABCDEF", value / 16_i64, 1_i64) + String.SubSlice("0123456789ABCDEF", value % 16_i64, 1_i64);
+}
+
+bool Contains(string set, i64 c) {
+    mut i64 i = 0_i64;
+    while i < String.Len(set) {
+        if Chars.B(set, i) == c { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+/// Encodes raw octets: unreserved bytes and bytes listed in `extra` stay, all others become `%XX`.
+pub string EncodeBytes(u8[] data, string extra) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 c = i64(data[i]);
+        if Chars.IsUnreserved(c) || Contains(extra, c) {
+            out = out + Chars.CharOf(c);
+        } else {
+            out = out + HexPair(c);
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+/// Encodes the UTF-8 octets of `text` (see EncodeBytes).
+pub string EncodeAllowing(string text, string extra) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 c = Chars.B(text, i);
+        if Chars.IsUnreserved(c) || Contains(extra, c) {
+            out = out + Chars.CharAt(text, i);
+        } else {
+            out = out + HexPair(c);
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+/// Strictest form: only unreserved characters stay (query values, path segments).
+pub string EncodeComponent(string text) { return EncodeAllowing(text, ""); }
+pub string EncodeUserinfo(string text) { return EncodeAllowing(text, "!$&'()*+,;=:"); }
+pub string EncodePath(string text) { return EncodeAllowing(text, "!$&'()*+,;=:@/"); }
+pub string EncodeQuery(string text) { return EncodeAllowing(text, "!$&'()*+,;=:@/?"); }
+pub string EncodeFragment(string text) { return EncodeAllowing(text, "!$&'()*+,;=:@/?"); }
+
+/// Normalizes an already-valid component: `%xx` escapes get uppercase hex, escapes of
+/// unreserved octets are decoded, and (when `lower`) literal letters become lowercase.
+/// Malformed escapes are copied unchanged; callers validate first.
+pub string NormalizeText(string text, bool lower) {
+    i64 n = String.Len(text);
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 c = Chars.B(text, i);
+        if c == 37_i64 && i + 2_i64 < n && Chars.IsHex(Chars.B(text, i + 1_i64)) && Chars.IsHex(Chars.B(text, i + 2_i64)) {
+            i64 v = Chars.HexValue(Chars.B(text, i + 1_i64)) * 16_i64 + Chars.HexValue(Chars.B(text, i + 2_i64));
+            if Chars.IsUnreserved(v) {
+                if lower && v >= 65_i64 && v <= 90_i64 { out = out + Chars.LowerAscii(Chars.CharOf(v)); } else { out = out + Chars.CharOf(v); }
+            } else {
+                out = out + HexPair(v);
+            }
+            i = i + 3_i64;
+        } else {
+            if lower { out = out + Chars.LowerAscii(Chars.CharAt(text, i)); } else { out = out + Chars.CharAt(text, i); }
+            i = i + 1_i64;
+        }
+    }
+    return out;
+}

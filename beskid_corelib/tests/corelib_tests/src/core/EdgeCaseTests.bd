@@ -1,0 +1,122 @@
+/// Edge cases for strings, numbers, and builders: multi-byte UTF-8, extreme floats, and seeded
+/// number round trips.
+
+use Testing.Expect;
+use Core.Collections.Array;
+use Core.Collections.Hash;
+use Core.Results;
+use Core.String;
+use Core.String.Builder;
+use Core.Text.Number;
+use Core.Text.NumberError;
+
+/// `é` (2 bytes) built from UTF-8 code units.
+string E() {
+    mut u8[] bytes = Array.Empty<u8>();
+    bytes = Array.Append<u8>(bytes, u8(195));
+    bytes = Array.Append<u8>(bytes, u8(169));
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+/// `日` (3 bytes).
+string Sun() {
+    mut u8[] bytes = Array.Empty<u8>();
+    bytes = Array.Append<u8>(bytes, u8(230));
+    bytes = Array.Append<u8>(bytes, u8(151));
+    bytes = Array.Append<u8>(bytes, u8(165));
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+f64 F64Or(Result<f64, NumberError> value, f64 fallback) {
+    return match value {
+        Result::Ok(v) => v,
+        Result::Error(_) => fallback,
+    };
+}
+
+i64 I64Or(Result<i64, NumberError> value, i64 fallback) {
+    return match value {
+        Result::Ok(v) => v,
+        Result::Error(_) => fallback,
+    };
+}
+
+test utf8_split_replace_and_search {
+    string text = "a" + E() + "b" + E() + Sun();
+    Expect.EqualI64(String.Len(text), 9, "byte length");
+    string[] parts = String.Split(text, E());
+    Expect.EqualI64(Array.Len<string>(parts), 3, "split on multi-byte separator");
+    Expect.EqualString(Array.Get<string>(parts, 2), Sun(), "three-byte tail intact");
+    Expect.EqualString(String.Replace(text, E(), "e"), "aebe" + Sun(), "replace multi-byte");
+    Expect.EqualI64(String.LastIndexOf(text, E()), 4, "last multi-byte match");
+    Expect.EqualBool(String.EndsWith(text, Sun()), true, "multi-byte suffix");
+    Expect.EqualString(String.ToUpperAscii(text), "A" + E() + "B" + E() + Sun(), "case mapping skips UTF-8");
+}
+
+test utf8_padding_and_builder {
+    Expect.EqualString(String.PadLeft("x", 3, E()), E() + "x", "two-byte fill reaches width 3 once");
+    mut StringBuilder b = Builder.New();
+    b = b.Append(Sun());
+    b = b.Append(E());
+    Expect.EqualString(b.ToString(), Sun() + E(), "builder keeps UTF-8 bytes");
+    Expect.EqualI64(b.Length(), 5, "builder counts bytes");
+}
+
+test float_extremes {
+    f64 huge = F64Or(Number.ParseF64("1e400"), 0.0);
+    Expect.EqualBool(Number.IsFinite(huge), false, "overflow to infinity");
+    Expect.EqualString(Number.FormatGeneral(huge), "Infinity", "infinity formatting");
+    Expect.NearF64(F64Or(Number.ParseF64("1e-400"), 1.0), 0.0, 0.0, "underflow to zero");
+    Expect.NearF64(F64Or(Number.ParseF64("1e-320"), 1.0), 0.0, 0.0000000001, "subnormal range stays tiny");
+    Expect.EqualString(Number.FormatGeneral(F64Or(Number.ParseF64("1e300"), 0.0)), "1e+300", "large exponent");
+    Expect.EqualString(Number.FormatGeneral(F64Or(Number.ParseF64("-2.5e-7"), 0.0)), "-2.5e-7", "small negative exponent");
+    Expect.EqualString(Number.FormatFixed(F64Or(Number.ParseF64("-0"), 1.0), 2), "0.00", "negative zero");
+}
+
+i64 Next(i64 state) {
+    return state * 6364136223846793005_i64 + 1442695040888963407_i64;
+}
+
+test integer_text_round_trip {
+    mut i64 state = 77;
+    mut i64 i = 0;
+    while i < 500 {
+        state = Next(state);
+        i64 value = state;
+        Expect.EqualI64(I64Or(Number.ParseI64("${value}"), 0), value, "decimal round trip");
+        if value >= 0 {
+            Expect.EqualI64(I64Or(Number.ParseHex(Number.FormatHex(value)), -1), value, "hex round trip");
+        }
+        i = i + 1;
+    }
+    Expect.EqualI64(I64Or(Number.ParseI64(Number.FormatI64(Number.MinI64())), 0), Number.MinI64(), "min round trip");
+    Expect.EqualString(Number.FormatI64(Number.MinI64()), "-9223372036854775808", "min formats in full");
+    mut StringBuilder b = Builder.New();
+    b = b.AppendI64(Number.MinI64());
+    Expect.EqualString(b.ToString(), "-9223372036854775808", "builder formats min in full");
+}
+
+test fixed_text_round_trip {
+    mut i64 state = 3;
+    mut i64 i = 0;
+    while i < 300 {
+        state = Next(state);
+        i64 thousandths = Hash.ShiftRightLogical(state, 20) % 2000000000 - 1000000000;
+        f64 value = f64(thousandths) / 1000.0;
+        f64 back = F64Or(Number.ParseF64(Number.FormatFixed(value, 3)), 0.0);
+        Expect.NearF64(back, value, 0.0005, "three decimals survive a text round trip");
+        i = i + 1;
+    }
+}
+
+test truncate_matches_integer_conversion {
+    mut i64 state = 11;
+    mut i64 i = 0;
+    while i < 300 {
+        state = Next(state);
+        // Values below 2^53 are exactly representable, so truncation must be lossless.
+        i64 value = Hash.ShiftRightLogical(state, 11) - 4503599627370496_i64;
+        Expect.EqualI64(I64Or(Number.TruncateToI64(f64(value)), 0), value, "exact integers survive f64");
+        i = i + 1;
+    }
+}

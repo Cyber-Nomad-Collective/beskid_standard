@@ -1,14 +1,12 @@
-/// Core.String.Builder — incremental string construction over a growable UTF-8 byte buffer.
+/// Core.String.Builder — incremental string construction.
 /// @tier(supported)
-/// Builders are linear values: every `Append*` returns the updated builder, and callers keep
-/// using the returned value (`b = b.Append("x");`). Earlier copies may share storage with the
-/// returned builder and must not be appended to again.
-use Core.Collections.Array;
+/// Builders are values: every `Append*` returns the updated builder, and callers keep using the
+/// returned value (`b = b.Append("x");`).
 use Core.String.Core;
-use Core.String.Utf8;
+use Core.String.Transform;
 
 pub type StringBuilder {
-    u8[] bytes,
+    string content,
     i64 length,
 
     /// Number of UTF-8 bytes appended so far.
@@ -40,7 +38,7 @@ pub type StringBuilder {
 
     /// Appends the decimal form of `value`.
     pub StringBuilder AppendI64(i64 value) {
-        return AppendText(this, "${value}");
+        return AppendText(this, DecimalText(value));
     }
 
     /// Appends `true` or `false`.
@@ -53,33 +51,37 @@ pub type StringBuilder {
 
     /// Materializes the appended bytes as a string.
     pub string ToString() {
-        return Utf8.FromUtf8CodeUnits(this.bytes);
+        return this.content;
     }
 }
 
+/// Appends through string concatenation, which the 0.5.2 runtime performs much faster than
+/// growing a `u8[]` one element at a time.
 StringBuilder AppendText(StringBuilder builder, string text) {
-    i64 len = Core.Len(text);
-    mut u8[] data = builder.bytes;
-    mut i64 i = 0;
-    while i < len {
-        data = Array.Append<u8>(data, Core.ByteAt(text, i));
-        i = i + 1;
+    string current = builder.content;
+    string combined = Transform.Concat(current, text);
+    i64 length = builder.length + Core.Len(text);
+    return StringBuilder { content: combined, length: length };
+}
+
+/// Decimal text of `value`; the 0.5.2 runtime interpolates the minimum `i64` as `-` alone.
+string DecimalText(i64 value) {
+    if value == -9223372036854775807_i64 - 1_i64 {
+        return "-9223372036854775808";
     }
-    return StringBuilder { bytes: data, length: builder.length + len };
+    return "${value}";
 }
 
 StringBuilder AppendCode(StringBuilder builder, u8 code) {
     if code > 127 {
         return builder;
     }
-    mut u8[] data = builder.bytes;
-    data = Array.Append<u8>(data, code);
-    return StringBuilder { bytes: data, length: builder.length + 1 };
+    return AppendText(builder, Transform.FromAscii(code));
 }
 
 /// Creates an empty builder.
 pub StringBuilder New() {
-    return StringBuilder { bytes: Array.Empty<u8>(), length: 0 };
+    return StringBuilder { content: "", length: 0 };
 }
 
 /// Creates a builder that starts with `text`.

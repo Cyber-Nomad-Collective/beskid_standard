@@ -1,0 +1,115 @@
+use Core.Optional.Option;
+use Core.Time;
+use Core.Time.Duration;
+use Network.Types;
+
+/// Happy Eyeballs tuning. Durations are relative to the start of a connect call.
+/// - attemptDelay: Connection Attempt Delay (RFC 8305 section 5), clamped to 100 ms..2 s.
+/// - resolutionDelay: wait for the preferred family after the other family answered (section 3), clamped to 0..1 s.
+/// - preferredFamily: the family tried first (RFC 8305 prefers V6).
+/// - familyFilter: when set, only that family is resolved and attempted.
+/// - timeout: overall budget for resolution and every attempt; None means no deadline.
+/// - maxAttempts: upper bound on started attempts; None means every address.
+/// - firstAddressFamilyCount: preferred-family addresses before the first other-family address (section 4), >= 1.
+pub type ConnectPolicy {
+    pub Duration attemptDelay,
+    pub Duration resolutionDelay,
+    pub AddressFamily preferredFamily,
+    pub Option<AddressFamily> familyFilter,
+    pub Option<Duration> timeout,
+    pub Option<i64> maxAttempts,
+    pub i64 firstAddressFamilyCount,
+    pub SocketOptions socketOptions,
+}
+
+pub i64 MinAttemptDelayMillis() { return 100_i64; }
+pub i64 MaxAttemptDelayMillis() { return 2000_i64; }
+pub i64 MaxResolutionDelayMillis() { return 1000_i64; }
+
+/// RFC 8305 recommended defaults: 250 ms attempt delay, 50 ms resolution delay,
+/// IPv6 preferred, both families, no overall deadline, every address.
+pub ConnectPolicy Default() {
+    return ConnectPolicy {
+        attemptDelay: Time.FromMilliseconds(250_i64),
+        resolutionDelay: Time.FromMilliseconds(50_i64),
+        preferredFamily: AddressFamily::V6(),
+        familyFilter: Option.Empty<AddressFamily>(),
+        timeout: Option.Empty<Duration>(),
+        maxAttempts: Option.Empty<i64>(),
+        firstAddressFamilyCount: 1_i64,
+        socketOptions: Network.Types.DefaultSocketOptions(),
+    };
+}
+
+pub ConnectPolicy WithAttemptDelay(ConnectPolicy p, Duration value) {
+    return ConnectPolicy { attemptDelay: value, resolutionDelay: p.resolutionDelay, preferredFamily: p.preferredFamily, familyFilter: p.familyFilter, timeout: p.timeout, maxAttempts: p.maxAttempts, firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithResolutionDelay(ConnectPolicy p, Duration value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: value, preferredFamily: p.preferredFamily, familyFilter: p.familyFilter, timeout: p.timeout, maxAttempts: p.maxAttempts, firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithPreferredFamily(ConnectPolicy p, AddressFamily value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: p.resolutionDelay, preferredFamily: value, familyFilter: p.familyFilter, timeout: p.timeout, maxAttempts: p.maxAttempts, firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithFamilyFilter(ConnectPolicy p, AddressFamily value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: p.resolutionDelay, preferredFamily: p.preferredFamily, familyFilter: Option.FromValue<AddressFamily>(value), timeout: p.timeout, maxAttempts: p.maxAttempts, firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithTimeout(ConnectPolicy p, Duration value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: p.resolutionDelay, preferredFamily: p.preferredFamily, familyFilter: p.familyFilter, timeout: Option.FromValue<Duration>(value), maxAttempts: p.maxAttempts, firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithMaxAttempts(ConnectPolicy p, i64 value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: p.resolutionDelay, preferredFamily: p.preferredFamily, familyFilter: p.familyFilter, timeout: p.timeout, maxAttempts: Option.FromValue<i64>(value), firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithFirstAddressFamilyCount(ConnectPolicy p, i64 value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: p.resolutionDelay, preferredFamily: p.preferredFamily, familyFilter: p.familyFilter, timeout: p.timeout, maxAttempts: p.maxAttempts, firstAddressFamilyCount: value, socketOptions: p.socketOptions };
+}
+
+pub ConnectPolicy WithSocketOptions(ConnectPolicy p, SocketOptions value) {
+    return ConnectPolicy { attemptDelay: p.attemptDelay, resolutionDelay: p.resolutionDelay, preferredFamily: p.preferredFamily, familyFilter: p.familyFilter, timeout: p.timeout, maxAttempts: p.maxAttempts, firstAddressFamilyCount: p.firstAddressFamilyCount, socketOptions: value };
+}
+
+i64 Clamp(i64 value, i64 low, i64 high) {
+    if value < low { return low; }
+    if value > high { return high; }
+    return value;
+}
+
+/// The effective Connection Attempt Delay in milliseconds (100..2000).
+pub i64 AttemptDelayMillis(ConnectPolicy p) {
+    return Clamp(Time.DurationToMilliseconds(p.attemptDelay), MinAttemptDelayMillis(), MaxAttemptDelayMillis());
+}
+
+/// The effective Resolution Delay in milliseconds (0..1000).
+pub i64 ResolutionDelayMillis(ConnectPolicy p) {
+    return Clamp(Time.DurationToMilliseconds(p.resolutionDelay), 0_i64, MaxResolutionDelayMillis());
+}
+
+/// The effective attempt bound; a very large count when the policy has none.
+pub i64 MaxAttemptCount(ConnectPolicy p) {
+    Option<i64> bound = p.maxAttempts;
+    return match bound {
+        Option::Some(value) => value,
+        Option::None => 9223372036854775807_i64,
+    };
+}
+
+/// The overall budget in milliseconds, or -1 when the policy has no deadline.
+pub i64 TimeoutMillis(ConnectPolicy p) {
+    Option<Duration> timeout = p.timeout;
+    if !Option.HasValue<Duration>(timeout) { return -1_i64; }
+    return Time.DurationToMilliseconds(Option.UnwrapOr<Duration>(timeout, Time.FromMilliseconds(0_i64)));
+}
+
+/// Fail closed on values outside the documented domain.
+pub bool IsValid(ConnectPolicy p) {
+    if p.firstAddressFamilyCount < 1_i64 { return false; }
+    if MaxAttemptCount(p) < 1_i64 { return false; }
+    Option<Duration> timeout = p.timeout;
+    if !Option.HasValue<Duration>(timeout) { return true; }
+    return Time.DurationToNanoseconds(Option.UnwrapOr<Duration>(timeout, Time.FromMilliseconds(0_i64))) >= 0_i64;
+}

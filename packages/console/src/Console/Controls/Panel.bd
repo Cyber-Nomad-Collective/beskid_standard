@@ -5,6 +5,9 @@ use Console.Controls.Contracts;
 use Console.Controls.Frame;
 use Console.Controls.RenderContext;
 use Console.Capabilities;
+use Ansi.Text;
+use Core.Collections.Array;
+use Core.Math;
 use Core.String;
 
 pub type Panel : Contracts.PaddingProvider, Contracts.MarginProvider, Contracts.FramedControl, Contracts.ConsoleControl {
@@ -86,27 +89,47 @@ pub bool UseUnicodeFrame(Panel panel) {
     return Frame.PreferUnicodeFrame();
 }
 
-pub i64 ContentWidth(Panel panel) {
-    return Core.String.Len(panel.body);
+/// Body lines: the body split on line feeds (a trailing CR is dropped); an empty body is one
+/// empty line.
+pub string[] BodyLines(Panel panel) {
+    string[] lines = String.Lines(panel.body);
+    if Array.Len<string>(lines) == 0 {
+        mut string[] onlyLine = Array.Empty<string>();
+        onlyLine = Array.Append<string>(onlyLine, "");
+        return onlyLine;
+    }
+    return lines;
 }
 
+/// Display columns of the widest body line; ANSI styling and wide characters are measured by
+/// `Ansi.Text.VisibleWidth`, not by byte length.
+pub i64 ContentWidth(Panel panel) {
+    string[] lines = BodyLines(panel);
+    mut i64 widest = 0;
+    mut i64 i = 0;
+    while i < Array.Len<string>(lines) {
+        widest = Math.Max(widest, Text.VisibleWidth(Array.Get<string>(lines, i)));
+        i = i + 1;
+    }
+    return widest;
+}
+
+/// Size of the rendered panel: borders plus one row per body line. The title sits inside the
+/// top border and adds no row.
 pub Console.ConsoleSize Measure(Panel panel, Console.ConsoleSize available) {
     i32 pad = Console.Style.ResolvePadding(panel.padding, available.columns);
     i32 margin = Console.Style.ResolveMargin(panel.margin, available.columns);
     i64 inner = ContentWidth(panel) + (pad * 2);
     i32 width = Console.Style.ClampWidth(inner + 2, 4, available.columns - margin);
-    i32 rows = 3;
-    if panel.title != "" {
-        rows = rows + 1;
-    }
+    i32 rows = i32(Array.Len<string>(BodyLines(panel))) + 2;
     return Console.ConsoleSize { columns: width, rows: rows };
 }
 
 pub string TopBorder(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
     if panel.title == "" {
-        return "${frame.topLeft}${Frame.Repeat(frame.top, i64(innerWidth))}${frame.topRight}";
+        return "${frame.topLeft}${String.Repeat(frame.top, i64(innerWidth))}${frame.topRight}";
     }
-    i32 titleLen = i32(Core.String.Len(panel.title));
+    i32 titleLen = i32(Text.VisibleWidth(panel.title));
     mut i32 titleWidth = innerWidth - 2;
     if titleWidth < 1 {
         titleWidth = 1;
@@ -127,17 +150,23 @@ pub string TopBorder(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
     if rightFill < 0 {
         rightFill = 0;
     }
-    return "${frame.topLeft}${Frame.Repeat(frame.top, i64(leftFill))} ${panel.title} ${Frame.Repeat(frame.top, i64(rightFill))}${frame.topRight}";
+    return "${frame.topLeft}${String.Repeat(frame.top, i64(leftFill))} ${panel.title} ${String.Repeat(frame.top, i64(rightFill))}${frame.topRight}";
 }
 
-pub string BodyLine(Panel panel, Frame.FrameChars frame, i32 innerWidth) {
+/// One framed body row. Lines wider than the space inside the padding are truncated with an
+/// ellipsis so the right border stays aligned.
+pub string BodyLine(Panel panel, Frame.FrameChars frame, i32 innerWidth, string line) {
     i32 pad = Console.Style.ResolvePadding(panel.padding, innerWidth + 2);
-    i32 bodyLen = i32(Core.String.Len(panel.body));
-    mut i32 padRight = innerWidth - bodyLen - pad;
+    mut i64 room = i64(innerWidth) - i64(pad) * 2;
+    if room < 1 {
+        room = 1;
+    }
+    string fitted = Text.Truncate(line, room, "...");
+    mut i64 padRight = i64(innerWidth) - Text.VisibleWidth(fitted) - i64(pad);
     if padRight < 0 {
         padRight = 0;
     }
-    return "${frame.side}${Frame.Repeat(" ", i64(pad))}${panel.body}${Frame.Repeat(" ", i64(padRight))}${frame.side}";
+    return frame.side + String.Repeat(" ", i64(pad)) + fitted + String.Repeat(" ", padRight) + frame.side;
 }
 
 pub string Render(Panel panel, Console.ConsoleSize size) {
@@ -146,13 +175,15 @@ pub string Render(Panel panel, Console.ConsoleSize size) {
     if innerWidth < 1 {
         innerWidth = 1;
     }
-    string top = TopBorder(panel, frame, innerWidth);
-    string mid = BodyLine(panel, frame, innerWidth);
-    string bottomFill = Frame.Repeat(frame.bottom, i64(innerWidth));
-    string bottom = "${frame.bottomLeft}${bottomFill}${frame.bottomRight}";
-    return "${top}
-${mid}
-${bottom}";
+    string[] lines = BodyLines(panel);
+    mut string block = TopBorder(panel, frame, innerWidth);
+    mut i64 i = 0;
+    while i < Array.Len<string>(lines) {
+        block = block + String.Newline() + BodyLine(panel, frame, innerWidth, Array.Get<string>(lines, i));
+        i = i + 1;
+    }
+    string bottomFill = String.Repeat(frame.bottom, i64(innerWidth));
+    return block + String.Newline() + frame.bottomLeft + bottomFill + frame.bottomRight;
 }
 
 pub string RenderWithContext(Panel panel, Console.ConsoleSize size, RenderContext.RenderContext ctx) {

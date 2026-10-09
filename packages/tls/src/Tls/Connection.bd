@@ -1,0 +1,313 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.IO.IoError;
+use Core.IO.Stream;
+use Core.Results;
+use Tls.Alert;
+use Tls.Handshake;
+use Tls.Record;
+use Tls.Suites;
+use Tls.TlsErrors;
+use Tls.Wire;
+use Codec.Mem;
+
+// TLS 1.3 record layer carrier over any `Core.IO.Stream` (RFC 8446 section 5). The
+// transport is passed to every call (a contract value cannot be stored in a struct in
+// Beskid 0.5.2). One read and one write record buffer are allocated per connection and
+// reused for every record. They start at 4 KiB (a literal allocation) and grow once to
+// `Record.BufferLength()` when a larger record arrives or is written: a 16 KiB buffer costs
+// about 120 ms to allocate in 0.5.3 (COMPILER-GAPS PERF1), which would otherwise dominate
+// every handshake.
+
+pub type TlsConnection {
+    HandshakeEngine engine,
+    RecordKeys readKeys,
+    RecordKeys writeKeys,
+    u8[] rbuf,
+    u8[] wbuf,
+    // [0] pending app data start, [1] pending end, [2] close_notify received, [3] close_notify sent,
+    // [4] failed, [5] handshake done, [6] read protected, [7] write protected, [8] last record length.
+    i64[] st,
+    TlsError[] failure,
+}
+
+i64 PStart() { return 0_i64; }
+i64 PEnd() { return 1_i64; }
+i64 PReadClosed() { return 2_i64; }
+i64 PWriteClosed() { return 3_i64; }
+i64 PFailed() { return 4_i64; }
+i64 PDone() { return 5_i64; }
+i64 PReadProtected() { return 6_i64; }
+i64 PWriteProtected() { return 7_i64; }
+i64 PLength() { return 8_i64; }
+
+TlsError F(i64 alert) { return TlsErrors.Fatal(alert); }
+
+/// Initial size of the record buffers (handshake flights and small records fit).
+i64 InitialBuffer() { return 4096_i64; }
+
+/// Grows the read buffer to the full record size, keeping the 5-byte header already read.
+unit GrowRead(TlsConnection c, i64 need) {
+    if Slice.Len(c.rbuf) >= need { return; }
+    u8[] grown = Mem.Zeroed(Record.BufferLength());
+    Mem.Copy(grown, 0_i64, c.rbuf, 0_i64, 5_i64);
+    c.rbuf = grown;
+    return;
+}
+
+/// Grows the write buffer to the full record size (contents are rebuilt per record).
+unit GrowWrite(TlsConnection c, i64 need) {
+    if Slice.Len(c.wbuf) >= need { return; }
+    c.wbuf = Mem.Zeroed(Record.BufferLength());
+    return;
+}
+
+/// Wraps a handshake engine (from `Handshake.NewClient` / `NewServer`) in a record layer.
+pub Result<TlsConnection, TlsError> New(HandshakeEngine engine) {
+    RecordKeys none = Record.FromKeyIv(Suites.Aes128(), Mem.Zeroed(16_i64), Mem.Zeroed(12_i64))?;
+    mut TlsError[] failure = Array.Empty<TlsError>();
+    return Result::Ok(TlsConnection {
+        engine: engine, readKeys: none, writeKeys: none,
+        rbuf: Mem.Zeroed(InitialBuffer()), wbuf: Mem.Zeroed(InitialBuffer()),
+        st: [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64], failure: failure,
+    });
+}
+
+pub HandshakeEngine Engine(TlsConnection c) { return c.engine; }
+pub bool IsHandshakeDone(TlsConnection c) { return c.st[PDone()] == 1_i64; }
+pub bool PeerClosed(TlsConnection c) { return c.st[PReadClosed()] == 1_i64; }
+
+/// The error that failed the connection, if any.
+pub bool HasFailure(TlsConnection c) { return Array.Len<TlsError>(c.failure) > 0_i64; }
+pub TlsError Failure(TlsConnection c) {
+    if Array.Len<TlsError>(c.failure) == 0_i64 { return TlsError::Closed; }
+    return c.failure[0];
+}
+
+// ---------------------------------------------------------------- record I/O
+
+Result<unit, TlsError> WriteRaw(Stream transport, u8[] buf, i64 count) {
+    Result<unit, IoError> w = IO.WriteAll(transport, buf, 0_i64, count);
+    return match w { Result::Ok(_) => Result::Ok(()), Result::Error(e) => Result::Error(TlsError::Io(e)), };
+}
+
+/// Writes `count` bytes of `src` as records of `contentType` (fragmented at 2^14).
+Result<unit, TlsError> WriteRecords(TlsConnection c, Stream transport, i64 contentType, u8[] src, i64 offset, i64 count) {
+    mut i64 done = 0_i64;
+    mut bool first = true;
+    while done < count || first {
+        first = false;
+        mut i64 n = count - done;
+        if n > Wire.MaxPlaintext() { n = Wire.MaxPlaintext(); }
+        GrowWrite(c, n + 22_i64);
+        Mem.Copy(c.wbuf, 5_i64, src, offset + done, n);
+        if c.st[PWriteProtected()] == 1_i64 {
+            i64 total = Record.Seal(c.writeKeys, c.wbuf, contentType, n, 0_i64)?;
+            Result<unit, TlsError> r1 = WriteRaw(transport, c.wbuf, total);
+            match r1 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+        } else {
+            Record.WriteHeader(c.wbuf, 0_i64, contentType, n);
+            Result<unit, TlsError> r2 = WriteRaw(transport, c.wbuf, 5_i64 + n);
+            match r2 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+        }
+        done = done + n;
+    }
+    return Result::Ok(());
+}
+
+/// Reads and (when protected) opens one record. Returns its content type; the content
+/// is at `rbuf[5, 5 + st[8])`.
+Result<i64, TlsError> ReadRecord(TlsConnection c, Stream transport) {
+    Result<unit, IoError> header = IO.ReadExact(transport, c.rbuf, 0_i64, 5_i64);
+    match header { Result::Error(e) => { return Result::Error(TlsError::Io(e)); }, Result::Ok(_) => {}, };
+    i64 outer = i64(c.rbuf[0]);
+    i64 length = (i64(c.rbuf[3]) << 8_i64) | i64(c.rbuf[4]);
+    if length > Wire.MaxCiphertext() { return Result::Error(F(Alert.RecordOverflow())); }
+    GrowRead(c, 5_i64 + length);
+    Result<unit, IoError> body = IO.ReadExact(transport, c.rbuf, 5_i64, length);
+    match body { Result::Error(e) => { return Result::Error(TlsError::Io(e)); }, Result::Ok(_) => {}, };
+    if outer == Wire.ContentChangeCipherSpec() {
+        // Middlebox compatibility (RFC 8446 section 5): one 0x01 byte, only during the handshake.
+        if c.st[PDone()] == 1_i64 || length != 1_i64 || c.rbuf[5] != 1_u8 { return Result::Error(F(Alert.UnexpectedMessage())); }
+        c.st[PLength()] = 0_i64;
+        return Result::Ok(outer);
+    }
+    if c.st[PReadProtected()] == 1_i64 {
+        if outer != Wire.ContentApplicationData() { return Result::Error(F(Alert.UnexpectedMessage())); }
+        Opened opened = Record.Open(c.readKeys, c.rbuf, 5_i64 + length)?;
+        c.st[PLength()] = opened.length;
+        if opened.contentType == Wire.ContentHandshake() && opened.length == 0_i64 { return Result::Error(F(Alert.UnexpectedMessage())); }
+        return Result::Ok(opened.contentType);
+    }
+    if length > Wire.MaxPlaintext() { return Result::Error(F(Alert.RecordOverflow())); }
+    if outer != Wire.ContentHandshake() && outer != Wire.ContentAlert() { return Result::Error(F(Alert.UnexpectedMessage())); }
+    if length == 0_i64 { return Result::Error(F(Alert.UnexpectedMessage())); }
+    c.st[PLength()] = length;
+    return Result::Ok(outer);
+}
+
+/// Applies engine events: handshake bytes are written, secrets switch the record keys.
+Result<unit, TlsError> Pump(TlsConnection c, Stream transport) {
+    HandshakeEngine e = c.engine;
+    CipherSuite suite = Handshake.NegotiatedSuite(e);
+    while Handshake.HasEvent(e) {
+        TlsEvent ev = Handshake.TakeEvent(e);
+        match ev {
+            TlsEvent::Send(_, data) => {
+                Result<unit, TlsError> sent = WriteRecords(c, transport, Wire.ContentHandshake(), data, 0_i64, Slice.Len(data));
+                match sent { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+            },
+            TlsEvent::ReadSecret(_, secret) => {
+                c.readKeys = Record.FromSecret(suite, secret)?;
+                c.st[PReadProtected()] = 1_i64;
+            },
+            TlsEvent::WriteSecret(_, secret) => {
+                c.writeKeys = Record.FromSecret(suite, secret)?;
+                c.st[PWriteProtected()] = 1_i64;
+            },
+            TlsEvent::Connected => { c.st[PDone()] = 1_i64; },
+        };
+    }
+    return Result::Ok(());
+}
+
+/// Interprets an alert record. close_notify returns Ok(true); user_canceled is ignored (Ok(false)).
+Result<bool, TlsError> OnAlert(TlsConnection c) {
+    if c.st[PLength()] != 2_i64 { return Result::Error(F(Alert.DecodeError())); }
+    i64 description = i64(c.rbuf[6]);
+    if description == Alert.CloseNotify() {
+        c.st[PReadClosed()] = 1_i64;
+        return Result::Ok(true);
+    }
+    if description == Alert.UserCanceled() { return Result::Ok(false); }
+    return Result::Error(TlsError::PeerAlert(description));
+}
+
+/// Records the failure and sends the matching fatal alert (best effort).
+TlsError Fail(TlsConnection c, Stream transport, TlsError error) {
+    if c.st[PFailed()] == 1_i64 { return error; }
+    c.st[PFailed()] = 1_i64;
+    Array.Append<TlsError>(c.failure, error);
+    i64 alert = TlsErrors.AlertToSend(error);
+    if alert >= 0_i64 && c.st[PWriteClosed()] == 0_i64 {
+        c.st[PWriteClosed()] = 1_i64;
+        u8[] body = Alert.Encode(alert);
+        WriteRecords(c, transport, Wire.ContentAlert(), body, 0_i64, 2_i64);
+    }
+    return error;
+}
+
+Result<unit, TlsError> Checked(TlsConnection c, Stream transport, Result<unit, TlsError> r) {
+    return match r { Result::Ok(_) => Result::Ok(()), Result::Error(e) => Result::Error(Fail(c, transport, e)), };
+}
+
+// ---------------------------------------------------------------- handshake
+
+/// Runs the handshake to completion over `transport`.
+pub Result<unit, TlsError> Handshake(TlsConnection c, Stream transport) {
+    if c.st[PFailed()] == 1_i64 { return Result::Error(Failure(c)); }
+    return Checked(c, transport, DoHandshake(c, transport));
+}
+
+Result<unit, TlsError> DoHandshake(TlsConnection c, Stream transport) {
+    HandshakeEngine e = c.engine;
+    Handshake.Start(e)?;
+    Result<unit, TlsError> r3 = Pump(c, transport);
+    match r3 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+    while c.st[PDone()] == 0_i64 {
+        Result<i64, TlsError> rr1 = ReadRecord(c, transport);
+        i64 contentType = match rr1 { Result::Ok(x) => x, Result::Error(err) => { return Result::Error(err); }, };
+        if contentType == Wire.ContentHandshake() {
+            Handshake.Feed(e, Handshake.ReadLevel(e), c.rbuf, 5_i64, c.st[PLength()])?;
+            Result<unit, TlsError> r4 = Pump(c, transport);
+            match r4 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+        } else {
+            if contentType == Wire.ContentAlert() {
+                bool closed = OnAlert(c)?;
+                if closed { return Result::Error(TlsError::PeerAlert(Alert.CloseNotify())); }
+            } else {
+                if contentType != Wire.ContentChangeCipherSpec() { return Result::Error(F(Alert.UnexpectedMessage())); }
+            }
+        }
+    }
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------- application data
+
+/// Reads application data into `destination`; 0 means the peer sent close_notify.
+pub Result<i64, TlsError> Read(TlsConnection c, Stream transport, u8[] destination, i64 offset, i64 count) {
+    if c.st[PFailed()] == 1_i64 { return Result::Error(Failure(c)); }
+    if c.st[PDone()] == 0_i64 { return Result::Error(TlsError::Closed); }
+    if count <= 0_i64 { return Result::Ok(0_i64); }
+    Result<i64, TlsError> r = DoRead(c, transport, destination, offset, count);
+    return match r { Result::Ok(n) => Result::Ok(n), Result::Error(e) => Result::Error(Fail(c, transport, e)), };
+}
+
+Result<i64, TlsError> DoRead(TlsConnection c, Stream transport, u8[] destination, i64 offset, i64 count) {
+    while c.st[PStart()] >= c.st[PEnd()] {
+        if c.st[PReadClosed()] == 1_i64 { return Result::Ok(0_i64); }
+        Result<i64, TlsError> rr2 = ReadRecord(c, transport);
+        i64 contentType = match rr2 { Result::Ok(x) => x, Result::Error(err) => { return Result::Error(err); }, };
+        i64 length = c.st[PLength()];
+        if contentType == Wire.ContentApplicationData() {
+            c.st[PStart()] = 5_i64;
+            c.st[PEnd()] = 5_i64 + length;
+        } else {
+            if contentType == Wire.ContentHandshake() {
+                HandshakeEngine e = c.engine;
+                Handshake.Feed(e, Handshake.ReadLevel(e), c.rbuf, 5_i64, length)?;
+                Result<unit, TlsError> r5 = Pump(c, transport);
+                match r5 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+            } else {
+                if contentType == Wire.ContentAlert() {
+                    bool closed = OnAlert(c)?;
+                    if closed { return Result::Ok(0_i64); }
+                } else {
+                    return Result::Error(F(Alert.UnexpectedMessage()));
+                }
+            }
+        }
+    }
+    i64 start = c.st[PStart()];
+    mut i64 n = c.st[PEnd()] - start;
+    if n > count { n = count; }
+    Mem.Copy(destination, offset, c.rbuf, start, n);
+    c.st[PStart()] = start + n;
+    return Result::Ok(n);
+}
+
+/// Writes all `count` bytes as application data records; returns `count`.
+pub Result<i64, TlsError> Write(TlsConnection c, Stream transport, u8[] source, i64 offset, i64 count) {
+    if c.st[PFailed()] == 1_i64 { return Result::Error(Failure(c)); }
+    if c.st[PDone()] == 0_i64 || c.st[PWriteClosed()] == 1_i64 { return Result::Error(TlsError::Closed); }
+    if count <= 0_i64 { return Result::Ok(0_i64); }
+    Result<unit, TlsError> r = DoWrite(c, transport, source, offset, count);
+    return match r { Result::Ok(_) => Result::Ok(count), Result::Error(e) => Result::Error(Fail(c, transport, e)), };
+}
+
+Result<unit, TlsError> DoWrite(TlsConnection c, Stream transport, u8[] source, i64 offset, i64 count) {
+    if Record.Sequence(c.writeKeys) >= Record.KeyUpdateThreshold() {
+        Handshake.RequestKeyUpdate(c.engine, false)?;
+        Result<unit, TlsError> r6 = Pump(c, transport);
+        match r6 { Result::Error(err) => { return Result::Error(err); }, Result::Ok(_) => {}, };
+    }
+    return WriteRecords(c, transport, Wire.ContentApplicationData(), source, offset, count);
+}
+
+/// Sends a KeyUpdate; with `requestPeer` the peer updates its sending keys too.
+pub Result<unit, TlsError> UpdateKeys(TlsConnection c, Stream transport, bool requestPeer) {
+    if c.st[PFailed()] == 1_i64 { return Result::Error(Failure(c)); }
+    Result<unit, TlsError> r = Handshake.RequestKeyUpdate(c.engine, requestPeer);
+    match r { Result::Error(e) => { return Result::Error(e); }, Result::Ok(_) => {}, };
+    return Checked(c, transport, Pump(c, transport));
+}
+
+/// Sends close_notify once. The transport is left open (see `TlsStream.Close`).
+pub Result<unit, TlsError> CloseNotify(TlsConnection c, Stream transport) {
+    if c.st[PWriteClosed()] == 1_i64 || c.st[PFailed()] == 1_i64 { return Result::Ok(()); }
+    c.st[PWriteClosed()] = 1_i64;
+    u8[] body = Alert.Encode(Alert.CloseNotify());
+    return WriteRecords(c, transport, Wire.ContentAlert(), body, 0_i64, 2_i64);
+}

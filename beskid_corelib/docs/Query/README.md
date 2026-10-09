@@ -1,8 +1,9 @@
-**Query** modules model array-backed query pipelines: **`Query.QueryState`** holds iterator state; **`Query.Operators`** exposes combinators; **`Query.Execution`** provides deferred/materialization helpers.
+# Query
 
-Optional values use **`Core.Optional`** — not a separate query contracts module.
+**Query** modules iterate and combine array-backed sequences.
 
-## Modules
+- **`Query.Iterator`**: the `Iterator<T>` contract (`Current() -> Option<Item>`, `MoveNext() -> This`).
+- **`Query.ArrayIterator`**: the array implementation, plus the module functions `Over`, `Current`, `MoveNext`, `Remaining`, and `Reset`.
+- **`Query.Operators`**: combinators over the remaining elements of an `ArrayIterator`; see [Query.Operators](./Operators.md).
 
-- [Query.Operators](./Operators.md) — `QueryState`, `FromArray`, `Where`, `Select`, `Take`, `Skip`, `Count`, `First`, `ToList`, `Any`, `All`, `OrderBy`, `CollectArray`
-- [Query.Execution](./Execution.md) — `IsDeferred`, `MaterializeCount`
+Optional results use `Core.Optional.Option`.

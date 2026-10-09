@@ -1,0 +1,160 @@
+/// Core.Text.Glob — shell-style wildcard matching.
+/// @tier(supported)
+/// Pattern syntax: `*` matches any run of characters, `?` one character, `[abc]` one listed
+/// character, `[a-z]` a range, `[!abc]` or `[^abc]` any character not listed, and `\` escapes the
+/// next character. `Match` treats the subject as plain text. `MatchPath` treats `/` as a
+/// separator: `*` and `?` never match `/`, and `**` matches any number of whole path segments
+/// (`src/**/*.bd` matches `src/a.bd` and `src/x/y/a.bd`). Matching works on bytes, so `?` matches
+/// one byte of a multi-byte UTF-8 character; literal non-ASCII text matches normally.
+use Core.String;
+
+/// Result of matching a bracket expression at `at`: whether `b` matched and where the
+/// expression ends (`end` is `-1` for an unterminated bracket, which then matches literally).
+pub type BracketMatch {
+    bool matched,
+    i64 end,
+}
+
+BracketMatch Bracket(string pattern, i64 at, u8 b) {
+    i64 len = String.Len(pattern);
+    mut i64 i = at + 1;
+    mut bool negate = false;
+    if i < len && (String.ByteAt(pattern, i) == 33 || String.ByteAt(pattern, i) == 94) {
+        negate = true;
+        i = i + 1;
+    }
+    mut bool matched = false;
+    mut bool first = true;
+    while i < len {
+        u8 c = String.ByteAt(pattern, i);
+        if c == 93 && !first {
+            if negate {
+                return BracketMatch { matched: !matched, end: i + 1 };
+            }
+            return BracketMatch { matched: matched, end: i + 1 };
+        }
+        first = false;
+        mut u8 low = c;
+        if c == 92 && i + 1 < len {
+            i = i + 1;
+            low = String.ByteAt(pattern, i);
+        }
+        if i + 2 < len && String.ByteAt(pattern, i + 1) == 45 && String.ByteAt(pattern, i + 2) != 93 {
+            u8 high = String.ByteAt(pattern, i + 2);
+            if b >= low && b <= high {
+                matched = true;
+            }
+            i = i + 3;
+        } else {
+            if b == low {
+                matched = true;
+            }
+            i = i + 1;
+        }
+    }
+    return BracketMatch { matched: false, end: -1 };
+}
+
+/// Matches `pattern[p..]` against `text[t..]`; `pathMode` makes `/` special.
+bool MatchFrom(string pattern, i64 p, string text, i64 t, bool pathMode) {
+    i64 plen = String.Len(pattern);
+    i64 tlen = String.Len(text);
+    mut i64 pi = p;
+    mut i64 ti = t;
+    while pi < plen {
+        u8 c = String.ByteAt(pattern, pi);
+        if c == 42 {
+            bool doubleStar = pathMode && pi + 1 < plen && String.ByteAt(pattern, pi + 1) == 42;
+            if doubleStar {
+                i64 next = pi + 2;
+                // `**/` may also match zero segments.
+                if next < plen && String.ByteAt(pattern, next) == 47 {
+                    if MatchFrom(pattern, next + 1, text, ti, pathMode) {
+                        return true;
+                    }
+                }
+                mut i64 k = ti;
+                while k <= tlen {
+                    if MatchFrom(pattern, next, text, k, pathMode) {
+                        return true;
+                    }
+                    k = k + 1;
+                }
+                return false;
+            }
+            mut i64 k = ti;
+            while k <= tlen {
+                if MatchFrom(pattern, pi + 1, text, k, pathMode) {
+                    return true;
+                }
+                if k < tlen && pathMode && String.ByteAt(text, k) == 47 {
+                    return false;
+                }
+                k = k + 1;
+            }
+            return false;
+        }
+        if ti >= tlen {
+            return false;
+        }
+        u8 b = String.ByteAt(text, ti);
+        if c == 63 {
+            if pathMode && b == 47 {
+                return false;
+            }
+            pi = pi + 1;
+            ti = ti + 1;
+            continue;
+        }
+        if c == 91 {
+            BracketMatch result = Bracket(pattern, pi, b);
+            if result.end >= 0 {
+                if !result.matched || (pathMode && b == 47) {
+                    return false;
+                }
+                pi = result.end;
+                ti = ti + 1;
+                continue;
+            }
+        }
+        mut u8 literal = c;
+        if c == 92 && pi + 1 < plen {
+            pi = pi + 1;
+            literal = String.ByteAt(pattern, pi);
+        }
+        if b != literal {
+            return false;
+        }
+        pi = pi + 1;
+        ti = ti + 1;
+    }
+    return ti == tlen;
+}
+
+/// Returns true when the whole of `text` matches `pattern`.
+pub bool Match(string pattern, string text) {
+    return MatchFrom(pattern, 0, text, 0, false);
+}
+
+/// Path-aware match: `*` and `?` stay within one segment and `**` spans segments.
+pub bool MatchPath(string pattern, string path) {
+    return MatchFrom(pattern, 0, path, 0, true);
+}
+
+/// Returns true when `pattern` contains an unescaped wildcard (`*`, `?`, or `[`).
+pub bool HasWildcards(string pattern) {
+    i64 len = String.Len(pattern);
+    mut i64 i = 0;
+    while i < len {
+        u8 c = String.ByteAt(pattern, i);
+        if c == 92 {
+            i = i + 2;
+            continue;
+        }
+        if c == 42 || c == 63 || c == 91 {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}

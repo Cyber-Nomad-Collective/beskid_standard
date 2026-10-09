@@ -31,9 +31,52 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   parents; `Core.Time.Calendar` constant-time date arithmetic, ISO weekdays,
   and RFC 3339 parsing and formatting; and `Testing.Expect` expectations that
   report expected and actual values.
+- Add seeded property and model-based tests (sorting, hash maps against the
+  linear `Map`, an all-collision hash table, the priority queue), a JSON
+  accept/reject conformance corpus with random-tree round trips, UTF-8 and
+  float edge cases, and a full 146097-day Gregorian-cycle calendar sweep
+  checked against Python-generated reference dates.
+- Add `Number.FormatI64`, correct for the minimum `i64` that 0.5.2
+  interpolation prints as `-`; route `StringBuilder.AppendI64` and
+  `Testing.Expect` messages through the same guard.
+- Add `Ansi.Text` (escape stripping, display-width measurement with wide and
+  zero-width code points, ANSI-aware truncation, padding, centering, and word
+  wrap) and `Ansi.Modes` (synchronized output, bracketed paste, focus
+  reporting, cursor shape, hyperlink ids, OSC 52 clipboard, OSC 9
+  notifications).
+- Add `Console.Controls.Table` (display-width columns, alignment, width caps
+  with truncation, Unicode/ASCII/no borders), multi-line `Panel` bodies, and
+  cluster-aware width (flags, ZWJ emoji, skin tones, VS16) in `Ansi.Text`;
+  `Wrap` now re-opens active styles on continuation lines.
+- Add `Capabilities.FromEnvironment` and `TerminalEnvironment` so color policy
+  is a pure, testable function of `TERM`, `COLORTERM`, `NO_COLOR`,
+  `FORCE_COLOR`, and TTY state; `ProbeStdout` now uses it.
+- Add `Sgr.ForegroundArgsFor` and `BackgroundArgsFor` for an explicit color
+  model, and a console reference page.
+- Add runnable compiler-gap canaries (`beskid_corelib/tests/canaries`), a
+  0.5.3 compiler fix list, and a `Time.bd` patch to apply with the compiler
+  rebuild; record the silent method-parameter/field shadowing miscompile.
 - Document the 0.5.2 compiler and runtime limits that shape these APIs, and
   how to test a modified Corelib with a released binary.
 
+- Add the networking protocol packages to the corelib aggregate:
+  `corelib_uri`, `corelib_codec`, `corelib_connect`, `corelib_crypto`,
+  `corelib_x509`, `corelib_tls`, `corelib_http2`, `corelib_websocket`,
+  `corelib_quic`, `corelib_http3`, and `corelib_web` (moved from `protocols/`
+  to `packages/`, each with a README). Each package depends on Foundation and
+  on the exact sibling packages it imports; tests depend on the aggregate.
+  Requires compiler 0.5.3, which grants corelib authority per service file.
+  Program notes, compiler gap log, rulings, and repros are in
+  `docs/networking/`.
+- Select an in-process OpenSSL 3 provider in `corelib_crypto` (ruling R27):
+  `libcrypto.so.3` is an optional extern contract (compiler 0.5.3), so the
+  aggregate still loads on hosts without OpenSSL 3. One-shot SHA-2, HMAC,
+  AES-GCM and ChaCha20-Poly1305 use EVP when it is available and passes a
+  known-answer self-test; otherwise, or with `BESKID_CRYPTO_PROVIDER=pure`,
+  the CLIF kernels run. The opt-in `crypto-openssl` package is removed.
+- Fix QUIC loss of datagrams on deadline-bounded receives (WEB7): the endpoint
+  receives on a dedicated fiber without a deadline, and PTO probes carry
+  in-flight flow-control credit frames.
 - Cover duplicate HTTP `Host` rejection at the server transport boundary while
   the client withholds a declared request body.
 - Cover deterministic same-direction UDP receive contention and concurrent
@@ -53,6 +96,56 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Unify helpers with the same behavior so each exists once. `Core.String.Ascii`
+  holds the ASCII byte classes and hex digit values; `Number.DigitsAt` reads
+  fixed-width digit fields; `Search.StartsWithAt` and `Search.SkipWhitespace`
+  back the affix tests, JSON, and TOML; `Encoding.Utf8.AppendCodePoint` is the
+  UTF-8 encoder; and `Core.Collections.Storage` (`CopyRange`, `CopyWithout`,
+  `Concat`, `Reversed`, `IndexOf`) is the only copier for persistent
+  collections, with one sized allocation per copy. Console controls use
+  `String.Repeat`, `Core.Math`, and `Number.DigitsAt`.
+- Remove the duplicates (breaking): `Casing.IsAsciiLower`, `IsAsciiUpper`,
+  `IsAsciiDigit`, `IsSnakePartChar`, `PascalToSnake`, and `CamelToSnake` (use
+  `Ascii.*` and `Casing.ToSnake`), `Pest.Expr.IsIdentChar`,
+  `Encoding.Hex.HexToNibble`, `Encoding.Utf8.RuneByteLen` (use
+  `String.Utf8RuneByteLen`), `Sort.Reverse` (use `Storage.Reversed`),
+  `Console.Controls.Frame.Repeat` (use `String.Repeat`), the
+  `Console.Format.Scan` forwarders, and the `Console.Format.Attributes` digit
+  tables (`ParseHexNibble`, `ParseHexByte`, `ParseU8`, `ParseDecimalDigit`, and
+  their result types).
+- Build `StringBuilder` output by string concatenation instead of per-byte
+  `u8[]` growth, which 0.5.2 performs far more slowly; keep `Join`, `Replace`,
+  and `Repeat` on concatenation for the same reason.
+- Replace the placeholder `Query.Operators.Map` (returned copies of a sample)
+  and `Filter` (returned its second argument) with lambda-free `Where`
+  (mask), `WhereEquals`, `WhereNotEquals`, `Distinct`, `CountOf`, `IndexOf`,
+  `Concat`, `Reverse`, and typed `SumI64`/`SumF64`/`MinI64`/`MaxI64`/
+  `AverageF64`; rename `FoldI64` to `SumI64`; sort `OrderBy` with the stable
+  merge sort instead of bubble sort; rewrite the stale Query docs.
+- Make the free-function forms of the `Ansi` cursor, erase, OSC, screen, and
+  input-mode builders delegate to their methods instead of duplicating every
+  sequence.
+- Add `Core.Text.SemVer` (SemVer 2.0 parsing, precedence, bumps, and
+  npm/Cargo-style requirements), `Core.Text.Glob` (plain and path-aware
+  wildcards), `Core.Text.Csv` (RFC 4180), `Core.Text.Url` (RFC 3986 parsing,
+  percent-encoding, query parameters, reference resolution), and
+  `Core.Text.Toml` (TOML 1.0 into `TomlValue`), with reference pages and a
+  guide for merging this branch with the 0.5.3 line.
+- **Breaking:** `List.Get`, `Map.Get`, `Queue.Peek`, and `Stack.Peek` return
+  `Result<_, CollectionError>` (`IndexOutOfRange(index, count)`,
+  `KeyNotFound`, `Empty`) instead of `Result<_, string>`.
+- Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
+  gray-ramp entry (every gray previously mapped to black), and 16-color
+  mapping picks the nearest palette entry including bright codes (white and
+  black previously both mapped to red). Remove the faulty
+  `ClampChannelBucket` and `DominantChannelIndex` helpers.
+- Detect truecolor only for `COLORTERM=truecolor|24bit`, 256 colors only for
+  `TERM` values containing `256color`, honor `FORCE_COLOR` levels, and treat
+  an empty `NO_COLOR` as unset.
+- Size `Console.Controls.Panel` by visible width so ANSI styling and wide
+  characters no longer misalign its border; `Measure` no longer adds a row
+  for a title drawn inside the top border, and over-wide lines truncate
+  instead of pushing the border out.
 - Correct the `Core.String` reference: `Contains` scans substrings, and the
   page now covers the full search, transform, and builder surface.
 - Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.
@@ -88,6 +181,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
+  when two versions grow from one base. `Array.Append` grows storage in place
+  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
+  only when the version owns the storage tip and copies the prefix otherwise.
+- Keep earlier versions intact on removal and overwrite: `List.Pop`,
+  `Stack.Pop`, and `Queue.Dequeue` no longer clear the shared slot, `Map.Remove`
+  and `Set.Remove` copy instead of shifting shared storage, and `Map.Insert`
+  copies before overwriting an existing key, all through the shared
+  `Core.Collections.Storage` copiers. `HashTable`, `StringMap`,
+  `I64Map`, and `PriorityQueue` document that they are single-owner values.
+- Fix QUIC loopback datagram loss (WEB7): the `QuicEndpoint` receiver fiber now
+  waits without a deadline, because a timed-out runtime receive can drop a datagram
+  that was already read. A PTO probe also carries the in-flight credit frames
+  (MAX_DATA, MAX_STREAM_DATA, MAX_STREAMS) again. The new `QuicCreditLoss` test
+  checks this in memory with lost credit frames.
+- `Crypto.Entropy` AOT link on macOS: compiler 0.5.3 links `libc.so.6` as
+  `-lc`, so the libc link shim in the web interop script is removed (WEB4).
 - Validate a request's `Host` field as soon as its header completes, before
   waiting for or interpreting the body framing.
 - Reject HTTP header control and non-ASCII octets during parsing and serialization, including HTAB before OWS trimming.
@@ -148,3 +258,4 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Results and Optional tests with their leaf modules and generic construction APIs.
 - Replace stale Time and concurrency test calls with current typed APIs.
 - Type Random byte comparisons explicitly as `u8`.
+

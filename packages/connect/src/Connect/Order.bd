@@ -1,0 +1,135 @@
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Network.Types;
+
+/// The family of one address.
+pub AddressFamily FamilyOf(SocketAddress address) {
+    return match address.address {
+        IpAddress::V4(_, _, _, _) => AddressFamily::V4(),
+        IpAddress::V6(_, _, _, _) => AddressFamily::V6(),
+    };
+}
+
+pub bool SameFamily(AddressFamily left, AddressFamily right) {
+    return match left {
+        AddressFamily::V4 => match right { AddressFamily::V4 => true, _ => false, },
+        AddressFamily::V6 => match right { AddressFamily::V6 => true, _ => false, },
+    };
+}
+
+/// The family that is not `family`.
+pub AddressFamily OtherFamily(AddressFamily family) {
+    return match family {
+        AddressFamily::V4 => AddressFamily::V6(),
+        AddressFamily::V6 => AddressFamily::V4(),
+    };
+}
+
+bool SameIp(IpAddress left, IpAddress right) {
+    return match left {
+        IpAddress::V4(a, b, c, d) => match right {
+            IpAddress::V4(e, f, g, h) => a == e && b == f && c == g && d == h,
+            _ => false,
+        },
+        IpAddress::V6(a, b, c, d) => match right {
+            IpAddress::V6(e, f, g, h) => a == e && b == f && c == g && d == h,
+            _ => false,
+        },
+    };
+}
+
+/// Address and port equality.
+pub bool SameAddress(SocketAddress left, SocketAddress right) {
+    return SameIp(left.address, right.address) && left.port.Value() == right.port.Value();
+}
+
+bool Contains(SocketAddress[] values, SocketAddress candidate) {
+    mut i64 index = 0_i64;
+    while index < Array.Len<SocketAddress>(values) {
+        if SameAddress(values[index], candidate) { return true; }
+        index = index + 1_i64;
+    }
+    return false;
+}
+
+bool Admitted(SocketAddress address, Option<AddressFamily> filter) {
+    return match filter {
+        Option::None => true,
+        Option::Some(family) => SameFamily(FamilyOf(address), family),
+    };
+}
+
+/// Concatenates two address lists, keeping order.
+pub SocketAddress[] Concat(SocketAddress[] first, SocketAddress[] second) {
+    mut SocketAddress[] result = Array.Empty<SocketAddress>();
+    mut i64 index = 0_i64;
+    while index < Array.Len<SocketAddress>(first) {
+        Array.Append<SocketAddress>(result, first[index]);
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while index < Array.Len<SocketAddress>(second) {
+        Array.Append<SocketAddress>(result, second[index]);
+        index = index + 1_i64;
+    }
+    return result;
+}
+
+/// Every address after the first.
+pub SocketAddress[] Tail(SocketAddress[] values) {
+    mut SocketAddress[] result = Array.Empty<SocketAddress>();
+    mut i64 index = 1_i64;
+    while index < Array.Len<SocketAddress>(values) {
+        Array.Append<SocketAddress>(result, values[index]);
+        index = index + 1_i64;
+    }
+    return result;
+}
+
+/// Addresses of `family` from `values`, in their original (resolver) order,
+/// without duplicates and without anything rejected by `filter`.
+pub SocketAddress[] Select(SocketAddress[] values, AddressFamily family, Option<AddressFamily> filter) {
+    mut SocketAddress[] result = Array.Empty<SocketAddress>();
+    mut i64 index = 0_i64;
+    while index < Array.Len<SocketAddress>(values) {
+        SocketAddress candidate = values[index];
+        if SameFamily(FamilyOf(candidate), family) && Admitted(candidate, filter) && !Contains(result, candidate) {
+            Array.Append<SocketAddress>(result, candidate);
+        }
+        index = index + 1_i64;
+    }
+    return result;
+}
+
+/// RFC 8305 section 4 ordering. Resolver order inside each family is kept
+/// (getaddrinfo already applies RFC 6724). The list starts with
+/// `firstAddressFamilyCount` addresses of the preferred family, then alternates
+/// one address of the other family and one of the preferred family; when one
+/// family runs out the rest of the other follows. Duplicates and addresses
+/// rejected by `filter` are dropped. A count below 1 is treated as 1.
+pub SocketAddress[] Interleave(SocketAddress[] values, AddressFamily preferred, i64 firstAddressFamilyCount, Option<AddressFamily> filter) {
+    SocketAddress[] first = Select(values, preferred, filter);
+    SocketAddress[] second = Select(values, OtherFamily(preferred), filter);
+    i64 firstLen = Array.Len<SocketAddress>(first);
+    i64 secondLen = Array.Len<SocketAddress>(second);
+    mut i64 lead = firstAddressFamilyCount;
+    if lead < 1_i64 { lead = 1_i64; }
+    mut SocketAddress[] result = Array.Empty<SocketAddress>();
+    mut i64 i = 0_i64;
+    mut i64 j = 0_i64;
+    while i < firstLen && i < lead {
+        Array.Append<SocketAddress>(result, first[i]);
+        i = i + 1_i64;
+    }
+    while i < firstLen || j < secondLen {
+        if j < secondLen {
+            Array.Append<SocketAddress>(result, second[j]);
+            j = j + 1_i64;
+        }
+        if i < firstLen {
+            Array.Append<SocketAddress>(result, first[i]);
+            i = i + 1_i64;
+        }
+    }
+    return result;
+}

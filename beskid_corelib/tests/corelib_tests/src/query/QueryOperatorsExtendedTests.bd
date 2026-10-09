@@ -1,0 +1,65 @@
+/// Query.Operators mask, equality, set-like, and numeric operators.
+
+use Testing.Expect;
+use Core.Optional.Option;
+use Query.ArrayIterator;
+use Query.Operators;
+
+i64 I64Or(Option<i64> value, i64 fallback) {
+    return match value {
+        Option::Some(v) => v,
+        Option::None => fallback,
+    };
+}
+
+f64 F64Or(Option<f64> value, f64 fallback) {
+    return match value {
+        Option::Some(v) => v,
+        Option::None => fallback,
+    };
+}
+
+test query_where_applies_mask {
+    i64[] values = [5_i64, 6_i64, 7_i64, 8_i64];
+    bool[] keep = [true, false, true, false];
+    Expect.EqualI64Array(Operators.Where<i64>(ArrayIterator.Over<i64>(values), keep), [5_i64, 7_i64], "mask selects");
+    bool[] shortMask = [false, true];
+    Expect.EqualI64Array(Operators.Where<i64>(ArrayIterator.Over<i64>(values), shortMask), [6_i64], "positions beyond the mask drop");
+}
+
+test query_equality_operators {
+    string[] words = ["a", "b", "a", "c", "b"];
+    Expect.EqualStringArray(Operators.WhereEquals<string>(ArrayIterator.Over<string>(words), "a"), ["a", "a"], "where equals");
+    Expect.EqualStringArray(Operators.WhereNotEquals<string>(ArrayIterator.Over<string>(words), "a"), ["b", "c", "b"], "where not equals");
+    Expect.EqualStringArray(Operators.Distinct<string>(ArrayIterator.Over<string>(words)), ["a", "b", "c"], "distinct keeps first occurrences");
+    Expect.EqualI64(Operators.CountOf<string>(ArrayIterator.Over<string>(words), "b"), 2, "count of");
+    Expect.EqualI64(Operators.IndexOf<string>(ArrayIterator.Over<string>(words), "c"), 3, "index of");
+    Expect.EqualI64(Operators.IndexOf<string>(ArrayIterator.Over<string>(words), "z"), -1, "index of missing");
+}
+
+test query_concat_reverse_and_order {
+    i64[] values = [3_i64, 1_i64, 2_i64];
+    i64[] tail = [9_i64];
+    Expect.EqualI64Array(Operators.Concat<i64>(ArrayIterator.Over<i64>(values), tail), [3_i64, 1_i64, 2_i64, 9_i64], "concat");
+    Expect.EqualI64Array(Operators.Reverse<i64>(ArrayIterator.Over<i64>(values)), [2_i64, 1_i64, 3_i64], "reverse");
+    Expect.EqualI64Array(Operators.OrderBy(ArrayIterator.Over<i64>(values), true), [1_i64, 2_i64, 3_i64], "ascending");
+    Expect.EqualI64Array(Operators.OrderBy(ArrayIterator.Over<i64>(values), false), [3_i64, 2_i64, 1_i64], "descending");
+}
+
+test query_numeric_aggregates {
+    i64[] values = [4_i64, -2_i64, 9_i64];
+    Expect.EqualI64(Operators.SumI64(ArrayIterator.Over<i64>(values)), 11, "sum");
+    Expect.EqualI64(I64Or(Operators.MinI64(ArrayIterator.Over<i64>(values)), 0), -2, "min");
+    Expect.EqualI64(I64Or(Operators.MaxI64(ArrayIterator.Over<i64>(values)), 0), 9, "max");
+    i64[] empty = [];
+    Expect.EqualI64(I64Or(Operators.MinI64(ArrayIterator.Over<i64>(empty)), 42), 42, "min of empty is None");
+    f64[] floats = [1.5, 2.5];
+    Expect.NearF64(Operators.SumF64(ArrayIterator.Over<f64>(floats)), 4.0, 0.0, "f64 sum");
+    Expect.NearF64(F64Or(Operators.AverageF64(ArrayIterator.Over<f64>(floats)), 0.0), 2.0, 0.0, "average");
+}
+
+test query_operators_start_at_current_element {
+    i64[] values = [1_i64, 2_i64, 3_i64];
+    ArrayIterator<i64> advanced = ArrayIterator.MoveNext<i64>(ArrayIterator.Over<i64>(values));
+    Expect.EqualI64(Operators.SumI64(advanced), 5, "sum skips consumed elements");
+}

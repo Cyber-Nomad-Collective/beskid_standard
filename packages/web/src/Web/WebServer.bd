@@ -1,0 +1,290 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO.IoError;
+use Core.IO.Stream;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Http2.Connection;
+use Http2.FrameErrors;
+use Http2.Server;
+use Network.Errors as NetErrors;
+use Network.Types as NetTypes;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Tls;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsStream;
+use Web.H1Wire;
+use Web.Prefixed;
+use Web.WebConfig;
+use Web.WebErrors;
+
+// Server side of the facade. One `Http2.Server.RequestHandler` serves every
+// HTTP version. Connections are served one after another on the calling fiber;
+// spawn one ServeTlsConnection / ServePlainConnection per accepted stream for
+// concurrency (no channel is needed).
+
+Option<Deadline> Within(i64 millis) {
+    if millis <= 0_i64 { return Option.Empty<Deadline>(); }
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+unit ArmDeadline(TcpStream tcp, i64 millis) {
+    TransferDeadlines policy = TransferDeadlines { read: Within(millis), write: Within(millis) };
+    tcp.SetDeadlines(policy);
+    return;
+}
+
+// Accepts connections on `listener`, runs the TLS 1.3 handshake with `tls`
+// (offer "h2" and "http/1.1" in `tls.alpn`, see WebConfig.ServerTls) and serves
+// each one over the negotiated protocol. Returns the number of connections
+// served once `config.maxConnections` is reached; AcceptFailed when accept
+// fails (for example its deadline passed). A failed connection does not stop
+// the loop.
+pub Result<i64,WebError> ServeTls(TcpListener listener, TlsServerConfig tls, RequestHandler handler, WebServerConfig config) {
+    mut i64 served = 0_i64;
+    i64 limit = config.maxConnections;
+    while limit <= 0_i64 || served < limit {
+        Result<TcpStream,NetworkError> accepted = listener.Accept(Within(config.acceptTimeoutMillis));
+        match accepted {
+            Result::Error(_) => { return Result::Error(WebError::AcceptFailed()); },
+            Result::Ok(tcp) => { ServeTlsConnection(tcp, tls, handler, config); },
+        };
+        served = served + 1_i64;
+    }
+    return Result::Ok(served);
+}
+
+// Plain-TCP counterpart of ServeTls: HTTP/1.1, and h2c with prior knowledge
+// when `config.h2cPriorKnowledge` and the client starts with the preface.
+pub Result<i64,WebError> ServePlain(TcpListener listener, RequestHandler handler, WebServerConfig config) {
+    mut i64 served = 0_i64;
+    i64 limit = config.maxConnections;
+    while limit <= 0_i64 || served < limit {
+        Result<TcpStream,NetworkError> accepted = listener.Accept(Within(config.acceptTimeoutMillis));
+        match accepted {
+            Result::Error(_) => { return Result::Error(WebError::AcceptFailed()); },
+            Result::Ok(tcp) => { ServePlainConnection(tcp, handler, config); },
+        };
+        served = served + 1_i64;
+    }
+    return Result::Ok(served);
+}
+
+// Serves one accepted TCP stream over TLS and closes it. Returns the number of
+// requests handled.
+pub Result<i64,WebError> ServeTlsConnection(TcpStream tcp, TlsServerConfig tls, RequestHandler handler, WebServerConfig config) {
+    Result<TlsStream,TlsError> secured = Tls.Accept(tcp, tls, Within(config.handshakeTimeoutMillis));
+    match secured {
+        Result::Error(error) => { return Result::Error(WebError::TlsFailed(error)); },
+        Result::Ok(stream) => { return ServeSecured(stream, handler, config); },
+    };
+    return Result::Error(WebError::AcceptFailed());
+}
+
+Result<i64,WebError> ServeSecured(TlsStream stream, RequestHandler handler, WebServerConfig config) {
+    string alpn = TlsStream.NegotiatedAlpn(stream);
+    TcpStream tcp = TlsStream.Transport(stream);
+    mut Result<i64,WebError> result = Result::Error(WebError::AlpnMismatch(alpn));
+    i64 alpnLength = String.Len(alpn);
+    bool choseH2 = alpn == "h2";
+    bool choseH1 = alpn == "http/1.1" || alpnLength == 0_i64;
+    if choseH2 {
+        result = ServeH2(stream, tcp, handler, config);
+    } else {
+        if choseH1 { result = ServeH1(stream, tcp, H1Wire.NewBuffer(), handler, config); }
+    }
+    TlsStream.Close(stream);
+    return result;
+}
+
+// Serves one accepted TCP stream without TLS and closes it.
+pub Result<i64,WebError> ServePlainConnection(TcpStream tcp, RequestHandler handler, WebServerConfig config) {
+    H1Buffer buffer = H1Wire.NewBuffer();
+    mut Result<i64,WebError> result = Result::Ok(0_i64);
+    if config.h2cPriorKnowledge {
+        ArmDeadline(tcp, config.idleTimeoutMillis);
+        Result<bool,WebError> sniffed = SniffPreface(tcp, buffer);
+        match sniffed {
+            Result::Error(error) => { result = Result::Error(error); },
+            Result::Ok(isH2) => {
+                if isH2 {
+                    PrefixedStream prefixed = Prefixed.New(tcp, buffer.data);
+                    result = ServeH2(prefixed, tcp, handler, config);
+                } else {
+                    result = ServeH1(tcp, tcp, buffer, handler, config);
+                }
+            },
+        };
+    } else {
+        result = ServeH1(tcp, tcp, buffer, handler, config);
+    }
+    tcp.Close();
+    return result;
+}
+
+// Reads until the received octets either equal the 24-octet HTTP/2 preface
+// (true) or differ from it (false). The octets stay in `buffer`.
+Result<bool,WebError> SniffPreface(TcpStream tcp, H1Buffer buffer) {
+    u8[] preface = Connection.Preface();
+    i64 need = Slice.Len(preface);
+    u8[] chunk = Slice.New(need);
+    while true {
+        u8[] have = buffer.data;
+        i64 n = Slice.Len(have);
+        mut i64 i = 0_i64;
+        while i < n && i < need {
+            if have[i] != preface[i] { return Result::Ok(false); }
+            i = i + 1_i64;
+        }
+        if n >= need { return Result::Ok(true); }
+        Result<i64,IoError> read = tcp.Read(chunk, 0_i64, need - n);
+        mut i64 count = 0_i64;
+        match read {
+            Result::Error(error) => { return Result::Error(WebError::Http1Failed(Errors.FromIoError(error))); },
+            Result::Ok(value) => { count = value; },
+        };
+        if count == 0_i64 { return Result::Ok(false); }
+        u8[] grown = Slice.New(n + count);
+        Slice.Copy(grown, 0_i64, have, 0_i64, n);
+        Slice.Copy(grown, n, chunk, 0_i64, count);
+        buffer.data = grown;
+    }
+    return Result::Ok(false);
+}
+
+// HTTP/2 on an established transport; `tcp` carries the connection deadline.
+Result<i64,WebError> ServeH2(Stream transport, TcpStream tcp, RequestHandler handler, WebServerConfig config) {
+    ArmDeadline(tcp, config.idleTimeoutMillis * 4_i64);
+    Result<i64,Http2Error> served = Server.ServeConnection(transport, handler, config.h2);
+    return match served {
+        Result::Ok(count) => Result::Ok(count),
+        Result::Error(error) => Result::Error(WebError::Http2Failed(error)),
+    };
+}
+
+// True when a read failure ends a kept-alive connection quietly: the peer
+// closed it, or the idle deadline passed between requests.
+bool QuietEnd(HttpError error) {
+    return match error {
+        HttpError::Closed => true,
+        HttpError::Transport(_) => true,
+        _ => false,
+    };
+}
+
+// HTTP/1.1 keep-alive loop: one request at a time, until the client asks to
+// close, the request limit is reached, or the connection goes idle.
+Result<i64,WebError> ServeH1(Stream transport, TcpStream tcp, H1Buffer buffer, RequestHandler handler, WebServerConfig config) {
+    Limits limits = config.limits;
+    mut i64 handled = 0_i64;
+    while true {
+        ArmDeadline(tcp, config.idleTimeoutMillis);
+        Result<u8[],HttpError> wire = H1Wire.ReadMessage(buffer, transport, limits, MessageRole::Request());
+        mut u8[] message = [];
+        match wire {
+            Result::Error(error) => {
+                if QuietEnd(error) { return Result::Ok(handled); }
+                RejectBadRequest(transport, limits);
+                return Result::Error(WebError::Http1Failed(error));
+            },
+            Result::Ok(value) => { message = value; },
+        };
+        Result<Request,HttpError> parsed = Codec.ParseRequest(message, limits);
+        mut Request request = Request { method: "GET", target: "/", headers: Array.Empty<Header>(), body: Slice.New(0_i64) };
+        match parsed {
+            Result::Error(error) => {
+                RejectBadRequest(transport, limits);
+                return Result::Error(WebError::Http1Failed(error));
+            },
+            Result::Ok(value) => { request = value; },
+        };
+        handled = handled + 1_i64;
+        Response response = handler.Handle(request);
+        i64 perConnection = config.maxRequestsPerConnection;
+        mut bool closing = H1Wire.WantsClose(request.headers);
+        if perConnection > 0_i64 && handled >= perConnection { closing = true; }
+        string method = request.method;
+        bool head = method == "HEAD";
+        Result<u8[],HttpError> encoded = EncodeResponse(response, head, closing, limits);
+        mut u8[] bytes = [];
+        match encoded {
+            Result::Error(error) => {
+                RespondStatus(transport, 500_i64, "Internal Server Error", limits);
+                return Result::Error(WebError::Http1Failed(error));
+            },
+            Result::Ok(value) => { bytes = value; },
+        };
+        Result<unit,HttpError> written = H1Wire.WriteAll(transport, bytes);
+        match written {
+            Result::Error(error) => { return Result::Error(WebError::Http1Failed(error)); },
+            Result::Ok(_) => {},
+        };
+        if closing { return Result::Ok(handled); }
+    }
+    return Result::Ok(handled);
+}
+
+string ReasonOf(Response response) {
+    if String.Len(response.reason) > 0_i64 { return response.reason; }
+    if response.status == 200_i64 { return "OK"; }
+    if response.status == 204_i64 { return "No Content"; }
+    if response.status == 404_i64 { return "Not Found"; }
+    if response.status == 500_i64 { return "Internal Server Error"; }
+    return "";
+}
+
+// Serializes a handler response for HTTP/1.1: hop-by-hop fields are replaced
+// by the facade's own framing; a HEAD response ends at its head.
+Result<u8[],HttpError> EncodeResponse(Response response, bool head, bool closing, Limits limits) {
+    mut Header[] headers = H1Wire.EndToEnd(response.headers);
+    if closing { Array.Append<Header>(headers, Header { name: "connection", value: "close" }); }
+    Response out = Response { status: response.status, reason: ReasonOf(response), headers: headers, body: response.body };
+    Result<u8[],HttpError> encoded = Codec.SerializeResponse(out, limits);
+    if !head { return encoded; }
+    match encoded {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(bytes) => { return HeadOnly(bytes, limits); },
+    };
+    return encoded;
+}
+
+Result<u8[],HttpError> HeadOnly(u8[] bytes, Limits limits) {
+    Result<i64,HttpError> boundary = Codec.HeadBoundary(bytes, limits);
+    match boundary {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(end) => {
+            u8[] out = Slice.New(end + 4_i64);
+            Slice.Copy(out, 0_i64, bytes, 0_i64, end + 4_i64);
+            return Result::Ok(out);
+        },
+    };
+    return Result::Error(HttpError::InvalidFraming());
+}
+
+unit RespondStatus(Stream transport, i64 status, string reason, Limits limits) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "connection", value: "close" });
+    Response response = Response { status: status, reason: reason, headers: headers, body: [] };
+    Result<u8[],HttpError> encoded = Codec.SerializeResponse(response, limits);
+    match encoded {
+        Result::Ok(bytes) => { H1Wire.WriteAll(transport, bytes); },
+        Result::Error(_) => {},
+    };
+    return;
+}
+
+unit RejectBadRequest(Stream transport, Limits limits) {
+    RespondStatus(transport, 400_i64, "Bad Request", limits);
+    return;
+}

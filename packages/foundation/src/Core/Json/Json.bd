@@ -8,13 +8,16 @@ pub mod Core.Json.JsonValue;
 pub mod Core.Json.JsonError;
 
 use Core.Collections.Array;
+use Core.Encoding.Utf8;
 use Core.Json.JsonError;
 use Core.Json.JsonValue;
 use Core.Optional.Option;
 use Core.Results;
+use Core.String.Ascii;
 use Core.String.Builder;
 use Core.String.Core;
-use Core.String.Utf8;
+use Core.String.Search;
+use Core.String;
 use Core.Text.Number;
 
 /// Arrays and objects may nest at most this deep.
@@ -41,34 +44,13 @@ pub type TextStep {
 /// Parses `text` as one JSON value.
 pub Result<JsonValue, JsonError> Parse(string text) {
     i64 len = Core.Len(text);
-    i64 start = SkipWhitespace(text, 0);
+    i64 start = Search.SkipWhitespace(text, 0);
     ParseStep step = ParseValue(text, start, 0)?;
-    i64 end = SkipWhitespace(text, step.next);
+    i64 end = Search.SkipWhitespace(text, step.next);
     if end < len {
         return Result<JsonValue, JsonError>::Error(JsonError::TrailingCharacters(end));
     }
     return Result<JsonValue, JsonError>::Ok(step.value);
-}
-
-i64 SkipWhitespace(string text, i64 at) {
-    i64 len = Core.Len(text);
-    mut i64 i = at;
-    while i < len {
-        u8 b = Core.ByteAt(text, i);
-        if b != 32 && b != 9 && b != 10 && b != 13 {
-            return i;
-        }
-        i = i + 1;
-    }
-    return i;
-}
-
-bool HasLiteral(string text, i64 at, string literal) {
-    i64 n = Core.Len(literal);
-    if at + n > Core.Len(text) {
-        return false;
-    }
-    return Core.SubSlice(text, at, n) == literal;
 }
 
 Result<ParseStep, JsonError> Step(JsonValue value, i64 next) {
@@ -90,23 +72,19 @@ Result<ParseStep, JsonError> ParseValue(string text, i64 at, i64 depth) {
         TextStep decoded = ParseText(text, at)?;
         return Step(JsonValue::Text(decoded.text), decoded.next);
     }
-    if b == 45 || (b >= 48 && b <= 57) {
+    if b == 45 || Ascii.IsDigit(b) {
         return ParseNumber(text, at);
     }
-    if HasLiteral(text, at, "true") {
+    if Search.StartsWithAt(text, at, "true") {
         return Step(JsonValue::Bool(true), at + 4);
     }
-    if HasLiteral(text, at, "false") {
+    if Search.StartsWithAt(text, at, "false") {
         return Step(JsonValue::Bool(false), at + 5);
     }
-    if HasLiteral(text, at, "null") {
+    if Search.StartsWithAt(text, at, "null") {
         return Step(JsonValue::Null, at + 4);
     }
     return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedCharacter(at));
-}
-
-bool IsDigitByte(u8 b) {
-    return b >= 48 && b <= 57;
 }
 
 /// Validates the JSON number grammar `-? (0 | [1-9][0-9]*) (. [0-9]+)? ([eE] [+-]? [0-9]+)?`
@@ -117,22 +95,22 @@ Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
     if Core.ByteAt(text, i) == 45 {
         i = i + 1;
     }
-    if i >= len || !IsDigitByte(Core.ByteAt(text, i)) {
+    if i >= len || !Ascii.IsDigit(Core.ByteAt(text, i)) {
         return Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(i));
     }
     if Core.ByteAt(text, i) == 48 {
         i = i + 1;
     } else {
-        while i < len && IsDigitByte(Core.ByteAt(text, i)) {
+        while i < len && Ascii.IsDigit(Core.ByteAt(text, i)) {
             i = i + 1;
         }
     }
     if i < len && Core.ByteAt(text, i) == 46 {
         i = i + 1;
-        if i >= len || !IsDigitByte(Core.ByteAt(text, i)) {
+        if i >= len || !Ascii.IsDigit(Core.ByteAt(text, i)) {
             return Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(i));
         }
-        while i < len && IsDigitByte(Core.ByteAt(text, i)) {
+        while i < len && Ascii.IsDigit(Core.ByteAt(text, i)) {
             i = i + 1;
         }
     }
@@ -141,10 +119,10 @@ Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
         if i < len && (Core.ByteAt(text, i) == 43 || Core.ByteAt(text, i) == 45) {
             i = i + 1;
         }
-        if i >= len || !IsDigitByte(Core.ByteAt(text, i)) {
+        if i >= len || !Ascii.IsDigit(Core.ByteAt(text, i)) {
             return Result<ParseStep, JsonError>::Error(JsonError::InvalidNumber(i));
         }
-        while i < len && IsDigitByte(Core.ByteAt(text, i)) {
+        while i < len && Ascii.IsDigit(Core.ByteAt(text, i)) {
             i = i + 1;
         }
     }
@@ -155,59 +133,6 @@ Result<ParseStep, JsonError> ParseNumber(string text, i64 at) {
     };
 }
 
-/// Value of four hex digits at `at`, or `-1` when any is not a hex digit.
-i64 Hex4(string text, i64 at) {
-    if at + 4 > Core.Len(text) {
-        return -1;
-    }
-    mut i64 value = 0;
-    mut i64 i = 0;
-    while i < 4 {
-        u8 b = Core.ByteAt(text, at + i);
-        mut i64 digit = -1;
-        if b >= 48 && b <= 57 {
-            digit = i64(b) - 48;
-        }
-        if b >= 97 && b <= 102 {
-            digit = i64(b) - 87;
-        }
-        if b >= 65 && b <= 70 {
-            digit = i64(b) - 55;
-        }
-        if digit < 0 {
-            return -1;
-        }
-        value = value * 16 + digit;
-        i = i + 1;
-    }
-    return value;
-}
-
-/// Appends the UTF-8 encoding of scalar value `cp` (`0..=0x10FFFF`, not a surrogate).
-u8[] AppendCodePoint(u8[] bytes, i64 cp) {
-    mut u8[] out = bytes;
-    if cp < 128 {
-        out = Array.Append<u8>(out, u8(cp));
-        return out;
-    }
-    if cp < 2048 {
-        out = Array.Append<u8>(out, u8(192 + cp / 64));
-        out = Array.Append<u8>(out, u8(128 + cp % 64));
-        return out;
-    }
-    if cp < 65536 {
-        out = Array.Append<u8>(out, u8(224 + cp / 4096));
-        out = Array.Append<u8>(out, u8(128 + (cp / 64) % 64));
-        out = Array.Append<u8>(out, u8(128 + cp % 64));
-        return out;
-    }
-    out = Array.Append<u8>(out, u8(240 + cp / 262144));
-    out = Array.Append<u8>(out, u8(128 + (cp / 4096) % 64));
-    out = Array.Append<u8>(out, u8(128 + (cp / 64) % 64));
-    out = Array.Append<u8>(out, u8(128 + cp % 64));
-    return out;
-}
-
 /// Decodes the string starting at the opening quote at `at`.
 Result<TextStep, JsonError> ParseText(string text, i64 at) {
     i64 len = Core.Len(text);
@@ -216,7 +141,7 @@ Result<TextStep, JsonError> ParseText(string text, i64 at) {
     while i < len {
         u8 b = Core.ByteAt(text, i);
         if b == 34 {
-            return Result<TextStep, JsonError>::Ok(TextStep { text: Utf8.FromUtf8CodeUnits(bytes), next: i + 1 });
+            return Result<TextStep, JsonError>::Ok(TextStep { text: String.FromUtf8CodeUnits(bytes), next: i + 1 });
         }
         if b < 32 {
             return Result<TextStep, JsonError>::Error(JsonError::ControlCharacter(i));
@@ -257,7 +182,7 @@ Result<TextStep, JsonError> ParseText(string text, i64 at) {
         if e != 117 {
             return Result<TextStep, JsonError>::Error(JsonError::InvalidEscape(i));
         }
-        i64 unit = Hex4(text, i + 2);
+        i64 unit = Number.DigitsAt(text, i + 2, 4, 16);
         if unit < 0 {
             return Result<TextStep, JsonError>::Error(JsonError::InvalidEscape(i));
         }
@@ -266,19 +191,19 @@ Result<TextStep, JsonError> ParseText(string text, i64 at) {
         }
         if unit >= 55296 && unit <= 56319 {
             // High surrogate: a `\uDC00`-`\uDFFF` low surrogate must follow.
-            if !HasLiteral(text, i + 6, "\\u") {
+            if !Search.StartsWithAt(text, i + 6, "\\u") {
                 return Result<TextStep, JsonError>::Error(JsonError::InvalidUnicode(i));
             }
-            i64 low = Hex4(text, i + 8);
+            i64 low = Number.DigitsAt(text, i + 8, 4, 16);
             if low < 56320 || low > 57343 {
                 return Result<TextStep, JsonError>::Error(JsonError::InvalidUnicode(i));
             }
             i64 cp = 65536 + (unit - 55296) * 1024 + (low - 56320);
-            bytes = AppendCodePoint(bytes, cp);
+            bytes = Utf8.AppendCodePoint(bytes, cp);
             i = i + 12;
             continue;
         }
-        bytes = AppendCodePoint(bytes, unit);
+        bytes = Utf8.AppendCodePoint(bytes, unit);
         i = i + 6;
     }
     return Result<TextStep, JsonError>::Error(JsonError::UnexpectedEnd(len));
@@ -290,14 +215,14 @@ Result<ParseStep, JsonError> ParseList(string text, i64 at, i64 depth) {
     }
     i64 len = Core.Len(text);
     mut JsonValue[] items = Array.Empty<JsonValue>();
-    mut i64 i = SkipWhitespace(text, at + 1);
+    mut i64 i = Search.SkipWhitespace(text, at + 1);
     if i < len && Core.ByteAt(text, i) == 93 {
         return Step(JsonValue::List(items), i + 1);
     }
     while true {
         ParseStep item = ParseValue(text, i, depth)?;
         items = Array.Append<JsonValue>(items, item.value);
-        i = SkipWhitespace(text, item.next);
+        i = Search.SkipWhitespace(text, item.next);
         if i >= len {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedEnd(i));
         }
@@ -308,7 +233,7 @@ Result<ParseStep, JsonError> ParseList(string text, i64 at, i64 depth) {
         if b != 44 {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedCharacter(i));
         }
-        i = SkipWhitespace(text, i + 1);
+        i = Search.SkipWhitespace(text, i + 1);
     }
     return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedEnd(i));
 }
@@ -320,7 +245,7 @@ Result<ParseStep, JsonError> ParseObject(string text, i64 at, i64 depth) {
     i64 len = Core.Len(text);
     mut string[] keys = Array.Empty<string>();
     mut JsonValue[] values = Array.Empty<JsonValue>();
-    mut i64 i = SkipWhitespace(text, at + 1);
+    mut i64 i = Search.SkipWhitespace(text, at + 1);
     if i < len && Core.ByteAt(text, i) == 125 {
         return Step(JsonValue::Object(keys, values), i + 1);
     }
@@ -332,18 +257,18 @@ Result<ParseStep, JsonError> ParseObject(string text, i64 at, i64 depth) {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedCharacter(i));
         }
         TextStep key = ParseText(text, i)?;
-        i = SkipWhitespace(text, key.next);
+        i = Search.SkipWhitespace(text, key.next);
         if i >= len {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedEnd(i));
         }
         if Core.ByteAt(text, i) != 58 {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedCharacter(i));
         }
-        i = SkipWhitespace(text, i + 1);
+        i = Search.SkipWhitespace(text, i + 1);
         ParseStep member = ParseValue(text, i, depth)?;
         keys = Array.Append<string>(keys, key.text);
         values = Array.Append<JsonValue>(values, member.value);
-        i = SkipWhitespace(text, member.next);
+        i = Search.SkipWhitespace(text, member.next);
         if i >= len {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedEnd(i));
         }
@@ -354,7 +279,7 @@ Result<ParseStep, JsonError> ParseObject(string text, i64 at, i64 depth) {
         if b != 44 {
             return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedCharacter(i));
         }
-        i = SkipWhitespace(text, i + 1);
+        i = Search.SkipWhitespace(text, i + 1);
     }
     return Result<ParseStep, JsonError>::Error(JsonError::UnexpectedEnd(i));
 }

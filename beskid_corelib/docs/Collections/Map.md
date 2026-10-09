@@ -2,7 +2,7 @@
 
 `Map<TKey, TValue>` owns `MapEntry<TKey, TValue>[] entries` and `i64 count`. It uses linear key lookup.
 
-`Insert`, `Get`, `ContainsKey`, `Remove`, `Count`, and `IsEmpty` are owning receiver methods. Inserting an existing key replaces its value without changing count. Removing a key preserves all remaining entries. `New<TKey, TValue>` is the module constructor.
+`Insert`, `Get`, `ContainsKey`, `Remove`, `Count`, and `IsEmpty` are owning receiver methods. `Get` returns `Result::Error(CollectionError::KeyNotFound)` for a missing key. Inserting an existing key replaces its value without changing count. Removing a key preserves all remaining entries. `New<TKey, TValue>` is the module constructor.
 
 ## Additional operations
 

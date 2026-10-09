@@ -1,0 +1,106 @@
+use Core.Collections.Array;
+use Tls.TlsConfig;
+
+// Connection configuration shared by clients and servers.
+
+/// How the cryptographic handshake is performed.
+pub enum HandshakeKind {
+    /// INSECURE: the loopback stand-in of `QuicHandshake` (no authentication, no secrecy).
+    /// Test-only; `suite` selects the packet protection suite (QuicProtection.Suite*).
+    InsecureLoopback(i64 suite),
+    /// TLS 1.3 client (server authentication per the TLS configuration).
+    TlsClient(TlsClientConfig config),
+    /// TLS 1.3 server (certificate chain and P-256 key).
+    TlsServer(TlsServerConfig config),
+}
+
+pub type QuicConfig {
+    /// ALPN protocols: offered in order by a client, accepted by a server. Required.
+    pub string[] alpn,
+    /// Server name a client authenticates.
+    pub string serverName,
+    /// Local max_idle_timeout in milliseconds (0 disables it on this side).
+    pub i64 idleTimeoutMs,
+    /// Connection receive window (initial_max_data).
+    pub i64 maxData,
+    /// Per-stream send and receive buffer, also the stream receive window.
+    pub i64 streamBuffer,
+    /// Streams the peer may open concurrently (bidirectional, unidirectional).
+    pub i64 maxStreamsBidi,
+    pub i64 maxStreamsUni,
+    /// Server: answer Initials without a token with Retry (address validation).
+    pub bool requireRetry,
+    pub HandshakeKind handshake,
+}
+
+/// Concurrent stream slots per connection (local and peer streams together).
+pub i64 MaxStreamSlots() { return 16_i64; }
+/// Connections per endpoint.
+pub i64 MaxConnections() { return 8_i64; }
+
+QuicConfig Defaults(string[] alpn, string serverName, HandshakeKind handshake) {
+    return QuicConfig {
+        alpn: alpn, serverName: serverName, idleTimeoutMs: 30000_i64, maxData: 65536_i64,
+        streamBuffer: 8192_i64, maxStreamsBidi: 4_i64, maxStreamsUni: 2_i64, requireRetry: false,
+        handshake: handshake,
+    };
+}
+
+/// A client configuration with the TLS 1.3 handshake. `alpn` lists the offered protocols;
+/// the TLS configuration supplies the server name and the certificate verification policy.
+pub QuicConfig TlsClientConfigFor(TlsClientConfig tls, string[] alpn) {
+    return Defaults(alpn, tls.serverName, HandshakeKind::TlsClient(tls));
+}
+
+/// A server configuration with the TLS 1.3 handshake (`alpn`: accepted protocols).
+pub QuicConfig TlsServerConfigFor(TlsServerConfig tls, string[] alpn) {
+    return Defaults(alpn, "", HandshakeKind::TlsServer(tls));
+}
+
+/// A configuration that uses the INSECURE loopback handshake. Only for tests of the transport
+/// until the TLS 1.3 handshake is wired in; it provides neither authentication nor secrecy.
+pub QuicConfig InsecureLoopbackForTestsOnly(string[] alpn, i64 suite) {
+    return QuicConfig {
+        alpn: alpn, serverName: "localhost", idleTimeoutMs: 30000_i64, maxData: 65536_i64,
+        streamBuffer: 8192_i64, maxStreamsBidi: 4_i64, maxStreamsUni: 2_i64, requireRetry: false,
+        handshake: HandshakeKind::InsecureLoopback(suite),
+    };
+}
+
+/// A copy with Retry-based address validation switched on or off.
+pub QuicConfig WithRetry(QuicConfig c, bool requireRetry) {
+    return QuicConfig {
+        alpn: c.alpn, serverName: c.serverName, idleTimeoutMs: c.idleTimeoutMs, maxData: c.maxData,
+        streamBuffer: c.streamBuffer, maxStreamsBidi: c.maxStreamsBidi, maxStreamsUni: c.maxStreamsUni,
+        requireRetry: requireRetry, handshake: c.handshake,
+    };
+}
+
+/// A copy with another idle timeout.
+pub QuicConfig WithIdleTimeout(QuicConfig c, i64 milliseconds) {
+    return QuicConfig {
+        alpn: c.alpn, serverName: c.serverName, idleTimeoutMs: milliseconds, maxData: c.maxData,
+        streamBuffer: c.streamBuffer, maxStreamsBidi: c.maxStreamsBidi, maxStreamsUni: c.maxStreamsUni,
+        requireRetry: c.requireRetry, handshake: c.handshake,
+    };
+}
+
+/// A copy with other stream limits: how many bidirectional and unidirectional streams the
+/// peer may open concurrently (initial_max_streams_bidi / _uni, RFC 9000 section 4.6).
+/// Together they must stay within MaxStreamSlots() - 4 (see IsValid); HTTP/3, for example,
+/// needs at least 3 unidirectional streams (RFC 9114 section 6.2).
+pub QuicConfig WithStreamLimits(QuicConfig c, i64 bidi, i64 uni) {
+    return QuicConfig {
+        alpn: c.alpn, serverName: c.serverName, idleTimeoutMs: c.idleTimeoutMs, maxData: c.maxData,
+        streamBuffer: c.streamBuffer, maxStreamsBidi: bidi, maxStreamsUni: uni,
+        requireRetry: c.requireRetry, handshake: c.handshake,
+    };
+}
+
+pub bool IsValid(QuicConfig c) {
+    if Array.Len<string>(c.alpn) == 0_i64 { return false; }
+    if c.streamBuffer < 1024_i64 || c.streamBuffer > 65536_i64 { return false; }
+    if c.maxData < c.streamBuffer || c.maxData > 1048576_i64 { return false; }
+    if c.maxStreamsBidi < 0_i64 || c.maxStreamsUni < 0_i64 || c.maxStreamsBidi + c.maxStreamsUni > 12_i64 { return false; }
+    return c.idleTimeoutMs >= 0_i64;
+}

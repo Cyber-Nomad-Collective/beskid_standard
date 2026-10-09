@@ -1,0 +1,131 @@
+use Core.Collections.Array;
+
+// Bounded sets of disjoint half-open ranges [lo, hi) kept sorted ascending, stored in one
+// i64 array: slot 0 holds the pair count, slot 1 the capacity, pairs follow from slot 2.
+// Used for received packet numbers, acknowledged and lost send ranges, and reassembly.
+
+/// An empty set holding at most `capacity` disjoint ranges.
+pub i64[] New(i64 capacity) {
+    mut i64[] r = Array.Empty<i64>();
+    Array.Append<i64>(r, 0_i64);
+    Array.Append<i64>(r, capacity);
+    mut i64 i = 0_i64;
+    while i < capacity * 2_i64 { Array.Append<i64>(r, 0_i64); i = i + 1_i64; }
+    return r;
+}
+
+pub i64 Count(i64[] r) { return r[0]; }
+pub i64 Lo(i64[] r, i64 i) { return r[2_i64 + i * 2_i64]; }
+pub i64 Hi(i64[] r, i64 i) { return r[3_i64 + i * 2_i64]; }
+pub unit Clear(i64[] r) { r[0] = 0_i64; return; }
+pub bool IsEmpty(i64[] r) { return r[0] == 0_i64; }
+
+unit SetPair(i64[] r, i64 i, i64 lo, i64 hi) {
+    r[2_i64 + i * 2_i64] = lo;
+    r[3_i64 + i * 2_i64] = hi;
+    return;
+}
+
+unit RemoveAt(i64[] r, i64 i) {
+    i64 n = r[0];
+    mut i64 k = i;
+    while k + 1_i64 < n {
+        SetPair(r, k, Lo(r, k + 1_i64), Hi(r, k + 1_i64));
+        k = k + 1_i64;
+    }
+    r[0] = n - 1_i64;
+    return;
+}
+
+/// Adds [lo, hi), merging overlapping and adjacent ranges. Returns false (set unchanged)
+/// when a new disjoint range does not fit; when full, the lowest range is never dropped.
+pub bool Add(i64[] r, i64 lo, i64 hi) {
+    if hi <= lo { return true; }
+    i64 n = r[0];
+    // First range whose hi >= lo (could merge or lies after).
+    mut i64 i = 0_i64;
+    while i < n && Hi(r, i) < lo { i = i + 1_i64; }
+    if i == n || Lo(r, i) > hi {
+        if n >= r[1] { return false; }
+        mut i64 k = n;
+        while k > i {
+            SetPair(r, k, Lo(r, k - 1_i64), Hi(r, k - 1_i64));
+            k = k - 1_i64;
+        }
+        SetPair(r, i, lo, hi);
+        r[0] = n + 1_i64;
+        return true;
+    }
+    mut i64 newLo = lo;
+    if Lo(r, i) < newLo { newLo = Lo(r, i); }
+    mut i64 newHi = hi;
+    if Hi(r, i) > newHi { newHi = Hi(r, i); }
+    SetPair(r, i, newLo, newHi);
+    while i + 1_i64 < r[0] && Lo(r, i + 1_i64) <= newHi {
+        if Hi(r, i + 1_i64) > newHi { newHi = Hi(r, i + 1_i64); }
+        SetPair(r, i, newLo, newHi);
+        RemoveAt(r, i + 1_i64);
+    }
+    return true;
+}
+
+/// Removes everything below `x`.
+pub unit DropBelow(i64[] r, i64 x) {
+    while r[0] > 0_i64 && Hi(r, 0_i64) <= x { RemoveAt(r, 0_i64); }
+    if r[0] > 0_i64 && Lo(r, 0_i64) < x { r[2] = x; }
+    return;
+}
+
+/// Removes [lo, hi) from the set (splitting a range when needed). Returns false when a split
+/// does not fit (then only the part above is kept trimmed).
+pub bool Remove(i64[] r, i64 lo, i64 hi) {
+    mut i64 i = 0_i64;
+    while i < r[0] {
+        i64 a = Lo(r, i);
+        i64 b = Hi(r, i);
+        if b <= lo || a >= hi { i = i + 1_i64; } else {
+            if a < lo && b > hi {
+                SetPair(r, i, a, lo);
+                return Add(r, hi, b);
+            }
+            if a < lo { SetPair(r, i, a, lo); i = i + 1_i64; } else {
+                if b > hi { SetPair(r, i, hi, b); i = i + 1_i64; } else { RemoveAt(r, i); }
+            }
+        }
+    }
+    return true;
+}
+
+/// End of the range that contains `x`, or `x` when no range contains it.
+pub i64 ContiguousEnd(i64[] r, i64 x) {
+    mut i64 i = 0_i64;
+    while i < r[0] {
+        if Lo(r, i) <= x && Hi(r, i) > x { return Hi(r, i); }
+        i = i + 1_i64;
+    }
+    return x;
+}
+
+pub bool Contains(i64[] r, i64 x) {
+    mut i64 i = 0_i64;
+    while i < r[0] {
+        if Lo(r, i) <= x && Hi(r, i) > x { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+/// Largest value in the set plus one (0 when empty).
+pub i64 Max(i64[] r) {
+    if r[0] == 0_i64 { return 0_i64; }
+    return Hi(r, r[0] - 1_i64);
+}
+
+/// Adds [lo, hi); when the set is full the lowest range is evicted first (ACK range history).
+pub unit AddEvicting(i64[] r, i64 lo, i64 hi) {
+    if !Add(r, lo, hi) {
+        RemoveAt(r, 0_i64);
+        Add(r, lo, hi);
+    }
+    return;
+}

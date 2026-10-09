@@ -1,0 +1,50 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+use Http2.HpackHuffman;
+use Http2.HpackInteger;
+use Codec.Mem;
+
+// RFC 7541 section 5.2 string literals: H bit, 7-bit prefix length, octets.
+
+/// Decoded string octets and the offset after the literal.
+pub type DecodedString { pub u8[] bytes, pub i64 next, }
+
+/// Decodes the string literal at `offset`. Wire lengths and decoded lengths
+/// above `maxLength` are StringTooLong.
+pub Result<DecodedString,HpackError> DecodeString(HuffmanTables tables, u8[] src, i64 offset, i64 maxLength) {
+    if offset >= Slice.Len(src) { return Result::Error(HpackError::Truncated); }
+    bool huffman = (src[offset] & 128_u8) != 0_u8;
+    Result<Decoded,HpackError> length = HpackInteger.DecodeInteger(src, offset, 7_i64);
+    return match length {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(header) => {
+            i64 count = header.value;
+            i64 start = header.next;
+            if count > maxLength { return Result::Error(HpackError::StringTooLong(count)); }
+            if count > Slice.Len(src) - start { return Result::Error(HpackError::Truncated); }
+            if huffman {
+                Result<u8[],HpackError> decoded = HpackHuffman.HuffmanDecode(tables, src, start, count, maxLength);
+                return match decoded {
+                    Result::Error(error) => Result::Error(error),
+                    Result::Ok(bytes) => Result::Ok(DecodedString { bytes: bytes, next: start + count }),
+                };
+            }
+            u8[] raw = Mem.Zeroed(count);
+            Mem.Copy(raw, 0_i64, src, start, count);
+            return Result::Ok(DecodedString { bytes: raw, next: start + count });
+        },
+    };
+}
+
+/// Appends `data` as a string literal, Huffman-coded when `huffman` is true.
+/// Returns the grown buffer.
+pub u8[] EncodeString(HuffmanTables tables, mut u8[] out, u8[] data, bool huffman) {
+    if huffman {
+        out = HpackInteger.EncodeInteger(out, 128_u8, 7_i64, HpackHuffman.HuffmanEncodedLength(tables, data));
+        return HpackHuffman.HuffmanEncode(tables, out, data);
+    }
+    out = HpackInteger.EncodeInteger(out, 0_u8, 7_i64, Slice.Len(data));
+    return Mem.Join(out, data, 0_i64, Slice.Len(data));
+}

@@ -1,0 +1,169 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.IO.IoError;
+use Core.IO.Stream;
+use Core.Results;
+use Core.String;
+use Http.Codec;
+use Http.Errors;
+use Http.Types;
+use Uri.Chars;
+
+// HTTP/1.1 message transfer over any `Core.IO.Stream` (corelib Http.Wire is
+// typed over TcpStream). Framing and parsing stay in corelib Http.Codec; this
+// module only moves octets. Octets past one message stay in the H1Buffer for
+// the next message on the same connection.
+
+pub type H1Buffer {
+    // Received octets not yet consumed (exact length, no spare capacity).
+    pub u8[] data,
+}
+
+pub H1Buffer NewBuffer() { return H1Buffer { data: Slice.New(0_i64) }; }
+
+pub H1Buffer FromBytes(u8[] initial) { return H1Buffer { data: initial }; }
+
+pub i64 ChunkBytes() { return 4096_i64; }
+
+u8[] Concat(u8[] head, u8[] tail, i64 count) {
+    i64 have = Slice.Len(head);
+    u8[] out = Slice.New(have + count);
+    Slice.Copy(out, 0_i64, head, 0_i64, have);
+    Slice.Copy(out, have, tail, 0_i64, count);
+    return out;
+}
+
+u8[] Range(u8[] source, i64 start, i64 count) {
+    u8[] out = Slice.New(count);
+    Slice.Copy(out, 0_i64, source, start, count);
+    return out;
+}
+
+// Reads one complete message (head and body) for `role`. A clean EOF before
+// any octet of the message is `Closed`; an EOF inside it is `UnexpectedEof`.
+pub Result<u8[],HttpError> ReadMessage(H1Buffer buffer, Stream transport, Limits limits, MessageRole role) {
+    u8[] chunk = Slice.New(ChunkBytes());
+    i64 ceiling = limits.maxHeaderBytes + limits.maxBodyBytes + 32_i64;
+    while true {
+        u8[] wire = buffer.data;
+        i64 have = Slice.Len(wire);
+        mut i64 total = 0_i64;
+        if have > 0_i64 {
+            Result<i64,HttpError> boundary = Codec.MessageEnd(wire, limits, role);
+            match boundary {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(end) => { total = end; },
+            };
+        }
+        if total > 0_i64 { return Take(buffer, transport, total); }
+        if have >= ceiling { return Result::Error(HttpError::BodyTooLarge()); }
+        Result<i64,IoError> read = IO.Read(transport, chunk, 0_i64, ChunkBytes());
+        mut i64 count = 0_i64;
+        match read {
+            Result::Error(error) => { return Result::Error(Errors.FromIoError(error)); },
+            Result::Ok(n) => { count = n; },
+        };
+        if count == 0_i64 {
+            if have == 0_i64 { return Result::Error(HttpError::Closed()); }
+            return Result::Error(HttpError::UnexpectedEof());
+        }
+        buffer.data = Concat(wire, chunk, count);
+    }
+    return Result::Error(HttpError::Closed());
+}
+
+Result<u8[],HttpError> Take(H1Buffer buffer, Stream transport, i64 total) {
+    u8[] wire = buffer.data;
+    i64 have = Slice.Len(wire);
+    if have >= total {
+        buffer.data = Range(wire, total, have - total);
+        if have == total { return Result::Ok(wire); }
+        return Result::Ok(Range(wire, 0_i64, total));
+    }
+    u8[] message = Slice.New(total);
+    Slice.Copy(message, 0_i64, wire, 0_i64, have);
+    buffer.data = Slice.New(0_i64);
+    Result<unit,IoError> rest = IO.ReadExact(transport, message, have, total - have);
+    match rest {
+        Result::Error(error) => { return Result::Error(Errors.FromIoError(error)); },
+        Result::Ok(_) => {},
+    };
+    return Result::Ok(message);
+}
+
+pub Result<unit,HttpError> WriteAll(Stream transport, u8[] bytes) {
+    Result<unit,IoError> written = IO.WriteAll(transport, bytes, 0_i64, Slice.Len(bytes));
+    match written {
+        Result::Error(error) => { return Result::Error(Errors.FromIoError(error)); },
+        Result::Ok(_) => {},
+    };
+    return Result::Ok(());
+}
+
+
+// True for fields that describe the HTTP/1.1 connection or framing, which the
+// facade writes itself (RFC 9112 section 6, RFC 9113 section 8.2.2).
+pub bool IsHopField(string name) {
+    string n = Chars.LowerAscii(name);
+    return n == "content-length" || n == "transfer-encoding" || n == "connection" || n == "keep-alive" || n == "proxy-connection" || n == "upgrade" || n == "te";
+}
+
+pub Header[] EndToEnd(Header[] headers) {
+    mut Header[] out = Array.Empty<Header>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header h = Array.Get<Header>(headers, i);
+        if !IsHopField(h.name) { Array.Append<Header>(out, h); }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+// Value of the first field named `name` (case-insensitive), or "".
+pub string FieldValue(Header[] headers, string name) {
+    string wanted = Chars.LowerAscii(name);
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header h = Array.Get<Header>(headers, i);
+        string n = Chars.LowerAscii(h.name);
+        if n == wanted { return h.value; }
+        i = i + 1_i64;
+    }
+    return "";
+}
+
+// True when a `connection` field lists the `close` option.
+pub bool WantsClose(Header[] headers) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header h = Array.Get<Header>(headers, i);
+        string n = Chars.LowerAscii(h.name);
+        if n == "connection" {
+            string v = Chars.LowerAscii(h.value);
+            if HasToken(v, "close") { return true; }
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+bool HasToken(string list, string token) {
+    mut i64 i = 0_i64;
+    i64 n = String.Len(list);
+    mut string current = "";
+    while i <= n {
+        mut bool split = i == n;
+        if !split {
+            u8 b = String.ByteAt(list, i);
+            split = b == 44_u8;
+            if !split && b != 32_u8 && b != 9_u8 { current = current + String.SubSlice(list, i, 1_i64); }
+        }
+        if split {
+            if current == token { return true; }
+            current = "";
+        }
+        i = i + 1_i64;
+    }
+    return false;
+}

@@ -1,0 +1,84 @@
+use Connect.Failures;
+use Http.Errors;
+use Http2.FrameErrors;
+use Tls.TlsErrors;
+
+// Typed failures of the Web facade. Each layer keeps its own error value, so a
+// caller can always see what failed underneath (connect, TLS, HTTP/1.1, HTTP/2).
+
+pub enum WebError {
+    // The request target is not an absolute http:// or https:// URL.
+    InvalidUrl(),
+    // The URL scheme is not http or https.
+    UnsupportedScheme(),
+    // The configuration is outside its domain (for example an empty ALPN list).
+    InvalidConfig(),
+    // The trust policy cannot be built: the system bundle is missing or empty.
+    TrustUnavailable(),
+    // Happy Eyeballs connection establishment failed.
+    ConnectFailed(ConnectError cause),
+    // The TLS 1.3 handshake or record layer failed.
+    TlsFailed(TlsError cause),
+    // The server selected an ALPN protocol this client did not offer.
+    AlpnMismatch(string protocol),
+    // The HTTP/1.1 exchange failed.
+    Http1Failed(HttpError cause),
+    // The HTTP/2 exchange failed.
+    Http2Failed(Http2Error cause),
+    // HTTP/3 over QUIC failed: `code` is the RFC 9114 / RFC 9204 code of the
+    // Http3 H3Error (H3Errors.CodeOf), or Http3TimeoutCode() / Http3TransportCode()
+    // for the errors without a wire code (see Web.WebH3.CodeOf).
+    Http3Failed(i64 code),
+    // The listener stopped accepting connections.
+    AcceptFailed(),
+}
+
+// Http3Failed code of a QUIC handshake or exchange that ran out of time.
+pub i64 Http3TimeoutCode() { return -1_i64; }
+// Http3Failed code of a QUIC transport failure (no route, handshake, ALPN, close).
+pub i64 Http3TransportCode() { return -2_i64; }
+
+// Stable numeric kind, for logs and tests.
+pub i64 Code(WebError error) {
+    return match error {
+        WebError::InvalidUrl => 1_i64,
+        WebError::UnsupportedScheme => 2_i64,
+        WebError::InvalidConfig => 3_i64,
+        WebError::TrustUnavailable => 4_i64,
+        WebError::ConnectFailed(_) => 5_i64,
+        WebError::TlsFailed(_) => 6_i64,
+        WebError::AlpnMismatch(_) => 7_i64,
+        WebError::Http1Failed(_) => 8_i64,
+        WebError::Http2Failed(_) => 9_i64,
+        WebError::Http3Failed(_) => 10_i64,
+        WebError::AcceptFailed => 11_i64,
+    };
+}
+
+// The underlying layer code: TlsErrors.Code for TLS, the RFC 9113 code for
+// HTTP/2 (or -1), the Http3 code for HTTP/3, else 0.
+pub i64 Detail(WebError error) {
+    return match error {
+        WebError::TlsFailed(cause) => TlsErrors.Code(cause),
+        WebError::Http2Failed(cause) => FrameErrors.CodeOf(cause),
+        WebError::Http3Failed(code) => code,
+        _ => 0_i64,
+    };
+}
+
+// A short name for diagnostics.
+pub string KindOf(WebError error) {
+    return match error {
+        WebError::InvalidUrl => "invalid-url",
+        WebError::UnsupportedScheme => "unsupported-scheme",
+        WebError::InvalidConfig => "invalid-config",
+        WebError::TrustUnavailable => "trust-unavailable",
+        WebError::ConnectFailed(_) => "connect",
+        WebError::TlsFailed(_) => "tls",
+        WebError::AlpnMismatch(_) => "alpn-mismatch",
+        WebError::Http1Failed(_) => "http1",
+        WebError::Http2Failed(_) => "http2",
+        WebError::Http3Failed(_) => "http3",
+        WebError::AcceptFailed => "accept",
+    };
+}

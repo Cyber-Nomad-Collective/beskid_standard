@@ -1,0 +1,103 @@
+/// Ansi.Text width, stripping, truncation, padding, and wrapping tests.
+
+use Testing.Expect;
+use Ansi.Escape;
+use Ansi.Text;
+use Core.Collections.Array;
+use Core.String;
+
+/// UTF-8 encoding of code point `cp`.
+string U(i64 cp) {
+    mut u8[] bytes = Array.Empty<u8>();
+    if cp < 128 {
+        bytes = Array.Append<u8>(bytes, u8(cp));
+    } else {
+        if cp < 2048 {
+            bytes = Array.Append<u8>(bytes, u8(192 + cp / 64));
+            bytes = Array.Append<u8>(bytes, u8(128 + cp % 64));
+        } else {
+            if cp < 65536 {
+                bytes = Array.Append<u8>(bytes, u8(224 + cp / 4096));
+                bytes = Array.Append<u8>(bytes, u8(128 + (cp / 64) % 64));
+                bytes = Array.Append<u8>(bytes, u8(128 + cp % 64));
+            } else {
+                bytes = Array.Append<u8>(bytes, u8(240 + cp / 262144));
+                bytes = Array.Append<u8>(bytes, u8(128 + (cp / 4096) % 64));
+                bytes = Array.Append<u8>(bytes, u8(128 + (cp / 64) % 64));
+                bytes = Array.Append<u8>(bytes, u8(128 + cp % 64));
+            }
+        }
+    }
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+string Bold() {
+    return Escape.Csi("1", "m");
+}
+
+string Reset() {
+    return Escape.Csi("0", "m");
+}
+
+test text_strip_removes_escapes {
+    Expect.EqualString(Text.Strip(Bold() + "hi" + Reset()), "hi", "SGR removed");
+    string link = Escape.OscSequence("8;;https://beskid-lang.org") + "docs" + Escape.OscSequence("8;;");
+    Expect.EqualString(Text.Strip(link), "docs", "BEL-terminated OSC removed");
+    string st = Escape.Esc() + "]0;title" + Escape.Esc() + "\\" + "x";
+    Expect.EqualString(Text.Strip(st), "x", "ST-terminated OSC removed");
+    Expect.EqualString(Text.Strip("a" + Escape.Esc() + "7b"), "ab", "two-byte escape removed");
+    Expect.EqualString(Text.Strip("plain"), "plain", "plain text unchanged");
+}
+
+test text_code_point_widths {
+    Expect.EqualI64(Text.CodePointWidth(65), 1, "ASCII");
+    Expect.EqualI64(Text.CodePointWidth(10), 0, "control");
+    Expect.EqualI64(Text.CodePointWidth(769), 0, "combining acute");
+    Expect.EqualI64(Text.CodePointWidth(8205), 0, "zero-width joiner");
+    Expect.EqualI64(Text.CodePointWidth(65039), 0, "variation selector");
+    Expect.EqualI64(Text.CodePointWidth(26085), 2, "CJK ideograph");
+    Expect.EqualI64(Text.CodePointWidth(44032), 2, "Hangul syllable");
+    Expect.EqualI64(Text.CodePointWidth(65297), 2, "fullwidth digit");
+    Expect.EqualI64(Text.CodePointWidth(128512), 2, "emoji");
+    Expect.EqualI64(Text.CodePointWidth(233), 1, "Latin-1 letter");
+    Expect.EqualI64(Text.CodePointWidth(9472), 1, "box drawing");
+}
+
+test text_visible_width {
+    Expect.EqualI64(Text.VisibleWidth("abc"), 3, "ASCII");
+    Expect.EqualI64(Text.VisibleWidth(U(26085) + U(26412)), 4, "two wide characters");
+    Expect.EqualI64(Text.VisibleWidth("e" + U(769)), 1, "base plus combining mark");
+    Expect.EqualI64(Text.VisibleWidth(Bold() + "ok" + Reset()), 2, "styles take no columns");
+    Expect.EqualI64(Text.VisibleWidth(U(128512) + "!"), 3, "emoji plus ASCII");
+    Expect.EqualI64(Text.VisibleWidth(""), 0, "empty");
+}
+
+test text_truncate {
+    string ellipsis = U(8230);
+    Expect.EqualString(Text.Truncate("hello world", 8, ellipsis), "hello w" + ellipsis, "cut with ellipsis");
+    Expect.EqualString(Text.Truncate("short", 8, ellipsis), "short", "fits unchanged");
+    Expect.EqualString(Text.Truncate(U(26085) + U(26412) + U(35486), 5, ""), U(26085) + U(26412), "never splits a wide character");
+    Expect.EqualString(Text.Truncate("abcdef", 2, "..."), "ab", "ellipsis wider than width is dropped");
+    Expect.EqualString(Text.Truncate(Bold() + "abcdef", 4, "."), Bold() + "abc" + Reset() + ".", "styling closed before ellipsis");
+    Expect.EqualString(Text.Truncate("abc", 0, "."), "", "zero width");
+}
+
+test text_padding {
+    Expect.EqualString(Text.PadEnd(U(26085), 4), U(26085) + "  ", "pad after wide character");
+    Expect.EqualString(Text.PadStart("ab", 4), "  ab", "pad start");
+    Expect.EqualString(Text.Center("ab", 5), " ab  ", "odd remainder goes right");
+    Expect.EqualString(Text.PadEnd(Bold() + "x" + Reset(), 3), Bold() + "x" + Reset() + "  ", "styled padding by width");
+    Expect.EqualString(Text.Center("long", 2), "long", "no truncation");
+}
+
+test text_wrap {
+    Expect.EqualStringArray(Text.Wrap("the quick brown fox", 10), ["the quick", "brown fox"], "word wrap");
+    Expect.EqualStringArray(Text.Wrap("abcdefghij", 4), ["abcd", "efgh", "ij"], "hard break long word");
+    Expect.EqualStringArray(Text.Wrap("a  b", 10), ["a b"], "spaces collapse");
+    Expect.EqualStringArray(Text.Wrap("one" + String.Newline() + "two", 10), ["one", "two"], "newlines kept");
+    string wide = U(26085) + U(26412) + U(35486);
+    mut string[] expected = Array.Empty<string>();
+    expected = Array.Append<string>(expected, U(26085) + U(26412));
+    expected = Array.Append<string>(expected, U(35486));
+    Expect.EqualStringArray(Text.Wrap(wide, 4), expected, "wide characters break by columns");
+}

@@ -2,7 +2,9 @@
 
 `Core.String` is the string hub. Strings are UTF-8; every length, offset, and count in this module is a **byte** (code unit) count, and comparison is ordinal (byte-wise). Import it with `use Core.String;` and call `String.Name(...)`.
 
-The hub forwards to four implementation modules: `Core.String.Core` (runtime-backed primitives), `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`.
+The hub forwards to the implementation modules `Core.String.Core` (runtime-backed primitives), `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`.
+
+`Core.String.Ascii` holds the byte classes every text module shares, so none keeps a private copy: `IsDigit`, `IsLower`, `IsUpper`, `IsAlpha`, `IsAlphanumeric`, `IsHexDigit`, `HexValue` (`0..=15` or `-1`), `IsWhitespace` (space, tab, CR, LF), `IsIdentifierByte(b, first)`, and the byte case maps `ToLower` and `ToUpper`. Import it with `use Core.String.Ascii;`.
 
 ## Inspecting
 
@@ -22,6 +24,8 @@ The hub forwards to four implementation modules: `Core.String.Core` (runtime-bac
 | `IndexOf(text, needle)` / `IndexOfFrom(text, start, needle)` | First offset or `-1`; the empty needle matches at `start`. |
 | `LastIndexOf(text, needle)` | Last offset or `-1`; the empty needle matches at `Len(text)`. |
 | `StartsWith(text, prefix)` / `EndsWith(text, suffix)` | Affix tests. |
+| `StartsWithAt(text, at, prefix)` | `prefix` occurs at offset `at`; offsets outside `text` never match. The affix tests and `LastIndexOf` use it. |
+| `SkipWhitespace(text, at) -> i64` | First offset at or after `at` that is not ASCII whitespace. |
 | `Count(text, needle)` | Non-overlapping occurrences; the empty needle counts 0. |
 | `Compare(a, b) -> i64` | `-1`, `0`, or `1` in ordinal order; a proper prefix sorts first. |
 | `Less(a, b) -> bool` | `Compare(a, b) < 0`. Use it instead of `<`, which strings do not support. |

@@ -1,0 +1,243 @@
+/// Server identity checks (RFC 9525, which obsoletes RFC 6125) and IP literals.
+///
+/// A DNS host name is compared with the subjectAltName dNSName entries, ASCII case
+/// insensitively, ignoring one trailing dot. A wildcard is accepted only as the complete
+/// left-most label ("*.example.com"), matches exactly one label, and needs at least two
+/// labels after it. An IP literal is compared byte for byte with the iPAddress entries
+/// and never with dNSName or wildcards. The subject common name is used only when the
+/// certificate has no subjectAltName extension at all (legacy fallback, DNS names only).
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.String;
+use X509.Certificate;
+use X509.Der;
+use X509.Names;
+use X509.X509Errors;
+
+u8 LowerByte(u8 c) {
+    if c >= 65_u8 && c <= 90_u8 { return c + 32_u8; }
+    return c;
+}
+
+/// Lower-cases ASCII and removes one trailing dot.
+pub string Normalize(string name) {
+    mut string s = Certificate.Lower(name);
+    i64 n = String.Len(s);
+    if n > 0_i64 && String.ByteAt(s, n - 1_i64) == 46_u8 { s = String.SubSlice(s, 0_i64, n - 1_i64); }
+    return s;
+}
+
+/// True for a syntactically valid DNS host name: labels of 1..63 letters, digits,
+/// hyphens, or underscores, not starting or ending with a hyphen, total length 1..253.
+pub bool IsValidDnsName(string name) {
+    i64 n = String.Len(name);
+    if n == 0_i64 || n > 253_i64 { return false; }
+    mut i64 labelLen = 0_i64;
+    mut u8 prev = 46_u8;
+    mut i64 i = 0_i64;
+    while i < n {
+        u8 c = LowerByte(String.ByteAt(name, i));
+        if c == 46_u8 {
+            if labelLen == 0_i64 || prev == 45_u8 { return false; }
+            labelLen = 0_i64;
+        } else {
+            bool ok = (c >= 97_u8 && c <= 122_u8) || (c >= 48_u8 && c <= 57_u8) || c == 45_u8 || c == 95_u8;
+            if !ok { return false; }
+            if labelLen == 0_i64 && c == 45_u8 { return false; }
+            labelLen = labelLen + 1_i64;
+            if labelLen > 63_i64 { return false; }
+        }
+        prev = c;
+        i = i + 1_i64;
+    }
+    return labelLen > 0_i64 && prev != 45_u8;
+}
+
+/// Matches one presented dNSName (possibly a wildcard) against a normalized host name.
+pub bool MatchDnsName(string presented, string hostName) {
+    string pattern = Normalize(presented);
+    string target = Normalize(hostName);
+    i64 pn = String.Len(pattern);
+    i64 tn = String.Len(target);
+    if pn == 0_i64 || tn == 0_i64 { return false; }
+    if String.ByteAt(pattern, 0_i64) != 42_u8 {
+        if String.Contains(pattern, "*") { return false; }
+        return pattern == target;
+    }
+    // "*." followed by at least two labels.
+    if pn < 3_i64 || String.ByteAt(pattern, 1_i64) != 46_u8 { return false; }
+    string rest = String.SubSlice(pattern, 1_i64, pn - 1_i64);
+    string restLabels = String.SubSlice(rest, 1_i64, String.Len(rest) - 1_i64);
+    if String.Contains(restLabels, "*") || !String.Contains(restLabels, ".") { return false; }
+    i64 dot = String.IndexOfFrom(target, 0_i64, ".");
+    if dot <= 0_i64 { return false; }
+    return String.SubSlice(target, dot, tn - dot) == rest;
+}
+
+i64 HexValue(u8 c) {
+    if c >= 48_u8 && c <= 57_u8 { return i64(c - 48_u8); }
+    u8 l = LowerByte(c);
+    if l >= 97_u8 && l <= 102_u8 { return i64(l - 87_u8); }
+    return -1_i64;
+}
+
+/// Parses a dotted-quad IPv4 address in `text[start, end)` into `out[at..at+4)`.
+/// Leading zeros are rejected. Returns false on any syntax error.
+bool ParseIpv4Into(string text, i64 start, i64 end, u8[] out, i64 at) {
+    mut i64 part = 0_i64;
+    mut i64 value = 0_i64;
+    mut i64 digits = 0_i64;
+    mut bool leadingZero = false;
+    mut i64 i = start;
+    while i <= end {
+        if i == end || String.ByteAt(text, i) == 46_u8 {
+            if digits == 0_i64 || part > 3_i64 { return false; }
+            out[at + part] = u8(value & 255_i64);
+            part = part + 1_i64;
+            value = 0_i64;
+            digits = 0_i64;
+            leadingZero = false;
+        } else {
+            u8 c = String.ByteAt(text, i);
+            if c < 48_u8 || c > 57_u8 { return false; }
+            if leadingZero { return false; }
+            if digits == 0_i64 && c == 48_u8 { leadingZero = true; }
+            value = value * 10_i64 + i64(c - 48_u8);
+            digits = digits + 1_i64;
+            if value > 255_i64 { return false; }
+        }
+        i = i + 1_i64;
+    }
+    return part == 4_i64;
+}
+
+/// Parses an IPv6 address (RFC 4291 text forms, with "::" and an optional trailing
+/// IPv4 part) in `text[start, end)` into 16 bytes.
+bool ParseIpv6Into(string text, i64 start, i64 end, u8[] out) {
+    i64[] groups = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+    mut i64 count = 0_i64;
+    mut i64 gap = -1_i64;
+    mut i64 i = start;
+    if end - start >= 2_i64 && String.ByteAt(text, start) == 58_u8 {
+        if String.ByteAt(text, start + 1_i64) != 58_u8 { return false; }
+        gap = 0_i64;
+        i = start + 2_i64;
+    }
+    mut bool v4Tail = false;
+    while i < end {
+        // One group: hex digits up to ':' or end; a '.' means an IPv4 tail.
+        mut i64 j = i;
+        mut i64 value = 0_i64;
+        mut bool dotted = false;
+        while j < end && String.ByteAt(text, j) != 58_u8 {
+            if String.ByteAt(text, j) == 46_u8 { dotted = true; }
+            j = j + 1_i64;
+        }
+        if dotted {
+            if j != end || count > 6_i64 { return false; }
+            u8[] v4 = Slice.New(4_i64);
+            if !ParseIpv4Into(text, i, end, v4, 0_i64) { return false; }
+            groups[count] = i64(v4[0]) * 256_i64 + i64(v4[1]);
+            groups[count + 1_i64] = i64(v4[2]) * 256_i64 + i64(v4[3]);
+            count = count + 2_i64;
+            v4Tail = true;
+            i = end;
+        } else {
+            i64 len = j - i;
+            if len < 1_i64 || len > 4_i64 || count >= 8_i64 { return false; }
+            mut i64 k = i;
+            while k < j {
+                i64 h = HexValue(String.ByteAt(text, k));
+                if h < 0_i64 { return false; }
+                value = value * 16_i64 + h;
+                k = k + 1_i64;
+            }
+            groups[count] = value;
+            count = count + 1_i64;
+            i = j;
+            if i < end {
+                // At ':'; "::" marks the gap.
+                i = i + 1_i64;
+                if i < end && String.ByteAt(text, i) == 58_u8 {
+                    if gap >= 0_i64 { return false; }
+                    gap = count;
+                    i = i + 1_i64;
+                } else if i == end {
+                    return false;
+                }
+            }
+        }
+    }
+    if v4Tail && count > 8_i64 { return false; }
+    if gap < 0_i64 && count != 8_i64 { return false; }
+    if gap >= 0_i64 && count > 7_i64 { return false; }
+    mut i64 g = 0_i64;
+    mut i64 src = 0_i64;
+    while g < 8_i64 {
+        mut i64 v = 0_i64;
+        if gap >= 0_i64 && g >= gap && g < gap + 8_i64 - count {
+            v = 0_i64;
+        } else {
+            v = groups[src];
+            src = src + 1_i64;
+        }
+        out[g * 2_i64] = u8((v >> 8_i64) & 255_i64);
+        out[g * 2_i64 + 1_i64] = u8(v & 255_i64);
+        g = g + 1_i64;
+    }
+    return true;
+}
+
+/// The 4- or 16-byte form of an IP literal, or an empty array when `text` is not one.
+/// IPv6 may be wrapped in brackets; zone identifiers are not accepted.
+pub u8[] ParseIp(string text) {
+    i64 n = String.Len(text);
+    if n == 0_i64 { return Slice.New(0_i64); }
+    mut i64 start = 0_i64;
+    mut i64 end = n;
+    if String.ByteAt(text, 0_i64) == 91_u8 {
+        if String.ByteAt(text, n - 1_i64) != 93_u8 { return Slice.New(0_i64); }
+        start = 1_i64;
+        end = n - 1_i64;
+    }
+    if String.IndexOfFrom(text, 0_i64, ":") >= 0_i64 {
+        u8[] v6 = Slice.New(16_i64);
+        if ParseIpv6Into(text, start, end, v6) { return v6; }
+        return Slice.New(0_i64);
+    }
+    if start != 0_i64 { return Slice.New(0_i64); }
+    u8[] v4 = Slice.New(4_i64);
+    if ParseIpv4Into(text, 0_i64, n, v4, 0_i64) { return v4; }
+    return Slice.New(0_i64);
+}
+
+/// Checks that `cert` is valid for `name` (a DNS host name or an IP literal).
+/// Returns X509Error::None on a match, HostnameMismatch otherwise, BadHostname when
+/// `name` is neither a valid DNS name nor an IP literal.
+pub X509Error VerifyHostname(Certificate cert, string name) {
+    Extensions ext = cert.extensions;
+    u8[] ip = ParseIp(name);
+    if Slice.Len(ip) > 0_i64 {
+        mut i64 i = 0_i64;
+        while i < Array.Len<IpBytes>(ext.ipAddresses) {
+            IpBytes entry = ext.ipAddresses[i];
+            if Der.BytesEqual(entry.bytes, ip) { return X509Error::None; }
+            i = i + 1_i64;
+        }
+        return X509Error::HostnameMismatch;
+    }
+    string wanted = Normalize(name);
+    if !IsValidDnsName(wanted) { return X509Error::BadHostname; }
+    if ext.hasSubjectAltName {
+        mut i64 k = 0_i64;
+        while k < Array.Len<string>(ext.dnsNames) {
+            if MatchDnsName(ext.dnsNames[k], wanted) { return X509Error::None; }
+            k = k + 1_i64;
+        }
+        return X509Error::HostnameMismatch;
+    }
+    DistinguishedName subject = cert.subject;
+    string cn = subject.commonName;
+    if cn != "" && MatchDnsName(cn, wanted) { return X509Error::None; }
+    return X509Error::HostnameMismatch;
+}

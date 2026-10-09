@@ -1,0 +1,119 @@
+use Testing.Assert;
+use Core.Results;
+use Uri.Errors;
+use Uri.Format;
+use Uri.Parse;
+use Uri.Types;
+
+UriRef Must(string text) {
+    Result<UriRef, UriError> r = Parse.ParseReference(text);
+    return match r { Result::Ok(u) => u, Result::Error(_) => Types.Empty(), };
+}
+i64 PortOf(string text) { UriRef u = Must(text); return u.port; }
+string RoundTrip(string text) {
+    Result<UriRef, UriError> r = Parse.ParseReference(text);
+    return match r { Result::Ok(u) => Format.Format(u), Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+
+test full_uri_components {
+    UriRef u = Must("http://user:pw@Example.com:8080/a/b%20c?q=1&r=2#frag");
+    Assert.True(u.hasScheme, "scheme");
+    Assert.Equal<string>(u.scheme, "http", "scheme text");
+    Assert.True(u.hasAuthority, "authority");
+    Assert.True(u.hasUserinfo, "userinfo");
+    Assert.Equal<string>(u.userinfo, "user:pw", "userinfo text");
+    Assert.Equal<string>(u.hostName, "Example.com", "host kept as written");
+    Assert.True(u.hasPort, "port");
+    Assert.Equal<i64>(u.port, 8080_i64, "port value");
+    Assert.Equal<string>(u.path, "/a/b%20c", "path raw");
+    Assert.True(u.hasQuery, "query");
+    Assert.Equal<string>(u.query, "q=1&r=2", "query text");
+    Assert.True(u.hasFragment, "fragment");
+    Assert.Equal<string>(u.fragment, "frag", "fragment text");
+}
+
+test minimal_forms {
+    UriRef a = Must("mailto:joe@example.com");
+    Assert.True(a.hasScheme, "mailto scheme");
+    Assert.False(a.hasAuthority, "mailto no authority");
+    Assert.Equal<string>(a.path, "joe@example.com", "mailto path");
+    UriRef b = Must("urn:isbn:0451450523");
+    Assert.Equal<string>(b.path, "isbn:0451450523", "urn path");
+    UriRef c = Must("file:///etc/hosts");
+    Assert.True(c.hasAuthority, "file authority present");
+    Assert.Equal<string>(c.hostName, "", "file empty host");
+    Assert.Equal<string>(c.path, "/etc/hosts", "file path");
+    UriRef d = Must("");
+    Assert.False(d.hasScheme, "empty: no scheme");
+    Assert.False(d.hasAuthority, "empty: no authority");
+    Assert.Equal<string>(d.path, "", "empty path");
+}
+
+test relative_references {
+    UriRef a = Must("//host/path");
+    Assert.False(a.hasScheme, "network-path: no scheme");
+    Assert.True(a.hasAuthority, "network-path: authority");
+    Assert.Equal<string>(a.path, "/path", "network-path: path");
+    UriRef b = Must("../x/y?z#w");
+    Assert.False(b.hasScheme, "relative: no scheme");
+    Assert.Equal<string>(b.path, "../x/y", "relative path");
+    Assert.Equal<string>(b.query, "z", "relative query");
+    Assert.Equal<string>(b.fragment, "w", "relative fragment");
+    UriRef c = Must("?only");
+    Assert.Equal<string>(c.path, "", "query-only: empty path");
+    Assert.True(c.hasQuery, "query-only: query");
+    UriRef d = Must("#only");
+    Assert.True(d.hasFragment, "fragment-only");
+    Assert.False(d.hasQuery, "fragment-only: no query");
+}
+
+test empty_is_not_absent {
+    UriRef a = Must("http://h/p?");
+    Assert.True(a.hasQuery, "empty query present");
+    Assert.Equal<string>(a.query, "", "empty query text");
+    UriRef b = Must("http://h/p#");
+    Assert.True(b.hasFragment, "empty fragment present");
+    UriRef c = Must("http://h:/p");
+    Assert.True(c.hasPort, "empty port present");
+    Assert.Equal<i64>(c.port, -1_i64, "empty port value");
+    UriRef d = Must("http://@h/");
+    Assert.True(d.hasUserinfo, "empty userinfo present");
+    UriRef e = Must("http://h/p");
+    Assert.False(e.hasQuery, "no query");
+    Assert.False(e.hasUserinfo, "no userinfo");
+    Assert.False(e.hasPort, "no port");
+}
+
+test rt_0_full { Assert.Equal<string>(RoundTrip("http://user:pw@Example.com:8080/a/b%20c?q=1&r=2#frag"), "http://user:pw@Example.com:8080/a/b%20c?q=1&r=2#frag", "full"); }
+test rt_1_empty_query { Assert.Equal<string>(RoundTrip("http://h/p?"), "http://h/p?", "empty query"); }
+test rt_2_empty_port_fragment { Assert.Equal<string>(RoundTrip("http://h:/p#"), "http://h:/p#", "empty port + fragment"); }
+test rt_3_file { Assert.Equal<string>(RoundTrip("file:///etc/hosts"), "file:///etc/hosts", "file"); }
+test rt_4_mailto { Assert.Equal<string>(RoundTrip("mailto:a@b"), "mailto:a@b", "mailto"); }
+test rt_5_network_path { Assert.Equal<string>(RoundTrip("//h/p"), "//h/p", "network path"); }
+test rt_6_ipv6 { Assert.Equal<string>(RoundTrip("http://[::1]:80/"), "http://[::1]:80/", "ipv6"); }
+test rt_7_empty_reference { Assert.Equal<string>(RoundTrip(""), "", "empty reference"); }
+test rt_8_colon_after_first_segment { Assert.Equal<string>(RoundTrip("a/b:c"), "a/b:c", "colon after first segment"); }
+
+test path_with_colon_and_at {
+    UriRef a = Must("/a:b/c@d");
+    Assert.Equal<string>(a.path, "/a:b/c@d", "colon and at in path");
+    UriRef b = Must("http://h/a;b=c,d/e");
+    Assert.Equal<string>(b.path, "/a;b=c,d/e", "sub-delims in path");
+    UriRef c = Must("http://h/?a=b/c?d:e@f");
+    Assert.Equal<string>(c.query, "a=b/c?d:e@f", "query punctuation");
+}
+
+test ports {
+    Assert.Equal<i64>(PortOf("http://h:0/"), 0_i64, "port 0");
+    Assert.Equal<i64>(PortOf("http://h:65535/"), 65535_i64, "port max");
+    Assert.Equal<i64>(PortOf("http://h:080/"), 80_i64, "leading zeros");
+    Assert.Equal<i64>(PortOf("http://[::1]:8443/"), 8443_i64, "ipv6 port");
+    Assert.Equal<i64>(PortOf("http://1.2.3.4:7/"), 7_i64, "ipv4 port");
+}
+
+test absolute_parse_requires_scheme {
+    Result<UriRef, UriError> a = Parse.Parse("//h/p");
+    Assert.Equal<i64>(match a { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }, 16_i64, "NotAbsolute");
+    Result<UriRef, UriError> b = Parse.Parse("a:b");
+    Assert.Equal<i64>(match b { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }, 0_i64, "ok");
+}

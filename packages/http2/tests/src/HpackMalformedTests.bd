@@ -1,0 +1,299 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Http2.Hpack;
+use Http2.HpackDecoder;
+use Http2.HpackEncoder;
+
+// Shared test helpers (each target is compiled on its own).
+
+i64 HexDigit(u8 b) {
+    if b >= 48_u8 && b <= 57_u8 { return i64(b - 48_u8); }
+    if b >= 97_u8 && b <= 102_u8 { return i64(b - 97_u8) + 10_i64; }
+    if b >= 65_u8 && b <= 70_u8 { return i64(b - 65_u8) + 10_i64; }
+    return -1_i64;
+}
+
+u8[] Hex(string text) {
+    mut u8[] out = [];
+    mut i64 high = -1_i64;
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 digit = HexDigit(String.ByteAt(text, i));
+        if digit >= 0_i64 {
+            if high < 0_i64 { high = digit; } else { Array.Append<u8>(out, u8(high * 16_i64 + digit)); high = -1_i64; }
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+string HexText(u8[] data) {
+    string digits = "0123456789abcdef";
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice(digits, b / 16_i64, 1_i64) + String.SubSlice(digits, b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+unit ExpectBytes(u8[] actual, string expectedHex, string because) {
+    Assert.True(Hpack.BytesEqual(actual, Hex(expectedHex)), because + ": got " + HexText(actual) + " want " + HexText(Hex(expectedHex)));
+    return;
+}
+
+string Text(u8[] data) {
+    return match Convert.BytesToString(data) { Result::Ok(text) => text, Result::Error(_) => "<binary " + HexText(data) + ">", };
+}
+
+unit ExpectField(HeaderField field, string name, string value, string because) {
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)) && Hpack.BytesEqual(field.value, Convert.StringToBytes(value)),
+        because + ": got " + Text(field.name) + ": " + Text(field.value) + " want " + name + ": " + value);
+    return;
+}
+
+/// `expected` alternates names and values.
+unit ExpectFields(HeaderField[] fields, string[] expected, string because) {
+    Assert.Equal<i64>(Array.Len<HeaderField>(fields) * 2_i64, Array.Len<string>(expected), because + ": field count");
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        ExpectField(Array.Get<HeaderField>(fields, i), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+HeaderField[] Fields(string[] pairs) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    mut i64 i = 0_i64;
+    while i + 1_i64 < Array.Len<string>(pairs) {
+        Array.Append<HeaderField>(out, Hpack.Field(Array.Get<string>(pairs, i), Array.Get<string>(pairs, i + 1_i64)));
+        i = i + 2_i64;
+    }
+    return out;
+}
+
+Decoder NewTestDecoder(i64 tableSize) {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.settingsTableSize = tableSize;
+    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
+    match created {
+        Result::Ok(decoder) => { return decoder; },
+        Result::Error(_) => { Assert.Fail("NewDecoder"); },
+    };
+    return NewTestDecoder(4096_i64);
+}
+
+Encoder NewTestEncoder(EncoderPolicy policy) {
+    Result<Encoder,HpackError> created = HpackEncoder.NewEncoder(policy);
+    match created {
+        Result::Ok(encoder) => { return encoder; },
+        Result::Error(_) => { Assert.Fail("NewEncoder"); },
+    };
+    return NewTestEncoder(HpackEncoder.DefaultEncoderPolicy());
+}
+
+HeaderField[] DecodeOk(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(fields) => { return fields; },
+        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
+    };
+    return Array.Empty<HeaderField>();
+}
+
+HpackError DecodeErr(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(_) => { Assert.Fail(because + ": decode succeeded"); },
+        Result::Error(error) => { return error; },
+    };
+    return HpackError::Truncated;
+}
+
+/// Dynamic table expectations: `expected` alternates names and values, newest first.
+unit ExpectTable(Decoder decoder, string[] expected, i64 size, string because) {
+    Assert.Equal<i64>(HpackDecoder.TableSize(decoder), size, because + ": table size");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder) * 2_i64, Array.Len<string>(expected), because + ": table count");
+    mut i64 i = 0_i64;
+    while i < HpackDecoder.TableCount(decoder) {
+        ExpectField(HpackDecoder.TableEntry(decoder, i + 1_i64), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because + ": table entry");
+        i = i + 1_i64;
+    }
+    return;
+}
+
+EncoderPolicy RfcPolicy(i64 tableSize, bool huffman) {
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    policy.tableSize = tableSize;
+    if huffman { policy.huffman = HuffmanMode::Always; } else { policy.huffman = HuffmanMode::Never; }
+    return policy;
+}
+
+/// Stable numbers for HpackError variants, for compact assertions.
+i64 ErrorCode(HpackError error) {
+    return match error {
+        HpackError::Truncated => 1_i64,
+        HpackError::IntegerOverflow => 2_i64,
+        HpackError::InvalidIndex(_) => 3_i64,
+        HpackError::StringTooLong(_) => 4_i64,
+        HpackError::HuffmanPaddingTooLong => 5_i64,
+        HpackError::HuffmanInvalidPadding => 6_i64,
+        HpackError::HuffmanEos => 7_i64,
+        HpackError::SizeUpdateNotAtStart => 8_i64,
+        HpackError::SizeUpdateExceedsLimit(_) => 9_i64,
+        HpackError::SizeUpdateMissing => 10_i64,
+        HpackError::HeaderListTooLarge(_) => 11_i64,
+        HpackError::TooManyFields => 12_i64,
+        HpackError::InvalidText => 13_i64,
+        HpackError::DecoderFailed => 14_i64,
+        HpackError::InvalidLimit(_) => 15_i64,
+    };
+}
+
+unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string because) {
+    HpackError error = DecodeErr(decoder, blockHex, because);
+    Assert.Equal<i64>(ErrorCode(error), code, because);
+    return;
+}
+
+// Malformed header blocks: every COMPRESSION_ERROR case is typed and bounded.
+
+Decoder DecoderWith(DecoderLimits limits) {
+    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
+    match created {
+        Result::Ok(decoder) => { return decoder; },
+        Result::Error(_) => { Assert.Fail("NewDecoder"); },
+    };
+    return NewTestDecoder(4096_i64);
+}
+
+test index_zero_is_invalid {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    ExpectDecodeError(decoder, "80", 3_i64, "indexed 0");
+}
+
+test index_past_tables_is_invalid {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    ExpectDecodeError(decoder, "be", 3_i64, "index 62 with an empty dynamic table");
+    mut Decoder named = NewTestDecoder(4096_i64);
+    ExpectDecodeError(named, "7e0161", 3_i64, "literal name index 62");
+    mut Decoder huge = NewTestDecoder(4096_i64);
+    ExpectDecodeError(huge, "ff8080808008", 2_i64, "index above MaxInteger");
+}
+
+test truncated_blocks_are_rejected {
+    mut Decoder a = NewTestDecoder(4096_i64);
+    ExpectDecodeError(a, "ff", 1_i64, "integer");
+    mut Decoder b = NewTestDecoder(4096_i64);
+    ExpectDecodeError(b, "400a6375", 1_i64, "name string");
+    mut Decoder c = NewTestDecoder(4096_i64);
+    ExpectDecodeError(c, "400a637573746f6d2d6b6579", 1_i64, "missing value");
+    mut Decoder d = NewTestDecoder(4096_i64);
+    ExpectDecodeError(d, "44", 1_i64, "missing value after name index");
+    mut Decoder e = NewTestDecoder(4096_i64);
+    ExpectDecodeError(e, "3f", 1_i64, "size update");
+}
+
+test size_update_after_a_field_is_rejected {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    ExpectDecodeError(decoder, "8220", 8_i64, "update after indexed field");
+}
+
+test size_update_above_settings_is_rejected {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    ExpectDecodeError(decoder, "3fe21f", 9_i64, "4097 > 4096");
+}
+
+test size_updates_at_block_start_are_applied {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] first = DecodeOk(decoder, "400a637573746f6d2d6b65790d637573746f6d2d686561646572", "insert");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 1_i64, "one entry");
+    // Two updates (0 then 4096) before an indexed field: the 0 evicts everything.
+    HeaderField[] second = DecodeOk(decoder, "203fe11f82", "updates");
+    ExpectFields(second, [":method", "GET"], "after updates");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 0_i64, "evicted");
+    Assert.Equal<i64>(HpackDecoder.TableMaxSize(decoder), 4096_i64, "max restored");
+    // A block made only of an update is valid and yields no fields.
+    HeaderField[] third = DecodeOk(decoder, "3f45", "update only");
+    Assert.Equal<i64>(Array.Len<HeaderField>(third), 0_i64, "no fields");
+    Assert.Equal<i64>(HpackDecoder.TableMaxSize(decoder), 100_i64, "max 100");
+}
+
+test reduced_settings_require_a_size_update {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    Result<unit,HpackError> set = HpackDecoder.SetSettingsTableSize(decoder, 100_i64);
+    match set { Result::Ok(_) => (), Result::Error(_) => { Assert.Fail("set"); }, };
+    ExpectDecodeError(decoder, "82", 10_i64, "missing update");
+    mut Decoder other = NewTestDecoder(4096_i64);
+    Result<unit,HpackError> set2 = HpackDecoder.SetSettingsTableSize(other, 100_i64);
+    match set2 { Result::Ok(_) => (), Result::Error(_) => { Assert.Fail("set"); }, };
+    ExpectDecodeError(other, "3fe11f82", 9_i64, "update above the new limit");
+    mut Decoder good = NewTestDecoder(4096_i64);
+    Result<unit,HpackError> set3 = HpackDecoder.SetSettingsTableSize(good, 100_i64);
+    match set3 { Result::Ok(_) => (), Result::Error(_) => { Assert.Fail("set"); }, };
+    HeaderField[] fields = DecodeOk(good, "3f4582", "update then field");
+    ExpectFields(fields, [":method", "GET"], "after required update");
+    HeaderField[] next = DecodeOk(good, "82", "no further update needed");
+    ExpectFields(next, [":method", "GET"], "next block");
+}
+
+test huffman_errors_in_literals_are_rejected {
+    mut Decoder eos = NewTestDecoder(4096_i64);
+    ExpectDecodeError(eos, "0084ffffffff0161", 7_i64, "EOS in name");
+    mut Decoder padding = NewTestDecoder(4096_i64);
+    ExpectDecodeError(padding, "048118", 6_i64, "zero padding in value");
+    mut Decoder longPad = NewTestDecoder(4096_i64);
+    ExpectDecodeError(longPad, "04821fff", 5_i64, "long padding in value");
+}
+
+test strings_longer_than_the_limit_are_rejected {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.maxStringLength = 4_i64;
+    mut Decoder decoder = DecoderWith(limits);
+    ExpectDecodeError(decoder, "000568656c6c6f0100", 4_i64, "5-octet name");
+    mut Decoder lengthOnly = DecoderWith(limits);
+    ExpectDecodeError(lengthOnly, "007f8080808007", 4_i64, "declared length past the limit before any octets");
+}
+
+test failed_decoder_rejects_later_blocks {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    ExpectDecodeError(decoder, "80", 3_i64, "first error");
+    ExpectDecodeError(decoder, "82", 14_i64, "decoder failed");
+}
+
+test oversized_header_list_keeps_table_in_sync {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.maxHeaderListSize = 60_i64;
+    mut Decoder decoder = DecoderWith(limits);
+    // custom-key: custom-header (55) is inserted, then indexed again: 110 > 60.
+    ExpectDecodeError(decoder, "400a637573746f6d2d6b65790d637573746f6d2d686561646572be", 11_i64, "list too large");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 1_i64, "entry still inserted");
+    HeaderField[] fields = DecodeOk(decoder, "be", "decoder still usable");
+    ExpectFields(fields, ["custom-key", "custom-header"], "synchronized table");
+}
+
+test too_many_fields_is_reported {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.maxFields = 2_i64;
+    mut Decoder decoder = DecoderWith(limits);
+    ExpectDecodeError(decoder, "828282", 12_i64, "three fields");
+    HeaderField[] fields = DecodeOk(decoder, "8282", "two fields");
+    Assert.Equal<i64>(Array.Len<HeaderField>(fields), 2_i64, "two");
+}
+
+test invalid_limits_are_rejected {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.settingsTableSize = -1_i64;
+    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
+    match created {
+        Result::Ok(_) => { Assert.Fail("negative table size accepted"); },
+        Result::Error(error) => { Assert.Equal<i64>(ErrorCode(error), 15_i64, "InvalidLimit"); },
+    };
+}

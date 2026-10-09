@@ -1,0 +1,182 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Hpack;
+
+// RFC 7541 sections 2.3 and 4: the static table (Appendix A) and the
+// dynamic table with size accounting and eviction. Index space: 1..61 is
+// static, 62.. is dynamic with 62 the newest entry.
+
+/// The 61 Appendix A entries, built once and held by a decoder or encoder.
+pub type StaticTable { pub HeaderField[] entries, }
+
+pub i64 StaticCount() { return 61_i64; }
+
+pub StaticTable NewStaticTable() {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(out, Hpack.Field(":authority", ""));
+    Array.Append<HeaderField>(out, Hpack.Field(":method", "GET"));
+    Array.Append<HeaderField>(out, Hpack.Field(":method", "POST"));
+    Array.Append<HeaderField>(out, Hpack.Field(":path", "/"));
+    Array.Append<HeaderField>(out, Hpack.Field(":path", "/index.html"));
+    Array.Append<HeaderField>(out, Hpack.Field(":scheme", "http"));
+    Array.Append<HeaderField>(out, Hpack.Field(":scheme", "https"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "200"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "204"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "206"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "304"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "400"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "404"));
+    Array.Append<HeaderField>(out, Hpack.Field(":status", "500"));
+    Array.Append<HeaderField>(out, Hpack.Field("accept-charset", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("accept-encoding", "gzip, deflate"));
+    Array.Append<HeaderField>(out, Hpack.Field("accept-language", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("accept-ranges", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("accept", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("access-control-allow-origin", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("age", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("allow", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("authorization", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("cache-control", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-disposition", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-encoding", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-language", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-length", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-location", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-range", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("content-type", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("cookie", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("date", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("etag", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("expect", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("expires", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("from", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("host", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("if-match", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("if-modified-since", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("if-none-match", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("if-range", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("if-unmodified-since", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("last-modified", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("link", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("location", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("max-forwards", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("proxy-authenticate", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("proxy-authorization", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("range", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("referer", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("refresh", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("retry-after", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("server", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("set-cookie", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("strict-transport-security", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("transfer-encoding", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("user-agent", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("vary", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("via", ""));
+    Array.Append<HeaderField>(out, Hpack.Field("www-authenticate", ""));
+    return StaticTable { entries: out };
+}
+
+/// Entries are stored oldest first in entries[start..]; index 1 is the newest.
+pub type DynamicTable { pub HeaderField[] entries, pub i64 start, pub i64 size, pub i64 maxSize, }
+
+pub DynamicTable NewDynamicTable(i64 maxSize) {
+    return DynamicTable { entries: Array.Empty<HeaderField>(), start: 0_i64, size: 0_i64, maxSize: maxSize };
+}
+
+/// Number of live dynamic entries.
+pub i64 DynamicCount(DynamicTable table) { return Array.Len<HeaderField>(table.entries) - table.start; }
+
+/// Dynamic entry `index` (1 is the newest); the caller checks 1..DynamicCount.
+pub HeaderField DynamicEntry(DynamicTable table, i64 index) {
+    return Array.Get<HeaderField>(table.entries, Array.Len<HeaderField>(table.entries) - index);
+}
+
+/// Drops evicted slots once they dominate the backing array.
+unit Compact(mut DynamicTable table) {
+    i64 total = Array.Len<HeaderField>(table.entries);
+    if table.start < 32_i64 || table.start * 2_i64 < total { return; }
+    mut HeaderField[] kept = Array.Empty<HeaderField>();
+    mut i64 i = table.start;
+    while i < total { Array.Append<HeaderField>(kept, Array.Get<HeaderField>(table.entries, i)); i = i + 1_i64; }
+    table.entries = kept;
+    table.start = 0_i64;
+    return;
+}
+
+/// Evicts oldest entries until size + `room` <= maxSize or the table is empty.
+unit EvictFor(mut DynamicTable table, i64 room) {
+    while table.size + room > table.maxSize && DynamicCount(table) > 0_i64 {
+        HeaderField oldest = Array.Get<HeaderField>(table.entries, table.start);
+        table.size = table.size - Hpack.FieldSize(oldest);
+        table.start = table.start + 1_i64;
+    }
+    if DynamicCount(table) == 0_i64 {
+        table.entries = Array.Empty<HeaderField>();
+        table.start = 0_i64;
+        table.size = 0_i64;
+    }
+    Compact(table);
+    return;
+}
+
+/// Section 4.4: evicts until the entry fits, then inserts it. An entry larger
+/// than maxSize empties the table and is not inserted.
+pub unit DynamicInsert(mut DynamicTable table, HeaderField field) {
+    i64 entrySize = Hpack.FieldSize(field);
+    EvictFor(table, entrySize);
+    if entrySize > table.maxSize { return; }
+    Array.Append<HeaderField>(table.entries, HeaderField { name: field.name, value: field.value, sensitive: false });
+    table.size = table.size + entrySize;
+    return;
+}
+
+/// Section 4.3: a new maximum size evicts entries until the table fits.
+pub unit DynamicResize(mut DynamicTable table, i64 maxSize) {
+    table.maxSize = maxSize;
+    EvictFor(table, 0_i64);
+    return;
+}
+
+/// Section 2.3.3: resolves an index into the combined index space.
+pub Result<HeaderField,HpackError> Lookup(StaticTable statics, DynamicTable table, i64 index) {
+    if index >= 1_i64 && index <= StaticCount() { return Result::Ok(Array.Get<HeaderField>(statics.entries, index - 1_i64)); }
+    i64 dynamicIndex = index - StaticCount();
+    if dynamicIndex >= 1_i64 && dynamicIndex <= DynamicCount(table) { return Result::Ok(DynamicEntry(table, dynamicIndex)); }
+    return Result::Error(HpackError::InvalidIndex(index));
+}
+
+/// Lowest index whose name and value both match, or 0.
+pub i64 FindField(StaticTable statics, DynamicTable table, HeaderField field) {
+    mut i64 i = 0_i64;
+    while i < StaticCount() {
+        HeaderField entry = Array.Get<HeaderField>(statics.entries, i);
+        if Hpack.BytesEqual(entry.name, field.name) && Hpack.BytesEqual(entry.value, field.value) { return i + 1_i64; }
+        i = i + 1_i64;
+    }
+    i = 1_i64;
+    while i <= DynamicCount(table) {
+        HeaderField entry = DynamicEntry(table, i);
+        if Hpack.BytesEqual(entry.name, field.name) && Hpack.BytesEqual(entry.value, field.value) { return StaticCount() + i; }
+        i = i + 1_i64;
+    }
+    return 0_i64;
+}
+
+/// Lowest index whose name matches, or 0.
+pub i64 FindName(StaticTable statics, DynamicTable table, u8[] name) {
+    mut i64 i = 0_i64;
+    while i < StaticCount() {
+        HeaderField entry = Array.Get<HeaderField>(statics.entries, i);
+        if Hpack.BytesEqual(entry.name, name) { return i + 1_i64; }
+        i = i + 1_i64;
+    }
+    i = 1_i64;
+    while i <= DynamicCount(table) {
+        HeaderField entry = DynamicEntry(table, i);
+        if Hpack.BytesEqual(entry.name, name) { return StaticCount() + i; }
+        i = i + 1_i64;
+    }
+    return 0_i64;
+}

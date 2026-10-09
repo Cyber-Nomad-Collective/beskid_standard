@@ -1,0 +1,231 @@
+/// RFC 8259 conformance cases for Core.Json, grouped like JSONTestSuite's accept (`y_`) and
+/// reject (`n_`) categories, plus seeded round-trip properties.
+/// Fixtures use `'` for `"` so they stay readable; `J` converts them.
+
+use Testing.Expect;
+use Core.Collections.Array;
+use Core.Collections.Hash;
+use Core.Json;
+use Core.Json.JsonValue;
+use Core.Results;
+use Core.String;
+
+string J(string text) {
+    return String.Replace(text, "'", "\"");
+}
+
+bool Accepts(string text) {
+    return match Json.Parse(text) {
+        Result::Ok(_) => true,
+        Result::Error(_) => false,
+    };
+}
+
+string[] AcceptCases() {
+    string tab = String.Tab();
+    string nl = String.Newline();
+    string cr = String.FromAscii(13);
+    mut string[] cases = Array.Empty<string>();
+    cases = Array.Append<string>(cases, "[]");
+    cases = Array.Append<string>(cases, "{}");
+    cases = Array.Append<string>(cases, "[null]");
+    cases = Array.Append<string>(cases, "[true,false]");
+    cases = Array.Append<string>(cases, "0");
+    cases = Array.Append<string>(cases, "-0");
+    cases = Array.Append<string>(cases, "[1e1]");
+    cases = Array.Append<string>(cases, "[1E+2]");
+    cases = Array.Append<string>(cases, "[1e-2]");
+    cases = Array.Append<string>(cases, "[0.5e-3]");
+    cases = Array.Append<string>(cases, "[-1.25E+10]");
+    cases = Array.Append<string>(cases, "[123456789012345678901234567890]");
+    cases = Array.Append<string>(cases, J("'top-level string'"));
+    cases = Array.Append<string>(cases, J("['\\u0000']"));
+    cases = Array.Append<string>(cases, J("['\\ud834\\udd1e']"));
+    cases = Array.Append<string>(cases, J("['\\/\\b\\f\\n\\r\\t']"));
+    cases = Array.Append<string>(cases, J("['\\u00E9\\u00e9']"));
+    cases = Array.Append<string>(cases, J("{'':0}"));
+    cases = Array.Append<string>(cases, J("{'a':1,'a':2}"));
+    cases = Array.Append<string>(cases, J("{'a':{'b':[{'c':null}]}}"));
+    cases = Array.Append<string>(cases, "[1,[2,[3,[4]]]]");
+    cases = Array.Append<string>(cases, " " + tab + nl + cr + "[ 1 , 2 ]" + nl);
+    cases = Array.Append<string>(cases, J("['caf") + String.FromUtf8CodeUnits(Utf8E()) + J("']"));
+    return cases;
+}
+
+/// UTF-8 bytes of U+00E9, written raw inside a string.
+u8[] Utf8E() {
+    mut u8[] bytes = Array.Empty<u8>();
+    bytes = Array.Append<u8>(bytes, u8(195));
+    bytes = Array.Append<u8>(bytes, u8(169));
+    return bytes;
+}
+
+string[] RejectCases() {
+    mut string[] cases = Array.Empty<string>();
+    cases = Array.Append<string>(cases, "");
+    cases = Array.Append<string>(cases, "   ");
+    cases = Array.Append<string>(cases, "[");
+    cases = Array.Append<string>(cases, "]");
+    cases = Array.Append<string>(cases, "[1,]");
+    cases = Array.Append<string>(cases, "[,1]");
+    cases = Array.Append<string>(cases, "[1 2]");
+    cases = Array.Append<string>(cases, "[1] [2]");
+    cases = Array.Append<string>(cases, J("{'a'}"));
+    cases = Array.Append<string>(cases, J("{'a':}"));
+    cases = Array.Append<string>(cases, J("{'a':1,}"));
+    cases = Array.Append<string>(cases, "{a:1}");
+    cases = Array.Append<string>(cases, "{'a':1}");
+    cases = Array.Append<string>(cases, "[01]");
+    cases = Array.Append<string>(cases, "[1.]");
+    cases = Array.Append<string>(cases, "[.5]");
+    cases = Array.Append<string>(cases, "[+1]");
+    cases = Array.Append<string>(cases, "[1e]");
+    cases = Array.Append<string>(cases, "[1e+]");
+    cases = Array.Append<string>(cases, "[-]");
+    cases = Array.Append<string>(cases, "[0x10]");
+    cases = Array.Append<string>(cases, "[NaN]");
+    cases = Array.Append<string>(cases, "[Infinity]");
+    cases = Array.Append<string>(cases, "[tru]");
+    cases = Array.Append<string>(cases, "nulll");
+    cases = Array.Append<string>(cases, J("['a\\x']"));
+    cases = Array.Append<string>(cases, J("['\\u12']"));
+    cases = Array.Append<string>(cases, J("['\\uDC00']"));
+    cases = Array.Append<string>(cases, J("['\\uD800']"));
+    cases = Array.Append<string>(cases, J("['\\uD800\\u0041']"));
+    cases = Array.Append<string>(cases, J("['unterminated"));
+    cases = Array.Append<string>(cases, J("['a") + String.Tab() + J("']"));
+    cases = Array.Append<string>(cases, J("['a") + String.Newline() + J("']"));
+    cases = Array.Append<string>(cases, J("['a']x"));
+    cases = Array.Append<string>(cases, String.Repeat("[", 129) + String.Repeat("]", 129));
+    return cases;
+}
+
+test json_accepts_valid_documents {
+    string[] cases = AcceptCases();
+    mut i64 i = 0;
+    while i < Array.Len<string>(cases) {
+        if !Accepts(Array.Get<string>(cases, i)) {
+            Expect.EqualString(Array.Get<string>(cases, i), "<accepted>", "valid JSON rejected");
+        }
+        i = i + 1;
+    }
+}
+
+test json_rejects_invalid_documents {
+    string[] cases = RejectCases();
+    mut i64 i = 0;
+    while i < Array.Len<string>(cases) {
+        if Accepts(Array.Get<string>(cases, i)) {
+            Expect.EqualString(Array.Get<string>(cases, i), "<rejected>", "invalid JSON accepted");
+        }
+        i = i + 1;
+    }
+}
+
+test json_depth_exactly_at_limit {
+    string atLimit = String.Repeat("[", 128) + String.Repeat("]", 128);
+    Expect.EqualBool(Accepts(atLimit), true, "128 levels accepted");
+}
+
+// ---------------------------------------------------------------------------------------------
+// Seeded round trips
+// ---------------------------------------------------------------------------------------------
+
+i64 Next(i64 state) {
+    return state * 6364136223846793005_i64 + 1442695040888963407_i64;
+}
+
+i64 Below(i64 state, i64 bound) {
+    return Hash.ShiftRightLogical(state, 33) % bound;
+}
+
+/// A generated value and the generator state after producing it.
+pub type Generated {
+    JsonValue value,
+    i64 state,
+}
+
+string Alphabet() {
+    return "ab\"\\/ z";
+}
+
+/// Random tree of depth at most `depth`. Numbers are multiples of 0.5 below 2^20, which print
+/// and parse exactly.
+Generated Generate(i64 seed, i64 depth) {
+    mut i64 state = Next(seed);
+    mut i64 kind = Below(state, 6);
+    if depth <= 0 && kind >= 4 {
+        kind = kind - 4;
+    }
+    if kind == 0 {
+        return Generated { value: JsonValue::Null, state: state };
+    }
+    if kind == 1 {
+        return Generated { value: JsonValue::Bool(Below(state, 2) == 1), state: state };
+    }
+    if kind == 2 {
+        state = Next(state);
+        i64 halves = Below(state, 2000000) - 1000000;
+        return Generated { value: JsonValue::Number(f64(halves) / 2.0), state: state };
+    }
+    if kind == 3 {
+        state = Next(state);
+        i64 length = Below(state, 6);
+        mut string text = "";
+        mut i64 i = 0;
+        while i < length {
+            state = Next(state);
+            text = String.Concat(text, String.SubSlice(Alphabet(), Below(state, 7), 1));
+            i = i + 1;
+        }
+        state = Next(state);
+        if Below(state, 4) == 0 {
+            text = String.Concat(text, String.Newline());
+        }
+        return Generated { value: JsonValue::Text(text), state: state };
+    }
+    state = Next(state);
+    i64 count = Below(state, 4);
+    if kind == 4 {
+        mut JsonValue[] items = Array.Empty<JsonValue>();
+        mut i64 i = 0;
+        while i < count {
+            Generated child = Generate(state, depth - 1);
+            items = Array.Append<JsonValue>(items, child.value);
+            state = child.state;
+            i = i + 1;
+        }
+        return Generated { value: JsonValue::List(items), state: state };
+    }
+    mut string[] keys = Array.Empty<string>();
+    mut JsonValue[] values = Array.Empty<JsonValue>();
+    mut i64 i = 0;
+    while i < count {
+        Generated child = Generate(state, depth - 1);
+        keys = Array.Append<string>(keys, "k${i}");
+        values = Array.Append<JsonValue>(values, child.value);
+        state = child.state;
+        i = i + 1;
+    }
+    return Generated { value: JsonValue::Object(keys, values), state: state };
+}
+
+string Reparsed(string text) {
+    return match Json.Parse(text) {
+        Result::Ok(value) => Json.Stringify(value),
+        Result::Error(_) => "<parse error>",
+    };
+}
+
+test json_random_trees_round_trip {
+    mut i64 state = 1234;
+    mut i64 round = 0;
+    while round < 150 {
+        Generated tree = Generate(state, 4);
+        state = tree.state;
+        string compact = Json.Stringify(tree.value);
+        Expect.EqualString(Reparsed(compact), compact, "compact round trip");
+        Expect.EqualString(Reparsed(Json.Pretty(tree.value)), compact, "pretty output parses to the same value");
+        round = round + 1;
+    }
+}

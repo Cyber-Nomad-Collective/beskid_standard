@@ -1,0 +1,115 @@
+/// Persistent collections keep every version intact when two versions grow from one base.
+/// `Array.Append` grows storage in place when capacity allows, so branching must copy.
+use Core.Collections.List;
+use Core.Collections.Stack;
+use Core.Collections.Queue;
+use Core.Collections.Set;
+use Core.Collections.Map;
+use Testing.Assert;
+
+test list_branches_keep_their_own_tail {
+    mut List<i64> base = List.New<i64>();
+    base = base.Push(1);
+    List<i64> left = base.Push(2);
+    List<i64> right = base.Push(3);
+    i64 leftTail = match left.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    i64 rightTail = match right.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(leftTail, 2, "left branch keeps its element");
+    Assert.Equal(rightTail, 3, "right branch keeps its element");
+    Assert.Equal(base.Count(), 1, "base version is unchanged");
+}
+
+test list_linear_growth_stays_correct {
+    mut List<i64> values = List.New<i64>();
+    mut i64 index = 0;
+    while index < 100 {
+        values = values.Push(index);
+        index = index + 1;
+    }
+    i64 last = match values.Get(99) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(values.Count(), 100, "linear pushes count");
+    Assert.Equal(last, 99, "linear pushes keep order");
+}
+
+test stack_branches_keep_their_own_top {
+    mut Stack<i64> base = Stack.New<i64>();
+    base = base.Push(1);
+    Stack<i64> left = base.Push(2);
+    Stack<i64> right = base.Push(3);
+    i64 leftTop = match left.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    i64 rightTop = match right.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(leftTop, 2, "left stack top");
+    Assert.Equal(rightTop, 3, "right stack top");
+}
+
+test queue_branches_keep_their_own_back {
+    mut Queue<i64> base = Queue.New<i64>();
+    base = base.Enqueue(1);
+    Queue<i64> left = base.Enqueue(2).Dequeue();
+    Queue<i64> right = base.Enqueue(3).Dequeue();
+    i64 leftFront = match left.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    i64 rightFront = match right.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(leftFront, 2, "left queue element");
+    Assert.Equal(rightFront, 3, "right queue element");
+}
+
+test set_and_map_branches_do_not_share_members {
+    mut Set<i64> setBase = Set.New<i64>();
+    setBase = setBase.Add(1);
+    Set<i64> setLeft = setBase.Add(2);
+    Set<i64> setRight = setBase.Add(3);
+    Assert.False(setLeft.Contains(3), "left set has no right member");
+    Assert.False(setRight.Contains(2), "right set has no left member");
+    mut Map<i64, i64> mapBase = Map.New<i64, i64>();
+    mapBase = mapBase.Insert(1, 10);
+    Map<i64, i64> mapLeft = mapBase.Insert(2, 20);
+    Map<i64, i64> mapRight = mapBase.Insert(3, 30);
+    Assert.False(mapLeft.ContainsKey(3), "left map has no right key");
+    Assert.False(mapRight.ContainsKey(2), "right map has no left key");
+}
+
+test stack_pop_keeps_the_previous_top {
+    mut Stack<i64> base = Stack.New<i64>();
+    base = base.Push(1);
+    base = base.Push(2);
+    Stack<i64> popped = base.Pop();
+    Stack<i64> pushed = popped.Push(3);
+    i64 baseTop = match base.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    i64 pushedTop = match pushed.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(baseTop, 2, "the version before the pop keeps its top");
+    Assert.Equal(pushedTop, 3, "push after pop has its own top");
+}
+
+test map_overwrite_keeps_the_previous_version {
+    mut Map<i64, i64> base = Map.New<i64, i64>();
+    base = base.Insert(1, 10);
+    Map<i64, i64> updated = base.Insert(1, 99);
+    Assert.Equal(updated.GetOr(1, -1), 99, "new version has the new value");
+    Assert.Equal(base.GetOr(1, -1), 10, "old version keeps its value");
+    Assert.Equal(updated.Count(), 1, "overwrite does not add an entry");
+}
+
+test removals_keep_the_previous_version {
+    mut Map<i64, i64> mapBase = Map.New<i64, i64>();
+    mapBase = mapBase.Insert(1, 10);
+    mapBase = mapBase.Insert(2, 20);
+    Map<i64, i64> mapRemoved = mapBase.Remove(1);
+    Assert.False(mapRemoved.ContainsKey(1), "removed key is gone from the new map");
+    Assert.Equal(mapBase.GetOr(1, -1), 10, "old map keeps the removed key");
+    Assert.Equal(mapBase.GetOr(2, -1), 20, "old map keeps the shifted key");
+    mut Set<i64> setBase = Set.New<i64>();
+    setBase = setBase.Add(1);
+    setBase = setBase.Add(2);
+    Set<i64> setRemoved = setBase.Remove(1);
+    Assert.False(setRemoved.Contains(1), "removed member is gone from the new set");
+    Assert.True(setBase.Contains(1), "old set keeps the removed member");
+    Assert.True(setBase.Contains(2), "old set keeps the shifted member");
+    mut Queue<i64> queueBase = Queue.New<i64>();
+    queueBase = queueBase.Enqueue(1);
+    queueBase = queueBase.Enqueue(2);
+    Queue<i64> dequeued = queueBase.Dequeue();
+    i64 oldFront = match queueBase.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    i64 newFront = match dequeued.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
+    Assert.Equal(oldFront, 1, "old queue keeps its front");
+    Assert.Equal(newFront, 2, "dequeued queue advances");
+}

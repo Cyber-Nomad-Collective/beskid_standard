@@ -1,0 +1,534 @@
+/// Core.Text.SemVer — Semantic Versioning 2.0.0 parsing, precedence, and requirement matching.
+/// @tier(supported)
+/// Versions are `MAJOR.MINOR.PATCH`, optionally followed by `-prerelease` and `+build`.
+/// Precedence follows the specification: numeric components compare numerically, a version with
+/// a prerelease sorts before the same version without one, prerelease identifiers compare
+/// numerically when both are numeric and in ASCII order otherwise, and build metadata is ignored.
+///
+/// Requirements (`Satisfies`) use the common npm/Cargo syntax: comparators `=`, `>`, `>=`, `<`,
+/// `<=`, caret `^1.2.3`, tilde `~1.2.3`, wildcards `1.2.x`/`1.x`/`*`, and a bare version (exact
+/// match). Space-separated comparators must all hold; `||` separates alternatives. A prerelease
+/// version only satisfies a comparator set that mentions a prerelease of the same
+/// `MAJOR.MINOR.PATCH`, as in npm.
+use Core.Collections.Array;
+use Core.Results;
+use Core.String.Ascii;
+use Core.String;
+use Core.Text.Number;
+
+/// A parsed version.
+pub type Version {
+    i64 major,
+    i64 minor,
+    i64 patch,
+    string[] prerelease,
+    string build,
+}
+
+/// Parse failures.
+/// @variant(Empty) No input.
+/// @variant(MissingComponent) Fewer than three numeric components.
+/// @variant(InvalidNumber) A numeric component or identifier is not a non-negative integer that
+/// fits in an i64.
+/// @variant(LeadingZero) A numeric component or numeric prerelease identifier has a leading zero.
+/// @variant(InvalidIdentifier) A prerelease or build identifier is empty or uses characters other
+/// than ASCII letters, digits, and `-`.
+/// @variant(InvalidRequirement) A requirement string is malformed.
+pub enum SemVerError {
+    Empty,
+    MissingComponent,
+    InvalidNumber,
+    LeadingZero,
+    InvalidIdentifier,
+    InvalidRequirement,
+}
+
+bool IsIdentifierByte(u8 b) {
+    return Ascii.IsAlphanumeric(b) || b == 45;
+}
+
+bool AllDigits(string text) {
+    i64 len = String.Len(text);
+    if len == 0 {
+        return false;
+    }
+    mut i64 i = 0;
+    while i < len {
+        if !Ascii.IsDigit(String.ByteAt(text, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+bool ValidIdentifier(string text) {
+    i64 len = String.Len(text);
+    if len == 0 {
+        return false;
+    }
+    mut i64 i = 0;
+    while i < len {
+        if !IsIdentifierByte(String.ByteAt(text, i)) {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+Result<i64, SemVerError> Component(string text) {
+    if !AllDigits(text) {
+        return Result<i64, SemVerError>::Error(SemVerError::InvalidNumber);
+    }
+    if String.Len(text) > 1 && String.ByteAt(text, 0) == 48 {
+        return Result<i64, SemVerError>::Error(SemVerError::LeadingZero);
+    }
+    return match Number.ParseI64(text) {
+        Result::Ok(value) => Result<i64, SemVerError>::Ok(value),
+        Result::Error(_) => Result<i64, SemVerError>::Error(SemVerError::InvalidNumber),
+    };
+}
+
+/// Parses a version such as `1.4.0`, `2.0.0-rc.1`, or `1.0.0+build.5`. A leading `v` is not
+/// accepted; strip it first if your input uses one.
+pub Result<Version, SemVerError> Parse(string text) {
+    if String.Len(text) == 0 {
+        return Result<Version, SemVerError>::Error(SemVerError::Empty);
+    }
+    mut string core = text;
+    mut string build = "";
+    i64 plus = String.IndexOf(text, "+");
+    if plus >= 0 {
+        build = String.SubSlice(text, plus + 1, String.Len(text) - plus - 1);
+        core = String.SubSlice(text, 0, plus);
+        string[] buildParts = String.Split(build, ".");
+        mut i64 b = 0;
+        while b < Array.Len<string>(buildParts) {
+            if !ValidIdentifier(Array.Get<string>(buildParts, b)) {
+                return Result<Version, SemVerError>::Error(SemVerError::InvalidIdentifier);
+            }
+            b = b + 1;
+        }
+    }
+    mut string[] prerelease = Array.Empty<string>();
+    i64 dash = String.IndexOf(core, "-");
+    mut string numbers = core;
+    if dash >= 0 {
+        numbers = String.SubSlice(core, 0, dash);
+        string pre = String.SubSlice(core, dash + 1, String.Len(core) - dash - 1);
+        string[] preParts = String.Split(pre, ".");
+        mut i64 p = 0;
+        while p < Array.Len<string>(preParts) {
+            string part = Array.Get<string>(preParts, p);
+            if !ValidIdentifier(part) {
+                return Result<Version, SemVerError>::Error(SemVerError::InvalidIdentifier);
+            }
+            if AllDigits(part) && String.Len(part) > 1 && String.ByteAt(part, 0) == 48 {
+                return Result<Version, SemVerError>::Error(SemVerError::LeadingZero);
+            }
+            prerelease = Array.Append<string>(prerelease, part);
+            p = p + 1;
+        }
+    }
+    string[] parts = String.Split(numbers, ".");
+    if Array.Len<string>(parts) != 3 {
+        return Result<Version, SemVerError>::Error(SemVerError::MissingComponent);
+    }
+    i64 major = Component(Array.Get<string>(parts, 0))?;
+    i64 minor = Component(Array.Get<string>(parts, 1))?;
+    i64 patch = Component(Array.Get<string>(parts, 2))?;
+    return Result<Version, SemVerError>::Ok(Version { major: major, minor: minor, patch: patch, prerelease: prerelease, build: build });
+}
+
+/// A release version without prerelease or build metadata.
+pub Version Of(i64 major, i64 minor, i64 patch) {
+    return Version { major: major, minor: minor, patch: patch, prerelease: Array.Empty<string>(), build: "" };
+}
+
+/// Formats `version` back to its canonical text.
+pub string Format(Version version) {
+    mut string text = Number.FormatI64(version.major) + "." + Number.FormatI64(version.minor) + "." + Number.FormatI64(version.patch);
+    if Array.Len<string>(version.prerelease) > 0 {
+        text = text + "-" + String.Join(version.prerelease, ".");
+    }
+    if String.Len(version.build) > 0 {
+        text = text + "+" + version.build;
+    }
+    return text;
+}
+
+i64 CompareI64(i64 a, i64 b) {
+    if a < b {
+        return -1;
+    }
+    if a > b {
+        return 1;
+    }
+    return 0;
+}
+
+i64 CompareIdentifier(string a, string b) {
+    bool an = AllDigits(a);
+    bool bn = AllDigits(b);
+    if an && bn {
+        // Lengths first: no leading zeros, so a longer numeral is larger, even beyond i64.
+        i64 byLength = CompareI64(String.Len(a), String.Len(b));
+        if byLength != 0 {
+            return byLength;
+        }
+        return String.Compare(a, b);
+    }
+    if an {
+        return -1;
+    }
+    if bn {
+        return 1;
+    }
+    return String.Compare(a, b);
+}
+
+/// Precedence comparison: `-1`, `0`, or `1`. Build metadata never affects the result.
+pub i64 Compare(Version a, Version b) {
+    i64 major = CompareI64(a.major, b.major);
+    if major != 0 {
+        return major;
+    }
+    i64 minor = CompareI64(a.minor, b.minor);
+    if minor != 0 {
+        return minor;
+    }
+    i64 patch = CompareI64(a.patch, b.patch);
+    if patch != 0 {
+        return patch;
+    }
+    string[] ap = a.prerelease;
+    string[] bp = b.prerelease;
+    i64 al = Array.Len<string>(ap);
+    i64 bl = Array.Len<string>(bp);
+    if al == 0 && bl == 0 {
+        return 0;
+    }
+    if al == 0 {
+        return 1;
+    }
+    if bl == 0 {
+        return -1;
+    }
+    mut i64 i = 0;
+    while i < al && i < bl {
+        i64 order = CompareIdentifier(Array.Get<string>(ap, i), Array.Get<string>(bp, i));
+        if order != 0 {
+            return order;
+        }
+        i = i + 1;
+    }
+    return CompareI64(al, bl);
+}
+
+/// Returns true when `version` has prerelease identifiers.
+pub bool IsPrerelease(Version version) {
+    return Array.Len<string>(version.prerelease) > 0;
+}
+
+/// Next major version (`1.4.2` gives `2.0.0`).
+pub Version BumpMajor(Version version) {
+    return Of(version.major + 1, 0, 0);
+}
+
+/// Next minor version (`1.4.2` gives `1.5.0`).
+pub Version BumpMinor(Version version) {
+    return Of(version.major, version.minor + 1, 0);
+}
+
+/// Next patch version (`1.4.2` gives `1.4.3`; `1.4.2-rc.1` gives `1.4.2`).
+pub Version BumpPatch(Version version) {
+    if IsPrerelease(version) {
+        return Of(version.major, version.minor, version.patch);
+    }
+    return Of(version.major, version.minor, version.patch + 1);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Requirements
+// ---------------------------------------------------------------------------------------------
+
+/// One `lower <= v < upper` style bound pair produced from a comparator.
+pub type Bound {
+    Version lower,
+    bool hasLower,
+    bool lowerInclusive,
+    Version upper,
+    bool hasUpper,
+    bool upperInclusive,
+}
+
+bool IsWildcard(string part) {
+    return part == "x" || part == "X" || part == "*";
+}
+
+/// A partial version `1`, `1.2`, `1.2.3`, with `x`/`*` wildcards, parsed into its numbers and how
+/// many leading components were given (`given` 0 means fully wild).
+pub type Partial {
+    Version version,
+    i64 given,
+}
+
+Result<Partial, SemVerError> ParsePartial(string text) {
+    if text == "" || IsWildcard(text) {
+        return Result<Partial, SemVerError>::Ok(Partial { version: Of(0, 0, 0), given: 0 });
+    }
+    i64 dash = String.IndexOf(text, "-");
+    i64 plus = String.IndexOf(text, "+");
+    mut i64 cut = String.Len(text);
+    if dash >= 0 {
+        cut = dash;
+    }
+    if plus >= 0 && plus < cut {
+        cut = plus;
+    }
+    string numbers = String.SubSlice(text, 0, cut);
+    string[] parts = String.Split(numbers, ".");
+    i64 count = Array.Len<string>(parts);
+    if count > 3 {
+        return Result<Partial, SemVerError>::Error(SemVerError::InvalidRequirement);
+    }
+    mut i64 given = 0;
+    mut i64 major = 0;
+    mut i64 minor = 0;
+    mut i64 patch = 0;
+    mut i64 i = 0;
+    while i < count {
+        string part = Array.Get<string>(parts, i);
+        if IsWildcard(part) {
+            break;
+        }
+        i64 value = match Component(part) {
+            Result::Ok(v) => v,
+            Result::Error(_) => -1_i64,
+        };
+        if value < 0 {
+            return Result<Partial, SemVerError>::Error(SemVerError::InvalidRequirement);
+        }
+        if i == 0 {
+            major = value;
+        }
+        if i == 1 {
+            minor = value;
+        }
+        if i == 2 {
+            patch = value;
+        }
+        given = given + 1;
+        i = i + 1;
+    }
+    if given == 3 && cut < String.Len(text) {
+        Version full = match Parse(text) {
+            Result::Ok(v) => v,
+            Result::Error(_) => Of(-1, 0, 0),
+        };
+        if full.major < 0 {
+            return Result<Partial, SemVerError>::Error(SemVerError::InvalidRequirement);
+        }
+        return Result<Partial, SemVerError>::Ok(Partial { version: full, given: 3 });
+    }
+    return Result<Partial, SemVerError>::Ok(Partial { version: Of(major, minor, patch), given: given });
+}
+
+Bound Unbounded() {
+    return Bound { lower: Of(0, 0, 0), hasLower: false, lowerInclusive: true, upper: Of(0, 0, 0), hasUpper: false, upperInclusive: false };
+}
+
+Bound Between(Version lower, Version upper) {
+    return Bound { lower: lower, hasLower: true, lowerInclusive: true, upper: upper, hasUpper: true, upperInclusive: false };
+}
+
+/// Smallest prerelease of `version`'s core (`1.2.3-0`), used so exclusive upper bounds such as
+/// `<2.0.0` also exclude `2.0.0-rc.1`.
+Version Floor(Version version) {
+    mut string[] zero = Array.Empty<string>();
+    zero = Array.Append<string>(zero, "0");
+    return Version { major: version.major, minor: version.minor, patch: version.patch, prerelease: zero, build: "" };
+}
+
+/// Upper bound one step above the given components (`1.2` gives `1.3.0`).
+Version NextAfter(Partial partial) {
+    Version v = partial.version;
+    if partial.given == 1 {
+        return Of(v.major + 1, 0, 0);
+    }
+    return Of(v.major, v.minor + 1, 0);
+}
+
+Result<Bound, SemVerError> ComparatorBound(string comparator) {
+    mut string op = "";
+    mut string rest = comparator;
+    if String.StartsWith(comparator, ">=") || String.StartsWith(comparator, "<=") {
+        op = String.SubSlice(comparator, 0, 2);
+        rest = String.SubSlice(comparator, 2, String.Len(comparator) - 2);
+    } else {
+        if String.StartsWith(comparator, ">") || String.StartsWith(comparator, "<") || String.StartsWith(comparator, "=") || String.StartsWith(comparator, "^") || String.StartsWith(comparator, "~") {
+            op = String.SubSlice(comparator, 0, 1);
+            rest = String.SubSlice(comparator, 1, String.Len(comparator) - 1);
+        }
+    }
+    Partial partial = ParsePartial(String.Trim(rest))?;
+    Version v = partial.version;
+    if partial.given == 0 {
+        if op == "" || op == "=" || op == ">=" || op == "<=" || op == "^" || op == "~" {
+            return Result<Bound, SemVerError>::Ok(Unbounded());
+        }
+        return Result<Bound, SemVerError>::Error(SemVerError::InvalidRequirement);
+    }
+    if op == "^" {
+        mut Version upper = Of(v.major + 1, 0, 0);
+        if v.major == 0 && partial.given >= 2 {
+            upper = Of(0, v.minor + 1, 0);
+            if v.minor == 0 && partial.given == 3 {
+                upper = Of(0, 0, v.patch + 1);
+            }
+        }
+        return Result<Bound, SemVerError>::Ok(Between(v, Floor(upper)));
+    }
+    if op == "~" {
+        mut Version upper = Of(v.major + 1, 0, 0);
+        if partial.given >= 2 {
+            upper = Of(v.major, v.minor + 1, 0);
+        }
+        return Result<Bound, SemVerError>::Ok(Between(v, Floor(upper)));
+    }
+    if partial.given < 3 {
+        // Partial versions behave like ranges: `1.2` means `>=1.2.0 <1.3.0`.
+        Version next = Floor(NextAfter(partial));
+        if op == "" || op == "=" {
+            return Result<Bound, SemVerError>::Ok(Between(v, next));
+        }
+        if op == ">=" {
+            return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: true, lowerInclusive: true, upper: v, hasUpper: false, upperInclusive: false });
+        }
+        if op == ">" {
+            return Result<Bound, SemVerError>::Ok(Bound { lower: next, hasLower: true, lowerInclusive: true, upper: v, hasUpper: false, upperInclusive: false });
+        }
+        if op == "<" {
+            return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: false, lowerInclusive: true, upper: Floor(v), hasUpper: true, upperInclusive: false });
+        }
+        return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: false, lowerInclusive: true, upper: next, hasUpper: true, upperInclusive: false });
+    }
+    if op == "" || op == "=" {
+        return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: true, lowerInclusive: true, upper: v, hasUpper: true, upperInclusive: true });
+    }
+    if op == ">=" {
+        return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: true, lowerInclusive: true, upper: v, hasUpper: false, upperInclusive: false });
+    }
+    if op == ">" {
+        return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: true, lowerInclusive: false, upper: v, hasUpper: false, upperInclusive: false });
+    }
+    if op == "<=" {
+        return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: false, lowerInclusive: true, upper: v, hasUpper: true, upperInclusive: true });
+    }
+    mut Version strictUpper = v;
+    if !IsPrerelease(v) {
+        strictUpper = Floor(v);
+    }
+    return Result<Bound, SemVerError>::Ok(Bound { lower: v, hasLower: false, lowerInclusive: true, upper: strictUpper, hasUpper: true, upperInclusive: false });
+}
+
+bool WithinBound(Version version, Bound bound) {
+    if bound.hasLower {
+        Version lower = bound.lower;
+        i64 order = Compare(version, lower);
+        if order < 0 || (order == 0 && !bound.lowerInclusive) {
+            return false;
+        }
+    }
+    if bound.hasUpper {
+        Version upper = bound.upper;
+        i64 order = Compare(version, upper);
+        if order > 0 || (order == 0 && !bound.upperInclusive) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// `comparator` without its leading operator characters (`<`, `>`, `=`, `^`, `~`) and spaces.
+string StripOperator(string comparator) {
+    i64 len = String.Len(comparator);
+    mut i64 i = 0;
+    while i < len {
+        u8 b = String.ByteAt(comparator, i);
+        if b != 60 && b != 62 && b != 61 && b != 94 && b != 126 && b != 32 {
+            break;
+        }
+        i = i + 1;
+    }
+    return String.SubSlice(comparator, i, len - i);
+}
+
+bool SameCore(Version a, Version b) {
+    return a.major == b.major && a.minor == b.minor && a.patch == b.patch;
+}
+
+/// Splits a comparator set on whitespace, keeping an operator attached to the version that
+/// follows it (`>= 1.2` and `>=1.2` are equivalent).
+string[] Comparators(string set) {
+    string[] raw = String.Split(String.Trim(set), " ");
+    mut string[] result = Array.Empty<string>();
+    mut string pending = "";
+    mut i64 i = 0;
+    while i < Array.Len<string>(raw) {
+        string token = Array.Get<string>(raw, i);
+        if String.Len(token) > 0 {
+            if token == ">" || token == ">=" || token == "<" || token == "<=" || token == "=" || token == "^" || token == "~" {
+                pending = token;
+            } else {
+                result = Array.Append<string>(result, String.Concat(pending, token));
+                pending = "";
+            }
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+Result<bool, SemVerError> SatisfiesSet(Version version, string set) {
+    string[] comparators = Comparators(set);
+    if Array.Len<string>(comparators) == 0 {
+        return Result<bool, SemVerError>::Ok(!IsPrerelease(version));
+    }
+    mut bool allowsPrerelease = !IsPrerelease(version);
+    mut bool ok = true;
+    mut i64 i = 0;
+    while i < Array.Len<string>(comparators) {
+        string comparator = Array.Get<string>(comparators, i);
+        Bound bound = ComparatorBound(comparator)?;
+        if !WithinBound(version, bound) {
+            ok = false;
+        }
+        Partial mentioned = match ParsePartial(StripOperator(comparator)) {
+            Result::Ok(p) => p,
+            Result::Error(_) => Partial { version: Of(0, 0, 0), given: 0 },
+        };
+        Version mentionedVersion = mentioned.version;
+        if IsPrerelease(mentionedVersion) && SameCore(mentionedVersion, version) {
+            allowsPrerelease = true;
+        }
+        i = i + 1;
+    }
+    return Result<bool, SemVerError>::Ok(ok && allowsPrerelease);
+}
+
+/// Returns whether `version` satisfies `requirement`, such as `^1.2.0`, `>=1.0.0 <2.0.0`, or
+/// `1.x || >=3.1.0`.
+pub Result<bool, SemVerError> Satisfies(Version version, string requirement) {
+    string[] alternatives = String.Split(requirement, "||");
+    mut i64 i = 0;
+    while i < Array.Len<string>(alternatives) {
+        bool matched = SatisfiesSet(version, Array.Get<string>(alternatives, i))?;
+        if matched {
+            return Result<bool, SemVerError>::Ok(true);
+        }
+        i = i + 1;
+    }
+    return Result<bool, SemVerError>::Ok(false);
+}

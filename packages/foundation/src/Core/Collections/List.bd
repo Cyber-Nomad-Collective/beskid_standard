@@ -1,11 +1,12 @@
 /// Growable list backed by typed `T[]` storage.
 /// @tier(supported)
-/// Lists are linear values: mutating operations return the updated list, and callers keep using
-/// the returned value. Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
+/// Lists are persistent values: every operation returns a new version and leaves earlier versions
+/// unchanged, even when they share storage (see `Core.Collections.Storage`). Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
 /// primitives and strings by value and other types by identity.
 use Core.Collections.Array;
 use Core.Collections.CollectionError;
 use Core.Optional.Option;
+use Core.Collections.Storage;
 use Core.Results;
 
 pub type List<T> {
@@ -21,21 +22,23 @@ pub type List<T> {
     }
 
     pub List<T> Push(T value) {
-        mut T[] nextStorage = storage;
-        Array.Append<T>(nextStorage, value);
+        T[] nextStorage = Storage.AppendAt<T>(storage, count, value);
         return List<T> { storage: nextStorage, count: count + 1 };
     }
 
+    /// Returns the list without its last element. Storage is left untouched because earlier
+    /// versions may still own the removed slot; the next `Push` copies the prefix instead.
     pub List<T> Pop() {
         if count == 0 {
-            return self;
+            return this;
         }
-        return List<T> { storage: Array.RemoveLast<T>(storage), count: count - 1 };
+        return List<T> { storage: storage, count: count - 1 };
     }
 
-    pub Result<T, string> Get(i64 index) {
+    /// Returns the element at `index`, or `IndexOutOfRange(index, Count())`.
+    pub Result<T, CollectionError> Get(i64 index) {
         if index < 0 || index >= count {
-            return Result::Error("index out of range");
+            return Result::Error(CollectionError::IndexOutOfRange(index, count));
         }
         return Result::Ok(Array.Get<T>(storage, index));
     }
@@ -66,12 +69,12 @@ pub type List<T> {
 
     /// Returns the index of the first element equal to `value`, or `-1`.
     pub i64 IndexOf(T value) {
-        return IndexOfIn<T>(this.storage, this.count, value);
+        return Storage.IndexOf<T>(this.storage, this.count, value);
     }
 
     /// Returns true when an element equal to `value` is present.
     pub bool Contains(T value) {
-        return IndexOfIn<T>(this.storage, this.count, value) >= 0;
+        return Storage.IndexOf<T>(this.storage, this.count, value) >= 0;
     }
 
     /// Replaces the element at `index`.
@@ -96,7 +99,7 @@ pub type List<T> {
 
     /// Returns a new list with the elements in reverse order.
     pub List<T> Reverse() {
-        return ReverseIn<T>(this.storage, this.count);
+        return List<T> { storage: Storage.Reversed<T>(this.storage, this.count), count: this.count };
     }
 
     /// Returns up to `length` elements starting at `start`, clamped to the list bounds.
@@ -106,12 +109,12 @@ pub type List<T> {
 
     /// Returns a new list with every element of `other` appended after this list's elements.
     pub List<T> Concat(List<T> other) {
-        return ConcatIn<T>(this.storage, this.count, other.storage, other.count);
+        return List<T> { storage: Storage.Concat<T>(this.storage, this.count, other.storage, other.count), count: this.count + other.count };
     }
 
     /// Copies the elements into a new array of exactly `Count()` elements.
     pub T[] ToArray() {
-        return CopyPrefix<T>(this.storage, this.count);
+        return Storage.CopyRange<T>(this.storage, 0, this.count);
     }
 
     /// Returns an empty list.
@@ -139,35 +142,14 @@ pub List<T> Of<T>(bulk T[] values) {
 /// Builds a list holding a copy of every element of `values`.
 pub List<T> FromArray<T>(T[] values) {
     i64 count = Array.Len<T>(values);
-    return List<T> { storage: CopyPrefix<T>(values, count), count: count };
-}
-
-T[] CopyPrefix<T>(T[] source, i64 count) {
-    mut T[] copy = Array.Empty<T>();
-    mut i64 i = 0;
-    while i < count {
-        copy = Array.Append<T>(copy, Array.Get<T>(source, i));
-        i = i + 1;
-    }
-    return copy;
-}
-
-i64 IndexOfIn<T>(T[] storage, i64 count, T value) {
-    mut i64 i = 0;
-    while i < count {
-        if Array.Get<T>(storage, i) == value {
-            return i;
-        }
-        i = i + 1;
-    }
-    return -1;
+    return List<T> { storage: Storage.CopyRange<T>(values, 0, count), count: count };
 }
 
 Result<List<T>, CollectionError> SetIn<T>(T[] storage, i64 count, i64 index, T value) {
     if index < 0 || index >= count {
         return Result<List<T>, CollectionError>::Error(CollectionError::IndexOutOfRange(index, count));
     }
-    mut T[] copy = CopyPrefix<T>(storage, count);
+    mut T[] copy = Storage.CopyRange<T>(storage, 0, count);
     copy = Array.Set<T>(copy, index, value);
     return Result<List<T>, CollectionError>::Ok(List<T> { storage: copy, count: count });
 }
@@ -195,41 +177,17 @@ Result<List<T>, CollectionError> RemoveAtIn<T>(T[] storage, i64 count, i64 index
     if index < 0 || index >= count {
         return Result<List<T>, CollectionError>::Error(CollectionError::IndexOutOfRange(index, count));
     }
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = 0;
-    while i < count {
-        if i != index {
-            next = Array.Append<T>(next, Array.Get<T>(storage, i));
-        }
-        i = i + 1;
-    }
+    T[] next = Storage.CopyWithout<T>(storage, count, index);
     return Result<List<T>, CollectionError>::Ok(List<T> { storage: next, count: count - 1 });
 }
 
 List<T> RemoveFirstIn<T>(T[] storage, i64 count, T value) {
-    i64 index = IndexOfIn<T>(storage, count, value);
+    i64 index = Storage.IndexOf<T>(storage, count, value);
     if index < 0 {
         return List<T> { storage: storage, count: count };
     }
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = 0;
-    while i < count {
-        if i != index {
-            next = Array.Append<T>(next, Array.Get<T>(storage, i));
-        }
-        i = i + 1;
-    }
+    T[] next = Storage.CopyWithout<T>(storage, count, index);
     return List<T> { storage: next, count: count - 1 };
-}
-
-List<T> ReverseIn<T>(T[] storage, i64 count) {
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = count - 1;
-    while i >= 0 {
-        next = Array.Append<T>(next, Array.Get<T>(storage, i));
-        i = i - 1;
-    }
-    return List<T> { storage: next, count: count };
 }
 
 List<T> SliceIn<T>(T[] storage, i64 count, i64 start, i64 length) {
@@ -244,25 +202,10 @@ List<T> SliceIn<T>(T[] storage, i64 count, i64 start, i64 length) {
     if to > count {
         to = count;
     }
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = from;
-    while i < to {
-        next = Array.Append<T>(next, Array.Get<T>(storage, i));
-        i = i + 1;
-    }
     mut i64 taken = to - from;
     if taken < 0 {
         taken = 0;
     }
-    return List<T> { storage: next, count: taken };
+    return List<T> { storage: Storage.CopyRange<T>(storage, from, taken), count: taken };
 }
 
-List<T> ConcatIn<T>(T[] left, i64 leftCount, T[] right, i64 rightCount) {
-    mut T[] next = CopyPrefix<T>(left, leftCount);
-    mut i64 i = 0;
-    while i < rightCount {
-        next = Array.Append<T>(next, Array.Get<T>(right, i));
-        i = i + 1;
-    }
-    return List<T> { storage: next, count: leftCount + rightCount };
-}

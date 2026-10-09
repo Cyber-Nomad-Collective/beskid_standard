@@ -1,0 +1,160 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Crypto.Scratch;
+
+/// Incremental SHA-1 (FIPS 180-4 section 6.1). SHA-1 is broken for collision
+/// resistance; it is here only for protocol uses that require it, such as the
+/// WebSocket `Sec-WebSocket-Accept` value (RFC 6455 section 4.2.2).
+/// `meta[0]` is the number of buffered bytes, `meta[1]` the total message length
+/// in bytes, `meta[2]` is 1 after `Finish`.
+pub type Sha1State {
+    u32[] h,
+    u32[] w,
+    u8[] buffer,
+    i64[] meta,
+}
+
+pub i64 DigestLength() { return 20_i64; }
+pub i64 BlockLength() { return 64_i64; }
+
+/// Starts a new SHA-1 computation.
+pub Sha1State New() {
+    mut u32[] w = Array.Empty<u32>();
+    mut i64 i = 0_i64;
+    while i < 80_i64 { Array.Append<u32>(w, 0_u32); i = i + 1_i64; }
+    return Sha1State {
+        h: [0x67452301_u32, 0xEFCDAB89_u32, 0x98BADCFE_u32, 0x10325476_u32, 0xC3D2E1F0_u32],
+        w: w,
+        buffer: Scratch.Bytes(64_i64),
+        meta: [0_i64, 0_i64, 0_i64],
+    };
+}
+
+u32 Rotl(u32 x, u32 n) { return (x << n) | (x >> (32_u32 - n)); }
+u32 Xor(u32 a, u32 b) { return (a | b) - (a & b); }
+
+unit Compress(Sha1State state, u8[] data, i64 offset) {
+    u32[] w = state.w;
+    mut i64 t = 0_i64;
+    while t < 16_i64 {
+        i64 p = offset + t * 4_i64;
+        w[t] = (u32(data[p]) << 24_u32) | (u32(data[p + 1_i64]) << 16_u32) | (u32(data[p + 2_i64]) << 8_u32) | u32(data[p + 3_i64]);
+        t = t + 1_i64;
+    }
+    while t < 80_i64 {
+        w[t] = Rotl(Xor(Xor(w[t - 3_i64], w[t - 8_i64]), Xor(w[t - 14_i64], w[t - 16_i64])), 1_u32);
+        t = t + 1_i64;
+    }
+    u32[] h = state.h;
+    mut u32 a = h[0]; mut u32 b = h[1]; mut u32 c = h[2]; mut u32 d = h[3]; mut u32 e = h[4];
+    t = 0_i64;
+    while t < 80_i64 {
+        mut u32 f = 0_u32;
+        mut u32 k = 0_u32;
+        if t < 20_i64 {
+            // Ch(b,c,d): the two terms share no bits, so ^ is |.
+            f = (b & c) | ((0xFFFFFFFF_u32 - b) & d);
+            k = 0x5A827999_u32;
+        } else if t < 40_i64 {
+            f = Xor(Xor(b, c), d);
+            k = 0x6ED9EBA1_u32;
+        } else if t < 60_i64 {
+            f = (b & c) | (d & (b | c));
+            k = 0x8F1BBCDC_u32;
+        } else {
+            f = Xor(Xor(b, c), d);
+            k = 0xCA62C1D6_u32;
+        }
+        u32 temp = Rotl(a, 5_u32) + f + e + k + w[t];
+        e = d; d = c; c = Rotl(b, 30_u32); b = a; a = temp;
+        t = t + 1_i64;
+    }
+    h[0] = h[0] + a; h[1] = h[1] + b; h[2] = h[2] + c; h[3] = h[3] + d; h[4] = h[4] + e;
+    return;
+}
+
+/// Absorbs `count` bytes of `data` starting at `offset`.
+/// An invalid range or an update after `Finish` absorbs nothing and returns false.
+pub bool UpdateRange(Sha1State state, u8[] data, i64 offset, i64 count) {
+    if state.meta[2] != 0_i64 { return false; }
+    if !Slice.IsValidRange(Slice.Len(data), offset, count) { return false; }
+    mut i64 pos = offset;
+    i64 end = offset + count;
+    mut i64 buffered = state.meta[0];
+    state.meta[1] = state.meta[1] + count;
+    if buffered > 0_i64 {
+        while buffered < 64_i64 && pos < end {
+            state.buffer[buffered] = data[pos];
+            buffered = buffered + 1_i64;
+            pos = pos + 1_i64;
+        }
+        if buffered < 64_i64 { state.meta[0] = buffered; return true; }
+        Compress(state, state.buffer, 0_i64);
+        buffered = 0_i64;
+    }
+    while end - pos >= 64_i64 {
+        Compress(state, data, pos);
+        pos = pos + 64_i64;
+    }
+    while pos < end {
+        state.buffer[buffered] = data[pos];
+        buffered = buffered + 1_i64;
+        pos = pos + 1_i64;
+    }
+    state.meta[0] = buffered;
+    return true;
+}
+
+/// Absorbs all of `data`.
+pub bool Update(Sha1State state, u8[] data) {
+    return UpdateRange(state, data, 0_i64, Slice.Len(data));
+}
+
+/// Pads, finishes, and returns the 20-byte digest. The state cannot be updated afterwards.
+pub u8[] Finish(Sha1State state) {
+    u8[] out = Scratch.Bytes(20_i64);
+    if state.meta[2] != 0_i64 {
+        WriteDigest(state, out);
+        return out;
+    }
+    i64 bitLength = state.meta[1] * 8_i64;
+    mut i64 buffered = state.meta[0];
+    state.buffer[buffered] = 0x80_u8;
+    buffered = buffered + 1_i64;
+    if buffered > 56_i64 {
+        while buffered < 64_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
+        Compress(state, state.buffer, 0_i64);
+        buffered = 0_i64;
+    }
+    while buffered < 56_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
+    mut i64 i = 0_i64;
+    while i < 8_i64 {
+        state.buffer[56_i64 + i] = u8((bitLength >> ((7_i64 - i) * 8_i64)) & 0xFF_i64);
+        i = i + 1_i64;
+    }
+    Compress(state, state.buffer, 0_i64);
+    state.meta[0] = 0_i64;
+    state.meta[2] = 1_i64;
+    WriteDigest(state, out);
+    return out;
+}
+
+unit WriteDigest(Sha1State state, u8[] out) {
+    mut i64 i = 0_i64;
+    while i < 5_i64 {
+        u32 v = state.h[i];
+        out[i * 4_i64] = u8(v >> 24_u32);
+        out[i * 4_i64 + 1_i64] = u8((v >> 16_u32) & 0xFF_u32);
+        out[i * 4_i64 + 2_i64] = u8((v >> 8_u32) & 0xFF_u32);
+        out[i * 4_i64 + 3_i64] = u8(v & 0xFF_u32);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+/// One-shot SHA-1 of `data`.
+pub u8[] Hash(u8[] data) {
+    Sha1State state = New();
+    Update(state, data);
+    return Finish(state);
+}

@@ -21,6 +21,7 @@ The runner prints `REPRODUCES` or `FIXED` per canary. Run it from an installed C
 | 2 | `NestedField` | `this.inner.count` through a generic field and `value.time.hour` through module types ICE. | `HashTable.Size`, local copies in `Calendar`. |
 | 2 | `QualifiedGenericCall` | `Core.Collections.Queue.New<i64>()` ICEs. | Module imports for every generic call. |
 | 2 | `FieldOnCall` | `Make().x` ICEs. | Temporary locals. |
+| 2 | `GenericReceiver` | Inside a generic function, a method call on a local of type `List<T>` ICEs (`abi_type` unavailable). | Delegating to helpers that take `T[]` (`List.Of` calls `List.FromArray`). |
 | 3 | `BulkArgs` | `bulk` parameters reject several arguments; one array argument ICEs. | `List.FromArray`/`Set.FromArray` instead of the shipped `Of` constructors. |
 | 3 | `EnumArrayLiteral`, `CallInArrayLiteral` | Array literals of enum values or concatenated calls ICE. | `Array.Append` chains. |
 | 3 | `FloatToIntCast` | `i64(f64)` ICEs. | Bit-decomposition in `Number.TruncateToI64`. |

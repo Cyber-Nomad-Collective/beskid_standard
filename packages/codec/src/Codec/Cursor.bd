@@ -40,11 +40,20 @@ pub type Cursor {
     pub Result<u8[], CodecError> ReadLine(i64 maxLength) { return DoReadLine(this, maxLength); }
     // Fails with LimitExceeded unless the cursor is exhausted.
     pub Result<unit, CodecError> ExpectEnd() { return DoExpectEnd(this); }
+    // Moves back to a position saved from Position(), undoing a partially consumed read.
+    // Positions ahead of the current one are ignored, so a rewind never skips input.
+    pub unit Rewind(i64 position) { DoRewind(this, position); }
 }
 
 // Free-function bodies: methods may not call sibling methods in 0.5.2 (see COMPILER-GAPS.md).
 i64 DoPosition(Cursor self) {
     return self.pos;
+}
+
+unit DoRewind(Cursor self, i64 position) {
+    if position >= 0_i64 && position <= self.pos {
+        self.pos = position;
+    }
 }
 
 i64 DoRemaining(Cursor self) {
@@ -56,8 +65,8 @@ bool DoIsEnd(Cursor self) {
 }
 
 Result<unit, CodecError> DoNeed(Cursor self, i64 count) {
-        if count < 0_i64 { return Result::Error(CodecError::InvalidValue()); }
-        if count > self.stop - self.pos { return Result::Error(CodecError::Truncated()); }
+        if count < 0_i64 { return Result::Error(CodecError::InvalidValue); }
+        if count > self.stop - self.pos { return Result::Error(CodecError::Truncated); }
         return Result::Ok(());
     }
 
@@ -99,7 +108,7 @@ Result<i64, CodecError> DoU64(Cursor self) {
 }
 
 Result<i64, CodecError> DoQuicVarint(Cursor self) {
-        if self.pos >= self.stop { return Result::Error(CodecError::Truncated()); }
+        if self.pos >= self.stop { return Result::Error(CodecError::Truncated); }
         i64 length = Varint.LengthFromFirstByte(self.buf[self.pos]);
         Result<unit, CodecError> ok = DoNeed(self, length);
         match ok {
@@ -114,7 +123,7 @@ Result<i64, CodecError> DoQuicVarint(Cursor self) {
     }
 
 Result<i64, CodecError> DoPeek8(Cursor self) {
-        if self.pos >= self.stop { return Result::Error(CodecError::Truncated()); }
+        if self.pos >= self.stop { return Result::Error(CodecError::Truncated); }
         return Result::Ok(i64(self.buf[self.pos]));
     }
 
@@ -161,7 +170,7 @@ Result<u8[], CodecError> DoReadLine(Cursor self, i64 maxLength) {
         match found {
             Result::Error(error) => { return Result::Error(error); },
             Result::Ok(cr) => {
-                if cr < 0_i64 { return Result::Error(CodecError::Truncated()); }
+                if cr < 0_i64 { return Result::Error(CodecError::Truncated); }
                 u8[] out = Slice.SubSlice(self.buf, self.pos, cr - self.pos);
                 self.pos = cr + 2_i64;
                 return Result::Ok(out);
@@ -170,7 +179,7 @@ Result<u8[], CodecError> DoReadLine(Cursor self, i64 maxLength) {
     }
 
 Result<unit, CodecError> DoExpectEnd(Cursor self) {
-        if self.pos != self.stop { return Result::Error(CodecError::LimitExceeded()); }
+        if self.pos != self.stop { return Result::Error(CodecError::LimitExceeded); }
         return Result::Ok(());
     }
 
@@ -182,6 +191,6 @@ pub Cursor New(u8[] buf) {
 
 /// A cursor over `count` bytes starting at `offset`.
 pub Result<Cursor, CodecError> Range(u8[] buf, i64 offset, i64 count) {
-    if !Slice.IsValidRange(Slice.Len(buf), offset, count) { return Result::Error(CodecError::InvalidValue()); }
+    if !Slice.IsValidRange(Slice.Len(buf), offset, count) { return Result::Error(CodecError::InvalidValue); }
     return Result::Ok(Cursor { buf: buf, pos: offset, stop: offset + count });
 }

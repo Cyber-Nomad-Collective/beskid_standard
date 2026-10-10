@@ -69,7 +69,7 @@ unit Nap() {
 
 /// Binds an endpoint. Servers accept connections; clients use `Connect`.
 pub Result<Endpoint, QuicError> Bind(SocketAddress local, QuicConfig config, bool isServer) {
-    if !QuicConfig.IsValid(config) { return Result::Error(QuicError::InvalidArgument()); }
+    if !QuicConfig.IsValid(config) { return Result::Error(QuicError::InvalidArgument); }
     return match UdpSocket.Bind(local) {
         Result::Error(e) => Result::Error(QuicError::Network(e)),
         Result::Ok(socket) => Result::Ok(Make(socket, config, isServer)),
@@ -416,13 +416,13 @@ bool ValidHandle(Endpoint ep, i64 handle) {
 /// Returns a connection handle for the stream calls.
 pub Result<i64, QuicError> Connect(Endpoint ep, SocketAddress remote, i64 timeoutMillis) {
     i64 deadline = DeadlineIn(timeoutMillis);
-    if ep.isServer { return Result::Error(QuicError::InvalidArgument()); }
-    if ActiveConnections(ep) >= QuicConfig.MaxConnections() { return Result::Error(QuicError::LimitExceeded()); }
+    if ep.isServer { return Result::Error(QuicError::InvalidArgument); }
+    if ActiveConnections(ep) >= QuicConfig.MaxConnections() { return Result::Error(QuicError::LimitExceeded); }
     Connection c = QuicConnection.NewClient(ep.config, NowNanos());
     i64 handle = AddConnection(ep, c, remote);
     while !QuicConnection.IsEstablished(c) {
         if QuicConnection.IsClosingOrClosed(c) { return Result::Error(QuicConnection.Error(c)); }
-        if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+        if Expired(deadline) { return Result::Error(QuicError::TimedOut); }
         Nap();
     }
     return Result::Ok(handle);
@@ -431,7 +431,7 @@ pub Result<i64, QuicError> Connect(Endpoint ep, SocketAddress remote, i64 timeou
 /// Waits for the next established server connection not yet accepted.
 pub Result<i64, QuicError> Accept(Endpoint ep, i64 timeoutMillis) {
     i64 deadline = DeadlineIn(timeoutMillis);
-    if !ep.isServer { return Result::Error(QuicError::InvalidArgument()); }
+    if !ep.isServer { return Result::Error(QuicError::InvalidArgument); }
     while !Expired(deadline) {
         mut i64 i = 0_i64;
         while i < Array.Len<i64>(ep.used) {
@@ -446,7 +446,7 @@ pub Result<i64, QuicError> Accept(Endpoint ep, i64 timeoutMillis) {
         }
         Nap();
     }
-    return Result::Error(QuicError::TimedOut());
+    return Result::Error(QuicError::TimedOut);
 }
 
 /// Negotiated ALPN protocol of a connection.
@@ -459,7 +459,7 @@ pub string Alpn(Endpoint ep, i64 handle) {
 pub Connection ConnectionOf(Endpoint ep, i64 handle) { return ConnAt(ep, handle); }
 
 Result<unit, QuicError> Usable(Endpoint ep, i64 handle) {
-    if !ValidHandle(ep, handle) { return Result::Error(QuicError::InvalidArgument()); }
+    if !ValidHandle(ep, handle) { return Result::Error(QuicError::InvalidArgument); }
     Connection c = ConnAt(ep, handle);
     if QuicConnection.IsClosingOrClosed(c) { return Result::Error(QuicConnection.Error(c)); }
     return Result::Ok(());
@@ -472,10 +472,10 @@ pub Result<i64, QuicError> OpenStream(Endpoint ep, i64 handle, bool bidi, i64 ti
         Usable(ep, handle)?;
         i64 id = QuicConnection.OpenStream(ConnAt(ep, handle), bidi);
         if id >= 0_i64 { return Result::Ok(id); }
-        if Expired(deadline) { return Result::Error(QuicError::LimitExceeded()); }
+        if Expired(deadline) { return Result::Error(QuicError::LimitExceeded); }
         Nap();
     }
-    return Result::Error(QuicError::Closed());
+    return Result::Error(QuicError::Closed);
 }
 
 /// Waits for a stream opened by the peer. Returns its id.
@@ -485,10 +485,10 @@ pub Result<i64, QuicError> AcceptStream(Endpoint ep, i64 handle, i64 timeoutMill
         Usable(ep, handle)?;
         i64 id = QuicConnection.AcceptStream(ConnAt(ep, handle));
         if id >= 0_i64 { return Result::Ok(id); }
-        if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+        if Expired(deadline) { return Result::Error(QuicError::TimedOut); }
         Nap();
     }
-    return Result::Error(QuicError::Closed());
+    return Result::Error(QuicError::Closed);
 }
 
 /// Writes all of data[offset..offset+count) to a stream, waiting for buffer space.
@@ -498,10 +498,10 @@ pub Result<unit, QuicError> Write(Endpoint ep, i64 handle, i64 stream, u8[] data
     while done < count {
         Usable(ep, handle)?;
         i64 n = QuicConnection.StreamWrite(ConnAt(ep, handle), stream, data, offset + done, count - done);
-        if n < 0_i64 { return Result::Error(QuicError::StreamState()); }
+        if n < 0_i64 { return Result::Error(QuicError::StreamState); }
         done = done + n;
         if done < count {
-            if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+            if Expired(deadline) { return Result::Error(QuicError::TimedOut); }
             Nap();
         }
     }
@@ -516,32 +516,32 @@ pub Result<i64, QuicError> Read(Endpoint ep, i64 handle, i64 stream, u8[] buffer
         Connection c = ConnAt(ep, handle);
         i64 n = QuicConnection.StreamRead(c, stream, buffer, offset, count);
         if n == -2_i64 { return Result::Error(QuicError::StreamReset(QuicConnection.StreamResetCode(c, stream))); }
-        if n < 0_i64 { return Result::Error(QuicError::StreamState()); }
+        if n < 0_i64 { return Result::Error(QuicError::StreamState); }
         if n > 0_i64 || QuicConnection.StreamAtEnd(c, stream) || count == 0_i64 { return Result::Ok(n); }
-        if Expired(deadline) { return Result::Error(QuicError::TimedOut()); }
+        if Expired(deadline) { return Result::Error(QuicError::TimedOut); }
         Nap();
     }
-    return Result::Error(QuicError::Closed());
+    return Result::Error(QuicError::Closed);
 }
 
 /// Ends the sending direction of a stream (FIN).
 pub Result<unit, QuicError> Finish(Endpoint ep, i64 handle, i64 stream) {
     Usable(ep, handle)?;
-    if !QuicConnection.StreamFinish(ConnAt(ep, handle), stream) { return Result::Error(QuicError::StreamState()); }
+    if !QuicConnection.StreamFinish(ConnAt(ep, handle), stream) { return Result::Error(QuicError::StreamState); }
     return Result::Ok(());
 }
 
 /// Abandons the sending direction with an application error code (RESET_STREAM).
 pub Result<unit, QuicError> Reset(Endpoint ep, i64 handle, i64 stream, i64 code) {
     Usable(ep, handle)?;
-    if !QuicConnection.StreamReset(ConnAt(ep, handle), stream, code) { return Result::Error(QuicError::StreamState()); }
+    if !QuicConnection.StreamReset(ConnAt(ep, handle), stream, code) { return Result::Error(QuicError::StreamState); }
     return Result::Ok(());
 }
 
 /// Asks the peer to stop sending on a stream (STOP_SENDING).
 pub Result<unit, QuicError> StopSending(Endpoint ep, i64 handle, i64 stream, i64 code) {
     Usable(ep, handle)?;
-    if !QuicConnection.StreamStopSending(ConnAt(ep, handle), stream, code) { return Result::Error(QuicError::StreamState()); }
+    if !QuicConnection.StreamStopSending(ConnAt(ep, handle), stream, code) { return Result::Error(QuicError::StreamState); }
     return Result::Ok(());
 }
 
@@ -561,7 +561,7 @@ pub i64 PeerStopCode(Endpoint ep, i64 handle, i64 stream) {
 /// closing period to end; the handle is released afterwards.
 pub Result<unit, QuicError> Close(Endpoint ep, i64 handle, i64 code, i64 timeoutMillis) {
     i64 deadline = DeadlineIn(timeoutMillis);
-    if !ValidHandle(ep, handle) { return Result::Error(QuicError::InvalidArgument()); }
+    if !ValidHandle(ep, handle) { return Result::Error(QuicError::InvalidArgument); }
     Connection c = ConnAt(ep, handle);
     QuicConnection.Close(c, code, NowNanos());
     while !QuicConnection.IsClosed(c) && !Expired(deadline) { Nap(); }
@@ -571,6 +571,6 @@ pub Result<unit, QuicError> Close(Endpoint ep, i64 handle, i64 code, i64 timeout
 
 /// Why a connection ended (QuicError::Closed while it is open).
 pub QuicError ConnectionError(Endpoint ep, i64 handle) {
-    if !ValidHandle(ep, handle) { return QuicError::InvalidArgument(); }
+    if !ValidHandle(ep, handle) { return QuicError::InvalidArgument; }
     return QuicConnection.Error(ConnAt(ep, handle));
 }

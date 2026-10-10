@@ -59,21 +59,21 @@ u8[] StripLeadingZeros(u8[] bytes) {
 pub Result<PublicKey, PkError> NewPublicKey(u8[] modulus, u8[] exponent) {
     Result<u32[], PkError> decoded = BigNat.FromBytes(modulus);
     return match decoded {
-        Result::Error(_) => Result::Error(PkError::InvalidModulus()),
+        Result::Error(_) => Result::Error(PkError::InvalidModulus),
         Result::Ok(raw) => {
             u32[] n = BigNat.Normalize(raw);
             i64 bits = BigNat.BitLength(n);
-            if bits < MinModulusBits() || bits > MaxModulusBits() || !BigNat.IsOdd(n) { return Result::Error(PkError::InvalidModulus()); }
+            if bits < MinModulusBits() || bits > MaxModulusBits() || !BigNat.IsOdd(n) { return Result::Error(PkError::InvalidModulus); }
             u8[] e = StripLeadingZeros(exponent);
             i64 elen = Slice.Len(e);
-            if elen == 0_i64 || elen > (bits + 7_i64) / 8_i64 { return Result::Error(PkError::InvalidExponent()); }
-            if (e[elen - 1_i64] & u8(1)) == u8(0) { return Result::Error(PkError::InvalidExponent()); }
-            if elen == 1_i64 && e[0] < u8(3) { return Result::Error(PkError::InvalidExponent()); }
+            if elen == 0_i64 || elen > (bits + 7_i64) / 8_i64 { return Result::Error(PkError::InvalidExponent); }
+            if (e[elen - 1_i64] & u8(1)) == u8(0) { return Result::Error(PkError::InvalidExponent); }
+            if elen == 1_i64 && e[0] < u8(3) { return Result::Error(PkError::InvalidExponent); }
             Result<u32[], PkError> ev = BigNat.FromBytes(e);
             return match ev {
-                Result::Error(_) => Result::Error(PkError::InvalidExponent()),
+                Result::Error(_) => Result::Error(PkError::InvalidExponent),
                 Result::Ok(evalue) => {
-                    if BigNat.Compare(evalue, n) >= 0_i64 { return Result::Error(PkError::InvalidExponent()); }
+                    if BigNat.Compare(evalue, n) >= 0_i64 { return Result::Error(PkError::InvalidExponent); }
                     return Result::Ok(PublicKey { n: n, e: e, bits: bits, size: (bits + 7_i64) / 8_i64 });
                 },
             };
@@ -84,15 +84,15 @@ pub Result<PublicKey, PkError> NewPublicKey(u8[] modulus, u8[] exponent) {
 /// RSAVP1 + I2OSP: `signature^e mod n` as exactly `key.size` bytes. The signature must be
 /// exactly `key.size` bytes and, as an integer, below n.
 pub Result<u8[], PkError> PublicOperation(PublicKey key, u8[] signature) {
-    if Slice.Len(signature) != key.size { return Result::Error(PkError::MalformedSignature()); }
+    if Slice.Len(signature) != key.size { return Result::Error(PkError::MalformedSignature); }
     Result<u32[], PkError> decoded = BigNat.FromBytes(signature);
     Result<u32[], PkError> created = ModArith.NewWorkspace(key.n, 3_i64);
     return match decoded {
-        Result::Error(_) => Result::Error(PkError::MalformedSignature()),
+        Result::Error(_) => Result::Error(PkError::MalformedSignature),
         Result::Ok(s) => match created {
             Result::Error(error) => Result::Error(error),
             Result::Ok(w) => {
-                if BigNat.Compare(s, key.n) >= 0_i64 { return Result::Error(PkError::MalformedSignature()); }
+                if BigNat.Compare(s, key.n) >= 0_i64 { return Result::Error(PkError::MalformedSignature); }
                 i64 n = BigNat.SignificantLimbs(key.n);
                 i64 base = ModArith.WSlot(n, 0_i64);
                 i64 out = ModArith.WSlot(n, 1_i64);
@@ -110,10 +110,10 @@ pub Result<u8[], PkError> PublicOperation(PublicKey key, u8[] signature) {
 /// block must equal 0x00 0x01 0xFF.. 0x00 || DigestInfo(hash) || digest exactly.
 pub Result<unit, PkError> VerifyPkcs1v15(PublicKey key, RsaHash hash, u8[] digest, u8[] signature) {
     i64 hlen = DigestLength(hash);
-    if Slice.Len(digest) != hlen { return Result::Error(PkError::InvalidDigest()); }
+    if Slice.Len(digest) != hlen { return Result::Error(PkError::InvalidDigest); }
     u8[] prefix = DigestInfoPrefix(hash);
     i64 tlen = Slice.Len(prefix) + hlen;
-    if key.size < tlen + 11_i64 { return Result::Error(PkError::InvalidModulus()); }
+    if key.size < tlen + 11_i64 { return Result::Error(PkError::InvalidModulus); }
     Result<u8[], PkError> recovered = PublicOperation(key, signature);
     return match recovered {
         Result::Error(error) => Result::Error(error),
@@ -123,7 +123,7 @@ pub Result<unit, PkError> VerifyPkcs1v15(PublicKey key, RsaHash hash, u8[] diges
             expected[1] = u8(1);
             Slice.Copy(expected, k - tlen, prefix, 0_i64, Slice.Len(prefix));
             Slice.Copy(expected, k - hlen, digest, 0_i64, hlen);
-            if !SameBytes(em, expected) { return Result::Error(PkError::BadSignature()); }
+            if !SameBytes(em, expected) { return Result::Error(PkError::BadSignature); }
             return Result::Ok(());
         },
     };
@@ -169,8 +169,8 @@ pub u8[] Mgf1(PssDigest hash, u8[] seed, i64 length) {
 /// requires the digest length).
 pub Result<unit, PkError> VerifyPss(PublicKey key, PssDigest hash, u8[] digest, u8[] signature, i64 saltLength) {
     i64 hlen = Slice.Len(digest);
-    if hlen == 0_i64 { return Result::Error(PkError::InvalidDigest()); }
-    if saltLength < 0_i64 { return Result::Error(PkError::OutOfRange()); }
+    if hlen == 0_i64 { return Result::Error(PkError::InvalidDigest); }
+    if saltLength < 0_i64 { return Result::Error(PkError::OutOfRange); }
     Result<u8[], PkError> recovered = PublicOperation(key, signature);
     return match recovered {
         Result::Error(error) => Result::Error(error),
@@ -179,7 +179,7 @@ pub Result<unit, PkError> VerifyPss(PublicKey key, PssDigest hash, u8[] digest, 
             i64 emLen = (emBits + 7_i64) / 8_i64;
             i64 k = key.size;
             // When emLen < k the leading octet of the I2OSP output must be zero.
-            if emLen < k && m[0] != u8(0) { return Result::Error(PkError::BadSignature()); }
+            if emLen < k && m[0] != u8(0) { return Result::Error(PkError::BadSignature); }
             u8[] em = Scratch.Sub(m, k - emLen, emLen);
             return EmsaPssVerify(hash, digest, em, emBits, saltLength);
         },
@@ -189,15 +189,15 @@ pub Result<unit, PkError> VerifyPss(PublicKey key, PssDigest hash, u8[] digest, 
 Result<unit, PkError> EmsaPssVerify(PssDigest hash, u8[] mHash, u8[] em, i64 emBits, i64 sLen) {
     i64 hlen = Slice.Len(mHash);
     i64 emLen = Slice.Len(em);
-    if emLen < hlen + sLen + 2_i64 { return Result::Error(PkError::BadSignature()); }
-    if em[emLen - 1_i64] != u8(188) { return Result::Error(PkError::BadSignature()); }
+    if emLen < hlen + sLen + 2_i64 { return Result::Error(PkError::BadSignature); }
+    if em[emLen - 1_i64] != u8(188) { return Result::Error(PkError::BadSignature); }
     i64 dbLen = emLen - hlen - 1_i64;
     u8[] h = Scratch.Sub(em, dbLen, hlen);
     i64 zeroBits = 8_i64 * emLen - emBits;
     u8 topMask = u8((255_i64 << (8_i64 - zeroBits)) & 255_i64);
-    if (em[0] & topMask) != u8(0) { return Result::Error(PkError::BadSignature()); }
+    if (em[0] & topMask) != u8(0) { return Result::Error(PkError::BadSignature); }
     u8[] db = Mgf1(hash, h, dbLen);
-    if Slice.Len(db) != dbLen { return Result::Error(PkError::BadSignature()); }
+    if Slice.Len(db) != dbLen { return Result::Error(PkError::BadSignature); }
     mut i64 i = 0_i64;
     while i < dbLen {
         db[i] = (db[i] | em[i]) - (db[i] & em[i]);
@@ -207,14 +207,14 @@ Result<unit, PkError> EmsaPssVerify(PssDigest hash, u8[] mHash, u8[] em, i64 emB
     i64 psLen = emLen - hlen - sLen - 2_i64;
     i = 0_i64;
     while i < psLen {
-        if db[i] != u8(0) { return Result::Error(PkError::BadSignature()); }
+        if db[i] != u8(0) { return Result::Error(PkError::BadSignature); }
         i = i + 1_i64;
     }
-    if db[psLen] != u8(1) { return Result::Error(PkError::BadSignature()); }
+    if db[psLen] != u8(1) { return Result::Error(PkError::BadSignature); }
     u8[] mPrime = BigNat.ZeroBytes(8_i64 + hlen + sLen);
     Slice.Copy(mPrime, 8_i64, mHash, 0_i64, hlen);
     Slice.Copy(mPrime, 8_i64 + hlen, db, dbLen - sLen, sLen);
     u8[] hPrime = hash.Digest(mPrime);
-    if !SameBytes(h, hPrime) { return Result::Error(PkError::BadSignature()); }
+    if !SameBytes(h, hPrime) { return Result::Error(PkError::BadSignature); }
     return Result::Ok(());
 }

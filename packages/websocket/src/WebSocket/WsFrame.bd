@@ -1,5 +1,4 @@
 use Core.Bytes.Slice;
-use Core.Collections.Array;
 use Core.Results;
 use WebSocket.WsErrors;
 use WebSocket.WsUtf8;
@@ -66,12 +65,12 @@ pub i64 HeaderLengthFrom(u8 second) {
 /// protocol error; reserved opcodes, fragmented or long control frames,
 /// non-minimal lengths and lengths with the top bit set are protocol errors.
 pub Result<FrameHeader, WsError> DecodeHeader(u8[] buf, i64 start, i64 stop) {
-    if start < 0_i64 || stop > Slice.Len(buf) || stop < start { return Result::Error(WsError::InvalidArgument()); }
-    if stop - start < 2_i64 { return Result::Error(WsError::Incomplete()); }
+    if start < 0_i64 || stop > Slice.Len(buf) || stop < start { return Result::Error(WsError::InvalidArgument); }
+    if stop - start < 2_i64 { return Result::Error(WsError::Incomplete); }
     i64 b0 = i64(buf[start]);
     i64 b1 = i64(buf[start + 1_i64]);
     i64 headerLength = HeaderLengthFrom(buf[start + 1_i64]);
-    if stop - start < headerLength { return Result::Error(WsError::Incomplete()); }
+    if stop - start < headerLength { return Result::Error(WsError::Incomplete); }
     bool fin = (b0 & 128_i64) != 0_i64;
     i64 rsv = (b0 >> 4_i64) & 7_i64;
     i64 opcode = b0 & 15_i64;
@@ -190,10 +189,10 @@ pub i64 EncodedHeaderLength(i64 count, bool masked) {
 /// Encodes the header of a frame carrying `count` payload bytes (minimal length
 /// encoding), with the masking key when `maskKey` holds 4 bytes.
 pub Result<u8[], WsError> EncodeHeader(bool fin, i64 opcode, i64 count, u8[] maskKey) {
-    if !IsKnownOpcode(opcode) || count < 0_i64 { return Result::Error(WsError::InvalidArgument()); }
+    if !IsKnownOpcode(opcode) || count < 0_i64 { return Result::Error(WsError::InvalidArgument); }
     i64 keyLength = Slice.Len(maskKey);
-    if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
-    if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
+    if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument); }
+    if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument); }
     bool masked = keyLength == 4_i64;
     u8[] out = Mem.Zeroed(EncodedHeaderLength(count, masked));
     WriteHeader(out, fin, opcode, count, maskKey);
@@ -235,10 +234,10 @@ i64 WriteHeader(u8[] out, bool fin, i64 opcode, i64 count, u8[] maskKey) {
 /// Encodes one frame: header (minimal length encoding) followed by the payload,
 /// masked with `maskKey` when it holds 4 bytes, unmasked when it is empty.
 pub Result<u8[], WsError> EncodeFrame(bool fin, i64 opcode, u8[] payload, i64 offset, i64 count, u8[] maskKey) {
-    if !IsKnownOpcode(opcode) || !Slice.IsValidRange(Slice.Len(payload), offset, count) { return Result::Error(WsError::InvalidArgument()); }
+    if !IsKnownOpcode(opcode) || !Slice.IsValidRange(Slice.Len(payload), offset, count) { return Result::Error(WsError::InvalidArgument); }
     i64 keyLength = Slice.Len(maskKey);
-    if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument()); }
-    if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument()); }
+    if keyLength != 0_i64 && keyLength != 4_i64 { return Result::Error(WsError::InvalidArgument); }
+    if IsControl(opcode) && (!fin || count > MaxControlPayload()) { return Result::Error(WsError::InvalidArgument); }
     bool masked = keyLength == 4_i64;
     u8[] out = Mem.Zeroed(EncodedHeaderLength(count, masked) + count);
     i64 pos = WriteHeader(out, fin, opcode, count, maskKey);
@@ -266,11 +265,11 @@ pub i64 AbnormalCode() { return 1006_i64; }
 pub Result<u8[], WsError> EncodeClosePayload(i64 code, u8[] reason) {
     i64 n = Slice.Len(reason);
     if code == 0_i64 {
-        if n != 0_i64 { return Result::Error(WsError::InvalidArgument()); }
+        if n != 0_i64 { return Result::Error(WsError::InvalidArgument); }
         return Result::Ok(Slice.New(0_i64));
     }
-    if !ValidCloseCode(code) || n + 2_i64 > MaxControlPayload() { return Result::Error(WsError::InvalidArgument()); }
-    if !WsUtf8.IsValid(reason, 0_i64, n) { return Result::Error(WsError::InvalidUtf8()); }
+    if !ValidCloseCode(code) || n + 2_i64 > MaxControlPayload() { return Result::Error(WsError::InvalidArgument); }
+    if !WsUtf8.IsValid(reason, 0_i64, n) { return Result::Error(WsError::InvalidUtf8); }
     u8[] out = Mem.Zeroed(n + 2_i64);
     out[0] = u8((code >> 8_i64) & 255_i64);
     out[1] = u8(code & 255_i64);
@@ -286,7 +285,7 @@ pub Result<i64, WsError> DecodeCloseCode(u8[] payload) {
     if n == 1_i64 { return Result::Error(WsError::ProtocolError(ReasonBadClosePayload())); }
     i64 code = (i64(payload[0]) << 8_i64) | i64(payload[1]);
     if !ValidCloseCode(code) { return Result::Error(WsError::ProtocolError(ReasonBadCloseCode())); }
-    if !WsUtf8.IsValid(payload, 2_i64, n - 2_i64) { return Result::Error(WsError::InvalidUtf8()); }
+    if !WsUtf8.IsValid(payload, 2_i64, n - 2_i64) { return Result::Error(WsError::InvalidUtf8); }
     return Result::Ok(code);
 }
 

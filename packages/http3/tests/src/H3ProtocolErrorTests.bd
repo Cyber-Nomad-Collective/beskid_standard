@@ -1,0 +1,152 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Codec.Hex;
+use Http2.Hpack;
+use Http3.H3Connection;
+use Http3.H3Errors;
+use Http3.H3Frame;
+use Http3.H3Quic;
+use Http3.H3Server;
+use Http3.QpackEncoder;
+
+// A hand-driven peer violates RFC 9114 rules; the endpoint closes the
+// connection (or resets the stream) with the required code.
+
+// Control stream bytes: stream type 0 and an empty SETTINGS frame.
+string ControlWithSettings() { return "000400"; }
+
+i64 Uni(QuicLink link, string hex, bool fin) {
+    i64 id = H3Quic.OpenUni(link);
+    bool ok = H3Quic.Write(link, id, Hex.Of(hex), fin);
+    return id;
+}
+
+i64 ServerErrorAfter(QuicLink fake, QuicLink serverLink) {
+    mut H3Conn server = H3Server.Accept(serverLink, H3Connection.DefaultConfig());
+    H3Incoming incoming = H3Server.Next(server);
+    return H3Connection.ErrorCode(server);
+}
+
+QuicLink[] Pair() { return H3Quic.NewPair(); }
+
+test h3_control_stream_rules {
+    QuicLink[] p1 = Pair();
+    i64 a = Uni(Array.Get<QuicLink>(p1, 0_i64), "00070100", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p1, 0_i64), Array.Get<QuicLink>(p1, 1_i64)), H3Errors.MissingSettings(), "first control frame is not SETTINGS");
+    Assert.Equal<i64>(H3Quic.CloseCode(Array.Get<QuicLink>(p1, 0_i64)), H3Errors.MissingSettings(), "peer sees CONNECTION_CLOSE code");
+    QuicLink[] p2 = Pair();
+    i64 b1 = Uni(Array.Get<QuicLink>(p2, 0_i64), ControlWithSettings(), false);
+    i64 b2 = Uni(Array.Get<QuicLink>(p2, 0_i64), ControlWithSettings(), false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p2, 0_i64), Array.Get<QuicLink>(p2, 1_i64)), H3Errors.StreamCreationError(), "second control stream");
+    QuicLink[] p3 = Pair();
+    i64 c = Uni(Array.Get<QuicLink>(p3, 0_i64), ControlWithSettings(), true);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p3, 0_i64), Array.Get<QuicLink>(p3, 1_i64)), H3Errors.ClosedCriticalStream(), "control stream closed");
+    QuicLink[] p4 = Pair();
+    i64 d = Uni(Array.Get<QuicLink>(p4, 0_i64), "000400" + "0400", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p4, 0_i64), Array.Get<QuicLink>(p4, 1_i64)), H3Errors.FrameUnexpected(), "second SETTINGS");
+    QuicLink[] p5 = Pair();
+    i64 e = Uni(Array.Get<QuicLink>(p5, 0_i64), "000402020a", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p5, 0_i64), Array.Get<QuicLink>(p5, 1_i64)), H3Errors.SettingsError(), "reserved HTTP/2 setting");
+    QuicLink[] p6 = Pair();
+    i64 f = Uni(Array.Get<QuicLink>(p6, 0_i64), "0004000000", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p6, 0_i64), Array.Get<QuicLink>(p6, 1_i64)), H3Errors.FrameUnexpected(), "DATA on the control stream");
+}
+
+test h3_unidirectional_stream_types {
+    QuicLink[] p1 = Pair();
+    i64 a = Uni(Array.Get<QuicLink>(p1, 0_i64), ControlWithSettings(), false);
+    i64 grease = Uni(Array.Get<QuicLink>(p1, 0_i64), "4021ffff", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p1, 0_i64), Array.Get<QuicLink>(p1, 1_i64)), -1_i64, "unknown stream type is ignored");
+    Assert.Equal<i64>(H3Quic.PeerStopCode(Array.Get<QuicLink>(p1, 0_i64), grease), H3Errors.StreamCreationError(), "with STOP_SENDING");
+    QuicLink[] p2 = Pair();
+    i64 b = Uni(Array.Get<QuicLink>(p2, 0_i64), ControlWithSettings(), false);
+    i64 push = Uni(Array.Get<QuicLink>(p2, 0_i64), "0100", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p2, 0_i64), Array.Get<QuicLink>(p2, 1_i64)), H3Errors.StreamCreationError(), "client push stream");
+    QuicLink[] p3 = Pair();
+    i64 c = Uni(Array.Get<QuicLink>(p3, 0_i64), ControlWithSettings(), false);
+    i64 enc1 = Uni(Array.Get<QuicLink>(p3, 0_i64), "02", false);
+    i64 enc2 = Uni(Array.Get<QuicLink>(p3, 0_i64), "02", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p3, 0_i64), Array.Get<QuicLink>(p3, 1_i64)), H3Errors.StreamCreationError(), "second encoder stream");
+    QuicLink[] p4 = Pair();
+    i64 d = Uni(Array.Get<QuicLink>(p4, 0_i64), ControlWithSettings(), false);
+    i64 enc = Uni(Array.Get<QuicLink>(p4, 0_i64), "023fe21f", false);
+    Assert.Equal<i64>(ServerErrorAfter(Array.Get<QuicLink>(p4, 0_i64), Array.Get<QuicLink>(p4, 1_i64)), H3Errors.QpackEncoderStreamError(), "table capacity above the advertised maximum");
+}
+
+// A request stream from the fake client carrying `fields` (QPACK static
+// and literals) followed by `tail` frames.
+i64 RequestStream(QuicLink link, HeaderField[] fields, string tail, bool fin) {
+    i64 id = H3Quic.OpenBidi(link);
+    mut QEncoder encoder = QpackEncoder.New(QpackEncoder.DefaultPolicy());
+    u8[] section = QpackEncoder.EncodeSection(encoder, id, fields);
+    mut u8[] bytes = H3Frame.AppendFrame(Slice.New(0_i64), H3Frame.TypeHeaders(), section);
+    u8[] rest = Hex.Of(tail);
+    mut i64 i = 0_i64;
+    while i < Slice.Len(rest) { Array.Append<u8>(bytes, rest[i]); i = i + 1_i64; }
+    bool ok = H3Quic.Write(link, id, bytes, fin);
+    return id;
+}
+
+HeaderField[] GetFields(bool withPath) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(out, Hpack.Field(":method", "GET"));
+    Array.Append<HeaderField>(out, Hpack.Field(":scheme", "https"));
+    Array.Append<HeaderField>(out, Hpack.Field(":authority", "example.com"));
+    if withPath { Array.Append<HeaderField>(out, Hpack.Field(":path", "/")); }
+    return out;
+}
+
+test h3_request_stream_rules {
+    QuicLink[] p = Pair();
+    QuicLink fake = Array.Get<QuicLink>(p, 0_i64);
+    i64 control = Uni(fake, ControlWithSettings(), false);
+    mut H3Conn server = H3Server.Accept(Array.Get<QuicLink>(p, 1_i64), H3Connection.DefaultConfig());
+    i64 noPath = RequestStream(fake, GetFields(false), "", true);
+    mut HeaderField[] withLength = GetFields(true);
+    Array.Append<HeaderField>(withLength, Hpack.Field("content-length", "5"));
+    i64 shortBody = RequestStream(fake, withLength, "000161", true);
+    i64 later = RequestStream(fake, GetFields(true), "", false);
+    bool finished = H3Quic.Write(fake, later, Slice.New(0_i64), true);
+    i64 greased = RequestStream(fake, GetFields(true), "210100", true);
+    H3Incoming first = H3Server.Next(server);
+    Assert.Equal<i64>(H3Connection.ErrorCode(server), -1_i64, "stream errors keep the connection");
+    Assert.Equal<i64>(H3Quic.PeerResetCode(fake, noPath), H3Errors.MessageError(), "missing :path");
+    Assert.Equal<i64>(H3Quic.PeerResetCode(fake, shortBody), H3Errors.MessageError(), "content-length mismatch");
+    Assert.Equal<i64>(first.streamId, later, "FIN in a separate write completes the request");
+    H3Incoming next = H3Server.Next(server);
+    Assert.Equal<i64>(next.streamId, greased, "grease frame ignored, request delivered");
+    i64 cut = RequestStream(fake, GetFields(true), "", false);
+    H3Quic.Reset(fake, cut, H3Errors.RequestCancelled());
+    H3Incoming afterReset = H3Server.Next(server);
+    Assert.Equal<i64>(afterReset.streamId, -1_i64, "reset request is dropped");
+    i64 dataFirst = H3Quic.OpenBidi(fake);
+    bool sent = H3Quic.Write(fake, dataFirst, Hex.Of("000161"), true);
+    H3Incoming second = H3Server.Next(server);
+    Assert.Equal<i64>(H3Connection.ErrorCode(server), H3Errors.FrameUnexpected(), "DATA before HEADERS");
+}
+
+test h3_reserved_frame_and_bad_qpack_on_request {
+    QuicLink[] p = Pair();
+    QuicLink fake = Array.Get<QuicLink>(p, 0_i64);
+    i64 control = Uni(fake, ControlWithSettings(), false);
+    mut H3Conn server = H3Server.Accept(Array.Get<QuicLink>(p, 1_i64), H3Connection.DefaultConfig());
+    i64 reserved = RequestStream(fake, GetFields(true), "0200", true);
+    H3Incoming none = H3Server.Next(server);
+    Assert.Equal<i64>(H3Connection.ErrorCode(server), H3Errors.FrameUnexpected(), "HTTP/2 frame type on a request stream");
+    QuicLink[] p2 = Pair();
+    QuicLink fake2 = Array.Get<QuicLink>(p2, 0_i64);
+    i64 control2 = Uni(fake2, ControlWithSettings(), false);
+    mut H3Conn server2 = H3Server.Accept(Array.Get<QuicLink>(p2, 1_i64), H3Connection.DefaultConfig());
+    i64 bad = H3Quic.OpenBidi(fake2);
+    bool sent = H3Quic.Write(fake2, bad, Hex.Of("01030000ff"), true);
+    H3Incoming none2 = H3Server.Next(server2);
+    Assert.Equal<i64>(H3Connection.ErrorCode(server2), H3Errors.QpackDecompressionFailed(), "bad field section");
+    QuicLink[] p3 = Pair();
+    QuicLink fake3 = Array.Get<QuicLink>(p3, 0_i64);
+    i64 control3 = Uni(fake3, ControlWithSettings(), false);
+    mut H3Conn server3 = H3Server.Accept(Array.Get<QuicLink>(p3, 1_i64), H3Connection.DefaultConfig());
+    i64 cut = RequestStream(fake3, GetFields(true), "0005", true);
+    H3Incoming none3 = H3Server.Next(server3);
+    Assert.Equal<i64>(H3Connection.ErrorCode(server3), H3Errors.FrameError(), "frame truncated by FIN");
+}

@@ -1,0 +1,55 @@
+use Core.Bytes.Slice;
+use Core.IO.Closer;
+use Core.IO.IoError;
+use Core.IO.Reader;
+use Core.IO.Stream;
+use Core.IO.Writer;
+use Core.Results;
+use Network.Tcp.TcpStream;
+
+// A TCP stream whose first reads return octets already taken from it (the
+// sniffed HTTP/2 preface). Declares all four Core.IO contracts because 0.5.2
+// conformance is nominal (COMPILER-GAPS, http2 note 3).
+
+pub type PrefixedStream: Stream, Reader, Writer, Closer {
+    TcpStream tcp,
+    u8[] prefix,
+    // [0] next prefix octet to return
+    i64[] position,
+
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) { return DoRead(this, destination, offset, count); }
+    pub Result<i64, IoError> Write(u8[] source, i64 offset, i64 count) { return DoWrite(this, source, offset, count); }
+    pub Result<unit, IoError> Close() { return DoClose(this); }
+}
+
+pub PrefixedStream New(TcpStream tcp, u8[] prefix) {
+    i64[] position = [0_i64];
+    return PrefixedStream { tcp: tcp, prefix: prefix, position: position };
+}
+
+Result<i64, IoError> DoRead(PrefixedStream s, u8[] destination, i64 offset, i64 count) {
+    if !Slice.IsValidRange(Slice.Len(destination), offset, count) { return Result::Error(IoError::InvalidRange); }
+    u8[] prefix = s.prefix;
+    i64[] position = s.position;
+    i64 at = position[0];
+    i64 left = Slice.Len(prefix) - at;
+    if left > 0_i64 && count > 0_i64 {
+        mut i64 take = count;
+        if take > left { take = left; }
+        Slice.Copy(destination, offset, prefix, at, take);
+        position[0] = at + take;
+        return Result::Ok(take);
+    }
+    TcpStream t = s.tcp;
+    return t.Read(destination, offset, count);
+}
+
+Result<i64, IoError> DoWrite(PrefixedStream s, u8[] source, i64 offset, i64 count) {
+    TcpStream t = s.tcp;
+    return t.Write(source, offset, count);
+}
+
+Result<unit, IoError> DoClose(PrefixedStream s) {
+    TcpStream t = s.tcp;
+    return t.Close();
+}

@@ -1,0 +1,52 @@
+use Core.Results;
+use Codec.Cursor;
+use Codec.Errors;
+
+// Length-prefixed vectors in TLS presentation-language style: `opaque x<min..max>`.
+// `prefixBytes` is 1, 2, 3 or 4 (the width of the length field). `min` and `max`
+// bound the body length in bytes.
+
+Result<i64, CodecError> ReadLength(Cursor c, i64 prefixBytes, i64 min, i64 max) {
+    if prefixBytes < 1_i64 || prefixBytes > 4_i64 || min < 0_i64 || max < min { return Result::Error(CodecError::InvalidValue()); }
+    Result<i64, CodecError> length = c.Uint(prefixBytes);
+    match length {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(n) => {
+            if n < min || n > max { return Result::Error(CodecError::InvalidLength()); }
+            return Result::Ok(n);
+        },
+    };
+}
+
+/// Reads one vector and returns a copy of its body. The cursor position is
+/// restored when the prefix is invalid or the body is truncated.
+pub Result<u8[], CodecError> Read(Cursor c, i64 prefixBytes, i64 min, i64 max) {
+    i64 saved = c.pos;
+    Result<i64, CodecError> length = ReadLength(c, prefixBytes, min, max);
+    match length {
+        Result::Error(error) => { c.pos = saved; return Result::Error(error); },
+        Result::Ok(n) => {
+            Result<u8[], CodecError> body = c.Bytes(n);
+            match body {
+                Result::Error(error) => { c.pos = saved; return Result::Error(error); },
+                Result::Ok(bytes) => { return Result::Ok(bytes); },
+            };
+        },
+    };
+}
+
+/// Reads one vector prefix and returns a cursor bounded to the body.
+pub Result<Cursor, CodecError> Open(Cursor c, i64 prefixBytes, i64 min, i64 max) {
+    i64 saved = c.pos;
+    Result<i64, CodecError> length = ReadLength(c, prefixBytes, min, max);
+    match length {
+        Result::Error(error) => { c.pos = saved; return Result::Error(error); },
+        Result::Ok(n) => {
+            Result<Cursor, CodecError> inner = c.Sub(n);
+            match inner {
+                Result::Error(error) => { c.pos = saved; return Result::Error(error); },
+                Result::Ok(sub) => { return Result::Ok(sub); },
+            };
+        },
+    };
+}

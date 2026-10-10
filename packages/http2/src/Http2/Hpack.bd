@@ -1,0 +1,124 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Encoding.EncodingError;
+use Core.Results;
+use Core.String;
+use Http.Codec;
+use Http.Types;
+use Http.Types.Header;
+
+// HPACK (RFC 7541) shared types: header fields, typed errors and constants.
+// Every decoding failure except HeaderListTooLarge and TooManyFields is an
+// HTTP/2 COMPRESSION_ERROR (RFC 9113 section 4.3): the connection must close.
+
+/// Typed HPACK failures.
+pub enum HpackError {
+    /// The block ended inside an integer, string or representation.
+    Truncated(),
+    /// A prefix integer exceeds MaxInteger() or uses too many continuation octets.
+    IntegerOverflow(),
+    /// Index 0, or an index past the static plus dynamic table.
+    InvalidIndex(i64 index),
+    /// A string literal is longer than the configured limit.
+    StringTooLong(i64 length),
+    /// Huffman padding longer than 7 bits (RFC 7541 section 5.2).
+    HuffmanPaddingTooLong(),
+    /// Huffman padding that is not the most significant bits of EOS.
+    HuffmanInvalidPadding(),
+    /// The EOS symbol inside a Huffman string literal.
+    HuffmanEos(),
+    /// A dynamic table size update after the first field representation (section 4.2).
+    SizeUpdateNotAtStart(),
+    /// A dynamic table size update above SETTINGS_HEADER_TABLE_SIZE (section 6.3).
+    SizeUpdateExceedsLimit(i64 requested),
+    /// The settings limit was reduced but the next block did not start with a size update.
+    SizeUpdateMissing(),
+    /// The decoded header list exceeds the max header list size (stream error, table stays in sync).
+    HeaderListTooLarge(i64 size),
+    /// The decoded header list has more fields than allowed (stream error, table stays in sync).
+    TooManyFields(),
+    /// A field is not valid UTF-8 text and cannot become an `Http.Types.Header`.
+    InvalidText(),
+    /// The decoder failed earlier; its table state is unknown, so it rejects every block.
+    DecoderFailed(),
+    /// A negative or too large limit or table size was configured.
+    InvalidLimit(i64 value),
+}
+
+/// One header field as octets. `sensitive` marks never-indexed fields
+/// (section 7.1.3): the decoder sets it for never-indexed literals and the
+/// encoder then never indexes the field.
+pub type HeaderField { pub u8[] name, pub u8[] value, pub bool sensitive, }
+
+/// Size overhead of one dynamic table entry (section 4.1).
+pub i64 EntryOverhead() { return 32_i64; }
+/// Initial SETTINGS_HEADER_TABLE_SIZE (RFC 9113 section 6.5.2).
+pub i64 DefaultTableSize() { return 4096_i64; }
+/// Largest prefix integer accepted or produced (2^31 - 1).
+pub i64 MaxInteger() { return 2147483647_i64; }
+
+/// A field from text; the caller provides the lowercase name HTTP/2 requires.
+pub HeaderField Field(string name, string value) {
+    return HeaderField { name: Convert.StringToBytes(name), value: Convert.StringToBytes(value), sensitive: false };
+}
+/// A never-indexed field from text.
+pub HeaderField SensitiveField(string name, string value) {
+    return HeaderField { name: Convert.StringToBytes(name), value: Convert.StringToBytes(value), sensitive: true };
+}
+/// Entry size: name octets + value octets + 32 (section 4.1).
+pub i64 FieldSize(HeaderField field) { return Slice.Len(field.name) + Slice.Len(field.value) + EntryOverhead(); }
+
+/// Octet equality.
+pub bool BytesEqual(u8[] left, u8[] right) {
+    i64 count = Slice.Len(left);
+    if count != Slice.Len(right) { return false; }
+    mut i64 i = 0_i64;
+    while i < count { if left[i] != right[i] { return false; } i = i + 1_i64; }
+    return true;
+}
+/// A field's name equals the text `name`.
+/// Compares byte by byte without converting `name` (no allocation on the encode path).
+pub bool NameIs(HeaderField field, string name) {
+    i64 count = String.Len(name);
+    if count != Slice.Len(field.name) { return false; }
+    mut i64 i = 0_i64;
+    while i < count { if field.name[i] != String.ByteAt(name, i) { return false; } i = i + 1_i64; }
+    return true;
+}
+
+/// Converts a corelib HTTP header; HTTP/2 field names are lowercase (RFC 9113 section 8.2.1).
+pub HeaderField FromHttpHeader(Header header) { return Field(Codec.LowerAscii(header.name), header.value); }
+/// Converts corelib HTTP headers in order.
+pub HeaderField[] FromHttpHeaders(Header[] headers) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) { Array.Append<HeaderField>(out, FromHttpHeader(Array.Get<Header>(headers, i))); i = i + 1_i64; }
+    return out;
+}
+/// Converts a decoded field to a corelib HTTP header; non-UTF-8 octets are InvalidText.
+pub Result<Header,HpackError> ToHttpHeader(HeaderField field) {
+    Result<string,EncodingError> name = Convert.BytesToString(field.name);
+    Result<string,EncodingError> value = Convert.BytesToString(field.value);
+    return match name {
+        Result::Error(_) => Result::Error(HpackError::InvalidText),
+        Result::Ok(nameText) => match value {
+            Result::Error(_) => Result::Error(HpackError::InvalidText),
+            Result::Ok(valueText) => Result::Ok(Header { name: nameText, value: valueText }),
+        },
+    };
+}
+/// Converts decoded fields to corelib HTTP headers in order.
+pub Result<Header[],HpackError> ToHttpHeaders(HeaderField[] fields) {
+    mut Header[] out = Array.Empty<Header>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        Result<Header,HpackError> converted = ToHttpHeader(Array.Get<HeaderField>(fields, i));
+        match converted {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(header) => { Array.Append<Header>(out, header); },
+        };
+        i = i + 1_i64;
+    }
+    return Result::Ok(out);
+}

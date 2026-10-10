@@ -1,0 +1,118 @@
+// Flow-control credit under loss, in memory with a simulated clock (WEB7).
+// RFC 9000 section 13.3: a lost MAX_DATA or MAX_STREAM_DATA is sent again with the current
+// limit. RFC 9002 section 6.2: a PTO sends an ack-eliciting probe, so a lost credit frame
+// that is the last packet in flight is still recovered. The receiver below loses the first
+// copy of every credit update it sends; the sender must not stall.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Quic.QuicConfig;
+use Quic.QuicConnection;
+use Quic.QuicPacket;
+use Quic.QuicWire;
+
+// Moves the datagrams `from` has to send into `to`. With `dropAll` every datagram is lost;
+// otherwise each `dropEvery`-th datagram (counted in counter[0]) is lost (0 = none).
+// Returns how many datagrams were built.
+i64 Pump(Connection from, Connection to, i64 now, bool dropAll, i64 dropEvery, i64[] counter) {
+    mut i64 moved = 0_i64;
+    mut i64 length = QuicConnection.BuildDatagram(from, now);
+    while length > 0_i64 && moved < 64_i64 {
+        counter[0] = counter[0] + 1_i64;
+        bool lost = dropAll || (dropEvery > 0_i64 && counter[0] % dropEvery == 0_i64);
+        if lost { counter[1] = counter[1] + 1_i64; } else {
+            QuicConnection.OnDatagram(to, QuicWire.CopyOf(from.out, 0_i64, length), length, now);
+        }
+        moved = moved + 1_i64;
+        length = QuicConnection.BuildDatagram(from, now);
+    }
+    return moved;
+}
+
+i64 Earliest(Connection a, Connection b, i64 now) {
+    i64 x = QuicConnection.NextTimeout(a, now);
+    i64 y = QuicConnection.NextTimeout(b, now);
+    if x < 0_i64 { return y; }
+    if y < 0_i64 || x < y { return x; }
+    return y;
+}
+
+i64 TotalBytes() { return 100000_i64; }
+
+u8 PatternAt(i64 i) { return u8((i * 7_i64 + 3_i64) & 255_i64); }
+
+test lost_credit_frames_do_not_stall_the_sender {
+    // 8 KiB stream windows and a 64 KiB connection window: 100 KB needs both
+    // MAX_STREAM_DATA and MAX_DATA updates.
+    QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(["h3"], 0_i64);
+    mut i64 now = 1000000000_i64;
+    i64 start = now;
+    Connection client = QuicConnection.NewClient(cfg, now);
+    i64 first = QuicConnection.BuildDatagram(client, now);
+    Header h = QuicPacket.ParseHeader(client.out, 0_i64, first, 0_i64);
+    Connection server = QuicConnection.NewServer(cfg, h.dcid, h.scid, h.dcid, Slice.New(0_i64), now);
+    QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, first), first, now);
+    i64[] cs = [0_i64, 0_i64];
+    i64[] sc = [0_i64, 0_i64];
+    mut i64 r = 0_i64;
+    while r < 20_i64 {
+        now = now + 1000000_i64;
+        Pump(server, client, now, false, 0_i64, sc);
+        Pump(client, server, now, false, 0_i64, cs);
+        r = r + 1_i64;
+    }
+    Assert.True(QuicConnection.IsHandshakeConfirmed(client), "handshake confirmed");
+    i64 id = QuicConnection.OpenStream(client, true);
+    Assert.True(id >= 0_i64, "stream opened");
+    u8[] chunk = Slice.New(1500_i64);
+    u8[] sink = Slice.New(4096_i64);
+    mut i64 written = 0_i64;
+    mut i64 received = 0_i64;
+    mut i64 sid = -1_i64;
+    mut bool ordered = true;
+    mut bool dropCredit = false;
+    mut i64 guard = 0_i64;
+    while received < TotalBytes() && guard < 20000_i64 && now - start < 60000000000_i64 {
+        mut i64 progress = 0_i64;
+        if written < TotalBytes() {
+            mut i64 want = TotalBytes() - written;
+            if want > 1500_i64 { want = 1500_i64; }
+            mut i64 k = 0_i64;
+            while k < want { chunk[k] = PatternAt(written + k); k = k + 1_i64; }
+            i64 n = QuicConnection.StreamWrite(client, id, chunk, 0_i64, want);
+            if n > 0_i64 { written = written + n; progress = progress + n; }
+            if written == TotalBytes() { QuicConnection.StreamFinish(client, id); }
+        }
+        // Every 7th client datagram is lost as well (data and ACKs).
+        progress = progress + Pump(client, server, now, false, 7_i64, cs);
+        if sid < 0_i64 { sid = QuicConnection.AcceptStream(server); }
+        if sid >= 0_i64 {
+            i64 got = QuicConnection.StreamRead(server, sid, sink, 0_i64, 4096_i64);
+            mut i64 j = 0_i64;
+            while j < got {
+                if sink[j] != PatternAt(received + j) { ordered = false; }
+                j = j + 1_i64;
+            }
+            if got > 0_i64 { received = received + got; progress = progress + got; dropCredit = true; }
+        }
+        // The first flight after each read carries the credit update: it is lost.
+        i64 out = Pump(server, client, now, dropCredit, 0_i64, sc);
+        if out > 0_i64 { dropCredit = false; }
+        progress = progress + out;
+        if progress == 0_i64 {
+            i64 t = Earliest(client, server, now);
+            if t > now { now = t; }
+        } else {
+            now = now + 1000000_i64;
+        }
+        QuicConnection.OnTimeout(client, now);
+        QuicConnection.OnTimeout(server, now);
+        guard = guard + 1_i64;
+    }
+    Assert.Equal<i64>(received, TotalBytes(), "all bytes delivered despite lost credit frames");
+    Assert.True(ordered, "bytes in order");
+    Assert.True(sc[1] > 0_i64 && cs[1] > 0_i64, "datagrams were lost in both directions");
+    // Each lost credit update costs about one probe timeout; 100 KB must not take
+    // anywhere near the 10 s HTTP/3 write timeout of simulated time.
+    i64 elapsedMillis = (now - start) / 1000000_i64;
+    Assert.True(elapsedMillis < 5000_i64, "transfer finished in bounded simulated time");
+}

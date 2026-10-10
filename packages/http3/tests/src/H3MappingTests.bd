@@ -1,0 +1,119 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Core.Results;
+use Http.Types;
+use Http2.Hpack;
+use Http3.H3Errors;
+use Http3.H3Mapping;
+
+// RFC 9114 section 4: request/response mapping and field validation.
+
+unit ExpectField(HeaderField[] fields, i64 index, string name, string value) {
+    HeaderField field = Array.Get<HeaderField>(fields, index);
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)), "name " + name);
+    Assert.True(Hpack.BytesEqual(field.value, Convert.StringToBytes(value)), "value of " + name);
+    return;
+}
+
+HeaderField[] Fields(string a, string av, string b, string bv) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(out, Hpack.Field(a, av));
+    Array.Append<HeaderField>(out, Hpack.Field(b, bv));
+    return out;
+}
+
+HeaderField[] Get(string authority) {
+    mut HeaderField[] out = Fields(":method", "GET", ":scheme", "https");
+    Array.Append<HeaderField>(out, Hpack.Field(":authority", authority));
+    Array.Append<HeaderField>(out, Hpack.Field(":path", "/"));
+    return out;
+}
+
+test h3_request_mapping {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.com" });
+    Array.Append<Header>(headers, Header { name: "Connection", value: "keep-alive" });
+    Array.Append<Header>(headers, Header { name: "X-Test", value: "1" });
+    Request request = Request { method: "POST", target: "/submit?q=1", headers: headers, body: Convert.StringToBytes("data") };
+    Result<HeaderField[],H3Error> mapped = H3Mapping.RequestFields(request, "https");
+    match mapped {
+        Result::Error(_) => { Assert.Fail("request maps"); },
+        Result::Ok(fields) => {
+            Assert.Equal<i64>(Array.Len<HeaderField>(fields), 6_i64, "four pseudo-headers, x-test, content-length");
+            ExpectField(fields, 0_i64, ":method", "POST");
+            ExpectField(fields, 1_i64, ":scheme", "https");
+            ExpectField(fields, 2_i64, ":authority", "example.com");
+            ExpectField(fields, 3_i64, ":path", "/submit?q=1");
+            ExpectField(fields, 4_i64, "x-test", "1");
+            ExpectField(fields, 5_i64, "content-length", "4");
+            Result<Request,H3Error> back = H3Mapping.RequestFromFields(fields, Convert.StringToBytes("data"));
+            match back {
+                Result::Error(_) => { Assert.Fail("request maps back"); },
+                Result::Ok(parsed) => {
+                    Assert.Equal<string>(parsed.method, "POST", "method");
+                    Assert.Equal<string>(parsed.target, "/submit?q=1", "target");
+                    Header hostHeader = Array.Get<Header>(parsed.headers, 0_i64);
+                    Assert.Equal<string>(hostHeader.value, "example.com", "authority becomes host");
+                },
+            };
+        },
+    };
+    Request absolute = Types.EmptyRequest("GET", "http://example.org:8080/a");
+    Result<HeaderField[],H3Error> abs = H3Mapping.RequestFields(absolute, "https");
+    match abs {
+        Result::Error(_) => { Assert.Fail("absolute target maps"); },
+        Result::Ok(fields) => {
+            ExpectField(fields, 1_i64, ":scheme", "http");
+            ExpectField(fields, 2_i64, ":authority", "example.org:8080");
+            ExpectField(fields, 3_i64, ":path", "/a");
+        },
+    };
+}
+
+test h3_request_validation {
+    i64 bad = H3Errors.MessageError();
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(Get("example.com")), 0_i64, "valid GET");
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(Get("")), bad, "https without authority");
+    mut HeaderField[] upper = Get("a");
+    Array.Append<HeaderField>(upper, Hpack.Field("X-Upper", "1"));
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(upper), bad, "uppercase name");
+    mut HeaderField[] conn = Get("a");
+    Array.Append<HeaderField>(conn, Hpack.Field("connection", "close"));
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(conn), bad, "connection-specific field");
+    mut HeaderField[] te = Get("a");
+    Array.Append<HeaderField>(te, Hpack.Field("te", "gzip"));
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(te), bad, "te other than trailers");
+    mut HeaderField[] late = Fields(":method", "GET", "accept", "*/*");
+    Array.Append<HeaderField>(late, Hpack.Field(":scheme", "https"));
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(late), bad, "pseudo-header after a regular field");
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(Fields(":method", "GET", ":scheme", "https")), bad, "missing :path");
+    mut HeaderField[] mismatch = Get("a.example");
+    Array.Append<HeaderField>(mismatch, Hpack.Field("host", "b.example"));
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(mismatch), bad, ":authority and host differ");
+    mut HeaderField[] unknown = Get("a");
+    Array.Append<HeaderField>(unknown, Hpack.Field(":protocol", "x"));
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(unknown), bad, "unknown pseudo-header");
+    Assert.Equal<i64>(H3Mapping.ValidateRequest(Fields(":method", "CONNECT", ":authority", "proxy:443")), 0_i64, "CONNECT");
+}
+
+test h3_response_validation_and_mapping {
+    i64 bad = H3Errors.MessageError();
+    Assert.Equal<i64>(H3Mapping.ValidateResponse(Fields(":status", "200", "server", "x")), 0_i64, "valid response");
+    Assert.Equal<i64>(H3Mapping.ValidateResponse(Fields("server", "x", "date", "y")), bad, "missing :status");
+    Assert.Equal<i64>(H3Mapping.ValidateResponse(Fields(":status", "2000", "server", "x")), bad, "bad status");
+    Assert.Equal<i64>(H3Mapping.ValidateResponse(Fields(":status", "200", ":path", "/")), bad, "request pseudo-header");
+    Assert.Equal<i64>(H3Mapping.ValidateTrailers(Fields("checksum", "1", ":status", "200")), bad, "pseudo-header in trailers");
+    Assert.Equal<i64>(H3Mapping.ContentLength(Fields("content-length", "5", "content-length", "6")), -2_i64, "conflicting content-length");
+    Response response = Types.EmptyResponse(204_i64, "No Content");
+    Result<HeaderField[],H3Error> mapped = H3Mapping.ResponseFields(response);
+    match mapped {
+        Result::Error(_) => { Assert.Fail("response maps"); },
+        Result::Ok(fields) => { ExpectField(fields, 0_i64, ":status", "204"); },
+    };
+    Result<HeaderField[],H3Error> interim = H3Mapping.ResponseFields(Types.EmptyResponse(100_i64, "Continue"));
+    match interim {
+        Result::Ok(_) => { Assert.Fail("interim responses are not sent through Respond"); },
+        Result::Error(_) => (),
+    };
+}

@@ -1,0 +1,102 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.Errors;
+use Crypto.Hkdf;
+use Crypto.Hmac;
+use Tls.Suites;
+use Codec.Mem;
+
+// TLS 1.3 key schedule (RFC 8446 section 7.1). Every function is pure: inputs are
+// secrets and transcript hashes, outputs are fresh arrays. Labels are fixed and short,
+// so HKDF-Expand-Label cannot fail on lengths; a failure yields an empty array, which
+// every consumer (AEAD key setup, HMAC compare) rejects, so the schedule fails closed.
+
+u8[] Ok(Result<u8[], CryptoError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
+}
+
+pub u8[] Zeros(i64 n) { return Mem.Zeroed(n); }
+
+/// Transcript-Hash of no messages.
+pub u8[] EmptyHash(HashAlgorithm h) { return Hmac.Digest(h, Slice.New(0_i64)); }
+
+/// HKDF-Expand-Label(secret, label, context, length).
+pub u8[] ExpandLabel(HashAlgorithm h, u8[] secret, string label, u8[] context, i64 length) {
+    return Ok(Hkdf.ExpandLabel(h, secret, label, context, length));
+}
+
+/// Derive-Secret(secret, label, messages) with the transcript hash already computed.
+pub u8[] DeriveSecret(HashAlgorithm h, u8[] secret, string label, u8[] transcriptHash) {
+    return Ok(Hkdf.DeriveSecret(h, secret, label, transcriptHash));
+}
+
+/// Early Secret = HKDF-Extract(0, PSK or 0^HashLen). No PSK support: IKM is zeros.
+pub u8[] EarlySecret(HashAlgorithm h) {
+    i64 n = Hmac.HashLength(h);
+    return Hkdf.Extract(h, Zeros(n), Zeros(n));
+}
+
+/// Handshake Secret = HKDF-Extract(Derive-Secret(early, "derived", ""), (EC)DHE).
+pub u8[] HandshakeSecret(HashAlgorithm h, u8[] earlySecret, u8[] sharedSecret) {
+    u8[] salt = DeriveSecret(h, earlySecret, "derived", EmptyHash(h));
+    return Hkdf.Extract(h, salt, sharedSecret);
+}
+
+/// Master Secret = HKDF-Extract(Derive-Secret(handshake, "derived", ""), 0).
+pub u8[] MasterSecret(HashAlgorithm h, u8[] handshakeSecret) {
+    u8[] salt = DeriveSecret(h, handshakeSecret, "derived", EmptyHash(h));
+    return Hkdf.Extract(h, salt, Zeros(Hmac.HashLength(h)));
+}
+
+pub u8[] ClientHandshakeTraffic(HashAlgorithm h, u8[] hs, u8[] th) { return DeriveSecret(h, hs, "c hs traffic", th); }
+pub u8[] ServerHandshakeTraffic(HashAlgorithm h, u8[] hs, u8[] th) { return DeriveSecret(h, hs, "s hs traffic", th); }
+pub u8[] ClientApplicationTraffic(HashAlgorithm h, u8[] ms, u8[] th) { return DeriveSecret(h, ms, "c ap traffic", th); }
+pub u8[] ServerApplicationTraffic(HashAlgorithm h, u8[] ms, u8[] th) { return DeriveSecret(h, ms, "s ap traffic", th); }
+pub u8[] ExporterMaster(HashAlgorithm h, u8[] ms, u8[] th) { return DeriveSecret(h, ms, "exp master", th); }
+pub u8[] ResumptionMaster(HashAlgorithm h, u8[] ms, u8[] th) { return DeriveSecret(h, ms, "res master", th); }
+
+/// application_traffic_secret_N+1 = HKDF-Expand-Label(secret_N, "traffic upd", "", Hash.length).
+pub u8[] NextTrafficSecret(HashAlgorithm h, u8[] secret) {
+    return ExpandLabel(h, secret, "traffic upd", Slice.New(0_i64), Hmac.HashLength(h));
+}
+
+/// [sender]_write_key for `suite` from a traffic secret.
+pub u8[] TrafficKey(CipherSuite suite, u8[] secret) {
+    return ExpandLabel(Suites.Hash(suite), secret, "key", Slice.New(0_i64), Suites.KeyLength(suite));
+}
+
+/// [sender]_write_iv for `suite` from a traffic secret.
+pub u8[] TrafficIv(CipherSuite suite, u8[] secret) {
+    return ExpandLabel(Suites.Hash(suite), secret, "iv", Slice.New(0_i64), 12_i64);
+}
+
+/// finished_key = HKDF-Expand-Label(BaseKey, "finished", "", Hash.length).
+pub u8[] FinishedKey(HashAlgorithm h, u8[] baseKey) {
+    return ExpandLabel(h, baseKey, "finished", Slice.New(0_i64), Hmac.HashLength(h));
+}
+
+/// verify_data = HMAC(finished_key, Transcript-Hash(Handshake Context, Certificate*, CertificateVerify*)).
+pub u8[] FinishedVerifyData(HashAlgorithm h, u8[] baseKey, u8[] transcriptHash) {
+    return Hmac.Compute(h, FinishedKey(h, baseKey), transcriptHash);
+}
+
+/// TLS-Exporter(label, context, length) (RFC 8446 section 7.5).
+pub u8[] Export(HashAlgorithm h, u8[] exporterMaster, string label, u8[] context, i64 length) {
+    u8[] secret = DeriveSecret(h, exporterMaster, label, EmptyHash(h));
+    return ExpandLabel(h, secret, "exporter", Hmac.Digest(h, context), length);
+}
+
+/// QUIC packet protection keys (RFC 9001 section 5.1): "quic key", "quic iv", "quic hp", "quic ku".
+pub u8[] QuicKey(CipherSuite suite, u8[] secret) {
+    return ExpandLabel(Suites.Hash(suite), secret, "quic key", Slice.New(0_i64), Suites.KeyLength(suite));
+}
+pub u8[] QuicIv(CipherSuite suite, u8[] secret) {
+    return ExpandLabel(Suites.Hash(suite), secret, "quic iv", Slice.New(0_i64), 12_i64);
+}
+pub u8[] QuicHeaderProtectionKey(CipherSuite suite, u8[] secret) {
+    return ExpandLabel(Suites.Hash(suite), secret, "quic hp", Slice.New(0_i64), Suites.KeyLength(suite));
+}
+pub u8[] QuicNextSecret(CipherSuite suite, u8[] secret) {
+    HashAlgorithm h = Suites.Hash(suite);
+    return ExpandLabel(h, secret, "quic ku", Slice.New(0_i64), Hmac.HashLength(h));
+}

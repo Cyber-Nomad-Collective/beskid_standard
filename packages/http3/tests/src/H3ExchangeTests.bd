@@ -1,0 +1,144 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http.Types;
+use Http2.Hpack;
+use Http3.H3Client;
+use Http3.H3Connection;
+use Http3.H3Errors;
+use Http3.H3Quic;
+use Http3.H3Server;
+use Http3.QpackDecoder;
+use Http3.QpackEncoder;
+use Http3.QpackTable;
+
+// Client and server over the in-memory QUIC link.
+
+Request Get(string path) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.com" });
+    return Request { method: "GET", target: path, headers: headers, body: Slice.New(0_i64) };
+}
+
+i64 StartOk(mut H3Conn client, Request request) {
+    Result<i64,H3Error> started = H3Client.Start(client, request);
+    return match started {
+        Result::Ok(id) => id,
+        Result::Error(_) => -1_i64,
+    };
+}
+
+unit RespondOk(mut H3Conn server, i64 id, string text) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Content-Type", value: "text/plain" });
+    Response response = Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes(text) };
+    Result<unit,H3Error> sent = H3Server.Respond(server, id, response);
+    match sent {
+        Result::Ok(_) => (),
+        Result::Error(_) => { Assert.Fail("respond"); },
+    };
+    return;
+}
+
+H3Config Config(bool dynamic) {
+    H3Config base = H3Connection.DefaultConfig();
+    if !dynamic { return base; }
+    return H3Config { maxTableCapacity: 4096_i64, blockedStreams: 16_i64, maxFieldSectionSize: 16384_i64, maxBodyBytes: 65536_i64, policy: QpackEncoder.DynamicPolicy(4096_i64), scheme: "https" };
+}
+
+test h3_get_exchange_in_memory {
+    QuicLink[] pair = H3Quic.NewPair();
+    mut H3Conn client = H3Client.Connect(Array.Get<QuicLink>(pair, 0_i64), Config(false));
+    mut H3Conn server = H3Server.Accept(Array.Get<QuicLink>(pair, 1_i64), Config(false));
+    i64 id = StartOk(client, Get("/hello"));
+    Assert.Equal<i64>(id, 0_i64, "first client bidirectional stream");
+    H3Incoming incoming = H3Server.Next(server);
+    Assert.Equal<i64>(incoming.streamId, 0_i64, "request arrives");
+    Request request = incoming.request;
+    Assert.Equal<string>(request.method, "GET", "method");
+    Assert.Equal<string>(request.target, "/hello", "target");
+    Header hostHeader = Array.Get<Header>(request.headers, 0_i64);
+    Assert.Equal<string>(hostHeader.value, "example.com", "host from :authority");
+    Assert.True(H3Connection.PeerSettingsReceived(server), "server saw client SETTINGS");
+    H3Incoming none = H3Server.Next(server);
+    Assert.Equal<i64>(none.streamId, -1_i64, "delivered once");
+    RespondOk(server, id, "hello");
+    H3Outcome outcome = H3Client.Poll(client, id);
+    Assert.Equal<i64>(outcome.state, H3Client.Ready(), "response ready");
+    Response response = outcome.response;
+    Assert.Equal<i64>(response.status, 200_i64, "status");
+    Assert.Equal<string>(response.reason, "OK", "default reason phrase");
+    Assert.True(Hpack.BytesEqual(response.body, Convert.StringToBytes("hello")), "body");
+    Assert.True(H3Connection.PeerSettingsReceived(client), "client saw server SETTINGS");
+    Assert.Equal<i64>(H3Connection.ErrorCode(client), -1_i64, "client healthy");
+    Assert.Equal<i64>(H3Connection.ErrorCode(server), -1_i64, "server healthy");
+}
+
+test h3_post_dynamic_qpack_and_trailers {
+    QuicLink[] pair = H3Quic.NewPair();
+    mut H3Conn client = H3Client.Connect(Array.Get<QuicLink>(pair, 0_i64), Config(true));
+    mut H3Conn server = H3Server.Accept(Array.Get<QuicLink>(pair, 1_i64), Config(true));
+    u8[] body = Slice.New(20000_i64);
+    body[19999] = 7_u8;
+    mut i64 round = 0_i64;
+    while round < 3_i64 {
+        mut Header[] headers = Array.Empty<Header>();
+        Array.Append<Header>(headers, Header { name: "Host", value: "example.com" });
+        Array.Append<Header>(headers, Header { name: "X-Custom-Token", value: "abcdefghijklmnop" });
+        Request post = Request { method: "POST", target: "/upload", headers: headers, body: body };
+        i64 id = StartOk(client, post);
+        Assert.Equal<i64>(id, round * 4_i64, "request stream id");
+        H3Incoming incoming = H3Server.Next(server);
+        Assert.Equal<i64>(incoming.streamId, id, "request arrives");
+        Request request = incoming.request;
+        Assert.Equal<i64>(Slice.Len(request.body), 20000_i64, "body spans two DATA frames");
+        Assert.Equal<i64>(i64(request.body[19999]), 7_i64, "body content");
+        mut HeaderField[] trailers = Array.Empty<HeaderField>();
+        Array.Append<HeaderField>(trailers, Hpack.Field("x-checksum", "42"));
+        Response response = Types.EmptyResponse(201_i64, "Created");
+        Result<unit,H3Error> sent = H3Server.RespondWithTrailers(server, id, response, trailers);
+        H3Outcome outcome = H3Client.Poll(client, id);
+        Assert.Equal<i64>(outcome.state, H3Client.Ready(), "response ready");
+        Response got = outcome.response;
+        Assert.Equal<i64>(got.status, 201_i64, "status");
+        HeaderField[] received = H3Client.Trailers(client, id);
+        Assert.Equal<i64>(Array.Len<HeaderField>(received), 1_i64, "trailers");
+        round = round + 1_i64;
+    }
+    QDecoder serverDecoder = server.decoder;
+    Assert.True(QpackTable.InsertCount(serverDecoder.table) > 0_i64, "client encoder used the dynamic table");
+    QEncoder clientEncoder = client.encoder;
+    Assert.True(QpackEncoder.KnownReceived(clientEncoder) > 0_i64, "inserts acknowledged");
+    Assert.Equal<i64>(H3Connection.ErrorCode(client), -1_i64, "client healthy");
+    Assert.Equal<i64>(H3Connection.ErrorCode(server), -1_i64, "server healthy");
+}
+
+test h3_goaway_graceful_shutdown {
+    QuicLink[] pair = H3Quic.NewPair();
+    mut H3Conn client = H3Client.Connect(Array.Get<QuicLink>(pair, 0_i64), Config(false));
+    mut H3Conn server = H3Server.Accept(Array.Get<QuicLink>(pair, 1_i64), Config(false));
+    i64 first = StartOk(client, Get("/a"));
+    H3Incoming incoming = H3Server.Next(server);
+    Assert.Equal<i64>(incoming.streamId, first, "first request accepted");
+    Assert.True(H3Server.Shutdown(server), "GOAWAY sent");
+    i64 second = StartOk(client, Get("/b"));
+    Assert.Equal<i64>(second, 4_i64, "second request raced the GOAWAY");
+    RespondOk(server, first, "a");
+    H3Incoming rejected = H3Server.Next(server);
+    Assert.Equal<i64>(rejected.streamId, -1_i64, "request above the GOAWAY id is not delivered");
+    H3Outcome done = H3Client.Poll(client, first);
+    Assert.Equal<i64>(done.state, H3Client.Ready(), "accepted request completes");
+    Assert.Equal<i64>(H3Connection.GoawayReceived(client), 4_i64, "GOAWAY id");
+    H3Outcome retry = H3Client.Poll(client, second);
+    Assert.Equal<i64>(retry.state, H3Client.Failed(), "raced request fails");
+    Assert.Equal<i64>(H3Errors.CodeOf(retry.error), H3Errors.RequestRejected(), "safe to retry");
+    Result<i64,H3Error> refused = H3Client.Start(client, Get("/c"));
+    match refused {
+        Result::Ok(_) => { Assert.Fail("no new requests after GOAWAY"); },
+        Result::Error(error) => { Assert.Equal<i64>(H3Errors.CodeOf(error), H3Errors.RequestRejected(), "going away"); },
+    };
+    H3Client.Close(client);
+    Assert.Equal<i64>(H3Quic.CloseCode(Array.Get<QuicLink>(pair, 1_i64)), H3Errors.NoError(), "closed with H3_NO_ERROR");
+}

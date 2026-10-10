@@ -1,0 +1,69 @@
+use Testing.Assert;
+use Core.Results;
+use Codec.Cursor;
+use Codec.Errors;
+use Codec.Hex;
+use Codec.Vec;
+
+i64 Err<T>(Result<T, CodecError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }; }
+string Body(Result<u8[], CodecError> r) { return match r { Result::Ok(b) => Hex.Encode(b), Result::Error(_) => "ERR", }; }
+
+test read_vec8_vec16_vec24 {
+    Cursor c = Cursor.New(Hex.Of("03 aabbcc 0002 dead 000001 ff"));
+    Assert.Equal<string>(Body(Vec.Read(c, 1_i64, 0_i64, 255_i64)), "aabbcc", "vec8");
+    Assert.Equal<string>(Body(Vec.Read(c, 2_i64, 0_i64, 65535_i64)), "dead", "vec16");
+    Assert.Equal<string>(Body(Vec.Read(c, 3_i64, 1_i64, 16777215_i64)), "ff", "vec24");
+    Assert.True(c.IsEnd(), "consumed");
+}
+
+test empty_vector_allowed_when_min_zero {
+    Cursor c = Cursor.New(Hex.Of("00"));
+    Assert.Equal<string>(Body(Vec.Read(c, 1_i64, 0_i64, 4_i64)), "", "empty body");
+    Assert.True(c.IsEnd(), "consumed");
+}
+
+test min_max_enforced_and_position_restored {
+    Cursor c = Cursor.New(Hex.Of("05 0102030405"));
+    Assert.Equal<i64>(Err(Vec.Read(c, 1_i64, 0_i64, 4_i64)), 4_i64, "above max");
+    Assert.Equal<i64>(c.Position(), 0_i64, "restored after max");
+    Assert.Equal<i64>(Err(Vec.Read(c, 1_i64, 6_i64, 9_i64)), 4_i64, "below min");
+    Assert.Equal<i64>(c.Position(), 0_i64, "restored after min");
+    Assert.Equal<string>(Body(Vec.Read(c, 1_i64, 5_i64, 5_i64)), "0102030405", "exact bound");
+}
+
+test truncated_prefix_and_body {
+    Cursor a = Cursor.New(Hex.Of("00"));
+    Assert.Equal<i64>(Err(Vec.Read(a, 2_i64, 0_i64, 10_i64)), 1_i64, "cut prefix");
+    Assert.Equal<i64>(a.Position(), 0_i64, "prefix restored");
+    Cursor b = Cursor.New(Hex.Of("04 010203"));
+    Assert.Equal<i64>(Err(Vec.Read(b, 1_i64, 0_i64, 10_i64)), 1_i64, "cut body");
+    Assert.Equal<i64>(b.Position(), 0_i64, "body restored");
+}
+
+test bad_arguments {
+    Cursor c = Cursor.New(Hex.Of("00 00 00 00 00"));
+    Assert.Equal<i64>(Err(Vec.Read(c, 0_i64, 0_i64, 1_i64)), 6_i64, "prefix 0");
+    Assert.Equal<i64>(Err(Vec.Read(c, 5_i64, 0_i64, 1_i64)), 6_i64, "prefix 5");
+    Assert.Equal<i64>(Err(Vec.Read(c, 1_i64, 5_i64, 1_i64)), 6_i64, "max < min");
+    Assert.Equal<i64>(Err(Vec.Read(c, 1_i64, -1_i64, 1_i64)), 6_i64, "negative min");
+}
+
+test open_gives_bounded_subcursor {
+    Cursor c = Cursor.New(Hex.Of("0004 0001 0002 ee"));
+    Result<Cursor, CodecError> r = Vec.Open(c, 2_i64, 0_i64, 100_i64);
+    match r {
+        Result::Error(_) => { Assert.Fail("open"); },
+        Result::Ok(inner) => {
+            Result<i64, CodecError> a = inner.U16();
+            Result<i64, CodecError> b = inner.U16();
+            Assert.Equal<i64>(Err(a), 0_i64, "a");
+            Assert.Equal<i64>(Err(b), 0_i64, "b");
+            Assert.True(inner.IsEnd(), "inner end");
+            Assert.Equal<i64>(Err(inner.U8()), 1_i64, "cannot escape");
+        },
+    };
+    Assert.Equal<i64>(c.Remaining(), 1_i64, "parent after vector");
+    Cursor d = Cursor.New(Hex.Of("0009 01"));
+    Assert.Equal<i64>(Err(Vec.Open(d, 2_i64, 0_i64, 100_i64)), 1_i64, "open truncated");
+    Assert.Equal<i64>(d.Position(), 0_i64, "open restored");
+}

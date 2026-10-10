@@ -1,0 +1,182 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use WebSocket.WsErrors;
+use WebSocket.WsFrame;
+
+u8[] Hello() { return [0x48_u8, 0x65_u8, 0x6c_u8, 0x6c_u8, 0x6f_u8]; }
+u8[] Key() { return [0x37_u8, 0xfa_u8, 0x21_u8, 0x3d_u8]; }
+u8[] NoKey() { return Slice.New(0_i64); }
+bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
+
+u8[] Enc(bool fin, i64 op, u8[] payload, u8[] key) {
+    return match WsFrame.EncodeFrame(fin, op, payload, 0_i64, Slice.Len(payload), key) {
+        Result::Ok(bytes) => bytes,
+        Result::Error(_) => Slice.New(0_i64),
+    };
+}
+
+FrameHeader Dec(u8[] bytes) {
+    return match WsFrame.DecodeHeader(bytes, 0_i64, Slice.Len(bytes)) {
+        Result::Ok(h) => h,
+        Result::Error(_) => FrameHeader { fin: false, rsv: -1_i64, opcode: -1_i64, masked: false, maskKey: Slice.New(0_i64), payloadLength: -1_i64, headerLength: -1_i64 },
+    };
+}
+
+// Error code and detail of a header decode, 0 when it decodes.
+i64 DecErr(u8[] bytes) {
+    return match WsFrame.DecodeHeader(bytes, 0_i64, Slice.Len(bytes)) {
+        Result::Ok(_) => 0_i64,
+        Result::Error(e) => WsErrors.Code(e) * 100_i64 + WsErrors.Detail(e),
+    };
+}
+
+i64 Proto(i64 reason) { return 1000_i64 + reason; }
+
+// RFC 6455 section 5.7 examples, byte-exact.
+test rfc_unmasked_text_hello {
+    Assert.True(Same(Enc(true, 1_i64, Hello(), NoKey()), [0x81_u8, 0x05_u8, 0x48_u8, 0x65_u8, 0x6c_u8, 0x6c_u8, 0x6f_u8]), "unmasked Hello");
+    FrameHeader h = Dec([0x81_u8, 0x05_u8, 0x48_u8]);
+    Assert.True(h.fin, "fin");
+    Assert.Equal<i64>(h.opcode, 1_i64, "text");
+    Assert.Equal<i64>(h.payloadLength, 5_i64, "len");
+    Assert.Equal<i64>(h.headerLength, 2_i64, "hlen");
+    Assert.False(h.masked, "unmasked");
+}
+
+test rfc_masked_text_hello {
+    u8[] wire = [0x81_u8, 0x85_u8, 0x37_u8, 0xfa_u8, 0x21_u8, 0x3d_u8, 0x7f_u8, 0x9f_u8, 0x4d_u8, 0x51_u8, 0x58_u8];
+    Assert.True(Same(Enc(true, 1_i64, Hello(), Key()), wire), "masked Hello");
+    FrameHeader h = Dec(wire);
+    Assert.True(h.masked, "masked");
+    Assert.Equal<i64>(h.headerLength, 6_i64, "hlen");
+    Assert.True(Same(h.maskKey, Key()), "key");
+    u8[] body = Slice.SubSlice(wire, 6_i64, 5_i64);
+    WsFrame.ApplyMask(body, 0_i64, 5_i64, h.maskKey, 0_i64);
+    Assert.True(Same(body, Hello()), "unmasks to Hello");
+}
+
+test rfc_fragmented_unmasked_text {
+    Assert.True(Same(Enc(false, 1_i64, [0x48_u8, 0x65_u8, 0x6c_u8], NoKey()), [0x01_u8, 0x03_u8, 0x48_u8, 0x65_u8, 0x6c_u8]), "first fragment");
+    Assert.True(Same(Enc(true, 0_i64, [0x6c_u8, 0x6f_u8], NoKey()), [0x80_u8, 0x02_u8, 0x6c_u8, 0x6f_u8]), "last fragment");
+    FrameHeader first = Dec([0x01_u8, 0x03_u8]);
+    Assert.False(first.fin, "not fin");
+    FrameHeader last = Dec([0x80_u8, 0x02_u8]);
+    Assert.Equal<i64>(last.opcode, 0_i64, "continuation");
+}
+
+test rfc_ping_and_masked_pong {
+    Assert.True(Same(Enc(true, 9_i64, Hello(), NoKey()), [0x89_u8, 0x05_u8, 0x48_u8, 0x65_u8, 0x6c_u8, 0x6c_u8, 0x6f_u8]), "ping");
+    Assert.True(Same(Enc(true, 10_i64, Hello(), Key()), [0x8a_u8, 0x85_u8, 0x37_u8, 0xfa_u8, 0x21_u8, 0x3d_u8, 0x7f_u8, 0x9f_u8, 0x4d_u8, 0x51_u8, 0x58_u8]), "masked pong");
+}
+
+test rfc_256_byte_binary {
+    u8[] payload = Slice.New(256_i64);
+    u8[] wire = Enc(true, 2_i64, payload, NoKey());
+    Assert.Equal<i64>(Slice.Len(wire), 260_i64, "4-byte header");
+    Assert.True(Same(Slice.SubSlice(wire, 0_i64, 4_i64), [0x82_u8, 0x7E_u8, 0x01_u8, 0x00_u8]), "16-bit length");
+    FrameHeader h = Dec(wire);
+    Assert.Equal<i64>(h.payloadLength, 256_i64, "len 256");
+    Assert.Equal<i64>(h.headerLength, 4_i64, "hlen");
+}
+
+test rfc_64k_binary {
+    u8[] payload = Slice.New(65536_i64);
+    u8[] wire = Enc(true, 2_i64, payload, NoKey());
+    Assert.Equal<i64>(Slice.Len(wire), 65546_i64, "10-byte header");
+    Assert.True(Same(Slice.SubSlice(wire, 0_i64, 10_i64), [0x82_u8, 0x7F_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0x01_u8, 0_u8, 0_u8]), "64-bit length");
+    FrameHeader h = Dec(Slice.SubSlice(wire, 0_i64, 10_i64));
+    Assert.Equal<i64>(h.payloadLength, 65536_i64, "len 65536");
+}
+
+test length_boundaries {
+    Assert.Equal<i64>(WsFrame.EncodedHeaderLength(125_i64, false), 2_i64, "125 fits 7 bits");
+    Assert.Equal<i64>(WsFrame.EncodedHeaderLength(126_i64, false), 4_i64, "126 uses 16 bits");
+    Assert.Equal<i64>(WsFrame.EncodedHeaderLength(65535_i64, true), 8_i64, "65535 uses 16 bits");
+    Assert.Equal<i64>(WsFrame.EncodedHeaderLength(65536_i64, true), 14_i64, "65536 uses 64 bits");
+    FrameHeader big = Dec([0x82_u8, 0x7F_u8, 0x7F_u8, 0xFF_u8, 0xFF_u8, 0xFF_u8, 0xFF_u8, 0xFF_u8, 0xFF_u8, 0xFF_u8]);
+    Assert.Equal<i64>(big.payloadLength, 9223372036854775807_i64, "2^63-1 decodes");
+}
+
+test malformed_headers {
+    Assert.Equal<i64>(DecErr([0x81_u8]), 900_i64, "one byte is incomplete");
+    Assert.Equal<i64>(DecErr([0x81_u8, 0x7E_u8, 0x00_u8]), 900_i64, "short 16-bit length");
+    Assert.Equal<i64>(DecErr([0x81_u8, 0x85_u8, 1_u8, 2_u8, 3_u8]), 900_i64, "short mask key");
+    Assert.Equal<i64>(DecErr([0xC1_u8, 0x00_u8]), Proto(1_i64), "RSV1");
+    Assert.Equal<i64>(DecErr([0xA1_u8, 0x00_u8]), Proto(1_i64), "RSV2");
+    Assert.Equal<i64>(DecErr([0x91_u8, 0x00_u8]), Proto(1_i64), "RSV3");
+    Assert.Equal<i64>(DecErr([0x83_u8, 0x00_u8]), Proto(2_i64), "opcode 3");
+    Assert.Equal<i64>(DecErr([0x87_u8, 0x00_u8]), Proto(2_i64), "opcode 7");
+    Assert.Equal<i64>(DecErr([0x8B_u8, 0x00_u8]), Proto(2_i64), "opcode 11");
+    Assert.Equal<i64>(DecErr([0x8F_u8, 0x00_u8]), Proto(2_i64), "opcode 15");
+}
+
+test malformed_control_and_lengths {
+    Assert.Equal<i64>(DecErr([0x09_u8, 0x00_u8]), Proto(3_i64), "fragmented ping");
+    Assert.Equal<i64>(DecErr([0x08_u8, 0x00_u8]), Proto(3_i64), "fragmented close");
+    Assert.Equal<i64>(DecErr([0x89_u8, 0x7E_u8, 0x00_u8, 0x7E_u8]), Proto(4_i64), "ping of 126");
+    Assert.Equal<i64>(DecErr([0x82_u8, 0x7E_u8, 0x00_u8, 0x7D_u8]), Proto(5_i64), "16-bit length of 125");
+    Assert.Equal<i64>(DecErr([0x82_u8, 0x7F_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0xFF_u8, 0xFF_u8]), Proto(5_i64), "64-bit length of 65535");
+    Assert.Equal<i64>(DecErr([0x82_u8, 0x7F_u8, 0x80_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0_u8]), Proto(6_i64), "2^63");
+    Assert.Equal<i64>(DecErr([0x89_u8, 0x7D_u8]), 0_i64, "ping of 125 is fine");
+}
+
+test role_checks {
+    Assert.True(match WsFrame.CheckRole(true, true) { Result::Ok(_) => true, Result::Error(_) => false, }, "server accepts masked");
+    Assert.False(match WsFrame.CheckRole(false, true) { Result::Ok(_) => true, Result::Error(_) => false, }, "server rejects unmasked");
+    Assert.True(match WsFrame.CheckRole(false, false) { Result::Ok(_) => true, Result::Error(_) => false, }, "client accepts unmasked");
+    Assert.False(match WsFrame.CheckRole(true, false) { Result::Ok(_) => true, Result::Error(_) => false, }, "client rejects masked");
+}
+
+test encode_rejects_bad_control {
+    u8[] big = Slice.New(126_i64);
+    Assert.False(match WsFrame.EncodeFrame(true, 9_i64, big, 0_i64, 126_i64, NoKey()) { Result::Ok(_) => true, Result::Error(_) => false, }, "ping > 125");
+    Assert.False(match WsFrame.EncodeFrame(false, 8_i64, Hello(), 0_i64, 5_i64, NoKey()) { Result::Ok(_) => true, Result::Error(_) => false, }, "fragmented close");
+    Assert.False(match WsFrame.EncodeFrame(true, 3_i64, Hello(), 0_i64, 5_i64, NoKey()) { Result::Ok(_) => true, Result::Error(_) => false, }, "reserved opcode");
+    Assert.False(match WsFrame.EncodeFrame(true, 1_i64, Hello(), 0_i64, 5_i64, [1_u8, 2_u8]) { Result::Ok(_) => true, Result::Error(_) => false, }, "2-byte key");
+}
+
+i64 CloseCodeOf(u8[] payload) {
+    return match WsFrame.DecodeCloseCode(payload) {
+        Result::Ok(code) => code,
+        Result::Error(e) => -(WsErrors.Code(e) * 100_i64 + WsErrors.Detail(e)),
+    };
+}
+
+test close_codes {
+    Assert.True(WsFrame.ValidCloseCode(1000_i64), "1000");
+    Assert.True(WsFrame.ValidCloseCode(1003_i64), "1003");
+    Assert.False(WsFrame.ValidCloseCode(1004_i64), "1004");
+    Assert.False(WsFrame.ValidCloseCode(1005_i64), "1005");
+    Assert.False(WsFrame.ValidCloseCode(1006_i64), "1006");
+    Assert.True(WsFrame.ValidCloseCode(1007_i64), "1007");
+    Assert.True(WsFrame.ValidCloseCode(1014_i64), "1014");
+    Assert.False(WsFrame.ValidCloseCode(1015_i64), "1015");
+    Assert.False(WsFrame.ValidCloseCode(999_i64), "999");
+    Assert.False(WsFrame.ValidCloseCode(2999_i64), "2999");
+    Assert.True(WsFrame.ValidCloseCode(3000_i64), "3000");
+    Assert.True(WsFrame.ValidCloseCode(4999_i64), "4999");
+    Assert.False(WsFrame.ValidCloseCode(5000_i64), "5000");
+}
+
+test close_payloads {
+    Assert.Equal<i64>(CloseCodeOf(Slice.New(0_i64)), 1005_i64, "empty is no status");
+    Assert.Equal<i64>(CloseCodeOf([0x03_u8]), -1011_i64, "one byte");
+    Assert.Equal<i64>(CloseCodeOf([0x03_u8, 0xE8_u8]), 1000_i64, "1000");
+    Assert.Equal<i64>(CloseCodeOf([0x03_u8, 0xED_u8]), -1012_i64, "1005 on the wire");
+    Assert.Equal<i64>(CloseCodeOf([0x0B_u8, 0xB8_u8, 0x6f_u8, 0x6b_u8]), 3000_i64, "3000 with reason");
+    Assert.Equal<i64>(CloseCodeOf([0x03_u8, 0xE8_u8, 0xC0_u8, 0xAF_u8]), -1100_i64, "overlong reason");
+    u8[] encoded = match WsFrame.EncodeClosePayload(1001_i64, [0x62_u8, 0x79_u8, 0x65_u8]) { Result::Ok(b) => b, Result::Error(_) => Slice.New(0_i64), };
+    Assert.True(Same(encoded, [0x03_u8, 0xE9_u8, 0x62_u8, 0x79_u8, 0x65_u8]), "encode 1001 bye");
+    Assert.False(match WsFrame.EncodeClosePayload(1006_i64, Slice.New(0_i64)) { Result::Ok(_) => true, Result::Error(_) => false, }, "cannot send 1006");
+    Assert.False(match WsFrame.EncodeClosePayload(1000_i64, Slice.New(124_i64)) { Result::Ok(_) => true, Result::Error(_) => false, }, "reason too long");
+}
+
+test mask_in_pieces {
+    u8[] whole = Hello();
+    WsFrame.ApplyMask(whole, 0_i64, 5_i64, Key(), 0_i64);
+    u8[] pieces = Hello();
+    WsFrame.ApplyMask(pieces, 0_i64, 3_i64, Key(), 0_i64);
+    WsFrame.ApplyMask(pieces, 3_i64, 2_i64, Key(), 3_i64);
+    Assert.True(Same(whole, pieces), "piecewise unmask equals whole");
+}

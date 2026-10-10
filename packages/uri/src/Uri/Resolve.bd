@@ -1,0 +1,84 @@
+use Core.Results;
+use Core.String;
+use Uri.Chars;
+use Uri.Errors;
+use Uri.Format;
+use Uri.Normalize;
+use Uri.Parse;
+use Uri.Types;
+
+// RFC 3986 section 5.2 reference resolution (strict: a reference with a scheme is never
+// treated as relative to the base).
+
+/// Section 5.2.3 merge of a relative path with the base path.
+pub string MergePaths(UriRef base, string refPath) {
+    if base.hasAuthority && String.Len(base.path) == 0_i64 { return "/" + refPath; }
+    i64 slash = Chars.LastIndexOf(base.path, 47_i64, 0_i64, String.Len(base.path));
+    if slash < 0_i64 { return refPath; }
+    return Chars.Sub(base.path, 0_i64, slash + 1_i64) + refPath;
+}
+
+/// Resolves `ref` against `base`. The base must have a scheme (NotAbsolute otherwise);
+/// its fragment is ignored.
+pub Result<UriRef, UriError> Resolve(UriRef base, UriRef ref) {
+    if !base.hasScheme { return Result::Error(UriError::NotAbsolute()); }
+    if ref.hasScheme {
+        return Result::Ok(UriRef {
+            hasScheme: true, scheme: ref.scheme,
+            hasAuthority: ref.hasAuthority, hasUserinfo: ref.hasUserinfo, userinfo: ref.userinfo,
+            hostName: ref.hostName, hasPort: ref.hasPort, port: ref.port,
+            path: Normalize.RemoveDotSegments(ref.path), hasQuery: ref.hasQuery, query: ref.query,
+            hasFragment: ref.hasFragment, fragment: ref.fragment,
+        });
+    }
+    if ref.hasAuthority {
+        return Result::Ok(UriRef {
+            hasScheme: true, scheme: base.scheme,
+            hasAuthority: true, hasUserinfo: ref.hasUserinfo, userinfo: ref.userinfo,
+            hostName: ref.hostName, hasPort: ref.hasPort, port: ref.port,
+            path: Normalize.RemoveDotSegments(ref.path), hasQuery: ref.hasQuery, query: ref.query,
+            hasFragment: ref.hasFragment, fragment: ref.fragment,
+        });
+    }
+    mut string path = "";
+    mut bool hasQuery = ref.hasQuery;
+    mut string query = ref.query;
+    if String.Len(ref.path) == 0_i64 {
+        path = base.path;
+        if !ref.hasQuery { hasQuery = base.hasQuery; query = base.query; }
+    } else {
+        if Chars.StartsAt(ref.path, 0_i64, "/") {
+            path = Normalize.RemoveDotSegments(ref.path);
+        } else {
+            path = Normalize.RemoveDotSegments(MergePaths(base, ref.path));
+        }
+    }
+    return Result::Ok(UriRef {
+        hasScheme: true, scheme: base.scheme,
+        hasAuthority: base.hasAuthority, hasUserinfo: base.hasUserinfo, userinfo: base.userinfo,
+        hostName: base.hostName, hasPort: base.hasPort, port: base.port,
+        path: path, hasQuery: hasQuery, query: query,
+        hasFragment: ref.hasFragment, fragment: ref.fragment,
+    });
+}
+
+/// Parses both texts, resolves, and formats the target.
+pub Result<string, UriError> ResolveText(string baseText, string refText) {
+    Result<UriRef, UriError> b = Parse.Parse(baseText);
+    match b {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(baseRef) => {
+            Result<UriRef, UriError> r = Parse.ParseReference(refText);
+            match r {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(reference) => {
+                    Result<UriRef, UriError> t = Resolve(baseRef, reference);
+                    return match t {
+                        Result::Error(error) => Result::Error(error),
+                        Result::Ok(target) => Result::Ok(Format.Format(target)),
+                    };
+                },
+            };
+        },
+    };
+}

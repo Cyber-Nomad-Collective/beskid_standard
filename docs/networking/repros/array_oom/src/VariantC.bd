@@ -1,0 +1,26 @@
+// GAP (GC does not help): allocate 64 KiB arrays one at a time, drop the reference and call CollectGarbage between
+// allocations. Only one array is live at a time, yet the runtime still reports out_of_memory if the heap is not
+// reclaimed. Prints a progress line before each allocation.
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.String;
+use Testing.Assert;
+
+string Num(i64 n) {
+    if n < 10_i64 { return String.DigitChar(n); }
+    return Num(n / 10_i64) + String.DigitChar(n % 10_i64);
+}
+
+test variant_c_drop_and_collect {
+    mut u8[] a = Slice.New(1_i64);
+    mut i64 i = 0_i64;
+    while i < 64_i64 {
+        Output.WriteLine("variant C: allocating 64 KiB array #" + Num(i + 1_i64) + " after dropping the previous one");
+        a = Slice.New(65536_i64);
+        a = Slice.New(1_i64);
+        Testing.Assert.CollectGarbage();
+        i = i + 1_i64;
+    }
+    Output.WriteLine("variant C: 64 sequential 64 KiB allocations completed without a trap");
+    Assert.Equal<i64>(Slice.Len(a), 1_i64, "last array");
+}

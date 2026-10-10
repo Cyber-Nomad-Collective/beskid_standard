@@ -1,0 +1,71 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Crypto.Errors;
+use Crypto.Hmac;
+use Crypto.Scratch;
+
+/// HKDF-Extract (RFC 5869 section 2.2). An empty salt means HashLen zero bytes.
+pub u8[] Extract(HashAlgorithm algorithm, u8[] salt, u8[] ikm) {
+    mut u8[] key = salt;
+    if Slice.Len(salt) == 0_i64 { key = Scratch.Bytes(Hmac.HashLength(algorithm)); }
+    return Hmac.Compute(algorithm, key, ikm);
+}
+
+/// HKDF-Expand (RFC 5869 section 2.3). Fails with OutputTooLong above 255 * HashLen
+/// and with InvalidLength for a negative length or a PRK shorter than HashLen.
+pub Result<u8[], CryptoError> Expand(HashAlgorithm algorithm, u8[] prk, u8[] info, i64 length) {
+    i64 hashLength = Hmac.HashLength(algorithm);
+    if length < 0_i64 || Slice.Len(prk) < hashLength { return Result::Error(CryptoError::InvalidLength()); }
+    if length > 255_i64 * hashLength { return Result::Error(CryptoError::OutputTooLong()); }
+    u8[] okm = Scratch.Bytes(length);
+    mut u8[] previous = Scratch.Bytes(0_i64);
+    mut i64 produced = 0_i64;
+    mut u8 counter = 1_u8;
+    while produced < length {
+        HmacState state = Hmac.New(algorithm, prk);
+        Hmac.Update(state, previous);
+        Hmac.Update(state, info);
+        Hmac.Update(state, [counter]);
+        previous = Hmac.Finish(state);
+        mut i64 take = hashLength;
+        if length - produced < take { take = length - produced; }
+        Slice.Copy(okm, produced, previous, 0_i64, take);
+        produced = produced + take;
+        counter = counter + 1_u8;
+    }
+    return Result::Ok(okm);
+}
+
+/// TLS 1.3 HKDF-Expand-Label (RFC 8446 section 7.1). `label` is given without the
+/// "tls13 " prefix. Labels above 249 bytes, contexts above 255 bytes, and lengths
+/// above 65535 fail with InvalidLength.
+pub Result<u8[], CryptoError> ExpandLabel(HashAlgorithm algorithm, u8[] secret, string label, u8[] context, i64 length) {
+    i64 labelLength = String.Len(label) + 6_i64;
+    i64 contextLength = Slice.Len(context);
+    if labelLength > 255_i64 || contextLength > 255_i64 || length < 0_i64 || length > 65535_i64 {
+        return Result::Error(CryptoError::InvalidLength());
+    }
+    u8[] info = Scratch.Bytes(4_i64 + labelLength + contextLength);
+    info[0] = u8(length >> 8_i64);
+    info[1] = u8(length & 0xFF_i64);
+    info[2] = u8(labelLength);
+    info[3] = 116_u8; info[4] = 108_u8; info[5] = 115_u8; info[6] = 49_u8; info[7] = 51_u8; info[8] = 32_u8;
+    mut i64 i = 0_i64;
+    while i < String.Len(label) { info[9_i64 + i] = String.ByteAt(label, i); i = i + 1_i64; }
+    info[3_i64 + labelLength] = u8(contextLength);
+    Slice.Copy(info, 4_i64 + labelLength, context, 0_i64, contextLength);
+    return Expand(algorithm, secret, info, length);
+}
+
+/// Derive-Secret(Secret, Label, Messages) = HKDF-Expand-Label(Secret, Label,
+/// Transcript-Hash(Messages), Hash.length). `transcriptHash` is the already computed
+/// Transcript-Hash of the messages (use `Hmac.HashClone` + `Hmac.HashFinish` on the running transcript).
+pub Result<u8[], CryptoError> DeriveSecret(HashAlgorithm algorithm, u8[] secret, string label, u8[] transcriptHash) {
+    return ExpandLabel(algorithm, secret, label, transcriptHash, Hmac.HashLength(algorithm));
+}
+
+/// Derive-Secret over raw handshake `messages` (hashes them first).
+pub Result<u8[], CryptoError> DeriveSecretFromMessages(HashAlgorithm algorithm, u8[] secret, string label, u8[] messages) {
+    return DeriveSecret(algorithm, secret, label, Hmac.Digest(algorithm, messages));
+}

@@ -1,0 +1,71 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Codec.Be;
+use Codec.Errors;
+
+// QUIC variable-length integers (RFC 9000 section 16). Range 0 .. 2^62-1.
+// Non-minimal encodings are accepted on read, as the RFC requires.
+
+/// A decoded variable-length integer and the number of bytes it occupied.
+pub type Varint { pub i64 value, pub i64 length, }
+
+/// Largest encodable value, 2^62 - 1.
+pub i64 MaxValue() { return 4611686018427387903_i64; }
+
+/// Minimal encoded length of `value`, or -1 when it is negative or above MaxValue.
+pub i64 EncodedLength(i64 value) {
+    if value < 0_i64 { return -1_i64; }
+    if value < 64_i64 { return 1_i64; }
+    if value < 16384_i64 { return 2_i64; }
+    if value < 1073741824_i64 { return 4_i64; }
+    if value <= 4611686018427387903_i64 { return 8_i64; }
+    return -1_i64;
+}
+
+/// Writes the minimal encoding at `offset`; returns the number of bytes written.
+pub Result<i64, CodecError> Write(u8[] buf, i64 offset, i64 value) {
+    i64 length = EncodedLength(value);
+    if length < 0_i64 { return Result::Error(CodecError::Overflow()); }
+    Result<unit, CodecError> written = Be.WriteUint(buf, offset, length, value);
+    match written {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => {},
+    };
+    mut i64 tag = 0_i64;
+    if length == 2_i64 { tag = 64_i64; }
+    if length == 4_i64 { tag = 128_i64; }
+    if length == 8_i64 { tag = 192_i64; }
+    buf[offset] = u8(i64(buf[offset]) | tag);
+    return Result::Ok(length);
+}
+
+/// Minimal encoding as a fresh array.
+pub Result<u8[], CodecError> Encode(i64 value) {
+    i64 length = EncodedLength(value);
+    if length < 0_i64 { return Result::Error(CodecError::Overflow()); }
+    u8[] out = Slice.New(length);
+    Result<i64, CodecError> written = Write(out, 0_i64, value);
+    return match written {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(_) => Result::Ok(out),
+    };
+}
+
+/// Length in bytes announced by the first byte of an encoding (1, 2, 4 or 8).
+pub i64 LengthFromFirstByte(u8 first) {
+    return 1_i64 << (i64(first) >> 6_i64);
+}
+
+/// Reads one variable-length integer at `offset`.
+pub Result<Varint, CodecError> Read(u8[] buf, i64 offset) {
+    if !Slice.IsValidRange(Slice.Len(buf), offset, 1_i64) { return Result::Error(CodecError::Truncated()); }
+    i64 length = LengthFromFirstByte(buf[offset]);
+    if !Slice.IsValidRange(Slice.Len(buf), offset, length) { return Result::Error(CodecError::Truncated()); }
+    mut i64 acc = i64(buf[offset]) & 63_i64;
+    mut i64 i = 1_i64;
+    while i < length {
+        acc = (acc << 8_i64) | i64(buf[offset + i]);
+        i = i + 1_i64;
+    }
+    return Result::Ok(Varint { value: acc, length: length });
+}

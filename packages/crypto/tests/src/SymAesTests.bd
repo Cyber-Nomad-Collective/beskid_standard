@@ -1,0 +1,150 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.String;
+use Core.Results;
+use Crypto.Errors;
+use Crypto.Aes;
+use Crypto.AesGcm;
+
+u8 Nibble(u8 c) {
+    if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
+    if c >= 97_u8 && c <= 102_u8 { return c - 87_u8; }
+    return c - 55_u8;
+}
+u8[] Hex(string text) {
+    i64 n = String.Len(text) / 2_i64;
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = Nibble(String.ByteAt(text, 2_i64 * i)) * 16_u8 + Nibble(String.ByteAt(text, 2_i64 * i + 1_i64)); i = i + 1_i64; }
+    return out;
+}
+bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
+
+
+u8[] Unwrap(Result<u8[], CryptoError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
+}
+u8[] Range(i64 n) { u8[] o = Slice.New(n); mut i64 i = 0_i64; while i < n { o[i] = u8(i); i = i + 1_i64; } return o; }
+
+test aes128_fips197_c1 { Assert.True(Same(Unwrap(Aes.Encrypt(Range(16_i64), Hex("00112233445566778899aabbccddeeff"))), Hex("69c4e0d86a7b0430d8cdb78070b4c55a")), "aes128"); }
+test aes192_fips197_c2 { Assert.True(Same(Unwrap(Aes.Encrypt(Range(24_i64), Hex("00112233445566778899aabbccddeeff"))), Hex("dda97ca4864cdfe06eaf70a0ec0d7191")), "aes192"); }
+test aes256_fips197_c3 { Assert.True(Same(Unwrap(Aes.Encrypt(Range(32_i64), Hex("00112233445566778899aabbccddeeff"))), Hex("8ea2b7ca516745bfeafc49904b496089")), "aes256"); }
+test aes_rejects_bad_key_length {
+    bool rejected = match Aes.NewKey(Slice.New(20_i64)) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
+    Assert.True(rejected, "20-byte key");
+}
+test aes_gcm_tc1 {
+    match AesGcm.New(Hex("00000000000000000000000000000000")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("000000000000000000000000"), Hex(""), Hex("")));
+            Assert.True(Same(sealed, Hex("58e2fccefa7e3061367f1d57a4e7455a")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("000000000000000000000000"), Hex(""), sealed)), Hex("")), "opened");
+        },
+    };
+}
+test aes_gcm_tc2 {
+    match AesGcm.New(Hex("00000000000000000000000000000000")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("000000000000000000000000"), Hex(""), Hex("00000000000000000000000000000000")));
+            Assert.True(Same(sealed, Hex("0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("000000000000000000000000"), Hex(""), sealed)), Hex("00000000000000000000000000000000")), "opened");
+        },
+    };
+}
+test aes_gcm_tc3 {
+    match AesGcm.New(Hex("feffe9928665731c6d6a8f9467308308")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("cafebabefacedbaddecaf888"), Hex(""), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")));
+            Assert.True(Same(sealed, Hex("42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f59854d5c2af327cd64a62cf35abd2ba6fab4")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("cafebabefacedbaddecaf888"), Hex(""), sealed)), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")), "opened");
+        },
+    };
+}
+test aes_gcm_tc4 {
+    match AesGcm.New(Hex("feffe9928665731c6d6a8f9467308308")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")));
+            Assert.True(Same(sealed, Hex("42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), sealed)), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")), "opened");
+        },
+    };
+}
+test aes_gcm_tc13 {
+    match AesGcm.New(Hex("0000000000000000000000000000000000000000000000000000000000000000")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("000000000000000000000000"), Hex(""), Hex("")));
+            Assert.True(Same(sealed, Hex("530f8afbc74536b9a963b4f1c4cb738b")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("000000000000000000000000"), Hex(""), sealed)), Hex("")), "opened");
+        },
+    };
+}
+test aes_gcm_tc14 {
+    match AesGcm.New(Hex("0000000000000000000000000000000000000000000000000000000000000000")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("000000000000000000000000"), Hex(""), Hex("00000000000000000000000000000000")));
+            Assert.True(Same(sealed, Hex("cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("000000000000000000000000"), Hex(""), sealed)), Hex("00000000000000000000000000000000")), "opened");
+        },
+    };
+}
+test aes_gcm_tc15 {
+    match AesGcm.New(Hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("cafebabefacedbaddecaf888"), Hex(""), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")));
+            Assert.True(Same(sealed, Hex("522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015adb094dac5d93471bdec1a502270e3cc6c")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("cafebabefacedbaddecaf888"), Hex(""), sealed)), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255")), "opened");
+        },
+    };
+}
+test aes_gcm_tc16 {
+    match AesGcm.New(Hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")));
+            Assert.True(Same(sealed, Hex("522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f66276fc6ece0f4e1768cddf8853bb2d551b")), "sealed");
+            Assert.True(Same(Unwrap(AesGcm.Open(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), sealed)), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")), "opened");
+        },
+    };
+}
+test aes_gcm_rejects_tampering {
+    match AesGcm.New(Hex("feffe9928665731c6d6a8f9467308308")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")));
+            mut i64 position = 0_i64;
+            while position < Slice.Len(sealed) {
+                u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+                copy[position] = (copy[position] | 0x80_u8) - (copy[position] & 0x80_u8);
+                bool failed = match AesGcm.Open(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), copy) {
+                    Result::Ok(_) => false,
+                    Result::Error(e) => match e { CryptoError::AuthenticationFailed => true, _ => false, },
+                };
+                Assert.True(failed, "tampered byte rejected");
+                position = position + 7_i64;
+            }
+            bool wrongNonce = match AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), sealed) { Result::Ok(_) => false, Result::Error(_) => true, };
+            Assert.True(wrongNonce, "nonce bound");
+            bool badNonce = match AesGcm.Seal(key, Hex("cafebabe"), Hex(""), Hex("")) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidNonceLength => true, _ => false, }, };
+            Assert.True(badNonce, "nonce length");
+        },
+    };
+}
+test aes_gcm_4000_bytes {
+    match AesGcm.New(Range(16_i64)) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] pt = Slice.New(4000_i64);
+            mut i64 i = 0_i64;
+            while i < 4000_i64 { pt[i] = u8((i * 31_i64 + 7_i64) & 255_i64); i = i + 1_i64; }
+            u8[] sealed = Unwrap(AesGcm.Seal(key, Range(12_i64), Range(37_i64), pt));
+            Assert.True(Same(sealed, Hex("944ae2aae5b936b4b4cc5cd64d39c9d044302fb2207f4c26092fdc617fce0ba462a2feb3970216239f0a14db9bf34e2a1b6901c457f5a7cbe1a07ffee1269f4c5de8f06a1c2e4bbe9cee8c43476071c3df7a707f3aceec5259332adb9703e380c7e3ae103549bef43fe1a323e8d38f634c656e14b07f5b89aa12539ec7c0b511e9124527bc7563f88b363989a4731e36e43bc6e66986d89643303f74be9f157af060dd1f89672e8ac280af955453ef398217d2b9ccfb728305617d4e77effcbb4f3729aa12434351b388de24aaa9afea0bc0d463285685c8bb90fd2dca7c29418580222d6b8231cc74d1fbadd35d191e187c937d518b0133c0b578e12c230b3cf0f1c477b42df4a164f0c16402b5217e9a46a86eaa1fe43e874838cf2464d5fde3c0a1050bc1fd05f3184e2df1d837e1c1468ba22f5a340373bb25537852fb7f7b63a87dc4e0ad8e6ba541b8fc3a14e45d725613ea7d96367d665796154ba8ff3dbcc270a56529a12ab70ad5778548e6dd4b8677bc37244b55fc1ade49a015143545dd2ff591f354a57badf2f352e57bf3c886135e4624fc61f212ea542fad9101d812f48de9cf4350e870aa71812849f9f60f62ca5efa54e7fde5d75c5f06e1b2128da56a69ba93fedbc91acb0cfe2962149d4339c619d566c9f26d901249a2ed276cd5ec7252bf1f2241fbb11a2a06a8a9acdadabc81036e16c01091ae5ad1b961935da32e24afbeba3b4580f5c6564114295983d3bda4064527355fdf65a5f7f6c597f822d3074f563e28829aae5e3fc3d3014a1abc57abd38dcec4dd210ee0f5af4dcd78459c0490674636e6a77027ea75a17f1ee9c085d66952d45ffae40466cab62016ef9416bf08521c5eeedadc5e7abefc88df708be2dbc212539681919e5c174640ec65278ff9d537ef184c22039199c1eaea96043f47d2181883d970043b6f05df118688a7faca4f7edd42bf7648a1a9449120a2d7506485e45e126077c9a07a05524836239654d5c5df4e42cd22d6180be25459218611f9262d9e0769270d71169b04c935a627a4c4feb198e7e1242723fd9b2e6cf8cad8cc79664961c27efa615d6eb1a4cb10663712c450bb1ba7bd071d660e466947b811835e9a13f6590051d3dcacb7238711cabf9b0a3917c086f66d4c5016a6679062b464c64145c83bb4e0a86ec11d9c282bbd5891061f11e896ed12564313a6c7a2b5abcccc122df2fb75cc01c23a3a0ec4247201650f95815fdc1289b741696430b7c813f11afc3e06d13608ed4b1e5bb9541932cfc08c20d56f1a4488ab049f2ff9262a7a0db93d78569bc670d0f373ad80c438fedd65b753298419a70a20a4e1f6ebb63056c3ef1488516c0818e14191f212787d5b318b82d1a3abdc7b5e75842593be2a2b38b7800e0edfbf313ecffd01cb6da34adbe28894088d160d6de633767d433073ddef4d411799f5e62c72d502b70e7508549aa86a9e3000398243d2e87a7ba0da006cea6ef4bd4e7702a6514d368bdb7805a192c053cf44510e4f1cffbbc4e1abc66ec979fd9982f5d1c7ebf25fcbb4c070ce7a0e75e55d3c166a640c9480bab00fb3d414455632404997254c0b097a74c39a5f13dcbc5eb1c4e305fb3898aa7a86dbb5598248437dff7846a78a13eb5af361aa0288711f0e0d48a41fc95de9f587b6e9b9730c84ad4f66aa508de74ec42de3725a1610f5662cc9004eda97a2a45f6dd73a2c795b2d25729354ffde5acebf4da3920f00f92a802de355e450b2836f8033305d6f92a652cfbb605cdc1971b670904bde3c784af1709d94b7b314ee893a69b992ea1e8383bd9894dbaef79b8b0979cf60bbf3dede2f4abac63318fbc5ea64468c5ca60ec4eac9367ce323feba36ef4b0033e5ed59cbc3c1d5e174ce4e219f6ef970329b6f80afa724ef20683520efa5a7fe0ab388fb7ade2d057763acddf0f77f5fbecd2e9d68b26eb2359eafdba910d890645b87bced7a02df44d303729eb321765990f2d2b33324d0020053d55d93f043ca850f604edc31324c6c360b1d7918f07db13691e172bfbc10806dca850cea553981d6cd2a32189df57888a541f4beab0309c29ce70d8aebbcf9ee350c93f9928c57d68088aff17b1801ab7cf4531816845bf62b1f42d5a36886f059642632be02523bbb54b77904aa02fd715daaf7449e84cbb9d80de75f2eda33a0e911fc323e19d7b6596b17f39cc1fd5c483530d7c6c2b74b6c12cac4998045022adedb63e1731def3ba2008ae00440cbb1da11b3cbc92f0f1e07f666101db4bb9ebb032c336b30250139c96e2c86ea37df6f03319b83f454c7a301d7e46ed61b2872b11c2fcad4dda53179b02b9564abf539b8662841253b7c3f4e9952d0a2cc4353c67cef685d3db751ed6f9577dc54607e4ef8808b0ec7464cf9b383f0d859cac45cd93ec0ccf8d5632d5b585c5df3c3f2b072008e87507796c12cff0045e8adb6d5c6192c53020c0ae6585f0c2f109f44234037dea716d037a106d4efd0e12ad49dce41e160da6ecff69679c1fe2c70f26edd535b5a9e38a40835c2803a66685adc6cb4c56101df3bafce464534659bd69d788f0d252b00a67695da2157bf00846e062795f30eddfdd087d0d38a79d800fe3ce067b1b6605c129e3e78e159aa75b82862b4625f603368589ab9dcb286e9a3f32e170513b8e6bfd044cc1289c23696ed0368518212ff311b23e28ec6ae2f7bcf166c352113a66cd456a4f5e607fcaec9b81a8b24f829249e469ff9a17679b028de1768a66a625254f165b63a863c79caae78f2370ee64b4da8fe2a3147a97d4b4224af8b1674f7b1976d7253031660b6e8564cac81db0d7fb271cb2fbd56acaaf09a98f987a1f1008caa48a5bb0f4e4c305f67e2b2572468ef98462fab89aaeb0c852bc97b311d340676bded57a87fb5526e3d8b28dfcb083ba2696f1c58f7787cd4aceda4ac663c5cb0d2db73c95c2087fa3706b0d04f5e12a1a4505870809b49e6e249be43f2524b58ddae02bf7323454e7d3c705bc6ac65050797e936d5091bc20ce6994b3f0ef9de7697c12dffbf28a7856d6f31e95998c9eaf45313c4e191710e6f7ceb5495b1c4c89c5269447a8609019ee8a31c8a311969ed43b344e43779f8ee162aedfa2559af0dbb95fcd3e8371da925dc1f8eeb7ea323d4a62fe235f5b0d60c86dcdf64f89251d298b4773585ada6020dec334a12bd9d374b3843fc825beff3c6cd6f3d87c0a5309d724bb5c2b1e87e215fc81884005a5d3f3413cc4496bae4dc35b96108acf184b8aa375e126a4f829ae80781b0ac1f023395ffa45e96d94853523bfd33488b729588f2a69931b77f0cf4d883ce81b8904ebd6481647cd8091bd0377a3183d9b62b09eb21c813d61b7ae8045b9edbe399d35e0bd6c10b5b992728884d749f12715cd5fc689e3e1d50b8499c68b1f97c428a2499fd6f48c3cb410cbf1d889fb52d178ef25e5a966cde2259bc2bf09b4def7764685b1d0c672c5220d64d711a571f188cdea0f9a1ca88a29bc273657aa30c96d3db1881e18a9eb32f6d43e36fbdcd0eb9ca0492bf627a36e19a48a1202536cca80be1c40bc72df8ddc1d6280c8303c4c9da64caa1d56d313be1e5777293a2066cfb6b4f2babeec90265aaea69d353621b64ac27ae7146f1f09fc5917759938bb24bd17511d030796146998d2a66d5707ce181877ae6b1d3dfbc000e26f02f4725f5c8ff7b1a174247ddf44b7c36ac8a9ea54a517362d7bbba9ec77968ee28ac8e12ea0c3ecb1a4ad69e3f659cca820f07759f2f2d06710d69d08c1f49462e7df1829723506e11a8cff45dd8e30d40749dc70b563e0bf9095de7261d5401b022b216a3bcfe98913ecd18b7c2a5af7a9524e0e1ea283c93f590fb98e0b160b1c3bc5697566b1ec277973d48eb49c50025fead1e790dd0fce22da333087d47cbb99fd3c0e27c595e817e046f04e02e57c3df0e8affa4567a747b732134b83625901bc54544c8309ce9ab928beb6c7692a7830a14e3814a788ca2610e31660aaf1a91e1f15a7b6439647b7d625f4cf77ff28f102dc03d45bb0d26017535ca60f01e4d3b3775ee8f399f715a8fc8e83ccc97cf252ebda4ce4242b9514b9e101ee0749db87cfeb74cddec80769460d69e252fca42a0bc620965c53b42b9a44cde9978bc6682259d6dfdfeff71f16b6b5be9f974bd32570d7695274bf77e5b0df9ea2dc9d6a5f4b2dcb6d8c985d0f31938fb63cb5113304f4670d143065e2a7c8748b3b45e579730cc7853c0adebe836227d0c1ab57e091a3bf5548d143f2b5c00d387f0fd593334c033875aeeca3363eafa9d5053772982fb80a6c7e4fd45d7715a34348d90d8d9dff01ee7a510c3e584a9f8e8f1829768b228b305c7c49dea9bd2749adae25eb4b7b2dbc41d25637479cbfa637a07171936b8a66a9accb06aa5f25cf6f98704aa2086fedab76157c1651eea7908fa64e5d478fdbd91ee90affd6576318daade320c88f9375c02f80dc27b1f6177b2f33a96cf85ddf182811ff5f6f52af167cef804939397ebe0e7bd4aacd9fa5ba8b96ddff961177847ba3229aef36fba80daf47784c803586a9c55c2cb77fef92105db2a4474c47a3dd36718c892e9630544b533b9224b3291ed16c5ae1eb91a140474eb092c153a944a0313f60fddd46c5bdd78548aabaa72971bccaa9b79522c75a6b7b2f1d217b8e7571e4792b94bf28bc71175ca5b4241c79d4bf247d42d2c77142009d13a976d42186ed6f2199f9ab7c54e649f652f6ccc474dddde8090f1f135cb5ca37cbc85583983b36c982b91e375dbf707f0a3c1ef08351f561610e220c75519694c84d2595e34e53a1572b643adf5969ecea863af11664c56ad34e8c32758f6c440833ff718db04bb6290a4286caf3c5a5eafacd333ff6e173681ce8c0e7e8e77c1af3214befc96ffbad67cdae2b03f277f2ffeb225b02cbaecfbc36430c16eb48c4dae2304bf9747a9f77323b613264a4e2369900d8cd19dadf50dc2089efd594ea30350fc3461af5e553fb144a701c185aa6c8cc3b4254c354ceb18d10e6eaaf4025ef425566cc3b82dbf7efea56816ae4257d3a7e5a843d8bd166056bfc71d420d397fdc5506b868edac141bc797d4b0f3dca989cfa640530d8dfa8c7c635650cc3812291189a6d1457e87a727e6db07d7d848f3dddc2cb1c231e471b062dd8eae4027f7c7de271d23f5dc5902ee0480a32c38bb79df7f563e766ca783cb2383db805c7fa7009714dd21d175edd091cc1c2ba46e4dfb7fb93301c2563f7090155268282f683053301f9a991aa564f744ce0d8b161e5ecea735f2d0058dd0a550a5df34282843351e59ccaa51d5bbb18e73e4b0b3f4a76e50af1f8814893eee3fb9dc999914c10f8ec70e77cbf10c55461f06a21e544533577a6962ab34655c1d65d478e22893c409397142c9289dd5ec6faa3b353157cf92096cc43e150e6d5cec10c4eac632d3b77c46410d3694a7adef5df5eb7226067d6ec6c4f1a516d8f8c1a358fd35e6320cf1b4fdc5440b9fcd89f429ef94ce33cdc18480048ccb3b0cd812dcdfaf6719211eac7a8e19c2cd098c82a99ae219354ffb06af51b768507f5ee04c0e20a531053d806313d4fac928b3455d64f7fbae28cbaa95219f43b568570d46b6824afce31d5816d8fd6ff998")), "sealed");
+        },
+    };
+}

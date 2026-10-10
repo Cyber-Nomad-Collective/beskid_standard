@@ -1,0 +1,855 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Crypto.ConstantTime;
+use Crypto.Hmac;
+use Tls.Alert;
+use Tls.Emit;
+use Tls.KeySchedule;
+use Tls.Messages;
+use Tls.PeerKeys;
+use Tls.PeerVerify;
+use Tls.Suites;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsPk;
+use Tls.Wire;
+use Codec.Mem;
+
+// Sans-I/O TLS 1.3 handshake engine (RFC 8446 section 4), shared by the TLS record layer
+// and QUIC (RFC 9001). The carrier feeds handshake bytes per encryption level with `Feed`
+// and drains events in order with `HasEvent` / `TakeEvent`:
+//   Send(level, bytes)         handshake bytes to transmit at that level
+//   ReadSecret(level, secret)  install the peer's traffic secret for that level
+//   WriteSecret(level, secret) install this side's traffic secret for that level
+//   Connected                  the handshake completed
+// Processing the events in order keeps every message under the right keys.
+
+pub enum TlsEvent {
+    Send(i64 level, u8[] data),
+    ReadSecret(i64 level, u8[] secret),
+    WriteSecret(i64 level, u8[] secret),
+    Connected,
+}
+
+// st indices.
+i64 SState() { return 0_i64; }
+i64 SSuite() { return 1_i64; }
+i64 SGroup() { return 2_i64; }
+i64 SRetries() { return 3_i64; }
+i64 SCertRequested() { return 4_i64; }
+i64 SLevel() { return 5_i64; }
+i64 SEventIndex() { return 6_i64; }
+i64 SUsedSni() { return 7_i64; }
+
+// b indices.
+i64 BHandshake() { return 0_i64; }
+i64 BClientHs() { return 1_i64; }
+i64 BServerHs() { return 2_i64; }
+i64 BMaster() { return 3_i64; }
+i64 BClientAp() { return 4_i64; }
+i64 BServerAp() { return 5_i64; }
+i64 BExporter() { return 6_i64; }
+i64 BResumption() { return 7_i64; }
+i64 BRandom() { return 8_i64; }
+i64 BSessionId() { return 9_i64; }
+i64 BCookie() { return 10_i64; }
+i64 BClientHello1() { return 11_i64; }
+i64 BPeerTransport() { return 12_i64; }
+i64 BExpectedFinished() { return 13_i64; }
+i64 BCertContext() { return 14_i64; }
+i64 BCount() { return 15_i64; }
+
+// States.
+i64 StClientStart() { return 0_i64; }
+i64 StWaitServerHello() { return 1_i64; }
+i64 StWaitEncryptedExtensions() { return 2_i64; }
+i64 StWaitCertificateOrRequest() { return 3_i64; }
+i64 StWaitCertificate() { return 4_i64; }
+i64 StWaitCertificateVerify() { return 5_i64; }
+i64 StWaitServerFinished() { return 6_i64; }
+i64 StConnected() { return 7_i64; }
+i64 StWaitClientHello() { return 10_i64; }
+i64 StWaitClientHello2() { return 11_i64; }
+i64 StWaitClientFinished() { return 12_i64; }
+i64 StFailed() { return 99_i64; }
+
+pub type HandshakeEngine {
+    pub bool isClient,
+    TlsClientConfig cc,
+    TlsServerConfig sc,
+    i64[] st,
+    TlsEvent[] events,
+    u8[] inbuf,
+    HashState transcript,
+    KeyShare share,
+    PeerKey peerKey,
+    Blob[] b,
+    // [0] negotiated ALPN, [1] received server name.
+    string[] names,
+    Blob[] peerChain,
+}
+
+// ---------------------------------------------------------------- construction
+
+u8[] None() { return Slice.New(0_i64); }
+
+Blob[] EmptyBlobs(i64 count) {
+    mut Blob[] list = Array.Empty<Blob>();
+    mut i64 i = 0_i64;
+    while i < count { Array.Append<Blob>(list, Blob { data: None() }); i = i + 1_i64; }
+    return list;
+}
+
+KeyShare NoShare() { return KeyShare { group: 0_i64, privateKey: None(), publicKey: None() }; }
+PeerKey NoKey() { return PeerKey { kind: 0_i64, point: None(), modulus: None(), exponent: None() }; }
+
+HandshakeEngine Make(bool isClient, TlsClientConfig cc, TlsServerConfig sc, i64 state) {
+    mut TlsEvent[] events = Array.Empty<TlsEvent>();
+    mut u8[] inbuf = Array.Empty<u8>();
+    mut Blob[] chain = Array.Empty<Blob>();
+    i64[] st = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+    st[0] = state;
+    return HandshakeEngine {
+        isClient: isClient, cc: cc, sc: sc, st: st, events: events, inbuf: inbuf,
+        transcript: Hmac.HashNew(HashAlgorithm::Sha256), share: NoShare(), peerKey: NoKey(),
+        b: EmptyBlobs(BCount()), names: ["", ""], peerChain: chain,
+    };
+}
+
+Result<unit, TlsError> CheckSuitesGroups(CipherSuite[] suites, i64[] groups) {
+    if Array.Len<CipherSuite>(suites) == 0_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigNoCipherSuites())); }
+    i64 n = Array.Len<i64>(groups);
+    if n == 0_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigNoGroups())); }
+    mut i64 i = 0_i64;
+    while i < n {
+        if !TlsPk.IsSupportedGroup(groups[i]) { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigUnsupportedGroup())); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> CheckAlpn(string[] names) {
+    i64 n = Array.Len<string>(names);
+    mut i64 i = 0_i64;
+    while i < n {
+        i64 len = String.Len(names[i]);
+        if len < 1_i64 || len > 255_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigInvalidAlpn())); }
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+TlsServerConfig DummyServer() { return TlsConfig.Server(Array.Empty<Blob>(), None()); }
+TlsClientConfig DummyClient() { return TlsConfig.Client("", CertificateVerification::DangerousAcceptAnyCertificate); }
+
+/// A client engine. Validates the configuration; call `Start` to produce the ClientHello.
+pub Result<HandshakeEngine, TlsError> NewClient(TlsClientConfig config) {
+    if String.Len(config.serverName) == 0_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigMissingServerName())); }
+    CheckSuitesGroups(config.cipherSuites, config.groups)?;
+    CheckAlpn(config.alpn)?;
+    if config.quic && Slice.Len(config.quicTransportParameters) == 0_i64 {
+        return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigQuicTransportParameters()));
+    }
+    return Result::Ok(Make(true, config, DummyServer(), StClientStart()));
+}
+
+/// A server engine waiting for a ClientHello.
+pub Result<HandshakeEngine, TlsError> NewServer(TlsServerConfig config) {
+    if Array.Len<Blob>(config.certificateChain) == 0_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigMissingCertificate())); }
+    if Slice.Len(config.privateKey) != 32_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigInvalidPrivateKey())); }
+    CheckSuitesGroups(config.cipherSuites, config.groups)?;
+    CheckAlpn(config.alpn)?;
+    if config.quic && Slice.Len(config.quicTransportParameters) == 0_i64 {
+        return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigQuicTransportParameters()));
+    }
+    return Result::Ok(Make(false, DummyClient(), config, StWaitClientHello()));
+}
+
+/// Trace replay (RFC 8448 and tests): a client engine that already sent `clientHello`
+/// (full encoding) with the ephemeral `share`. No Send event is produced for it.
+pub Result<HandshakeEngine, TlsError> NewClientAfterHello(TlsClientConfig config, KeyShare share, u8[] clientHello) {
+    HandshakeEngine e = NewClient(config)?;
+    Messages.ClientHello ch = Messages.DecodeClientHello(Mem.SubSlice(clientHello, 4_i64, Slice.Len(clientHello) - 4_i64))?;
+    e.share = share;
+    SetB(e, BRandom(), ch.random);
+    SetB(e, BSessionId(), ch.sessionId);
+    SetB(e, BClientHello1(), clientHello);
+    e.st[SState()] = StWaitServerHello();
+    return Result::Ok(e);
+}
+
+// ---------------------------------------------------------------- small helpers
+
+unit SetB(HandshakeEngine e, i64 index, u8[] data) { e.b[index] = Blob { data: data }; return; }
+
+u8[] GetB(HandshakeEngine e, i64 index) {
+    Blob x = e.b[index];
+    return x.data;
+}
+
+unit Push(HandshakeEngine e, TlsEvent ev) { Array.Append<TlsEvent>(e.events, ev); return; }
+
+CipherSuite SuiteOf(HandshakeEngine e) { return Suites.FromCode(e.st[SSuite()]); }
+
+HashAlgorithm HashOf(HandshakeEngine e) { return Suites.Hash(SuiteOf(e)); }
+
+unit AddT(HandshakeEngine e, u8[] message) { Hmac.HashUpdate(e.transcript, message); return; }
+
+u8[] TH(HandshakeEngine e) { return Hmac.HashFinish(Hmac.HashClone(e.transcript)); }
+
+TlsError F(i64 alert) { return TlsErrors.Fatal(alert); }
+
+bool HasSuite(CipherSuite[] list, i64 code) {
+    i64 n = Array.Len<CipherSuite>(list);
+    mut i64 i = 0_i64;
+    while i < n {
+        CipherSuite s = list[i];
+        if Suites.Code(s) == code { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+bool HasString(string[] list, string value) {
+    i64 n = Array.Len<string>(list);
+    mut i64 i = 0_i64;
+    while i < n { if list[i] == value { return true; } i = i + 1_i64; }
+    return false;
+}
+
+i64[] SuiteCodes(CipherSuite[] list) {
+    mut i64[] out = Array.Empty<i64>();
+    i64 n = Array.Len<CipherSuite>(list);
+    mut i64 i = 0_i64;
+    while i < n {
+        CipherSuite s = list[i];
+        Array.Append<i64>(out, Suites.Code(s));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+/// Concatenates two byte arrays.
+u8[] Cat(u8[] a, u8[] b) {
+    i64 na = Slice.Len(a);
+    i64 nb = Slice.Len(b);
+    u8[] out = Mem.Zeroed(na + nb);
+    Mem.Copy(out, 0_i64, a, 0_i64, na);
+    Mem.Copy(out, na, b, 0_i64, nb);
+    return out;
+}
+
+/// The synthetic message_hash message that replaces ClientHello1 after a HelloRetryRequest.
+u8[] MessageHash(HashAlgorithm h, u8[] clientHello1) {
+    return Messages.Wrap(Wire.MsgMessageHash(), Hmac.Digest(h, clientHello1));
+}
+
+bool IsDowngradeSentinel(u8[] random) {
+    // "DOWNGRD" followed by 0x01 (TLS 1.2) or 0x00 (TLS 1.1 and below) in the last 8 bytes.
+    u8[] tag = [0x44_u8, 0x4F_u8, 0x57_u8, 0x4E_u8, 0x47_u8, 0x52_u8, 0x44_u8];
+    mut i64 i = 0_i64;
+    while i < 7_i64 { if random[24_i64 + i] != tag[i] { return false; } i = i + 1_i64; }
+    return random[31] == 0_u8 || random[31] == 1_u8;
+}
+
+// ---------------------------------------------------------------- public queries
+
+pub bool HasEvent(HandshakeEngine e) { return e.st[SEventIndex()] < Array.Len<TlsEvent>(e.events); }
+
+/// The next event; only valid when `HasEvent` is true.
+pub TlsEvent TakeEvent(HandshakeEngine e) {
+    i64 i = e.st[SEventIndex()];
+    e.st[SEventIndex()] = i + 1_i64;
+    TlsEvent ev = e.events[i];
+    if i + 1_i64 == Array.Len<TlsEvent>(e.events) {
+        e.events = Array.Empty<TlsEvent>();
+        e.st[SEventIndex()] = 0_i64;
+    }
+    return ev;
+}
+
+pub bool IsConnected(HandshakeEngine e) { return e.st[SState()] == StConnected(); }
+pub bool IsFailed(HandshakeEngine e) { return e.st[SState()] == StFailed(); }
+
+/// The negotiated cipher suite (meaningful once the handshake secrets exist).
+pub CipherSuite NegotiatedSuite(HandshakeEngine e) { return SuiteOf(e); }
+
+/// The negotiated named group (0 before ServerHello).
+pub i64 NegotiatedGroup(HandshakeEngine e) { return e.st[SGroup()]; }
+
+/// The ALPN protocol both sides agreed on, or "" when none was negotiated.
+pub string NegotiatedAlpn(HandshakeEngine e) { return e.names[0]; }
+
+/// Server side: the server_name the client sent, or "".
+pub string ReceivedServerName(HandshakeEngine e) { return e.names[1]; }
+
+/// True after a HelloRetryRequest was sent or received.
+pub bool UsedHelloRetry(HandshakeEngine e) { return e.st[SRetries()] > 0_i64; }
+
+/// The peer's QUIC transport parameters (empty for TLS).
+pub u8[] PeerTransportParameters(HandshakeEngine e) { return GetB(e, BPeerTransport()); }
+
+/// Client side: the server's certificate chain (DER, end-entity first).
+pub Blob[] PeerCertificates(HandshakeEngine e) { return e.peerChain; }
+
+/// The encryption level at which the engine expects the next handshake bytes.
+pub i64 ReadLevel(HandshakeEngine e) { return e.st[SLevel()]; }
+
+/// TLS-Exporter (RFC 8446 section 7.5); InternalError before the handshake completes.
+pub Result<u8[], TlsError> ExportKeyingMaterial(HandshakeEngine e, string label, u8[] context, i64 length) {
+    if e.st[SState()] != StConnected() { return Result::Error(F(Alert.InternalError())); }
+    return Result::Ok(KeySchedule.Export(HashOf(e), GetB(e, BExporter()), label, context, length));
+}
+
+/// The resumption master secret (for future session tickets).
+pub u8[] ResumptionMasterSecret(HandshakeEngine e) { return GetB(e, BResumption()); }
+
+// ---------------------------------------------------------------- driving
+
+/// Client: builds and queues the ClientHello. Server: nothing to do.
+pub Result<unit, TlsError> Start(HandshakeEngine e) {
+    if !e.isClient || e.st[SState()] != StClientStart() { return Result::Ok(()); }
+    TlsClientConfig c = e.cc;
+    i64 g = c.groups[0];
+    KeyShare share = TlsPk.Generate(g)?;
+    e.share = share;
+    SetB(e, BRandom(), TlsPk.RandomBytes(32_i64)?);
+    if c.quic { SetB(e, BSessionId(), None()); } else { SetB(e, BSessionId(), TlsPk.RandomBytes(32_i64)?); }
+    u8[] ch = BuildClientHello(e);
+    SetB(e, BClientHello1(), ch);
+    Push(e, TlsEvent::Send(Wire.LevelInitial(), ch));
+    e.st[SState()] = StWaitServerHello();
+    return Result::Ok(());
+}
+
+/// Feeds `count` handshake bytes received at `level`. Complete messages are processed
+/// at once; partial ones are buffered. Messages must not span a key change.
+pub Result<unit, TlsError> Feed(HandshakeEngine e, i64 level, u8[] data, i64 offset, i64 count) {
+    if e.st[SState()] == StFailed() { return Result::Error(TlsError::Closed); }
+    Result<unit, TlsError> r = DoFeed(e, level, data, offset, count);
+    match r {
+        Result::Error(err) => { e.st[SState()] = StFailed(); return Result::Error(err); },
+        Result::Ok(_) => { return Result::Ok(()); },
+    };
+}
+
+Result<unit, TlsError> DoFeed(HandshakeEngine e, i64 level, u8[] data, i64 offset, i64 count) {
+    if level != e.st[SLevel()] { return Result::Error(F(Alert.UnexpectedMessage())); }
+    if count <= 0_i64 { return Result::Ok(()); }
+    if Slice.Len(e.inbuf) + count > Wire.MaxHandshakeMessage() + 4_i64 + 16384_i64 { return Result::Error(F(Alert.DecodeError())); }
+    e.inbuf = Mem.Join(e.inbuf, data, offset, count);
+    while true {
+        i64 have = Slice.Len(e.inbuf);
+        i64 n = Messages.MessageLength(e.inbuf, 0_i64, have)?;
+        if n == 0_i64 { return Result::Ok(()); }
+        u8[] msg = Mem.SubSlice(e.inbuf, 0_i64, n);
+        e.inbuf = Mem.SubSlice(e.inbuf, n, have - n);
+        i64 before = e.st[SLevel()];
+        Dispatch(e, Messages.Frame(msg))?;
+        if e.st[SLevel()] != before && Slice.Len(e.inbuf) > 0_i64 { return Result::Error(F(Alert.UnexpectedMessage())); }
+    }
+    return Result::Ok(());
+}
+
+/// Sends a KeyUpdate (TLS only, after the handshake); `requestPeer` asks the peer to update too.
+pub Result<unit, TlsError> RequestKeyUpdate(HandshakeEngine e, bool requestPeer) {
+    if e.st[SState()] != StConnected() { return Result::Error(F(Alert.InternalError())); }
+    TlsClientConfig c = e.cc;
+    TlsServerConfig s = e.sc;
+    if c.quic || s.quic { return Result::Error(F(Alert.InternalError())); }
+    SendKeyUpdate(e, requestPeer);
+    return Result::Ok(());
+}
+
+unit SendKeyUpdate(HandshakeEngine e, bool requestPeer) {
+    Push(e, TlsEvent::Send(Wire.LevelApplication(), Messages.EncodeKeyUpdate(requestPeer)));
+    mut i64 own = BServerAp();
+    if e.isClient { own = BClientAp(); }
+    u8[] next = KeySchedule.NextTrafficSecret(HashOf(e), GetB(e, own));
+    SetB(e, own, next);
+    Push(e, TlsEvent::WriteSecret(Wire.LevelApplication(), next));
+    return;
+}
+
+Result<unit, TlsError> Dispatch(HandshakeEngine e, Framed m) {
+    i64 state = e.st[SState()];
+    i64 kind = m.kind;
+    if state == StWaitServerHello() && kind == Wire.MsgServerHello() { return ClientOnServerHello(e, m); }
+    if state == StWaitEncryptedExtensions() && kind == Wire.MsgEncryptedExtensions() { return ClientOnEncryptedExtensions(e, m); }
+    if state == StWaitCertificateOrRequest() && kind == Wire.MsgCertificateRequest() { return ClientOnCertificateRequest(e, m); }
+    if (state == StWaitCertificateOrRequest() || state == StWaitCertificate()) && kind == Wire.MsgCertificate() { return ClientOnCertificate(e, m); }
+    if state == StWaitCertificateVerify() && kind == Wire.MsgCertificateVerify() { return ClientOnCertificateVerify(e, m); }
+    if state == StWaitServerFinished() && kind == Wire.MsgFinished() { return ClientOnFinished(e, m); }
+    if (state == StWaitClientHello() || state == StWaitClientHello2()) && kind == Wire.MsgClientHello() { return ServerOnClientHello(e, m); }
+    if state == StWaitClientFinished() && kind == Wire.MsgFinished() { return ServerOnFinished(e, m); }
+    if state == StConnected() { return OnPostHandshake(e, m); }
+    return Result::Error(F(Alert.UnexpectedMessage()));
+}
+
+// ---------------------------------------------------------------- client
+
+u8[] BuildClientHello(HandshakeEngine e) {
+    TlsClientConfig c = e.cc;
+    mut Extension[] exts = Array.Empty<Extension>();
+    if !TlsConfig.IsIpLiteral(c.serverName) {
+        Array.Append<Extension>(exts, Messages.Ext(Wire.ExtServerName(), Messages.EncodeServerName(c.serverName)));
+    }
+    Array.Append<Extension>(exts, Messages.Ext(Wire.ExtSupportedGroups(), Messages.EncodeU16List(c.groups)));
+    Array.Append<Extension>(exts, Messages.Ext(Wire.ExtSignatureAlgorithms(), Messages.EncodeU16List(TlsPk.OfferedSchemes())));
+    Array.Append<Extension>(exts, Messages.Ext(Wire.ExtSupportedVersions(), Messages.EncodeClientVersions()));
+    KeyShare share = e.share;
+    mut KeyShareEntry[] shares = Array.Empty<KeyShareEntry>();
+    Array.Append<KeyShareEntry>(shares, KeyShareEntry { group: share.group, keyExchange: share.publicKey });
+    Array.Append<Extension>(exts, Messages.Ext(Wire.ExtKeyShare(), Messages.EncodeClientShares(shares)));
+    if Array.Len<string>(c.alpn) > 0_i64 {
+        Array.Append<Extension>(exts, Messages.Ext(Wire.ExtAlpn(), Messages.EncodeAlpn(c.alpn)));
+    }
+    u8[] cookie = GetB(e, BCookie());
+    if Slice.Len(cookie) > 0_i64 {
+        Array.Append<Extension>(exts, Messages.Ext(Wire.ExtCookie(), Messages.EncodeCookie(cookie)));
+    }
+    if c.quic {
+        Array.Append<Extension>(exts, Messages.Ext(Wire.ExtQuicTransportParameters(), c.quicTransportParameters));
+    }
+    Messages.ClientHello ch = Messages.ClientHello {
+        legacyVersion: Wire.VersionTls12(), random: GetB(e, BRandom()), sessionId: GetB(e, BSessionId()),
+        cipherSuites: SuiteCodes(c.cipherSuites), compressionMethods: [0_u8], extensions: exts,
+    };
+    return Messages.EncodeClientHello(ch);
+}
+
+Result<unit, TlsError> ClientOnServerHello(HandshakeEngine e, Framed m) {
+    TlsClientConfig c = e.cc;
+    Messages.ServerHello sh = Messages.DecodeServerHello(m.body)?;
+    if !Messages.Has(sh.extensions, Wire.ExtSupportedVersions()) {
+        // A TLS 1.2 (or older) ServerHello: check the downgrade sentinel, then refuse.
+        if IsDowngradeSentinel(sh.random) { return Result::Error(F(Alert.IllegalParameter())); }
+        return Result::Error(F(Alert.ProtocolVersion()));
+    }
+    i64 version = Messages.ServerVersion(Messages.Data(sh.extensions, Wire.ExtSupportedVersions()))?;
+    if version != Wire.VersionTls13() { return Result::Error(F(Alert.IllegalParameter())); }
+    if sh.legacyVersion != Wire.VersionTls12() { return Result::Error(F(Alert.ProtocolVersion())); }
+    if sh.compressionMethod != 0_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+    if Slice.Compare(sh.sessionId, GetB(e, BSessionId())) != 0_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+    if !HasSuite(c.cipherSuites, sh.cipherSuite) { return Result::Error(F(Alert.IllegalParameter())); }
+    if Messages.IsRetryRequest(sh) { return ClientOnRetry(e, m, sh); }
+    if e.st[SRetries()] > 0_i64 && sh.cipherSuite != e.st[SSuite()] { return Result::Error(F(Alert.IllegalParameter())); }
+    i64 n = Array.Len<Extension>(sh.extensions);
+    mut i64 i = 0_i64;
+    while i < n {
+        Extension x = sh.extensions[i];
+        if x.kind != Wire.ExtSupportedVersions() && x.kind != Wire.ExtKeyShare() { return Result::Error(F(Alert.UnsupportedExtension())); }
+        i = i + 1_i64;
+    }
+    if !Messages.Has(sh.extensions, Wire.ExtKeyShare()) { return Result::Error(F(Alert.MissingExtension())); }
+    KeyShareEntry peer = Messages.ServerShare(Messages.Data(sh.extensions, Wire.ExtKeyShare()))?;
+    KeyShare mine = e.share;
+    if peer.group != mine.group { return Result::Error(F(Alert.IllegalParameter())); }
+    u8[] shared = TlsPk.Agree(mine, peer.keyExchange)?;
+    e.st[SSuite()] = sh.cipherSuite;
+    e.st[SGroup()] = peer.group;
+    HashAlgorithm h = HashOf(e);
+    if e.st[SRetries()] == 0_i64 {
+        e.transcript = Hmac.HashNew(h);
+        AddT(e, GetB(e, BClientHello1()));
+    }
+    AddT(e, m.encoded);
+    DeriveHandshakeSecrets(e, shared);
+    Push(e, TlsEvent::ReadSecret(Wire.LevelHandshake(), GetB(e, BServerHs())));
+    Push(e, TlsEvent::WriteSecret(Wire.LevelHandshake(), GetB(e, BClientHs())));
+    e.st[SState()] = StWaitEncryptedExtensions();
+    e.st[SLevel()] = Wire.LevelHandshake();
+    return Result::Ok(());
+}
+
+unit DeriveHandshakeSecrets(HandshakeEngine e, u8[] shared) {
+    HashAlgorithm h = HashOf(e);
+    u8[] early = KeySchedule.EarlySecret(h);
+    u8[] hs = KeySchedule.HandshakeSecret(h, early, shared);
+    u8[] th = TH(e);
+    SetB(e, BHandshake(), hs);
+    SetB(e, BClientHs(), KeySchedule.ClientHandshakeTraffic(h, hs, th));
+    SetB(e, BServerHs(), KeySchedule.ServerHandshakeTraffic(h, hs, th));
+    return;
+}
+
+unit DeriveApplicationSecrets(HandshakeEngine e) {
+    HashAlgorithm h = HashOf(e);
+    u8[] master = KeySchedule.MasterSecret(h, GetB(e, BHandshake()));
+    u8[] th = TH(e);
+    SetB(e, BMaster(), master);
+    SetB(e, BClientAp(), KeySchedule.ClientApplicationTraffic(h, master, th));
+    SetB(e, BServerAp(), KeySchedule.ServerApplicationTraffic(h, master, th));
+    SetB(e, BExporter(), KeySchedule.ExporterMaster(h, master, th));
+    return;
+}
+
+Result<unit, TlsError> ClientOnRetry(HandshakeEngine e, Framed m, Messages.ServerHello hrr) {
+    TlsClientConfig c = e.cc;
+    if e.st[SRetries()] > 0_i64 { return Result::Error(F(Alert.UnexpectedMessage())); }
+    i64 n = Array.Len<Extension>(hrr.extensions);
+    mut i64 i = 0_i64;
+    while i < n {
+        Extension x = hrr.extensions[i];
+        if x.kind != Wire.ExtSupportedVersions() && x.kind != Wire.ExtKeyShare() && x.kind != Wire.ExtCookie() {
+            return Result::Error(F(Alert.UnsupportedExtension()));
+        }
+        i = i + 1_i64;
+    }
+    mut bool changed = false;
+    if Messages.Has(hrr.extensions, Wire.ExtCookie()) {
+        SetB(e, BCookie(), Messages.Cookie(Messages.Data(hrr.extensions, Wire.ExtCookie()))?);
+        changed = true;
+    }
+    if Messages.Has(hrr.extensions, Wire.ExtKeyShare()) {
+        i64 g = Messages.RetryGroup(Messages.Data(hrr.extensions, Wire.ExtKeyShare()))?;
+        KeyShare old = e.share;
+        if !Messages.InList(c.groups, g) || g == old.group { return Result::Error(F(Alert.IllegalParameter())); }
+        e.share = TlsPk.Generate(g)?;
+        changed = true;
+    }
+    if !changed { return Result::Error(F(Alert.IllegalParameter())); }
+    e.st[SRetries()] = 1_i64;
+    e.st[SSuite()] = hrr.cipherSuite;
+    HashAlgorithm h = HashOf(e);
+    e.transcript = Hmac.HashNew(h);
+    AddT(e, MessageHash(h, GetB(e, BClientHello1())));
+    AddT(e, m.encoded);
+    u8[] ch2 = BuildClientHello(e);
+    AddT(e, ch2);
+    Push(e, TlsEvent::Send(Wire.LevelInitial(), ch2));
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ClientOnEncryptedExtensions(HandshakeEngine e, Framed m) {
+    TlsClientConfig c = e.cc;
+    Extension[] exts = Messages.DecodeEncryptedExtensions(m.body)?;
+    i64 n = Array.Len<Extension>(exts);
+    mut i64 i = 0_i64;
+    while i < n {
+        Extension x = exts[i];
+        mut bool allowed = x.kind == Wire.ExtSupportedGroups() || x.kind == Wire.ExtRecordSizeLimit();
+        if x.kind == Wire.ExtServerName() {
+            if Slice.Len(x.data) != 0_i64 { return Result::Error(F(Alert.DecodeError())); }
+            allowed = true;
+        }
+        if x.kind == Wire.ExtAlpn() {
+            if Array.Len<string>(c.alpn) == 0_i64 { return Result::Error(F(Alert.UnsupportedExtension())); }
+            string[] chosen = Messages.AlpnList(x.data)?;
+            if Array.Len<string>(chosen) != 1_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+            if !HasString(c.alpn, chosen[0]) { return Result::Error(F(Alert.IllegalParameter())); }
+            e.names[0] = chosen[0];
+            allowed = true;
+        }
+        if x.kind == Wire.ExtQuicTransportParameters() && c.quic {
+            SetB(e, BPeerTransport(), x.data);
+            allowed = true;
+        }
+        if x.kind == Wire.ExtSupportedVersions() || x.kind == Wire.ExtKeyShare() || x.kind == Wire.ExtSignatureAlgorithms()
+            || x.kind == Wire.ExtPreSharedKey() || x.kind == Wire.ExtCookie() || x.kind == Wire.ExtPskKeyExchangeModes() {
+            return Result::Error(F(Alert.IllegalParameter()));
+        }
+        if !allowed { return Result::Error(F(Alert.UnsupportedExtension())); }
+        i = i + 1_i64;
+    }
+    if c.alpnRequired && Array.Len<string>(c.alpn) > 0_i64 && String.Len(e.names[0]) == 0_i64 {
+        return Result::Error(F(Alert.NoApplicationProtocol()));
+    }
+    if c.quic && Slice.Len(GetB(e, BPeerTransport())) == 0_i64 { return Result::Error(F(Alert.MissingExtension())); }
+    AddT(e, m.encoded);
+    e.st[SState()] = StWaitCertificateOrRequest();
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ClientOnCertificateRequest(HandshakeEngine e, Framed m) {
+    Messages.CertificateRequestMsg cr = Messages.DecodeCertificateRequest(m.body)?;
+    if Slice.Len(cr.context) != 0_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+    SetB(e, BCertContext(), cr.context);
+    e.st[SCertRequested()] = 1_i64;
+    AddT(e, m.encoded);
+    e.st[SState()] = StWaitCertificate();
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ClientOnCertificate(HandshakeEngine e, Framed m) {
+    TlsClientConfig c = e.cc;
+    Messages.CertificateMsg cert = Messages.DecodeCertificate(m.body)?;
+    if Slice.Len(cert.context) != 0_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+    i64 n = Array.Len<CertificateEntry>(cert.entries);
+    if n == 0_i64 { return Result::Error(F(Alert.DecodeError())); }
+    mut Blob[] chain = Array.Empty<Blob>();
+    mut i64 i = 0_i64;
+    while i < n {
+        CertificateEntry entry = cert.entries[i];
+        Array.Append<Blob>(chain, Blob { data: entry.data });
+        i = i + 1_i64;
+    }
+    e.peerChain = chain;
+    e.peerKey = PeerVerify.VerifyServerChain(c, chain)?;
+    AddT(e, m.encoded);
+    e.st[SState()] = StWaitCertificateVerify();
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ClientOnCertificateVerify(HandshakeEngine e, Framed m) {
+    TlsClientConfig c = e.cc;
+    Messages.CertificateVerifyMsg cv = Messages.DecodeCertificateVerify(m.body)?;
+    if !TlsPk.IsVerifyScheme(cv.scheme) || !Messages.InList(TlsPk.OfferedSchemes(), cv.scheme) {
+        return Result::Error(F(Alert.IllegalParameter()));
+    }
+    u8[] content = Messages.SignedContent(true, TH(e));
+    TlsPk.Verify(e.peerKey, cv.scheme, content, cv.signature, c.minRsaBits)?;
+    AddT(e, m.encoded);
+    e.st[SState()] = StWaitServerFinished();
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ClientOnFinished(HandshakeEngine e, Framed m) {
+    HashAlgorithm h = HashOf(e);
+    u8[] expected = KeySchedule.FinishedVerifyData(h, GetB(e, BServerHs()), TH(e));
+    if Slice.Len(m.body) != Slice.Len(expected) || !ConstantTime.Equal(m.body, expected) {
+        return Result::Error(F(Alert.DecryptError()));
+    }
+    AddT(e, m.encoded);
+    DeriveApplicationSecrets(e);
+    Push(e, TlsEvent::ReadSecret(Wire.LevelApplication(), GetB(e, BServerAp())));
+    e.st[SLevel()] = Wire.LevelApplication();
+    mut u8[] flight = None();
+    if e.st[SCertRequested()] == 1_i64 {
+        mut CertificateEntry[] none = Array.Empty<CertificateEntry>();
+        u8[] empty = Messages.EncodeCertificate(GetB(e, BCertContext()), none);
+        AddT(e, empty);
+        flight = empty;
+    }
+    u8[] fin = Messages.EncodeFinished(KeySchedule.FinishedVerifyData(h, GetB(e, BClientHs()), TH(e)));
+    AddT(e, fin);
+    SetB(e, BResumption(), KeySchedule.ResumptionMaster(h, GetB(e, BMaster()), TH(e)));
+    Push(e, TlsEvent::Send(Wire.LevelHandshake(), Cat(flight, fin)));
+    Push(e, TlsEvent::WriteSecret(Wire.LevelApplication(), GetB(e, BClientAp())));
+    Push(e, TlsEvent::Connected);
+    e.st[SState()] = StConnected();
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------- server
+
+i64 ShareIndex(KeyShareEntry[] shares, i64 group) {
+    i64 n = Array.Len<KeyShareEntry>(shares);
+    mut i64 i = 0_i64;
+    while i < n {
+        KeyShareEntry s = shares[i];
+        if s.group == group { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+Result<unit, TlsError> ServerOnClientHello(HandshakeEngine e, Framed m) {
+    TlsServerConfig s = e.sc;
+    bool second = e.st[SState()] == StWaitClientHello2();
+    Messages.ClientHello ch = Messages.DecodeClientHello(m.body)?;
+    Extension[] exts = ch.extensions;
+    if !Messages.Has(exts, Wire.ExtSupportedVersions()) { return Result::Error(F(Alert.ProtocolVersion())); }
+    i64[] versions = Messages.ClientVersions(Messages.Data(exts, Wire.ExtSupportedVersions()))?;
+    if !Messages.InList(versions, Wire.VersionTls13()) { return Result::Error(F(Alert.ProtocolVersion())); }
+    if ch.legacyVersion != Wire.VersionTls12() { return Result::Error(F(Alert.ProtocolVersion())); }
+    if Slice.Len(ch.compressionMethods) != 1_i64 || ch.compressionMethods[0] != 0_u8 { return Result::Error(F(Alert.IllegalParameter())); }
+    if s.quic && Slice.Len(ch.sessionId) != 0_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+    i64 pskAt = Messages.Find(exts, Wire.ExtPreSharedKey());
+    if pskAt >= 0_i64 && pskAt != Array.Len<Extension>(exts) - 1_i64 { return Result::Error(F(Alert.IllegalParameter())); }
+    // Cipher suite: server preference.
+    mut i64 suite = -1_i64;
+    i64 ns = Array.Len<CipherSuite>(s.cipherSuites);
+    mut i64 i = 0_i64;
+    while i < ns && suite < 0_i64 {
+        CipherSuite candidate = s.cipherSuites[i];
+        if Messages.InList(ch.cipherSuites, Suites.Code(candidate)) { suite = Suites.Code(candidate); }
+        i = i + 1_i64;
+    }
+    if suite < 0_i64 { return Result::Error(F(Alert.HandshakeFailure())); }
+    if second && suite != e.st[SSuite()] { return Result::Error(F(Alert.IllegalParameter())); }
+    // Signature algorithms: this server signs with ecdsa_secp256r1_sha256 only.
+    if !Messages.Has(exts, Wire.ExtSignatureAlgorithms()) { return Result::Error(F(Alert.MissingExtension())); }
+    i64[] schemes = Messages.U16List(Messages.Data(exts, Wire.ExtSignatureAlgorithms()), 2_i64)?;
+    if !Messages.InList(schemes, Wire.SchemeEcdsaSecp256r1Sha256()) { return Result::Error(F(Alert.HandshakeFailure())); }
+    // Groups and key shares.
+    bool hasGroups = Messages.Has(exts, Wire.ExtSupportedGroups());
+    bool hasShares = Messages.Has(exts, Wire.ExtKeyShare());
+    if hasGroups != hasShares || !hasGroups { return Result::Error(F(Alert.MissingExtension())); }
+    i64[] clientGroups = Messages.U16List(Messages.Data(exts, Wire.ExtSupportedGroups()), 2_i64)?;
+    KeyShareEntry[] shares = Messages.ClientShares(Messages.Data(exts, Wire.ExtKeyShare()))?;
+    i64 nshare = Array.Len<KeyShareEntry>(shares);
+    i = 0_i64;
+    while i < nshare {
+        KeyShareEntry sh = shares[i];
+        if !Messages.InList(clientGroups, sh.group) || ShareIndex(shares, sh.group) != i { return Result::Error(F(Alert.IllegalParameter())); }
+        i = i + 1_i64;
+    }
+    mut i64 group = -1_i64;
+    mut i64 retryGroup = -1_i64;
+    i64 ng = Array.Len<i64>(s.groups);
+    i = 0_i64;
+    while i < ng {
+        i64 g = s.groups[i];
+        if group < 0_i64 && ShareIndex(shares, g) >= 0_i64 { group = g; }
+        if retryGroup < 0_i64 && Messages.InList(clientGroups, g) { retryGroup = g; }
+        i = i + 1_i64;
+    }
+    if second && (nshare != 1_i64 || group != e.st[SGroup()]) { return Result::Error(F(Alert.IllegalParameter())); }
+    // Server name.
+    if Messages.Has(exts, Wire.ExtServerName()) {
+        string name = Messages.ServerName(Messages.Data(exts, Wire.ExtServerName()))?;
+        if Array.Len<string>(s.serverNames) > 0_i64 && !HasString(s.serverNames, name) { return Result::Error(F(Alert.UnrecognizedName())); }
+        e.names[1] = name;
+        e.st[SUsedSni()] = 1_i64;
+    } else {
+        if s.requireSni { return Result::Error(F(Alert.MissingExtension())); }
+    }
+    // ALPN (RFC 7301 section 3.2): server preference; no overlap is no_application_protocol.
+    if Messages.Has(exts, Wire.ExtAlpn()) && Array.Len<string>(s.alpn) > 0_i64 {
+        string[] offered = Messages.AlpnList(Messages.Data(exts, Wire.ExtAlpn()))?;
+        mut string chosen = "";
+        i64 na = Array.Len<string>(s.alpn);
+        i = 0_i64;
+        while i < na && String.Len(chosen) == 0_i64 {
+            if HasString(offered, s.alpn[i]) { chosen = s.alpn[i]; }
+            i = i + 1_i64;
+        }
+        if String.Len(chosen) == 0_i64 { return Result::Error(F(Alert.NoApplicationProtocol())); }
+        e.names[0] = chosen;
+    }
+    if s.quic {
+        if !Messages.Has(exts, Wire.ExtQuicTransportParameters()) { return Result::Error(F(Alert.MissingExtension())); }
+        SetB(e, BPeerTransport(), Messages.Data(exts, Wire.ExtQuicTransportParameters()));
+    }
+    e.st[SSuite()] = suite;
+    HashAlgorithm h = HashOf(e);
+    if group < 0_i64 {
+        if second || retryGroup < 0_i64 { return Result::Error(F(Alert.HandshakeFailure())); }
+        return ServerSendRetry(e, m, ch, retryGroup);
+    }
+    if !second {
+        e.transcript = Hmac.HashNew(h);
+    }
+    AddT(e, m.encoded);
+    e.st[SGroup()] = group;
+    KeyShareEntry peer = shares[ShareIndex(shares, group)];
+    KeyShare mine = TlsPk.Generate(group)?;
+    u8[] shared = TlsPk.Agree(mine, peer.keyExchange)?;
+    return ServerSendFlight(e, ch, mine, shared);
+}
+
+Result<unit, TlsError> ServerSendRetry(HandshakeEngine e, Framed m, Messages.ClientHello ch, i64 group) {
+    HashAlgorithm h = HashOf(e);
+    e.transcript = Hmac.HashNew(h);
+    AddT(e, MessageHash(h, m.encoded));
+    mut Extension[] exts = Array.Empty<Extension>();
+    Array.Append<Extension>(exts, Messages.Ext(Wire.ExtSupportedVersions(), Messages.EncodeServerVersion()));
+    Array.Append<Extension>(exts, Messages.Ext(Wire.ExtKeyShare(), Messages.EncodeRetryGroup(group)));
+    Messages.ServerHello hrr = Messages.ServerHello {
+        legacyVersion: Wire.VersionTls12(), random: Messages.RetryRandom(), sessionId: ch.sessionId,
+        cipherSuite: e.st[SSuite()], compressionMethod: 0_i64, extensions: exts,
+    };
+    u8[] encoded = Messages.EncodeServerHello(hrr);
+    AddT(e, encoded);
+    Push(e, TlsEvent::Send(Wire.LevelInitial(), encoded));
+    e.st[SRetries()] = 1_i64;
+    e.st[SGroup()] = group;
+    e.st[SState()] = StWaitClientHello2();
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ServerSendFlight(HandshakeEngine e, Messages.ClientHello ch, KeyShare mine, u8[] shared) {
+    TlsServerConfig s = e.sc;
+    HashAlgorithm h = HashOf(e);
+    mut Extension[] shExts = Array.Empty<Extension>();
+    Array.Append<Extension>(shExts, Messages.Ext(Wire.ExtSupportedVersions(), Messages.EncodeServerVersion()));
+    Array.Append<Extension>(shExts, Messages.Ext(Wire.ExtKeyShare(), Messages.EncodeServerShare(mine.group, mine.publicKey)));
+    Messages.ServerHello sh = Messages.ServerHello {
+        legacyVersion: Wire.VersionTls12(), random: TlsPk.RandomBytes(32_i64)?, sessionId: ch.sessionId,
+        cipherSuite: e.st[SSuite()], compressionMethod: 0_i64, extensions: shExts,
+    };
+    u8[] shBytes = Messages.EncodeServerHello(sh);
+    AddT(e, shBytes);
+    DeriveHandshakeSecrets(e, shared);
+    Push(e, TlsEvent::Send(Wire.LevelInitial(), shBytes));
+    Push(e, TlsEvent::WriteSecret(Wire.LevelHandshake(), GetB(e, BServerHs())));
+    Push(e, TlsEvent::ReadSecret(Wire.LevelHandshake(), GetB(e, BClientHs())));
+    // EncryptedExtensions.
+    mut Extension[] ee = Array.Empty<Extension>();
+    if e.st[SUsedSni()] == 1_i64 { Array.Append<Extension>(ee, Messages.Ext(Wire.ExtServerName(), None())); }
+    if String.Len(e.names[0]) > 0_i64 {
+        mut string[] chosen = Array.Empty<string>();
+        Array.Append<string>(chosen, e.names[0]);
+        Array.Append<Extension>(ee, Messages.Ext(Wire.ExtAlpn(), Messages.EncodeAlpn(chosen)));
+    }
+    if s.quic { Array.Append<Extension>(ee, Messages.Ext(Wire.ExtQuicTransportParameters(), s.quicTransportParameters)); }
+    u8[] eeBytes = Messages.EncodeEncryptedExtensions(ee);
+    AddT(e, eeBytes);
+    // Certificate.
+    mut CertificateEntry[] entries = Array.Empty<CertificateEntry>();
+    i64 nc = Array.Len<Blob>(s.certificateChain);
+    mut i64 i = 0_i64;
+    while i < nc {
+        Blob cert = s.certificateChain[i];
+        mut Extension[] none = Array.Empty<Extension>();
+        Array.Append<CertificateEntry>(entries, CertificateEntry { data: cert.data, extensions: none });
+        i = i + 1_i64;
+    }
+    u8[] certBytes = Messages.EncodeCertificate(None(), entries);
+    AddT(e, certBytes);
+    // CertificateVerify.
+    u8[] signature = TlsPk.SignP256(s.privateKey, Messages.SignedContent(true, TH(e)))?;
+    u8[] cvBytes = Messages.EncodeCertificateVerify(Wire.SchemeEcdsaSecp256r1Sha256(), signature);
+    AddT(e, cvBytes);
+    // Finished.
+    u8[] finBytes = Messages.EncodeFinished(KeySchedule.FinishedVerifyData(h, GetB(e, BServerHs()), TH(e)));
+    AddT(e, finBytes);
+    Push(e, TlsEvent::Send(Wire.LevelHandshake(), Cat(Cat(eeBytes, certBytes), Cat(cvBytes, finBytes))));
+    DeriveApplicationSecrets(e);
+    Push(e, TlsEvent::WriteSecret(Wire.LevelApplication(), GetB(e, BServerAp())));
+    SetB(e, BExpectedFinished(), KeySchedule.FinishedVerifyData(h, GetB(e, BClientHs()), TH(e)));
+    e.st[SState()] = StWaitClientFinished();
+    e.st[SLevel()] = Wire.LevelHandshake();
+    return Result::Ok(());
+}
+
+Result<unit, TlsError> ServerOnFinished(HandshakeEngine e, Framed m) {
+    u8[] expected = GetB(e, BExpectedFinished());
+    if Slice.Len(m.body) != Slice.Len(expected) || !ConstantTime.Equal(m.body, expected) {
+        return Result::Error(F(Alert.DecryptError()));
+    }
+    AddT(e, m.encoded);
+    SetB(e, BResumption(), KeySchedule.ResumptionMaster(HashOf(e), GetB(e, BMaster()), TH(e)));
+    Push(e, TlsEvent::ReadSecret(Wire.LevelApplication(), GetB(e, BClientAp())));
+    Push(e, TlsEvent::Connected);
+    e.st[SState()] = StConnected();
+    e.st[SLevel()] = Wire.LevelApplication();
+    return Result::Ok(());
+}
+
+// ---------------------------------------------------------------- post-handshake
+
+Result<unit, TlsError> OnPostHandshake(HandshakeEngine e, Framed m) {
+    TlsClientConfig c = e.cc;
+    TlsServerConfig s = e.sc;
+    bool quic = c.quic || s.quic;
+    if e.isClient && m.kind == Wire.MsgNewSessionTicket() {
+        // Tickets are validated and dropped: this implementation does not resume sessions.
+        Messages.DecodeNewSessionTicket(m.body)?;
+        return Result::Ok(());
+    }
+    if m.kind == Wire.MsgKeyUpdate() && !quic {
+        i64 requested = Messages.DecodeKeyUpdate(m.body)?;
+        mut i64 peer = BClientAp();
+        if e.isClient { peer = BServerAp(); }
+        u8[] next = KeySchedule.NextTrafficSecret(HashOf(e), GetB(e, peer));
+        SetB(e, peer, next);
+        Push(e, TlsEvent::ReadSecret(Wire.LevelApplication(), next));
+        if requested == 1_i64 { SendKeyUpdate(e, false); }
+        return Result::Ok(());
+    }
+    return Result::Error(F(Alert.UnexpectedMessage()));
+}

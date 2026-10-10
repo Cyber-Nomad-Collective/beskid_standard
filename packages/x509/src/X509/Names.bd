@@ -1,0 +1,86 @@
+/// X.501 distinguished names as used by RFC 5280.
+///
+/// A name keeps its exact DER encoding, which path building compares byte for byte
+/// (RFC 5280 section 7.1 permits binary comparison for names issued by one CA), and the
+/// common attributes decoded to text for display and for callers.
+use X509.Der;
+use X509.X509Errors;
+
+pub type DistinguishedName {
+    /// The complete Name SEQUENCE, tag and length included.
+    pub u8[] der,
+    pub string commonName,
+    pub string organization,
+    pub string organizationalUnit,
+    pub string country,
+    pub string locality,
+    pub string state,
+    /// Number of attribute values (all RDNs together).
+    pub i64 attributeCount,
+}
+
+pub DistinguishedName EmptyName() {
+    return DistinguishedName { der: [0x30_u8, 0_u8], commonName: "", organization: "", organizationalUnit: "", country: "", locality: "", state: "", attributeCount: 0_i64 };
+}
+
+/// Parses the Name SEQUENCE `e` (RDNSequence). Every RDN is a non-empty SET of
+/// AttributeTypeAndValue. Values of the decoded attributes must be directory strings.
+pub DistinguishedName Parse(DerParser p, DerElement e) {
+    if !Der.Ok(p) { return EmptyName(); }
+    if !Der.Is(e, 0_i64, true, 16_i64) { Der.Fail(p, 4_i64); return EmptyName(); }
+    mut string cn = "";
+    mut string o = "";
+    mut string ou = "";
+    mut string c = "";
+    mut string l = "";
+    mut string st = "";
+    mut i64 count = 0_i64;
+    mut i64 pos = e.content;
+    while Der.Ok(p) && pos < e.end {
+        DerElement set = Der.ExpectUniversal(p, pos, e.end, 17_i64);
+        if Der.Ok(p) && set.length == 0_i64 { Der.Fail(p, 25_i64); }
+        mut i64 at = set.content;
+        while Der.Ok(p) && at < set.end {
+            DerElement atv = Der.ExpectSequence(p, at, set.end);
+            string oid = Der.ReadOid(p, atv.content, atv.end);
+            DerElement oidEl = Der.Read(p, atv.content, atv.end);
+            DerElement value = Der.Read(p, oidEl.end, atv.end);
+            Der.ExpectEnd(p, value.end, atv.end);
+            if Der.Ok(p) {
+                count = count + 1_i64;
+                if oid == "2.5.4.3" { cn = Der.ReadString(p, value); }
+                else if oid == "2.5.4.10" { o = Der.ReadString(p, value); }
+                else if oid == "2.5.4.11" { ou = Der.ReadString(p, value); }
+                else if oid == "2.5.4.6" { c = Der.ReadString(p, value); }
+                else if oid == "2.5.4.7" { l = Der.ReadString(p, value); }
+                else if oid == "2.5.4.8" { st = Der.ReadString(p, value); }
+            }
+            at = atv.end;
+        }
+        pos = set.end;
+    }
+    if !Der.Ok(p) { return EmptyName(); }
+    return DistinguishedName { der: Der.Encoded(p, e), commonName: cn, organization: o, organizationalUnit: ou, country: c, locality: l, state: st, attributeCount: count };
+}
+
+/// Binary equality of the two encodings.
+pub bool Equal(DistinguishedName a, DistinguishedName b) {
+    return Der.BytesEqual(a.der, b.der);
+}
+
+/// A short display form such as "CN=Example, O=Org, C=PL".
+pub string Display(DistinguishedName n) {
+    mut string out = "";
+    if n.commonName != "" { out = Join(out, "CN=" + n.commonName); }
+    if n.organizationalUnit != "" { out = Join(out, "OU=" + n.organizationalUnit); }
+    if n.organization != "" { out = Join(out, "O=" + n.organization); }
+    if n.locality != "" { out = Join(out, "L=" + n.locality); }
+    if n.state != "" { out = Join(out, "ST=" + n.state); }
+    if n.country != "" { out = Join(out, "C=" + n.country); }
+    return out;
+}
+
+string Join(string a, string b) {
+    if a == "" { return b; }
+    return a + ", " + b;
+}

@@ -1,0 +1,57 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use X509.Hostname;
+use TestSupport;
+
+bool Ip(string text, string hex) {
+    u8[] got = Hostname.ParseIp(text);
+    u8[] want = TestSupport.Hex(hex);
+    return Slice.Compare(got, want) == 0_i64;
+}
+
+test dns_exact_and_case {
+    Assert.True(Hostname.MatchDnsName("www.example.test", "www.example.test"), "exact");
+    Assert.True(Hostname.MatchDnsName("WWW.Example.TEST", "www.example.test"), "case");
+    Assert.True(Hostname.MatchDnsName("www.example.test", "WWW.EXAMPLE.TEST."), "trailing dot");
+    Assert.False(Hostname.MatchDnsName("www.example.test", "example.test"), "different");
+    Assert.False(Hostname.MatchDnsName("example.test", "www.example.test"), "no implicit subdomain");
+}
+
+test dns_wildcards {
+    Assert.True(Hostname.MatchDnsName("*.example.test", "a.example.test"), "one label");
+    Assert.False(Hostname.MatchDnsName("*.example.test", "a.b.example.test"), "only one label");
+    Assert.False(Hostname.MatchDnsName("*.example.test", "example.test"), "not the base");
+    Assert.False(Hostname.MatchDnsName("*.test", "example.test"), "needs two labels after");
+    Assert.False(Hostname.MatchDnsName("f*.example.test", "foo.example.test"), "partial label");
+    Assert.False(Hostname.MatchDnsName("a.*.example.test", "a.b.example.test"), "not left-most");
+    Assert.False(Hostname.MatchDnsName("*.*.example.test", "a.b.example.test"), "two wildcards");
+    Assert.False(Hostname.MatchDnsName("*", "test"), "bare star");
+    Assert.False(Hostname.MatchDnsName("*.example.test", "192.0.2.1"), "ip is not a name");
+}
+
+test dns_validity {
+    Assert.True(Hostname.IsValidDnsName("a-b.example.test"), "ldh");
+    Assert.False(Hostname.IsValidDnsName("-a.example.test"), "leading hyphen");
+    Assert.False(Hostname.IsValidDnsName("a..test"), "empty label");
+    Assert.False(Hostname.IsValidDnsName("a b.test"), "space");
+    Assert.False(Hostname.IsValidDnsName(""), "empty");
+}
+
+test ip_literals {
+    Assert.True(Ip("192.0.2.10", "C000020A"), "v4");
+    Assert.True(Ip("2001:db8::1", "20010DB8000000000000000000000001"), "v6 gap");
+    Assert.True(Ip("[2001:db8::1]", "20010DB8000000000000000000000001"), "v6 brackets");
+    Assert.True(Ip("::", "00000000000000000000000000000000"), "all zero");
+    Assert.True(Ip("::1", "00000000000000000000000000000001"), "loopback");
+    Assert.True(Ip("::ffff:192.0.2.1", "00000000000000000000FFFFC0000201"), "v4 mapped");
+    Assert.True(Ip("1:2:3:4:5:6:7:8", "00010002000300040005000600070008"), "full");
+    Assert.True(Ip("1::", "00010000000000000000000000000000"), "trailing gap");
+    Assert.True(Ip("192.0.2.010", ""), "leading zero rejected");
+    Assert.True(Ip("192.0.2", ""), "three parts");
+    Assert.True(Ip("256.0.0.1", ""), "range");
+    Assert.True(Ip("1::2::3", ""), "two gaps");
+    Assert.True(Ip("1:2:3:4:5:6:7:8:9", ""), "nine groups");
+    Assert.True(Ip("12345::", ""), "group too long");
+    Assert.True(Ip("1:", ""), "dangling colon");
+    Assert.True(Ip("example.test", ""), "name");
+}

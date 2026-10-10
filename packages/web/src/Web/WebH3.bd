@@ -1,0 +1,187 @@
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Time;
+use Core.Time.Deadline;
+use Http.Types;
+use Http2.Server;
+use Network.Dns;
+use Network.Errors as NetErrors;
+use Network.Types as NetTypes;
+use Http3.H3Client;
+use Http3.H3Connection;
+use Http3.H3Errors;
+use Http3.H3Quic;
+use Http3.H3Server;
+use Tls.TlsConfig;
+use Web.WebConfig;
+use Web.WebErrors;
+
+// HTTP/3 (RFC 9114) for the Web facade, over Http3 + Quic.
+//
+// Client: one request per QUIC connection (R14). The URL host is resolved
+// (IP literals directly, names through Network.Dns), then each address gets an
+// equal share of the remaining handshake budget, in resolver order. The TLS
+// policy is the one of the TCP path, with ALPN "h3" only.
+//
+// Server: one QUIC endpoint; connections are served one after another on the
+// calling fiber, each until the peer closes it or it is idle.
+
+// The Http3Failed code of an H3Error: the wire code, or the Web codes for the
+// errors that have none.
+pub i64 CodeOf(H3Error error) {
+    return match error {
+        H3Error::Timeout() => WebErrors.Http3TimeoutCode(),
+        H3Error::Transport() => WebErrors.Http3TransportCode(),
+        _ => H3Errors.CodeOf(error),
+    };
+}
+
+WebError Failed(H3Error error) { return WebError::Http3Failed(CodeOf(error)); }
+
+Option<Deadline> Within(i64 millis) {
+    if millis <= 0_i64 { return Option.Empty<Deadline>(); }
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+// -1 (no limit) for a non-positive Web timeout.
+i64 Millis(i64 value) {
+    if value <= 0_i64 { return -1_i64; }
+    return value;
+}
+
+H3Config ClientH3Config() { return H3Connection.DefaultConfig(); }
+
+// ------------------------------------------------------------ client
+
+// The addresses to try for `hostName`: an IP literal as is, otherwise the
+// Network.Dns answer (both families, resolver order). Empty when resolution fails.
+pub SocketAddress[] Resolve(string hostName, Port port, i64 timeoutMillis) {
+    Result<IpAddress,H3Error> literal = H3Quic.ParseAddress(hostName);
+    match literal {
+        Result::Ok(address) => {
+            mut SocketAddress[] one = Array.Empty<SocketAddress>();
+            Array.Append<SocketAddress>(one, SocketAddress { address: address, port: port });
+            return one;
+        },
+        Result::Error(_) => {},
+    };
+    Result<SocketAddress[],NetworkError> resolved = Dns.Resolve(hostName, port, Option.Empty<AddressFamily>(), Within(timeoutMillis));
+    return match resolved {
+        Result::Ok(addresses) => addresses,
+        Result::Error(_) => Array.Empty<SocketAddress>(),
+    };
+}
+
+/// Sends `request` (origin-form target, Host set) over HTTP/3 to `hostName`
+/// and `port`. `reached[0]` becomes 1 once a QUIC handshake with ALPN "h3"
+/// succeeded: a failure after that point must not be retried over TCP.
+/// Must run inside a fiber.
+pub Result<Response,WebError> Exchange(string hostName, Port port, CertificateVerification verification, Request request, WebClientConfig config, i64[] reached) {
+    TlsClientConfig tls = TlsConfig.Client(hostName, verification);
+    SocketAddress[] addresses = Resolve(hostName, port, config.connectTimeoutMillis);
+    i64 count = Array.Len<SocketAddress>(addresses);
+    if count == 0_i64 { return Result::Error(Failed(H3Error::Transport())); }
+    i64 deadline = H3Quic.DeadlineIn(config.http3HandshakeMillis);
+    mut H3Error last = H3Error::Timeout();
+    mut i64 i = 0_i64;
+    while i < count {
+        i64 remaining = (deadline - H3Quic.NowNanos()) / 1000000_i64;
+        if remaining <= 0_i64 { return Result::Error(Failed(last)); }
+        i64 share = remaining / (count - i);
+        Result<QuicLink,H3Error> linked = H3Quic.ConnectSocket(Array.Get<SocketAddress>(addresses, i), tls, share);
+        match linked {
+            Result::Ok(link) => {
+                reached[0] = 1_i64;
+                return SendOn(link, request, config);
+            },
+            Result::Error(error) => { last = error; },
+        };
+        i = i + 1_i64;
+    }
+    return Result::Error(Failed(last));
+}
+
+Result<Response,WebError> SendOn(QuicLink link, Request request, WebClientConfig config) {
+    mut H3Conn conn = H3Client.Connect(link, ClientH3Config());
+    Result<Response,H3Error> sent = H3Client.Send(conn, request, Millis(config.requestTimeoutMillis));
+    H3Client.Close(conn);
+    return match sent {
+        Result::Ok(response) => Result::Ok(response),
+        Result::Error(error) => Result::Error(Failed(error)),
+    };
+}
+
+// ------------------------------------------------------------ server
+
+H3Config ServerH3Config(WebServerConfig config) { return H3Connection.DefaultConfig(); }
+
+/// Serves HTTP/3 over QUIC on `address` (an IP literal) and UDP `port`. The
+/// TLS configuration is used with ALPN "h3" only. Returns the number of
+/// connections served once `config.maxConnections` is reached; AcceptFailed
+/// when no connection arrives within `config.acceptTimeoutMillis`;
+/// Http3Failed when the endpoint cannot be bound. Must run inside a fiber.
+pub Result<i64,WebError> ServeQuic(string address, i64 port, TlsServerConfig tls, RequestHandler handler, WebServerConfig config) {
+    Result<H3Listener,H3Error> bound = H3Server.ListenQuic(address, port, tls, ServerH3Config(config));
+    return match bound {
+        Result::Error(error) => Result::Error(Failed(error)),
+        Result::Ok(listener) => ServeListener(listener, handler, config),
+    };
+}
+
+Result<i64,WebError> ServeListener(H3Listener listener, RequestHandler handler, WebServerConfig config) {
+    mut i64 served = 0_i64;
+    i64 limit = config.maxConnections;
+    while limit <= 0_i64 || served < limit {
+        Result<H3Conn,H3Error> accepted = H3Server.AcceptQuic(listener, Millis(config.acceptTimeoutMillis));
+        match accepted {
+            Result::Error(error) => {
+                if IsTimeout(error) {
+                    H3Server.StopListening(listener);
+                    return Result::Error(WebError::AcceptFailed());
+                }
+            },
+            Result::Ok(conn) => { i64 handled = ServeConnection(conn, handler, config); },
+        };
+        served = served + 1_i64;
+    }
+    H3Server.StopListening(listener);
+    return Result::Ok(served);
+}
+
+bool IsTimeout(H3Error error) {
+    return match error { H3Error::Timeout() => true, _ => false, };
+}
+
+// Serves the requests of one HTTP/3 connection until the client closes it,
+// it is idle for `config.idleTimeoutMillis`, or `maxRequestsPerConnection` is
+// reached (then GOAWAY). Returns the number of requests handled.
+pub i64 ServeConnection(H3Conn start, RequestHandler handler, WebServerConfig config) {
+    mut H3Conn conn = start;
+    mut i64 handled = 0_i64;
+    i64 limit = config.maxRequestsPerConnection;
+    mut bool open = true;
+    while open && (limit <= 0_i64 || handled < limit) {
+        H3Incoming incoming = H3Server.NextRequest(conn, Millis(config.idleTimeoutMillis));
+        if incoming.streamId < 0_i64 {
+            open = false;
+        } else {
+            Response response = handler.Handle(incoming.request);
+            Result<unit,H3Error> sent = H3Server.Respond(conn, incoming.streamId, response);
+            match sent {
+                Result::Ok(_) => { handled = handled + 1_i64; },
+                Result::Error(_) => { open = false; },
+            };
+        }
+    }
+    if H3Connection.ErrorCode(conn) < 0_i64 {
+        // Still open (idle or request limit): graceful GOAWAY, then close.
+        bool announced = H3Server.Shutdown(conn);
+        H3Quic.Close(conn.link, H3Errors.NoError());
+    }
+    H3Server.Release(conn, 2000_i64);
+    return handled;
+}

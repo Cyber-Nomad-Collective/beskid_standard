@@ -1,0 +1,75 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Http3.H3Errors;
+use Http3.H3Frame;
+
+// RFC 9114 section 7.2.4 SETTINGS and RFC 9204 section 5 QPACK settings.
+
+pub i64 IdQpackMaxTableCapacity() { return 1_i64; }
+pub i64 IdMaxFieldSectionSize() { return 6_i64; }
+pub i64 IdQpackBlockedStreams() { return 7_i64; }
+
+/// Settings of one endpoint. `maxFieldSectionSize` is -1 for unlimited.
+pub type SettingValues { pub i64 maxTableCapacity, pub i64 maxFieldSectionSize, pub i64 blockedStreams, }
+
+/// RFC defaults before SETTINGS arrive: no dynamic table, unlimited section size.
+pub SettingValues Defaults() { return SettingValues { maxTableCapacity: 0_i64, maxFieldSectionSize: -1_i64, blockedStreams: 0_i64 }; }
+
+/// The result of decoding a SETTINGS payload: `code` 0 or an H3 error code.
+pub type SettingsResult { pub i64 code, pub SettingValues settings, }
+
+/// HTTP/2 setting identifiers that HTTP/3 reserves (section 7.2.4.1).
+pub bool IsReservedHttp2(i64 id) { return id == 0_i64 || id == 2_i64 || id == 3_i64 || id == 4_i64 || id == 5_i64; }
+
+/// SETTINGS payload: known non-default values, then one grease setting.
+pub u8[] Encode(SettingValues settings) {
+    mut u8[] out = Slice.New(0_i64);
+    if settings.maxTableCapacity > 0_i64 {
+        out = H3Frame.AppendVarint(out, IdQpackMaxTableCapacity());
+        out = H3Frame.AppendVarint(out, settings.maxTableCapacity);
+    }
+    if settings.maxFieldSectionSize >= 0_i64 {
+        out = H3Frame.AppendVarint(out, IdMaxFieldSectionSize());
+        out = H3Frame.AppendVarint(out, settings.maxFieldSectionSize);
+    }
+    if settings.blockedStreams > 0_i64 {
+        out = H3Frame.AppendVarint(out, IdQpackBlockedStreams());
+        out = H3Frame.AppendVarint(out, settings.blockedStreams);
+    }
+    out = H3Frame.AppendVarint(out, 33_i64 + 31_i64 * 7_i64);
+    out = H3Frame.AppendVarint(out, 0_i64);
+    return out;
+}
+
+SettingsResult Fail(i64 code) { return SettingsResult { code: code, settings: Defaults() }; }
+
+/// Decodes a SETTINGS payload buf[start .. start+length). Duplicate or
+/// reserved identifiers are H3_SETTINGS_ERROR; a truncated pair is
+/// H3_FRAME_ERROR; unknown identifiers are ignored.
+pub SettingsResult Decode(u8[] buf, i64 start, i64 length) {
+    i64 end = start + length;
+    mut i64[] seen = Array.Empty<i64>();
+    mut i64 capacity = 0_i64;
+    mut i64 sectionSize = -1_i64;
+    mut i64 blocked = 0_i64;
+    mut i64 pos = start;
+    while pos < end {
+        i64 id = H3Frame.VarintAt(buf, pos, end);
+        if id < 0_i64 { return Fail(H3Errors.FrameError()); }
+        pos = pos + H3Frame.VarintLength(buf[pos]);
+        i64 value = H3Frame.VarintAt(buf, pos, end);
+        if value < 0_i64 { return Fail(H3Errors.FrameError()); }
+        pos = pos + H3Frame.VarintLength(buf[pos]);
+        if IsReservedHttp2(id) { return Fail(H3Errors.SettingsError()); }
+        mut i64 k = 0_i64;
+        while k < Array.Len<i64>(seen) {
+            if seen[k] == id { return Fail(H3Errors.SettingsError()); }
+            k = k + 1_i64;
+        }
+        Array.Append<i64>(seen, id);
+        if id == IdQpackMaxTableCapacity() { capacity = value; }
+        if id == IdMaxFieldSectionSize() { sectionSize = value; }
+        if id == IdQpackBlockedStreams() { blocked = value; }
+    }
+    return SettingsResult { code: 0_i64, settings: SettingValues { maxTableCapacity: capacity, maxFieldSectionSize: sectionSize, blockedStreams: blocked } };
+}

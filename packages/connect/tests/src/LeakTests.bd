@@ -1,0 +1,226 @@
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
+use Core.Results;
+use Network.Types;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Connect;
+use Connect.Failures;
+use Connect.Policy;
+use Testing.Assert;
+
+// ---- shared loopback helpers (duplicated per target; targets are independent roots) ----
+
+pub SocketAddress Loopback4(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+pub SocketAddress Loopback6(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32), port: value };
+}
+
+pub Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+// A port that refuses connections: bind, read the port, close.
+pub Result<SocketAddress, NetworkError> ClosedPort4() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    listener.Close()?;
+    return Result::Ok(address);
+}
+
+// A listener whose accept queue is full, so new connects hang until their deadline.
+pub type Blackhole {
+    TcpListener listener,
+    TcpStream[] fillers,
+    SocketAddress address,
+}
+
+pub Result<Blackhole, NetworkError> OpenBlackhole() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
+    SocketAddress address = listener.LocalAddress()?;
+    mut TcpStream[] fillers = Array.Empty<TcpStream>();
+    mut i64 tries = 0_i64;
+    mut bool hanging = false;
+    while !hanging && tries < 16_i64 {
+        match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(100_i64)) {
+            Result::Ok(stream) => { Array.Append<TcpStream>(fillers, stream); },
+            Result::Error(_) => { hanging = true; },
+        };
+        tries = tries + 1_i64;
+    }
+    Assert.True(hanging, "a full accept queue makes new connects hang");
+    return Result::Ok(Blackhole { listener: listener, fillers: fillers, address: address });
+}
+
+pub unit CloseBlackhole(Blackhole hole) {
+    mut i64 index = 0_i64;
+    while index < Array.Len<TcpStream>(hole.fillers) {
+        TcpStream filler = hole.fillers[index];
+        filler.Close();
+        index = index + 1_i64;
+    }
+    hole.listener.Close();
+    return;
+}
+
+// Accepts the connection a race produced, proves bytes flow, and closes both ends.
+pub Result<unit, NetworkError> Exchange(TcpListener listener, TcpStream client) {
+    TcpStream accepted = listener.Accept(Within(2000_i64))?;
+    Assert.True(match IO.WriteAll(accepted, [42_u8], 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "server writes one byte");
+    u8[] bytes = Slice.New(1_i64);
+    Assert.True(match IO.ReadExact(client, bytes, 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "client reads the byte");
+    Assert.Equal<u8>(bytes[0], 42_u8, "byte survives the winning stream");
+    accepted.Close();
+    client.Close();
+    return Result::Ok(());
+}
+
+pub i64 PeerPort(TcpStream stream) {
+    return match stream.PeerAddress() { Result::Ok(address) => address.port.Value(), Result::Error(_) => -1_i64, };
+}
+
+pub bool PeerIsV6(TcpStream stream) {
+    return match stream.PeerAddress() {
+        Result::Ok(address) => match address.address { IpAddress::V6(_, _, _, _) => true, _ => false, },
+        Result::Error(_) => false,
+    };
+}
+
+// Error kinds as small codes so tests compare without nested pattern matches.
+pub i64 ErrorKind(ConnectError error) {
+    return match error {
+        ConnectError::InvalidPolicy => 1_i64,
+        ConnectError::ResolutionFailed(_) => 2_i64,
+        ConnectError::NoAddresses => 3_i64,
+        ConnectError::AllAttemptsFailed(_) => 4_i64,
+        ConnectError::DeadlineExceeded(_) => 5_i64,
+        ConnectError::Cancelled(_) => 6_i64,
+    };
+}
+
+pub i64 NetworkKind(NetworkError error) {
+    return match error {
+        NetworkError::ConnectionRefused => 1_i64,
+        NetworkError::TimedOut => 2_i64,
+        NetworkError::Cancelled => 3_i64,
+        NetworkError::HostNotFound => 4_i64,
+        _ => 9_i64,
+    };
+}
+
+pub SocketAddress[] List1(SocketAddress a) {
+    mut SocketAddress[] result = Array.Empty<SocketAddress>();
+    Array.Append<SocketAddress>(result, a);
+    return result;
+}
+
+pub SocketAddress[] List2(SocketAddress a, SocketAddress b) {
+    mut SocketAddress[] result = List1(a);
+    Array.Append<SocketAddress>(result, b);
+    return result;
+}
+
+// ---- end shared helpers ----
+
+// The runtime socket table has 256 slots. 300 races, each with a refused loser
+// and an accepted winner, would exhaust it if any race leaked a socket; the
+// process-exit leak audit of the test runner reports anything left open.
+Result<unit, NetworkError> RefusedCyclesResult() {
+    SocketAddress refused = ClosedPort4()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    SocketAddress[] candidates = List2(refused, good);
+    mut i64 cycle = 0_i64;
+    while cycle < 300_i64 {
+        match Connect.ConnectAddresses(candidates, Policy.Default()) {
+            Result::Ok(stream) => { Exchange(listener, stream)?; },
+            Result::Error(_) => Assert.Fail("each cycle connects"),
+        };
+        cycle = cycle + 1_i64;
+    }
+    listener.Close()?;
+    TcpListener fresh = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
+    fresh.Close()?;
+    return Result::Ok(());
+}
+
+unit RefusedCycles() {
+    match RefusedCyclesResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("refused cycles have no NetworkError (a leak surfaces as ResourceExhausted)"), };
+}
+
+test leak_refused_losers_over_300_races {
+    Fiber<unit> scenario = spawn RefusedCycles();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "refused cycles join");
+}
+
+// Losers still connecting when the winner arrives are cancelled and joined.
+Result<unit, NetworkError> CancelledLoserCyclesResult() {
+    Blackhole hole = OpenBlackhole()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    SocketAddress[] candidates = List2(hole.address, good);
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.Default(), Time.FromMilliseconds(100_i64));
+    mut i64 cycle = 0_i64;
+    while cycle < 30_i64 {
+        match Connect.ConnectAddresses(candidates, policy) {
+            Result::Ok(stream) => {
+                Assert.Equal<i64>(PeerPort(stream), good.port.Value(), "good address wins");
+                Exchange(listener, stream)?;
+            },
+            Result::Error(_) => Assert.Fail("each cycle connects"),
+        };
+        cycle = cycle + 1_i64;
+    }
+    listener.Close()?;
+    CloseBlackhole(hole);
+    return Result::Ok(());
+}
+
+unit CancelledLoserCycles() {
+    match CancelledLoserCyclesResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("cancelled-loser cycles have no NetworkError"), };
+}
+
+test leak_cancelled_losers_are_joined {
+    Fiber<unit> scenario = spawn CancelledLoserCycles();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "cancelled-loser cycles join");
+}
+
+// Resolving races (two name queries each) also release every fiber and socket,
+// well past the runtime's 64-entry channel table.
+Result<unit, NetworkError> ResolvingCyclesResult() {
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    mut i64 cycle = 0_i64;
+    while cycle < 100_i64 {
+        match Connect.ConnectHost("127.0.0.1", good.port, Policy.Default()) {
+            Result::Ok(stream) => { Exchange(listener, stream)?; },
+            Result::Error(_) => Assert.Fail("each resolving cycle connects"),
+        };
+        cycle = cycle + 1_i64;
+    }
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit ResolvingCycles() {
+    match ResolvingCyclesResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("resolving cycles have no NetworkError"), };
+}
+
+test leak_resolving_races_past_channel_table {
+    Fiber<unit> scenario = spawn ResolvingCycles();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "resolving cycles join");
+}

@@ -1,0 +1,120 @@
+// A Beskid QUIC client and server over UDP on 127.0.0.1: Retry address validation, the
+// handshake, a bidirectional stream echo and connection close, with one driver fiber per
+// endpoint.
+use Testing.Assert;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Results;
+use Network.Types;
+use Quic.QuicConfig;
+use Quic.QuicEndpoint;
+use Quic.QuicErrors;
+
+SocketAddress LocalHost() {
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+}
+
+Endpoint Open(QuicConfig cfg, bool server) {
+    Result<Endpoint, QuicError> r = QuicEndpoint.Bind(LocalHost(), cfg, server);
+    return match r {
+        Result::Ok(ep) => ep,
+        Result::Error(_) => Fail(),
+    };
+}
+
+Endpoint Fail() {
+    Assert.Fail("bind");
+    return Fail();
+}
+
+SocketAddress AddressOf(Endpoint ep) {
+    return match QuicEndpoint.LocalAddress(ep) {
+        Result::Ok(a) => a,
+        Result::Error(_) => LocalHost(),
+    };
+}
+
+i64 Value(Result<i64, QuicError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(e) => -1000_i64 - QuicErrors.WireCode(e), };
+}
+
+bool Done(Result<unit, QuicError> r) {
+    return match r { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+// Server side: accept one connection and one stream, echo it back, then wait for the close.
+i64 Echo(Endpoint ep) {
+    i64 conn = Value(QuicEndpoint.Accept(ep, 10000_i64));
+    if conn < 0_i64 { return conn; }
+    i64 stream = Value(QuicEndpoint.AcceptStream(ep, conn, 10000_i64));
+    if stream < 0_i64 { return stream; }
+    u8[] buf = Slice.New(2048_i64);
+    mut i64 total = 0_i64;
+    mut bool reading = true;
+    while reading {
+        i64 n = Value(QuicEndpoint.Read(ep, conn, stream, buf, 0_i64, 2048_i64, 10000_i64));
+        if n < 0_i64 { return n; }
+        if n == 0_i64 { reading = false; } else {
+            if !Done(QuicEndpoint.Write(ep, conn, stream, buf, 0_i64, n, 10000_i64)) { return -2_i64; }
+            total = total + n;
+        }
+    }
+    if !Done(QuicEndpoint.Finish(ep, conn, stream)) { return -3_i64; }
+    return total;
+}
+
+// The scenario runs inside a fiber: the test root is not a fiber, so its sleeps and socket
+// waits would not let the driver fibers run. Returns 0 or the number of the failed step.
+i64 Scenario() {
+    QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(["echo/1"], 0_i64);
+    Endpoint server = Open(QuicConfig.WithRetry(cfg, true), true);
+    Endpoint client = Open(cfg, false);
+    SocketAddress target = AddressOf(server);
+    Fiber<unit> serverDriver = QuicEndpoint.Start(server);
+    Fiber<unit> clientDriver = QuicEndpoint.Start(client);
+    Fiber<i64> echo = spawn (() => Echo(server));
+    i64 step = Talk(client, server, target);
+    i64 echoed = match echo.Join() { Result::Ok(v) => v, Result::Error(_) => -9_i64, };
+    QuicEndpoint.Stop(client);
+    QuicEndpoint.Stop(server);
+    bool c1 = match clientDriver.Join() { Result::Ok(_) => true, Result::Error(_) => false, };
+    bool c2 = match serverDriver.Join() { Result::Ok(_) => true, Result::Error(_) => false, };
+    if step != 0_i64 { return step; }
+    if echoed != 3000_i64 { return 20_i64; }
+    if !c1 || !c2 { return 21_i64; }
+    return 0_i64;
+}
+
+i64 Talk(Endpoint client, Endpoint server, SocketAddress target) {
+    i64 conn = Value(QuicEndpoint.Connect(client, target, 10000_i64));
+    if conn < 0_i64 { return 1_i64; }
+    if QuicEndpoint.Alpn(client, conn) != "echo/1" { return 2_i64; }
+    if QuicEndpoint.RetriesSent(server) != 1_i64 { return 3_i64; }
+    i64 stream = Value(QuicEndpoint.OpenStream(client, conn, true, 5000_i64));
+    if stream != 0_i64 { return 4_i64; }
+    u8[] data = Slice.New(3000_i64);
+    mut i64 i = 0_i64;
+    while i < 3000_i64 { data[i] = u8((i * 7_i64) & 255_i64); i = i + 1_i64; }
+    if !Done(QuicEndpoint.Write(client, conn, stream, data, 0_i64, 3000_i64, 10000_i64)) { return 5_i64; }
+    if !Done(QuicEndpoint.Finish(client, conn, stream)) { return 6_i64; }
+    u8[] back = Slice.New(4096_i64);
+    mut i64 total = 0_i64;
+    mut bool reading = true;
+    while reading {
+        i64 n = Value(QuicEndpoint.Read(client, conn, stream, back, total, 4096_i64 - total, 10000_i64));
+        if n < 0_i64 { return 7_i64; }
+        if n == 0_i64 { reading = false; }
+        total = total + n;
+    }
+    if total != 3000_i64 { return 8_i64; }
+    i = 0_i64;
+    while i < 3000_i64 { if back[i] != data[i] { return 9_i64; } i = i + 1_i64; }
+    if !Done(QuicEndpoint.Close(client, conn, 7_i64, 3000_i64)) { return 10_i64; }
+    return 0_i64;
+}
+
+test udp_loopback_retry_handshake_echo_and_close {
+    Fiber<i64> scenario = spawn Scenario();
+    i64 result = match scenario.Join() { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+    Assert.Equal<i64>(result, 0_i64, "loopback scenario");
+}

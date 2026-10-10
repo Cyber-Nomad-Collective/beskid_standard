@@ -1,0 +1,110 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.String;
+use Core.Results;
+use Crypto.Errors;
+use Crypto.ChaCha20;
+use Crypto.Poly1305;
+use Crypto.ChaCha20Poly1305;
+
+u8 Nibble(u8 c) {
+    if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
+    if c >= 97_u8 && c <= 102_u8 { return c - 87_u8; }
+    return c - 55_u8;
+}
+u8[] Hex(string text) {
+    i64 n = String.Len(text) / 2_i64;
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = Nibble(String.ByteAt(text, 2_i64 * i)) * 16_u8 + Nibble(String.ByteAt(text, 2_i64 * i + 1_i64)); i = i + 1_i64; }
+    return out;
+}
+u8[] Ascii(string text) {
+    i64 n = String.Len(text);
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = String.ByteAt(text, i); i = i + 1_i64; }
+    return out;
+}
+bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
+
+
+u8[] Unwrap(Result<u8[], CryptoError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
+}
+u8[] Pattern(i64 n, i64 mul, i64 add) {
+    u8[] o = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { o[i] = u8((i * mul + add) & 255_i64); i = i + 1_i64; }
+    return o;
+}
+string Sunscreen() { return "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."; }
+u8[] Key0() { return Pattern(32_i64, 1_i64, 0_i64); }
+
+test chacha20_rfc8439_2_3_2_block {
+    u8[] out = Unwrap(ChaCha20.Block(Key0(), 1_u32, Hex("000000090000004a00000000")));
+    Assert.True(Same(out, Hex("10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")), "block");
+}
+test chacha20_rfc8439_2_4_2_encrypt {
+    u8[] out = Unwrap(ChaCha20.Apply(Key0(), 1_u32, Hex("000000000000004a00000000"), Ascii(Sunscreen())));
+    Assert.True(Same(out, Hex("6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d")), "ciphertext");
+    u8[] back = Unwrap(ChaCha20.Apply(Key0(), 1_u32, Hex("000000000000004a00000000"), out));
+    Assert.True(Same(back, Ascii(Sunscreen())), "round trip");
+}
+test chacha20_rejects_bad_lengths {
+    bool badKey = match ChaCha20.Block(Slice.New(31_i64), 0_u32, Slice.New(12_i64)) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
+    Assert.True(badKey, "key length");
+    bool badNonce = match ChaCha20.Block(Slice.New(32_i64), 0_u32, Slice.New(8_i64)) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidNonceLength => true, _ => false, }, };
+    Assert.True(badNonce, "nonce length");
+}
+test poly1305_rfc8439_2_5_2 {
+    u8[] tag = Unwrap(Poly1305.Mac(Hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"), Ascii("Cryptographic Forum Research Group")));
+    Assert.True(Same(tag, Hex("a8061dc1305136c6c22b8baf0c0127a9")), "tag");
+}
+test poly1305_final_reduction_edge {
+    Assert.True(Same(Unwrap(Poly1305.Mac(Hex("0200000000000000000000000000000000000000000000000000000000000000"), Hex("ffffffffffffffffffffffffffffffff"))), Hex("03000000000000000000000000000000")), "edge");
+}
+test poly1305_long_incremental {
+    u8[] msg = Pattern(1000_i64, 7_i64, 0_i64);
+    Assert.True(Same(Unwrap(Poly1305.Mac(Pattern(32_i64, 1_i64, 100_i64), msg)), Hex("41e234f6889f83d91e9632dc63bedcd3")), "one shot");
+    match Poly1305.New(Pattern(32_i64, 1_i64, 100_i64)) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(s) => {
+            Poly1305.UpdateRange(s, msg, 0_i64, 3_i64);
+            Poly1305.UpdateRange(s, msg, 3_i64, 500_i64);
+            Poly1305.UpdateRange(s, msg, 503_i64, 497_i64);
+            Assert.True(Same(Poly1305.Finish(s), Hex("41e234f6889f83d91e9632dc63bedcd3")), "incremental");
+        },
+    };
+}
+test aead_chacha20poly1305_rfc8439_2_8_2 {
+    u8[] key = Pattern(32_i64, 1_i64, 128_i64);
+    u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Ascii(Sunscreen())));
+    Assert.True(Same(sealed, Hex("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691")), "sealed");
+    u8[] opened = Unwrap(ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), sealed));
+    Assert.True(Same(opened, Ascii(Sunscreen())), "opened");
+}
+test aead_chacha20poly1305_rejects_tampering {
+    u8[] key = Pattern(32_i64, 1_i64, 128_i64);
+    u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Ascii(Sunscreen())));
+    mut i64 position = 0_i64;
+    while position < Slice.Len(sealed) {
+        u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+        copy[position] = (copy[position] | 1_u8) - (copy[position] & 1_u8);
+        bool failed = match ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), copy) {
+            Result::Ok(_) => false,
+            Result::Error(e) => match e { CryptoError::AuthenticationFailed => true, _ => false, },
+        };
+        Assert.True(failed, "tampered byte rejected");
+        position = position + 17_i64;
+    }
+    bool wrongAad = match ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c8"), sealed) { Result::Ok(_) => false, Result::Error(_) => true, };
+    Assert.True(wrongAad, "aad bound");
+    bool shortInput = match ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Slice.New(15_i64)) { Result::Ok(_) => false, Result::Error(_) => true, };
+    Assert.True(shortInput, "short input");
+}
+test aead_chacha20poly1305_multi_block_no_aad {
+    u8[] key = Pattern(32_i64, 1_i64, 128_i64);
+    u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(key, Hex("070000004041424344454647"), Slice.New(0_i64), Pattern(1500_i64, 13_i64, 5_i64)));
+    Assert.True(Same(sealed, Hex("9a69f67138bb13da7898086f972fb166142267c300174deee0c087e324fc883deb2c74f47568ad2bb5c0953bbb95098000863df217dfae9fbd4e72cb00a63061b9e39b333b9f7d0c41d01917af8892709bf96ef8d5f562915a6a3b0f8afa7217b9744499f94d3eb2dd40d13165257d8aa0fac3df27c36fc7bb5c54bf8cb1941cf066e0fac0581e23b296214b706d4b6b95eb7b3a924e43ea48dd024ac858f1aca27f4dbc80dc4a4bf2c2c34f3a15a290a3a3510714258a5a37c0110746972d0e46a015ff0015314ca3ad7c37b92aed9b10b315e4624830b302f2e7f2816aa94a714c67c39f7bc633e665a5a2e70ee2722b4a135a03aca678d43143c4889d2c90e4bc421f5a69c6e52e134ff0a37290526c543cfc0a8ff8d7ae17b0c8c284b48d95da9ac275f3d1ffbd4e513610268ccbeb840a42b18919f65837e663663017c8835a73fa41078ecf0e6f57c8cdaa939a72e3aed0156eff1f092dd38f7e21b5f2c9f314b4cd75aff7625535b2a6d7814a6765bb0f551640884e2f391e4a5457c2cf850a65b129d58c61f71c901250bfd6122b051fdf37a25e05cd1682653d1d25a19bab1d0b18d5dd1ff0990d694f14bc24e105b8e9b7532e11183250f78b8df2b0fe71ffe6b28b39022f8ce2f70a9b5a686ff2bfe1d86c952d16418025f31d303c26702e70b1037de93c526a78d0b7a77788a6a8b73a321b8b6744eb1c5c92af72080d3a30bd538704b7d0c379bb9e296f3c5f39947ffeb75c274b38307ed08bcccbed8976bf7a67d67bf139896925ce1da2d369e15c482d8b92ae42fee578ff77bd68c9b3a5294ca9cd7ac09273a06f888dc1cad9f46dfea2b3731decf491fb7087c6b06051f7886da6bbbbaf1d51ef7edc8e236167635eedec1d120d91a13ebfc179df0aa733338f382be4677267c4c5ff9c8d6bc46e3748d67d5761bf1123f34f92e30ef2683d40c762b2dbdbd6ca2bccb39787757a0b392fcff5207a55f059abdb39da7539256fbcb1de223e655f034dd337841dfd4567be8ac2c94c87562ec56c805642acf1eea489104d7551d3a969f6db9fc3f698d881e5a9ef1193431efc88657634acab9b071216140a36ea1f9df12736029e014c088b310030d1d60d828c67a1f80e683ed329f0dd3a203dd7a47aedabd8c0c3e4b06430149f42fb33037d414db1f1a7a819e21715b125869358f8ebf2d7199586f067ad6d8d5d94d0abd23b889fd44fbd921872c1732fd13404398fae6978df1b168f6c71d2313e1427ccf44825f9abdb1403439f4eca0ec0bc3324036d2254c720831652ad59e7577609d75bc32b90e2ff5cf6a0454f0b72f97e040fc2c4340c7cf9380b6b8bd8414f07f64d0ae7c99d4d9897f4cbbad10facdc7874c4fbb0e3f3022c75eb2e7165410d75c310f6eeb9449f66af31897da573d60d3a8491cc6bd0caeba3f1765a528f5c10a595b909eea564ca7c71739de09faddec5ee29013a21b0740ecabdef065d0c81b899f5c64f397367fcb549529bd49d370b93b2061f9dff75d71c3275a35b65a78c2e4c668bdc34c0e685b3ad2c9f79a23e9bf2134a5253a9752c5e126f5977352305486e0af48940354d9c7bd6cbc74a411b0188fffebf921ba09c4128e7717f833cdd95dd6e0d5486d3515d5f77e09e50e9d5721a2aca66a7439caa505d882275d7ea74fe0170e89e94f9e470c079e630a18a32250bfd6f78ce4d2f99ac83a8d6456894b654b7ba75126895a25dacc0142eb8ec536947a0abef6235840576dbb9b91dbfc4520d539179a888f5ac4326dc797124c2c2e7bad6df457f1526aafdd87e47e76da249b2c5fb5b630e9d6e28e56ebd5791126f23493fb7b454d2f8e06f3e34b94222d7f7320d1e3bed3df50f8afa77e75997560587da11fd4d67e321c5bb1ae72c3bd3c343e66c89446356e7ea61b8f8381c79ab842c1da1a3e3303b11c2d2c220334173e10dda34eb9cf9951984174cae533e2ed3e35fde23d61c03a294ba587a77053b96729abec09f7d770d0d7a8d3ec095a65567eb1820b3f6046540f2aa010f93ffa4f067a76d2c2e7b0046a863d44d55bf23a33a8218d309f28b858ba34578ae5fd222ff49c3bcb5311d1f8f461fda13e15684414ebd03496b4a7e6cf69be2d497")), "1500 bytes");
+}

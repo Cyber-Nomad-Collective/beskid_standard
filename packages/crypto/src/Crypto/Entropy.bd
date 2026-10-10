@@ -1,0 +1,107 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.ConstantTime;
+use Crypto.Errors;
+
+/// Operating-system CSPRNG access through libc `getentropy` (macOS 10.12+, glibc 2.25+).
+///
+/// Beskid 0.5.2 extern contracts accept only scalar parameters and a Beskid `u8[]`
+/// has no pointer escape, so `getentropy` fills a malloc'd C buffer and the bytes are
+/// copied back with `fmemopen` + `fgetc` (one call per byte, fine for keys and nonces).
+/// Every failure wipes the partial output and returns EntropyUnavailable; there is
+/// no fallback to a non-cryptographic generator.
+///
+/// The contracts follow `Core.Threading.Thread`: a Linux contract named by the glibc
+/// soname and a Darwin contract named `libc`, tried in that order. Compiler 0.5.3 links
+/// a versioned soname by its base name (`libc.so.6` -> `-lc`), so an AOT link reaches
+/// libc on Linux and libSystem on macOS without a link shim (COMPILER-GAPS WEB4).
+/// The C names are dictated by libc, so these contracts trigger naming warning W1633.
+[Extern(Abi:"C", Library:"libc.so.6")]
+contract LinuxLibc {
+    i32 getentropy(i64 buffer, i64 length);
+    i64 malloc(i64 size);
+    i32 free(i64 pointer);
+    i64 memset(i64 pointer, i32 value, i64 count);
+    i64 fmemopen(i64 buffer, i64 size, i64 mode);
+    i32 fgetc(i64 stream);
+    i32 fclose(i64 stream);
+}
+
+[Extern(Abi:"C", Library:"libc")]
+contract DarwinLibc {
+    i32 getentropy(i64 buffer, i64 length);
+}
+
+/// getentropy accepts at most 256 bytes per call.
+i64 MaxChunk() { return 256_i64; }
+
+i32 GetEntropy(i64 pointer, i64 length) {
+    i32 rc = LinuxLibc.getentropy(pointer, length);
+    if rc == 0_i32 { return rc; }
+    return DarwinLibc.getentropy(pointer, length);
+}
+
+/// Copies `count` bytes from C memory at `source` into `target[offset..]`.
+bool CopyOut(i64 source, i64 count, i64 mode, u8[] target, i64 offset) {
+    i64 stream = LinuxLibc.fmemopen(source, count, mode);
+    if stream == 0_i64 { return false; }
+    mut bool ok = true;
+    mut i64 i = 0_i64;
+    while i < count && ok {
+        i32 value = LinuxLibc.fgetc(stream);
+        if value < 0_i32 || value > 255_i32 { ok = false; } else { target[offset + i] = u8(value); }
+        i = i + 1_i64;
+    }
+    LinuxLibc.fclose(stream);
+    return ok;
+}
+
+bool FillFrom(i64 scratch, i64 mode, u8[] buffer) {
+    i64 total = Slice.Len(buffer);
+    mut i64 done = 0_i64;
+    while done < total {
+        mut i64 chunk = MaxChunk();
+        if total - done < chunk { chunk = total - done; }
+        if GetEntropy(scratch, chunk) != 0_i32 { return false; }
+        if !CopyOut(scratch, chunk, mode, buffer, done) { return false; }
+        done = done + chunk;
+    }
+    return true;
+}
+
+/// Fills `buffer` with bytes from the OS CSPRNG. On failure the buffer is zeroed and
+/// EntropyUnavailable is returned. Buffers of 16 bytes or more that come back all zero
+/// are treated as a broken source (probability 2^-128 for a working one).
+pub Result<unit, CryptoError> Fill(u8[] buffer) {
+    i64 total = Slice.Len(buffer);
+    if total == 0_i64 { return Result::Ok(()); }
+    i64 scratch = LinuxLibc.malloc(MaxChunk());
+    if scratch == 0_i64 { ConstantTime.Wipe(buffer); return Result::Error(CryptoError::EntropyUnavailable()); }
+    i64 mode = LinuxLibc.malloc(2_i64);
+    if mode == 0_i64 {
+        LinuxLibc.free(scratch);
+        ConstantTime.Wipe(buffer);
+        return Result::Error(CryptoError::EntropyUnavailable());
+    }
+    LinuxLibc.memset(mode, 114_i32, 1_i64);
+    LinuxLibc.memset(mode + 1_i64, 0_i32, 1_i64);
+    bool ok = FillFrom(scratch, mode, buffer);
+    LinuxLibc.memset(scratch, 0_i32, MaxChunk());
+    LinuxLibc.free(scratch);
+    LinuxLibc.free(mode);
+    if !ok || (total >= 16_i64 && ConstantTime.Equal(buffer, Slice.New(total))) {
+        ConstantTime.Wipe(buffer);
+        return Result::Error(CryptoError::EntropyUnavailable());
+    }
+    return Result::Ok(());
+}
+
+/// Returns `count` fresh random bytes from the OS CSPRNG.
+pub Result<u8[], CryptoError> Bytes(i64 count) {
+    if count < 0_i64 { return Result::Error(CryptoError::InvalidLength()); }
+    u8[] out = Slice.New(count);
+    return match Fill(out) {
+        Result::Ok(_) => Result::Ok(out),
+        Result::Error(error) => Result::Error(error),
+    };
+}

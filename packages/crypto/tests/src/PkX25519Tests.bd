@@ -1,0 +1,111 @@
+/// X25519 tests: RFC 7748 section 5.2 vectors and the section 6.1 Diffie-Hellman example.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Crypto.X25519;
+use Crypto.PkErrors;
+
+pub u8 PkNibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
+    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
+    if c >= u8(65) && c <= u8(70) { return c - u8(55); }
+    return u8(0);
+}
+
+/// Test-only hex decoder; an odd-length string gets an implicit leading zero nibble.
+pub u8[] Hex(string text) {
+    i64 len = String.Len(text);
+    i64 odd = len % 2_i64;
+    u8[] out = Slice.New((len + 1_i64) / 2_i64);
+    mut i64 i = 0_i64;
+    while i < len {
+        i64 pos = i + odd;
+        u8 nib = PkNibble(String.ByteAt(text, i));
+        i64 index = pos / 2_i64;
+        if pos % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string HexDigit(u8 v) {
+    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
+    return String.CodeUnitChar(v + u8(87));
+}
+
+pub string ToHex(u8[] bytes) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) {
+        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+pub i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+pub string Hx(Result<u8[], PkError> r) {
+    return match r { Result::Ok(v) => ToHex(v), Result::Error(_) => "error", };
+}
+
+test pk_x25519_rfc7748_vector_1 {
+    Assert.Equal<string>(Hx(X25519.ScalarMult(Hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4"), Hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c"))),
+        "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552", "RFC 7748 5.2 vector 1");
+}
+
+test pk_x25519_rfc7748_vector_2 {
+    Assert.Equal<string>(Hx(X25519.ScalarMult(Hex("4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d"), Hex("e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493"))),
+        "95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957", "RFC 7748 5.2 vector 2");
+}
+
+test pk_x25519_one_iteration {
+    u8[] nine = Hex("0900000000000000000000000000000000000000000000000000000000000000");
+    Assert.Equal<string>(Hx(X25519.ScalarMult(nine, nine)), "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079", "RFC 7748 5.2 after one iteration");
+}
+
+test pk_x25519_rfc7748_section_6_1 {
+    u8[] alice = Hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+    u8[] bob = Hex("5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb");
+    Assert.Equal<string>(Hx(X25519.PublicKey(alice)), "8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a", "Alice public key");
+    Assert.Equal<string>(Hx(X25519.PublicKey(bob)), "de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f", "Bob public key");
+    string shared = "4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742";
+    Assert.Equal<string>(Hx(X25519.SharedSecret(alice, Hex("de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f"))), shared, "Alice shared");
+    Assert.Equal<string>(Hx(X25519.SharedSecret(bob, Hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a"))), shared, "Bob shared");
+}
+
+test pk_x25519_non_canonical_u {
+    u8[] k = Hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    string expected = Hx(X25519.PublicKey(k));
+    // p + 9 and p + 9 with bit 255 set both decode to u = 9.
+    Assert.Equal<string>(Hx(X25519.ScalarMult(k, Hex("f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f"))), expected, "u = p + 9 reduces");
+    Assert.Equal<string>(Hx(X25519.ScalarMult(k, Hex("f6ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"))), expected, "bit 255 is masked");
+}
+
+test pk_x25519_rejects_bad_input {
+    u8[] k = Hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    Assert.Equal<string>(Hx(X25519.SharedSecret(k, Slice.New(32_i64))), "error", "all-zero shared secret rejected");
+    Assert.Equal<string>(Hx(X25519.SharedSecret(k, Hex("0100000000000000000000000000000000000000000000000000000000000000"))), "error", "order-1 point rejected");
+    Assert.Equal<string>(Hx(X25519.ScalarMult(Slice.New(31_i64), Slice.New(32_i64))), "error", "short scalar rejected");
+    Assert.Equal<string>(Hx(X25519.ScalarMult(k, Slice.New(33_i64))), "error", "long u rejected");
+}
+
+test pk_x25519_timing {
+    u8[] k = Hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4");
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < 20_i64 {
+        Result<u8[], PkError> r = X25519.PublicKey(k);
+        i = i + 1_i64;
+    }
+    Output.WriteLine("x25519 scalar mult: " + Dec((NowNanos() - start) / 20000_i64) + " us");
+    Assert.True(true, "timing printed");
+}

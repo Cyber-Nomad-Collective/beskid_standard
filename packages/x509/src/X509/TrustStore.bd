@@ -1,0 +1,148 @@
+/// Trust anchors for path validation.
+///
+/// A trust anchor keeps only what validation needs: the subject name (DER and common
+/// attributes), the public key, the subject key identifier, and the anchor's own
+/// constraints (pathLenConstraint and nameConstraints). Anchors are loaded from PEM text
+/// or a file one certificate at a time, so a system bundle such as /etc/ssl/cert.pem
+/// (about 330 KB, ~130 roots) never needs more than one certificate buffer at once.
+/// Certificates that fail to parse are skipped and counted.
+use Core.Collections.Array;
+use Core.FS;
+use Core.FS.FsError;
+use Core.Results;
+use Core.String;
+use X509.Certificate;
+use X509.Der;
+use X509.Names;
+use X509.Pem;
+use X509.X509Errors;
+
+pub type TrustAnchor {
+    pub DistinguishedName subject,
+    pub PublicKeyInfo publicKey,
+    pub u8[] subjectKeyId,
+    /// The anchor's pathLenConstraint, or -1.
+    pub i64 pathLen,
+    pub NameConstraints nameConstraints,
+}
+
+pub type TrustStore {
+    pub TrustAnchor[] anchors,
+    /// Number of PEM blocks that were skipped because they did not parse.
+    pub i64 skipped,
+}
+
+pub TrustStore Empty() {
+    return TrustStore { anchors: Array.Empty<TrustAnchor>(), skipped: 0_i64 };
+}
+
+pub TrustAnchor AnchorOf(Certificate c) {
+    Extensions ext = c.extensions;
+    return TrustAnchor { subject: c.subject, publicKey: c.publicKey, subjectKeyId: ext.subjectKeyId, pathLen: ext.pathLen, nameConstraints: ext.nameConstraints };
+}
+
+/// A store with `anchor` added.
+pub TrustStore With(TrustStore store, TrustAnchor anchor) {
+    mut TrustAnchor[] list = store.anchors;
+    Array.Append<TrustAnchor>(list, anchor);
+    return TrustStore { anchors: list, skipped: store.skipped };
+}
+
+/// A store with `certificate` added as an anchor.
+pub TrustStore WithCertificate(TrustStore store, Certificate certificate) {
+    return With(store, AnchorOf(certificate));
+}
+
+pub i64 Count(TrustStore store) { return Array.Len<TrustAnchor>(store.anchors); }
+
+/// Adds every CERTIFICATE block of `text`. Blocks that do not parse are counted in
+/// `skipped`; a malformed PEM armor stops the scan.
+pub TrustStore AddPem(TrustStore store, string text) {
+    mut TrustAnchor[] list = store.anchors;
+    mut i64 skipped = store.skipped;
+    mut i64 pos = 0_i64;
+    i64 n = String.Len(text);
+    while pos < n {
+        PemStep step = Pem.Next(text, pos);
+        if step.found {
+            Result<Certificate, X509Error> parsed = Certificate.Parse(step.der);
+            if Certificate.Succeeded(parsed) {
+                Array.Append<TrustAnchor>(list, AnchorOf(Certificate.Unwrap(parsed)));
+            } else {
+                skipped = skipped + 1_i64;
+            }
+            pos = step.next;
+        } else {
+            X509Error error = step.error;
+            bool clean = match error { X509Error::None => true, _ => false, };
+            if !clean { skipped = skipped + 1_i64; }
+            pos = n;
+        }
+    }
+    return TrustStore { anchors: list, skipped: skipped };
+}
+
+/// Builds a store from PEM text. Fails with BadPem when no anchor could be loaded.
+pub Result<TrustStore, X509Error> FromPem(string text) {
+    TrustStore store = AddPem(Empty(), text);
+    if Count(store) == 0_i64 { return Result::Error(X509Error::BadPem); }
+    return Result::Ok(store);
+}
+
+/// Builds a store from a PEM file such as /etc/ssl/cert.pem.
+pub Result<TrustStore, X509Error> FromFile(string path) {
+    Result<string, FsError> text = FS.ReadAllText(path);
+    return match text {
+        Result::Error(_) => Result::Error(X509Error::Io),
+        Result::Ok(t) => FromPem(t),
+    };
+}
+
+/// The first system CA bundle that exists, in the search order of Go's crypto/x509
+/// (root_linux.go) plus macOS: Debian/Ubuntu/Gentoo, Fedora/RHEL, openSUSE, OpenELEC,
+/// CentOS/RHEL 7, then Alpine and macOS. Returns the macOS path when none exists, so
+/// `FromFile` fails closed with its typed error.
+pub string SystemBundlePath() {
+    string[] candidates = [
+        "/etc/ssl/certs/ca-certificates.crt",
+        "/etc/pki/tls/certs/ca-bundle.crt",
+        "/etc/ssl/ca-bundle.pem",
+        "/etc/pki/tls/cacert.pem",
+        "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+        "/etc/ssl/cert.pem",
+    ];
+    mut i64 i = 0_i64;
+    while i < Array.Len<string>(candidates) {
+        string path = candidates[i];
+        Result<bool, FsError> exists = FS.Exists(path);
+        match exists {
+            Result::Ok(found) => { if found { return path; } },
+            Result::Error(_) => {},
+        };
+        i = i + 1_i64;
+    }
+    return "/etc/ssl/cert.pem";
+}
+
+/// Index of the first anchor whose subject common name equals `commonName`, or -1.
+pub i64 FindByCommonName(TrustStore store, string commonName) {
+    mut i64 i = 0_i64;
+    while i < Count(store) {
+        TrustAnchor a = store.anchors[i];
+        DistinguishedName s = a.subject;
+        if s.commonName == commonName { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+/// Index of the first anchor whose subject DER equals `subject`, or -1.
+pub i64 FindBySubject(TrustStore store, DistinguishedName subject) {
+    mut i64 i = 0_i64;
+    while i < Count(store) {
+        TrustAnchor a = store.anchors[i];
+        if Names.Equal(a.subject, subject) { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}

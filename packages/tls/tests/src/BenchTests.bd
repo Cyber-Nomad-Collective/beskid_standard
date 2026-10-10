@@ -1,0 +1,240 @@
+/// TLS 1.3 throughput and handshake benchmarks over a loopback TlsStream (see
+/// docs/networking/BENCHMARKS.md). Client and server run as fibers of one process on one
+/// thread, so every byte is sealed once and opened once on the same core. Each mode
+/// forces the crypto provider (ruling R27) before the handshake: AES-GCM keys keep the
+/// provider they were created with, ChaCha20-Poly1305 follows the switch per call.
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.IO;
+use Core.IO.IoError;
+use Core.Optional.Option;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Time.TimerError;
+use Codec.Hex;
+use Crypto.Provider;
+use Network.Errors;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Network.Types;
+use Testing.Assert;
+use Tls;
+use Tls.PeerKeys;
+use Tls.Record;
+use Tls.Suites;
+use Tls.TlsConfig;
+use Tls.TlsErrors;
+use Tls.TlsStream;
+
+i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+unit Throughput(string name, i64 bytes, i64 nanos) {
+    i64 safe = nanos + 1_i64;
+    i64 centi = bytes * 100000_i64 / safe;
+    i64 frac = centi % 100_i64;
+    mut string pad = "";
+    if frac < 10_i64 { pad = "0"; }
+    Output.WriteLine("BENCH " + name + ": " + Dec(centi / 100_i64) + "." + pad + Dec(frac) + " MB/s (" + Dec(safe / 1000_i64) + " us total)");
+    return;
+}
+
+
+Option<Deadline> Soon() {
+    Result<Deadline, TimerError> d = Deadline.After(Time.FromMilliseconds(120000_i64));
+    return match d { Result::Ok(v) => Option.FromValue<Deadline>(v), Result::Error(_) => Option.Empty<Deadline>(), };
+}
+
+i64 Chunk() { return 16384_i64; }
+i64 Total() { return 8388608_i64; }
+
+TlsServerConfig ServerConfig(CipherSuite suite) {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    TlsServerConfig s = TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key);
+    mut CipherSuite[] only = Array.Empty<CipherSuite>();
+    Array.Append<CipherSuite>(only, suite);
+    s.cipherSuites = only;
+    return s;
+}
+
+TlsClientConfig ClientConfig(CipherSuite suite) {
+    TlsClientConfig c = TlsConfig.Client("localhost", TlsConfig.AcceptAnyCertificateForTestsOnly());
+    mut CipherSuite[] only = Array.Empty<CipherSuite>();
+    Array.Append<CipherSuite>(only, suite);
+    c.cipherSuites = only;
+    return c;
+}
+
+// Server: handshake, then read `bytes` bytes into one reused 16 KiB buffer, answer one
+// byte, wait for close. `result[0]` = 0 on success.
+unit Serve(TcpListener listener, TlsServerConfig config, i64 bytes, i64[] result) {
+    Result<TcpStream, NetworkError> accepted = listener.Accept(Soon());
+    match accepted {
+        Result::Error(_) => { result[0] = 1_i64; },
+        Result::Ok(tcp) => {
+            Result<TlsStream, TlsError> tls = Tls.Accept(tcp, config, Soon());
+            match tls {
+                Result::Error(e) => { result[0] = 100_i64 + TlsErrors.Code(e); },
+                Result::Ok(s) => { result[0] = Sink(s, bytes); },
+            };
+        },
+    };
+    listener.Close();
+    return;
+}
+
+i64 Sink(TlsStream s, i64 bytes) {
+    u8[] buf = Slice.New(Chunk());
+    mut i64 got = 0_i64;
+    while got < bytes {
+        Result<i64, IoError> n = s.Read(buf, 0_i64, Chunk());
+        i64 k = match n { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+        if k <= 0_i64 { s.Close(); return 2_i64; }
+        got = got + k;
+    }
+    buf[0] = 1_u8;
+    Result<unit, IoError> w = IO.WriteAll(s, buf, 0_i64, 1_i64);
+    match w { Result::Error(_) => { s.Close(); return 3_i64; }, Result::Ok(_) => {}, };
+    Result<i64, IoError> end = s.Read(buf, 0_i64, 1_i64);
+    s.Close();
+    return 0_i64;
+}
+
+// Client: handshake (timed into info[0]), then `bytes` bytes in 16 KiB writes from one
+// reused buffer, then wait for the server's one-byte answer (timed into info[1]).
+i64 Drive(SocketAddress target, TlsClientConfig client, i64 bytes, u8[] payload, i64[] info) {
+    Result<TcpStream, NetworkError> connected = TcpStream.Connect(target, Network.Types.DefaultSocketOptions(), Soon());
+    match connected {
+        Result::Error(_) => { return 97_i64; },
+        Result::Ok(tcp) => {
+            i64 t0 = NowNanos();
+            Result<TlsStream, TlsError> tls = Tls.Connect(tcp, client, Soon());
+            info[0] = NowNanos() - t0;
+            match tls {
+                Result::Error(e) => { return 200_i64 + TlsErrors.Code(e); },
+                Result::Ok(s) => {
+                    i64 t1 = NowNanos();
+                    mut i64 sent = 0_i64;
+                    while sent < bytes {
+                        Result<unit, IoError> w = IO.WriteAll(s, payload, 0_i64, Chunk());
+                        match w { Result::Error(_) => { s.Close(); return 4_i64; }, Result::Ok(_) => {}, };
+                        sent = sent + Chunk();
+                    }
+                    if bytes > 0_i64 {
+                        Result<unit, IoError> r = IO.ReadExact(s, payload, 0_i64, 1_i64);
+                        match r { Result::Error(_) => { s.Close(); return 5_i64; }, Result::Ok(_) => {}, };
+                    }
+                    info[1] = NowNanos() - t1;
+                    s.Close();
+                    return 0_i64;
+                },
+            };
+        },
+    };
+}
+
+// One connection: returns client code * 1000 + server code.
+i64 Session(CipherSuite suite, i64 bytes, u8[] payload, i64[] info) {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    Result<TcpListener, NetworkError> bound = TcpListener.Bind(bindAddress, 4_i64);
+    match bound {
+        Result::Error(_) => { return 99_i64; },
+        Result::Ok(listener) => {
+            Result<SocketAddress, NetworkError> local = listener.LocalAddress();
+            match local {
+                Result::Error(_) => { return 98_i64; },
+                Result::Ok(address) => {
+                    i64[] result = [-1_i64];
+                    TcpListener l = listener;
+                    TlsServerConfig cfg = ServerConfig(suite);
+                    i64 n = bytes;
+                    Fiber<unit> worker = spawn (() => Serve(l, cfg, n, result));
+                    i64 clientCode = Drive(address, ClientConfig(suite), bytes, payload, info);
+                    worker.Join();
+                    return clientCode * 1000_i64 + result[0];
+                },
+            };
+        },
+    };
+}
+
+// Runs one mode: `pure` forces the pure provider. Prints handshake latency (best of
+// `handshakes` connections) and the 8 MiB transfer throughput. Returns 0 on success.
+i64 Mode(string label, CipherSuite suite, bool pure, i64 handshakes, u8[] payload) {
+    Provider.ForcePure(pure);
+    i64[] info = [0_i64, 0_i64];
+    mut i64 best = 9223372036854775807_i64;
+    mut i64 sum = 0_i64;
+    mut i64 i = 0_i64;
+    while i < handshakes {
+        i64 code = Session(suite, 0_i64, payload, info);
+        if code != 0_i64 { Provider.ForcePure(false); return code; }
+        if info[0] < best { best = info[0]; }
+        sum = sum + info[0];
+        i = i + 1_i64;
+    }
+    Output.WriteLine("BENCH tls " + label + " full handshake: best " + Dec(best / 1000_i64) + " us, mean " + Dec(sum / handshakes / 1000_i64) + " us over " + Dec(handshakes));
+    i64 code = Session(suite, Total(), payload, info);
+    Provider.ForcePure(false);
+    if code != 0_i64 { return code; }
+    Throughput("tls " + label + " 8MiB in 16KiB records (seal+open)", Total(), info[1]);
+    return 0_i64;
+}
+
+unit RunAll(i64[] codes) {
+    u8[] payload = Slice.New(Chunk());
+    mut i64 i = 0_i64;
+    while i < Chunk() { payload[i] = u8(i & 255_i64); i = i + 1_i64; }
+    codes[0] = Mode("aes128gcm pure", Suites.Aes128(), true, 3_i64, payload);
+    codes[1] = Mode("aes128gcm native", Suites.Aes128(), false, 3_i64, payload);
+    codes[2] = Mode("chacha20poly1305 pure", Suites.ChaCha(), true, 1_i64, payload);
+    codes[3] = Mode("chacha20poly1305 native", Suites.ChaCha(), false, 1_i64, payload);
+    return;
+}
+
+test bench_tls_loopback_throughput_and_handshake {
+    i64[] codes = [-1_i64, -1_i64, -1_i64, -1_i64];
+    Fiber<unit> run = spawn (() => RunAll(codes));
+    run.Join();
+    Assert.Equal<i64>(codes[0], 0_i64, "aes pure");
+    Assert.Equal<i64>(codes[1], 0_i64, "aes native");
+    Assert.Equal<i64>(codes[2], 0_i64, "chacha pure");
+    Assert.Equal<i64>(codes[3], 0_i64, "chacha native");
+}
+
+// In-memory record layer breakdown: Record.Seal + Record.Open of 16 KiB records in one
+// reused buffer, without sockets, per provider.
+// Test fixtures generated with openssl (see tests/interop/certs). Test-only keys.
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] RootCertDer() {
+    string s = "3082019b30820141a00302010202143cc5b42faaa832daa7def808045536bbb6ddf944300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a301b3119301706035504030c104265736b6964205465737420526f6f743059301306072a8648ce3d020106082a8648ce3d030107034200048f4684a2e70c8677b376730c494a3546e98fb943810d320fcfffa26392a5110bc6e1f045"
+        + "ac328a4017509ec27c8201c8e65d18f99bafb9e40ef52c7821d5d50aa3633061301d0603551d0e0416041446dda763d1978ccc27a6f76bd7519ff9619f4eb7301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300f0603"
+        + "551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d040302034800304502200c22ab56867a1fda253fb2c517682802dd87d91a6f152a0fd8ff2c4572d11bb2022100e8f98b28d498dfc5f8aae457d71cd4f433"
+        + "94ab8ac6d6ca6d526e21bc35bd1e7a"
+        ;
+    return Hex.Of(s);
+}

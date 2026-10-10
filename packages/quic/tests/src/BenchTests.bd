@@ -1,0 +1,184 @@
+/// QUIC stream throughput and handshake latency over UDP loopback (see
+/// docs/networking/BENCHMARKS.md). The client writes 2 MiB on one bidirectional stream in
+/// 4 KiB writes from one reused buffer (runtime array limit HQ3); the server reads into one
+/// reused 4 KiB buffer. Endpoints, drivers and the reader are fibers of one process on one
+/// thread. Each mode forces the crypto provider (ruling R27) before the connection: packet
+/// protection keys keep the provider they were created with; header protection is always
+/// the pure AES block.
+use Testing.Assert;
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Crypto.Provider;
+use Network.Types;
+use Quic.QuicConfig;
+use Quic.QuicEndpoint;
+use Quic.QuicErrors;
+use Codec.Hex;
+use Tls.PeerKeys;
+use Tls.TlsConfig;
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+unit Throughput(string name, i64 bytes, i64 nanos) {
+    i64 safe = nanos + 1_i64;
+    i64 centi = bytes * 100000_i64 / safe;
+    i64 frac = centi % 100_i64;
+    mut string pad = "";
+    if frac < 10_i64 { pad = "0"; }
+    Output.WriteLine("BENCH " + name + ": " + Dec(centi / 100_i64) + "." + pad + Dec(frac) + " MB/s (" + Dec(safe / 1000_i64) + " us total)");
+    return;
+}
+
+i64 Piece() { return 4096_i64; }
+i64 Total() { return 2097152_i64; }
+i64 Handshakes() { return 3_i64; }
+
+SocketAddress LocalHost() {
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+}
+
+Endpoint Open(QuicConfig cfg, bool server) {
+    Result<Endpoint, QuicError> r = QuicEndpoint.Bind(LocalHost(), cfg, server);
+    return match r { Result::Ok(ep) => ep, Result::Error(_) => Fail(), };
+}
+
+Endpoint Fail() {
+    Assert.Fail("bind");
+    return Fail();
+}
+
+SocketAddress AddressOf(Endpoint ep) {
+    return match QuicEndpoint.LocalAddress(ep) { Result::Ok(a) => a, Result::Error(_) => LocalHost(), };
+}
+
+i64 Value(Result<i64, QuicError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(e) => -1000_i64 - QuicErrors.WireCode(e), };
+}
+
+bool Done(Result<unit, QuicError> r) {
+    return match r { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+QuicConfig ServerQuic() {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    return QuicConfig.TlsServerConfigFor(TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key), ["bench/1"]);
+}
+
+QuicConfig ClientQuic() {
+    return QuicConfig.TlsClientConfigFor(TlsConfig.Client("localhost", TlsConfig.AcceptAnyCertificateForTestsOnly()), ["bench/1"]);
+}
+
+// Server: accept `Handshakes()` connections; on the last one read one stream to its end.
+// result[0] = bytes read (or a negative step), result[1] = monotonic nanos at the end.
+i64 Sink(Endpoint ep, i64[] result) {
+    mut i64 k = 0_i64;
+    mut i64 conn = -1_i64;
+    while k < Handshakes() {
+        conn = Value(QuicEndpoint.Accept(ep, 30000_i64));
+        if conn < 0_i64 { return conn; }
+        k = k + 1_i64;
+    }
+    i64 stream = Value(QuicEndpoint.AcceptStream(ep, conn, 30000_i64));
+    if stream < 0_i64 { return stream; }
+    u8[] buf = Slice.New(Piece());
+    mut i64 total = 0_i64;
+    mut bool reading = true;
+    while reading {
+        i64 n = Value(QuicEndpoint.Read(ep, conn, stream, buf, 0_i64, Piece(), 30000_i64));
+        if n < 0_i64 { return n; }
+        if n == 0_i64 { reading = false; } else { total = total + n; }
+    }
+    result[1] = QuicEndpoint.NowNanos();
+    return total;
+}
+
+// Client: `Handshakes()` connections (timed), then the transfer on the last one.
+// times[0] = best handshake, times[1] = sum, times[2] = transfer start.
+i64 Drive(Endpoint client, SocketAddress target, u8[] data, i64[] times) {
+    mut i64 k = 0_i64;
+    mut i64 conn = -1_i64;
+    times[0] = 9223372036854775807_i64;
+    while k < Handshakes() {
+        i64 t0 = QuicEndpoint.NowNanos();
+        conn = Value(QuicEndpoint.Connect(client, target, 30000_i64));
+        i64 dt = QuicEndpoint.NowNanos() - t0;
+        if conn < 0_i64 { return 100_i64 - conn; }
+        if dt < times[0] { times[0] = dt; }
+        times[1] = times[1] + dt;
+        k = k + 1_i64;
+    }
+    i64 stream = Value(QuicEndpoint.OpenStream(client, conn, true, 5000_i64));
+    if stream < 0_i64 { return 4_i64; }
+    times[2] = QuicEndpoint.NowNanos();
+    mut i64 sent = 0_i64;
+    while sent < Total() {
+        if !Done(QuicEndpoint.Write(client, conn, stream, data, 0_i64, Piece(), 30000_i64)) { return 5_i64; }
+        sent = sent + Piece();
+    }
+    if !Done(QuicEndpoint.Finish(client, conn, stream)) { return 6_i64; }
+    return 0_i64;
+}
+
+i64 Mode(string label, bool pure, u8[] data) {
+    Provider.ForcePure(pure);
+    Endpoint server = Open(ServerQuic(), true);
+    Endpoint client = Open(ClientQuic(), false);
+    SocketAddress target = AddressOf(server);
+    Fiber<unit> serverDriver = QuicEndpoint.Start(server);
+    Fiber<unit> clientDriver = QuicEndpoint.Start(client);
+    i64[] result = [0_i64, 0_i64];
+    Fiber<i64> sink = spawn (() => Sink(server, result));
+    i64[] times = [0_i64, 0_i64, 0_i64];
+    i64 step = Drive(client, target, data, times);
+    i64 got = match sink.Join() { Result::Ok(v) => v, Result::Error(_) => -9_i64, };
+    QuicEndpoint.Stop(client);
+    QuicEndpoint.Stop(server);
+    clientDriver.Join();
+    serverDriver.Join();
+    Provider.ForcePure(false);
+    if step != 0_i64 { return step; }
+    if got != Total() { return 20_i64; }
+    Output.WriteLine("BENCH quic " + label + " handshake: best " + Dec(times[0] / 1000_i64) + " us, mean " + Dec(times[1] / Handshakes() / 1000_i64) + " us over " + Dec(Handshakes()));
+    Throughput("quic " + label + " 2MiB stream in 4KiB writes", Total(), result[1] - times[2]);
+    return 0_i64;
+}
+
+unit RunAll(i64[] codes) {
+    u8[] data = Slice.New(Piece());
+    mut i64 i = 0_i64;
+    while i < Piece() { data[i] = u8((i * 13_i64) & 255_i64); i = i + 1_i64; }
+    codes[0] = Mode("aes128gcm pure", true, data);
+    codes[1] = Mode("aes128gcm native", false, data);
+    return;
+}
+
+test bench_quic_loopback_stream_and_handshake {
+    i64[] codes = [-1_i64, -1_i64];
+    Fiber<unit> run = spawn (() => RunAll(codes));
+    run.Join();
+    Assert.Equal<i64>(codes[0], 0_i64, "pure");
+    Assert.Equal<i64>(codes[1], 0_i64, "native");
+}
+
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}

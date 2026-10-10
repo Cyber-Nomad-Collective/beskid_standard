@@ -1,0 +1,146 @@
+/// BigNat and ModArith tests. Vectors from Python 3 big integers:
+/// random.seed(7); a=getrandbits(1000); b=getrandbits(700); m=getrandbits(2048)|1|2^2047;
+/// x=getrandbits(2040); y=getrandbits(2040).
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Crypto.BigNat;
+use Crypto.ModArith;
+use Crypto.PkErrors;
+
+pub u8 PkNibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
+    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
+    if c >= u8(65) && c <= u8(70) { return c - u8(55); }
+    return u8(0);
+}
+
+/// Test-only hex decoder; an odd-length string gets an implicit leading zero nibble.
+pub u8[] Hex(string text) {
+    i64 len = String.Len(text);
+    i64 odd = len % 2_i64;
+    u8[] out = Slice.New((len + 1_i64) / 2_i64);
+    mut i64 i = 0_i64;
+    while i < len {
+        i64 pos = i + odd;
+        u8 nib = PkNibble(String.ByteAt(text, i));
+        i64 index = pos / 2_i64;
+        if pos % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string HexDigit(u8 v) {
+    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
+    return String.CodeUnitChar(v + u8(87));
+}
+
+pub string ToHex(u8[] bytes) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) {
+        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+pub i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+u32[] Nat(string hex) {
+    Result<u32[], PkError> r = BigNat.FromBytes(Hex(hex));
+    return match r { Result::Ok(v) => v, Result::Error(_) => BigNat.Zeros(1_i64), };
+}
+
+string NatHex(u32[] a) {
+    Result<u8[], PkError> r = BigNat.ToBytes(a, (BigNat.BitLength(a) + 7_i64) / 8_i64);
+    return match r { Result::Ok(v) => ToHex(v), Result::Error(_) => "error", };
+}
+
+test pk_bignat_roundtrip {
+    Assert.Equal<string>(NatHex(Nat("a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d836f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902bd23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438")), "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d836f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902bd23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438", "bytes roundtrip");
+    Assert.Equal<string>(NatHex(Nat("0000ff")), "ff", "leading zeros dropped");
+    Assert.Equal<i64>(BigNat.BitLength(Nat("0100")), 9_i64, "bit length");
+    Assert.True(BigNat.IsZero(Nat("")), "empty is zero");
+}
+
+test pk_bignat_fixed_width {
+    Result<u32[], PkError> ok = BigNat.FromBytesFixed(Hex("00000000ffffffff"), 1_i64);
+    Assert.True(match ok { Result::Ok(_) => true, Result::Error(_) => false, }, "leading zeros fit");
+    Result<u32[], PkError> big = BigNat.FromBytesFixed(Hex("01ffffffff"), 1_i64);
+    Assert.True(match big { Result::Ok(_) => false, Result::Error(_) => true, }, "too wide rejected");
+    Result<u8[], PkError> narrow = BigNat.ToBytes(Nat("0100"), 1_i64);
+    Assert.True(match narrow { Result::Ok(_) => false, Result::Error(_) => true, }, "ToBytes too narrow");
+}
+
+test pk_bignat_arith {
+    u32[] a = Nat("a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d836f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902bd23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438");
+    u32[] b = Nat("08f6d0554ef8aa38922766581e27a1c08a6a63ec24ede6a46b4cb2424a23d5962217beaddbc496cb8e81973e0becd7b03898d190f9ebdacc0cb1e29c658cda1495e60af593bd04cf0fd630f1f29d0da9953f48f1a09f76b5");
+    Assert.Equal<string>(NatHex(BigNat.Add(a, b)), "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d94692e77960dab5c7fd34baf38d2b091aa06b07462e87377ca243280ecc0b248c0afa1c41ea9d9b4123b32f9b698aa1a850b1b9a2831b6af7def0eac078180947a2428ac63a60a91f74e95800193b1ae187e696d5f3862aed", "add");
+    Result<u32[], PkError> d = BigNat.Sub(a, b);
+    Assert.Equal<string>(match d { Result::Ok(v) => NatHex(v), Result::Error(_) => "error", }, "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d934a546cec2e96156d8e5ee4350dbc5998b963f6de4ab6a33cba9c38a37c3795fc6ca9ee633146daa06b0011f51b0f247df8016808f43b55fc58d2587acfe551e767674db12e69f81553cf61c3400ff8e5d6804f2b2473d83", "sub");
+    Result<u32[], PkError> neg = BigNat.Sub(b, a);
+    Assert.True(match neg { Result::Ok(_) => false, Result::Error(_) => true, }, "sub underflow rejected");
+    Assert.Equal<string>(NatHex(BigNat.Mul(a, b)), "05a539505e02fec9581f2efd2cf0f2ce1d8b9d8b1108e88d787951b4bc5eac61352d0911b7609bd3051621071d3a99e34a2cd69f29178c4b559bf24dd10a118a9a3b0dcee65106bd642fd44c726ba4618b4554240876e1be2d9a40ba3491b4aed74711938460f958d0faea81a569325f7c1393e8e27db96d8dc95df9a596d96d905d238fdb57976978d9edd7e29e1cacb16b9761cafea37c0413c4a93d904f3e0a1d2eca8bd1180161900934adbe0d29891af1ce086cc6385524f00838efd0b3db97c1502f8a904729c9e472e5a2786749e2f73b98", "mul");
+    Result<u32[], PkError> r = BigNat.Mod(a, b);
+    Assert.Equal<string>(match r { Result::Ok(v) => NatHex(v), Result::Error(_) => "error", }, "402276c3a3dd2051cc03e8bc18edf47cb0d5f4c37f2af0e7f2546c89c3f10526da3344f45a3c8b63cac55b9312dd2358efda538825c94472982b8506fd731b83a1c92f4161842d020b49e73068492b515b54c026046b4b", "mod");
+    Assert.Equal<i64>(BigNat.Compare(a, b), 1_i64, "compare");
+    Assert.Equal<i64>(BigNat.Compare(b, a), -1_i64, "compare reversed");
+    Assert.Equal<i64>(BigNat.Compare(a, BigNat.Resize(a, 60_i64)), 0_i64, "compare ignores zero limbs");
+}
+
+test pk_modarith_montgomery {
+    u32[] m = Nat("8ede0d7ac3baea9e13deef86ab1031d0f646e1f40a097c976bf46c697d2caf82eeeacbe226e875555790f82ec1d3fcff2a3af4d46b0a18e8830e07bc1e398f1012bd4acefaecbd389be4bcfc49b64a0872e6cc3ababced2057ee05cde00902c77ebff206867347214cdd2055930d6eaf14f4733f3e7d1bfbc7a2ea20b2f14c942e05319acb5c74273f98e2774cbd87ad5c90a9587403e430ec66a78795e761d17731af10506bf2efc6f877186d76b07e881ed162ae2eb1547f15052434b9b5df9e7769b10f4205b4907a70c31012f037b64ce4228c38fb2918f135d25f557203301850c5a38fd547923a736994e3bf911a61dbe22e44158bae97ba94d0eda82f");
+    Result<u32[], PkError> created = ModArith.NewWorkspace(m, 4_i64);
+    match created {
+        Result::Error(_) => { Assert.Fail("workspace"); },
+        Result::Ok(w) => {
+            i64 n = 64_i64;
+            i64 x = ModArith.WSlot(n, 0_i64);
+            i64 y = ModArith.WSlot(n, 1_i64);
+            i64 p = ModArith.WSlot(n, 2_i64);
+            i64 acc = ModArith.WSlot(n, 3_i64);
+            ModArith.WLoad(w, n, x, BigNat.Resize(Nat("4720778ca8181166d2287672fdf2022a96fb1a14a0f9e77f1b103cdf1582b0eab477d26415479c65dc9f503f63af83bd0561e6211c70cf49952399c4aaeac137dc76fb0f17a3007e62aa0a1df9fd789c6539382b0537e65affb2297631a992f0ce583505c6af0758d5563dab2cd31ee315128862c33a4fb774eb5248db40af72158370d269a9a5ae658f33fe3b890b93f448b3a5aa3c814f426dcbb394fb36bb2d420f0f88080b10a3d6b2aa05e11ab2715945795e8229451abd81f1d69ed617f5e837d70820fe119a72d174c9df6acc011cdd9474031b7f26144b98289fcd59a54a7bb1fee08f571242425051c1ccd17f9acae01f5057ca02135e92b1d3f2"), n));
+            ModArith.WLoad(w, n, y, BigNat.Resize(Nat("7b45141a81682c64e50cad66237a0465e7e4236472f1a38f2c6ec8cc4169a3ae3a2b7fdfe01893f3aed0b6c7ac1491def88334e647cb8f74e69a5d0dd27a65bd628881ad1b72dba7abe1c29e1a8ef4f341e07a83f73f16dbf4a8b2b0c4312d20203626f3fe39c0519088f590fbbd119c1caaf75e8766ed88daf4016b4013ef254b0c4e010c4759482c9cbc43435cc52eae05cf96d0cc5fd4c28c2e7c26847f0316909e3bbbe9eaa8948c893b61867626bb7dbd2d1c9af0153e7c2a26a2c0bd3b1287fff52ddf5d616499c9e25a7605aec6f0245bd86d40fc891b4a6a50df4db4d66a3a47469a4d8cdb305fdd2e16096e36aab0d1bc52d9230d977ee2257159"), n));
+            ModArith.WAdd(w, n, p, x, y);
+            Assert.Equal<string>(NatHex(ModArith.WStore(w, n, p)), "c2658ba729803dcbb73523d9216c06907edf3d7913eb8b0e477f05ab56ec5498eea35243f56030598b7007070fc4159bfde51b07643c5ebe7bbdf6d27d6526f53eff7cbc3315dc260e8bccbc148c6d8fa719b2aefc76fd36f45adc26f5dac010ee8e5bf9c4e8c7aa65df333c2890307f31bd7fc14aa13d404fdf53b41b549e97608fbed375f0fef6922bf0417ee5d0c2a24e833c7b08e12404f9fa2fbb7fb5be43d2ad4b43f1f5b938633be5676790d92cd702a67b1d195a5939ac18795f9353087037cc36005b72ff0c9b572455707ac80d01f04c705c7baf2f9602797f1b0e7bb4b5f9457adce3ed72a22d7fd7d63fb6457bb1dba330ed0faadd74d7454b", "modadd");
+            ModArith.WSub(w, n, p, x, y);
+            Assert.Equal<string>(NatHex(ModArith.WStore(w, n, p)), "8ea9e8de35e19a8315cc0b4fb7eaa9cebaf5f8eaba3784db5be30ddd9000c8902b651834ab1da45dc9bec6c8398b97f10847d385a5debe2857bc90f8d511ff6b8d3739485ce8ed5d729b8543c995b88c1c0a24f861cae5efd6f90f44a5767b2d4f6e1414983bbc685421ed9dad3e84bc5becdad042b8ef5df63ce171908c79547acfa8bd9cb9d673a5d1d4ef07b5b3f3c1d6ec3c82dd545266e68924cd55d8892f486081243811102f07c141dc1b0b2313d4aceafa70988daef1467bffed93f87b5ac9e8f11c475540b049caa282599cd38710dbc4d491039b8e2ed38d2d3282d4e731070e481b895c71854c08076b547daacbfc3ca7130a558c3674817a0ac8", "modsub");
+            ModArith.WSub(w, n, p, y, x);
+            Assert.Equal<string>(NatHex(ModArith.WStore(w, n, p)), "34249c8dd9501afe12e436f32588023b50e9094fd1f7bc10115e8bed2be6f2c385b3ad7bcad0f78dd231668848650e21f3214ec52b5ac02b5176c349278fa4858611869e03cfdb294937b88020917c56dca74258f2073080f4f6893a92879a2f51ddf1ee378ab8f8bb32b7e5cee9f2b907986efbc42c9dd16608af2264d33fb33588dd2ea29db399c70d884507d3b99ab9bd1bf1268fde85801e62c891894847e94e8f2c33e1df97f0b5d6915ba55b744a2477b3be18c6d023bea834cc21e7231c9fc81e25be5f4fca26f86d90969ae2c5d346c7646a257d6306fed2283f805b311fbe9547b9be35c8ee1d8cdc543c9cb70fe5f19d0281590b84204f739d67", "modsub wrap");
+            ModArith.WToMont(w, n, x, x);
+            ModArith.WToMont(w, n, y, y);
+            ModArith.WMul(w, n, p, x, y);
+            ModArith.WFromMont(w, n, p, p);
+            Assert.Equal<string>(NatHex(ModArith.WStore(w, n, p)), "48c0111dc4df27452bdbec8a7d55021cc1a338c8f486eaaec822cab56c17ebcfcf3cd6de08076715eabe6d8edcd7691aa889ab577371388ddfa13e20bd1e565c587199e5f97f375e5802d24438e4cc8a4f4f3bdea747429f33008e6add8a1dc0e0f136a6f6597ddb9c9bdd5348b05c86f1f3168ebdf4e8f97860683ade4aedbf212c15ea668af45c9df7a8b86c9a86040d1da659e3de565613c56a4c26566965f53250ea34700311013361f5870492e915760a7056f3277b0929281adf666153b801211abd168ccc0090aa83f3f7b2de0b88e3315039980c193a81eda20ef5b5aec2a205fbe55005e6f214bec113671bef1c6344ccbd107d44c0a1189a406b60", "modmul");
+            ModArith.WPowPublic(w, n, p, x, acc, Hex("010001"));
+            ModArith.WFromMont(w, n, p, p);
+            Assert.Equal<string>(NatHex(ModArith.WStore(w, n, p)), "610c6279b91db8f27678b440cc6ead1a3ec7eefa6c7a6af556c74448290e9b7797f246ded4fbf3112392eb83057c00c437b7f84e99b5a37e594777ec86053796f1d7eea71e75763bae2278497ca509f81d27d8c02662b4db941bcd1e7d79ce26035194579925a798393dc1f2fd6ec8770cc715fbb591dd59d086b18702eaab19b98cecb1e0fc39c60cbe14248b44b9ca2dc0daddd8b6380c45054f8443b226e9cfbda5c47a91231d710b5a62c3d9c5bfcdd5366dacbc3db8858139df033e7406a9f60c9e17f11a2b82ff8b070ed7390a640d4626f7e58af25a7e02d72104c54a5f283400ba1dffee82373346eed49cfcebc84d115676cc2e628d7dcd47d64bc0", "modexp");
+        },
+    };
+    Result<u32[], PkError> even = ModArith.NewWorkspace(Nat("10"), 1_i64);
+    Assert.True(match even { Result::Ok(_) => false, Result::Error(_) => true, }, "even modulus rejected");
+}
+
+test pk_modarith_constant_time_helpers {
+    u32[] a = [1_u32, 2_u32];
+    u32[] b = [3_u32, 4_u32];
+    ModArith.CondSwap(a, b, 0_u32);
+    Assert.Equal<u32>(a[0], 1_u32, "no swap");
+    ModArith.CondSwap(a, b, 1_u32);
+    Assert.Equal<u32>(a[1], 4_u32, "swap");
+    Assert.Equal<u32>(b[0], 1_u32, "swap other");
+    Assert.Equal<u32>(ModArith.IsZeroBit([0_u32, 0_u32]), 1_u32, "zero");
+    Assert.Equal<u32>(ModArith.IsZeroBit([0_u32, 0x80000000_u32]), 0_u32, "nonzero");
+    Assert.Equal<u32>(ModArith.LessBit([5_u32, 1_u32], [4_u32, 2_u32]), 1_u32, "less");
+    Assert.Equal<u32>(ModArith.LessBit([5_u32, 2_u32], [4_u32, 2_u32]), 0_u32, "not less");
+    Assert.Equal<u32>(ModArith.Xor(0xF0F0_u32, 0xFF00_u32), 0x0FF0_u32, "xor");
+}

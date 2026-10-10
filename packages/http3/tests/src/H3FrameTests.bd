@@ -1,0 +1,79 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Codec.Hex;
+use Http3.H3Errors;
+use Http3.H3Frame;
+use Http3.H3Settings;
+
+// RFC 9114 frames, varints and SETTINGS.
+
+test h3_varints_and_frame_round_trip {
+    Assert.Equal<string>(Hex.Encode(H3Frame.AppendVarint(Slice.New(0_i64), 37_i64)), "25", "1-byte varint");
+    Assert.Equal<string>(Hex.Encode(H3Frame.AppendVarint(Slice.New(0_i64), 15293_i64)), "7bbd", "2-byte varint");
+    Assert.Equal<string>(Hex.Encode(H3Frame.AppendVarint(Slice.New(0_i64), 494878333_i64)), "9d7f3e7d", "4-byte varint");
+    Assert.Equal<string>(Hex.Encode(H3Frame.AppendVarint(Slice.New(0_i64), 151288809941952652_i64)), "c2197c5eff14e88c", "8-byte varint");
+    Assert.Equal<i64>(H3Frame.VarintAt(Hex.Of("c2197c5eff14e88c"), 0_i64, 8_i64), 151288809941952652_i64, "8-byte read");
+    u8[] frame = H3Frame.AppendFrame(Slice.New(0_i64), H3Frame.TypeData(), Hex.Of("616263"));
+    Assert.Equal<string>(Hex.Encode(frame), "0003616263", "DATA frame");
+    FrameHead head = H3Frame.ReadFrame(frame, 0_i64, 5_i64, 100_i64);
+    Assert.Equal<i64>(head.status, H3Frame.Complete(), "complete");
+    Assert.Equal<i64>(head.frameType, 0_i64, "type");
+    Assert.Equal<i64>(head.start, 2_i64, "payload start");
+    Assert.Equal<i64>(head.length, 3_i64, "payload length");
+    Assert.Equal<i64>(head.next, 5_i64, "next");
+    FrameHead partial = H3Frame.ReadFrame(frame, 0_i64, 4_i64, 100_i64);
+    Assert.Equal<i64>(partial.status, H3Frame.NeedMore(), "partial payload");
+    FrameHead header = H3Frame.ReadFrame(Hex.Of("0140"), 0_i64, 2_i64, 100_i64);
+    Assert.Equal<i64>(header.status, H3Frame.NeedMore(), "partial length varint");
+    FrameHead large = H3Frame.ReadFrame(Hex.Of("01410000"), 0_i64, 4_i64, 100_i64);
+    Assert.Equal<i64>(large.status, H3Errors.ExcessiveLoad(), "payload above the limit");
+    u8[] goaway = H3Frame.AppendFrame(Slice.New(0_i64), H3Frame.TypeGoaway(), H3Frame.AppendVarint(Slice.New(0_i64), 8_i64));
+    Assert.Equal<string>(Hex.Encode(goaway), "070108", "GOAWAY");
+    Assert.Equal<i64>(H3Frame.SingleVarint(goaway, 2_i64, 1_i64), 8_i64, "GOAWAY id");
+    Assert.Equal<i64>(H3Frame.SingleVarint(Hex.Of("0800"), 0_i64, 2_i64), -1_i64, "trailing byte after the id");
+    Assert.Equal<i64>(H3Frame.SingleVarint(Hex.Of("40"), 0_i64, 1_i64), -1_i64, "truncated id");
+}
+
+test h3_settings_round_trip_and_validation {
+    SettingValues local = SettingValues { maxTableCapacity: 4096_i64, maxFieldSectionSize: 16384_i64, blockedStreams: 16_i64 };
+    u8[] payload = H3Settings.Encode(local);
+    Assert.Equal<string>(Hex.Encode(payload), "0150000680004000071040fa00", "encoded settings with grease");
+    SettingsResult back = H3Settings.Decode(payload, 0_i64, Slice.Len(payload));
+    Assert.Equal<i64>(back.code, 0_i64, "valid");
+    SettingValues s = back.settings;
+    Assert.Equal<i64>(s.maxTableCapacity, 4096_i64, "capacity");
+    Assert.Equal<i64>(s.maxFieldSectionSize, 16384_i64, "section size");
+    Assert.Equal<i64>(s.blockedStreams, 16_i64, "blocked");
+    SettingsResult empty = H3Settings.Decode(Slice.New(0_i64), 0_i64, 0_i64);
+    SettingValues defaults = empty.settings;
+    Assert.Equal<i64>(defaults.maxFieldSectionSize, -1_i64, "unlimited by default");
+    SettingsResult reserved = H3Settings.Decode(Hex.Of("0201"), 0_i64, 2_i64);
+    Assert.Equal<i64>(reserved.code, H3Errors.SettingsError(), "HTTP/2 SETTINGS_ENABLE_PUSH is reserved");
+    SettingsResult zero = H3Settings.Decode(Hex.Of("0000"), 0_i64, 2_i64);
+    Assert.Equal<i64>(zero.code, H3Errors.SettingsError(), "identifier 0 is reserved");
+    SettingsResult duplicate = H3Settings.Decode(Hex.Of("01000101"), 0_i64, 4_i64);
+    Assert.Equal<i64>(duplicate.code, H3Errors.SettingsError(), "duplicate identifier");
+    SettingsResult truncated = H3Settings.Decode(Hex.Of("01"), 0_i64, 1_i64);
+    Assert.Equal<i64>(truncated.code, H3Errors.FrameError(), "missing value");
+    SettingsResult unknown = H3Settings.Decode(Hex.Of("2105"), 0_i64, 2_i64);
+    Assert.Equal<i64>(unknown.code, 0_i64, "unknown identifier ignored");
+}
+
+test h3_frame_validity_per_stream {
+    i64 unexpected = H3Errors.FrameUnexpected();
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindControl(), H3Frame.TypeData(), true), unexpected, "DATA on control");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindControl(), H3Frame.TypeHeaders(), false), unexpected, "HEADERS on control");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindControl(), H3Frame.TypeGoaway(), false), 0_i64, "GOAWAY on control");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindControl(), H3Frame.TypeMaxPushId(), true), 0_i64, "MAX_PUSH_ID to a server");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindControl(), H3Frame.TypeMaxPushId(), false), unexpected, "MAX_PUSH_ID to a client");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), H3Frame.TypeSettings(), true), unexpected, "SETTINGS on a request stream");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), H3Frame.TypeGoaway(), false), unexpected, "GOAWAY on a request stream");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), H3Frame.TypeCancelPush(), true), unexpected, "CANCEL_PUSH on a request stream");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), H3Frame.TypePushPromise(), true), unexpected, "PUSH_PROMISE to a server");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), H3Frame.TypePushPromise(), false), 0_i64, "PUSH_PROMISE to a client");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), 2_i64, true), unexpected, "HTTP/2 PRIORITY type");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindControl(), 9_i64, true), unexpected, "HTTP/2 CONTINUATION type");
+    Assert.Equal<i64>(H3Frame.CheckAllowed(H3Frame.KindRequest(), 33_i64, true), 0_i64, "grease type");
+    Assert.True(H3Frame.IsGrease(33_i64 + 31_i64 * 5_i64), "grease formula");
+    Assert.False(H3Frame.IsGrease(34_i64), "not grease");
+}

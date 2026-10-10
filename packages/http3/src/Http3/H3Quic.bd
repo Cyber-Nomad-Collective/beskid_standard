@@ -1,0 +1,868 @@
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.Time;
+use Core.Time.Instant;
+use Http3.H3Errors;
+use Network.Types;
+use Quic.QuicConfig;
+use Quic.QuicConnection;
+use Quic.QuicEndpoint;
+use Quic.QuicErrors;
+use Tls.TlsConfig;
+use Uri.Host;
+use Codec.Mem;
+
+// The QUIC services HTTP/3 needs (RFC 9114 sections 3 and 6), as module
+// functions over one concrete type. HTTP/3 code only calls these functions,
+// so the transport behind `QuicLink` can change without touching the
+// HTTP/3 layer (a contract value cannot be a struct field in 0.5.2, so
+// `QuicLink` is an enum of concrete transports and every function
+// dispatches on it).
+//
+// `Memory`: an in-memory loopback. `NewPair` returns the client and server
+// ends of one simulated QUIC connection, with stream ids, directions, FIN,
+// RESET_STREAM, STOP_SENDING and CONNECTION_CLOSE as in RFC 9000. Data
+// written by one end is readable by the other at once.
+//
+// `Quic`: one connection of a `Quic.QuicEndpoint` (RFC 9000 over UDP with
+// the TLS 1.3 handshake). Stream ids are the QUIC stream ids; FIN, reset
+// codes and application close codes pass through unchanged. Writes wait
+// (bounded by the session I/O timeout) for stream buffer and flow-control
+// credit; reads never wait.
+
+/// The transport behind an HTTP/3 connection.
+pub enum QuicLink {
+    /// In-memory loopback (tests).
+    Memory(MemLink link),
+    /// A real QUIC connection.
+    Quic(H3QuicSession session),
+}
+
+/// One simulated stream: bytes in each direction plus state.
+pub type MemStream {
+    pub i64 id,
+    pub u8[] toServer,
+    pub u8[] toClient,
+    // [0] server read offset, [1] client read offset, [2] FIN toward the
+    // server, [3] FIN toward the client, [4] reset code of the client send
+    // side (-1), [5] reset code of the server send side (-1), [6] STOP_SENDING
+    // code from the server (-1), [7] STOP_SENDING code from the client (-1).
+    pub i64[] st,
+}
+
+/// The shared state of one simulated connection.
+pub type MemConnection {
+    pub MemStream[] streams,
+    // [0..3] next stream index for client bidi, server bidi, client uni,
+    // server uni; [4] close code (-1 while open); [5] closed by server (0/1).
+    pub i64[] st,
+}
+
+/// One endpoint of an in-memory connection.
+pub type MemLink { pub MemConnection conn, pub bool isServer, }
+
+/// Two connected endpoints: [client, server] of one in-memory connection.
+pub QuicLink[] NewPair() {
+    MemConnection conn = MemConnection { streams: Array.Empty<MemStream>(), st: [0_i64, 0_i64, 0_i64, 0_i64, -1_i64, 0_i64] };
+    MemLink clientEnd = MemLink { conn: conn, isServer: false };
+    MemLink serverEnd = MemLink { conn: conn, isServer: true };
+    mut QuicLink[] out = Array.Empty<QuicLink>();
+    Array.Append<QuicLink>(out, QuicLink::Memory(clientEnd));
+    Array.Append<QuicLink>(out, QuicLink::Memory(serverEnd));
+    return out;
+}
+
+/// The stream was opened by the server (RFC 9000 section 2.1).
+pub bool IsServerInitiated(i64 id) { return (id & 1_i64) == 1_i64; }
+/// The stream is unidirectional.
+pub bool IsUnidirectional(i64 id) { return (id & 2_i64) == 2_i64; }
+/// The stream was opened by the peer of `link`.
+pub bool IsPeerInitiated(QuicLink link, i64 id) { return IsServerInitiated(id) != IsServerSide(link); }
+
+i64 Find(MemConnection conn, i64 id) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<MemStream>(conn.streams) {
+        MemStream s = Array.Get<MemStream>(conn.streams, i);
+        if s.id == id { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+i64 MemOpen(MemLink link, bool uni) {
+    MemConnection conn = link.conn;
+    mut i64 slot = 0_i64;
+    if link.isServer { slot = 1_i64; }
+    if uni { slot = slot + 2_i64; }
+    i64 index = conn.st[slot];
+    conn.st[slot] = index + 1_i64;
+    i64 id = index * 4_i64 + slot;
+    mut MemStream[] streams = conn.streams;
+    Array.Append<MemStream>(streams, MemStream { id: id, toServer: Slice.New(0_i64), toClient: Slice.New(0_i64), st: [0_i64, 0_i64, 0_i64, 0_i64, -1_i64, -1_i64, -1_i64, -1_i64] });
+    conn.streams = streams;
+    return id;
+}
+
+/// Opens a bidirectional stream; returns its id, or -1 when closed.
+i64 MemOpenBidi(MemLink link) {
+    if MemIsClosed(link) { return -1_i64; }
+    return MemOpen(link, false);
+}
+
+/// Opens a unidirectional stream; returns its id, or -1 when closed.
+i64 MemOpenUni(MemLink link) {
+    if MemIsClosed(link) { return -1_i64; }
+    return MemOpen(link, true);
+}
+
+/// Number of streams known to the connection; with StreamAt this lists them
+/// in creation order, so callers discover new peer streams incrementally.
+i64 MemStreamCount(MemLink link) {
+    MemConnection conn = link.conn;
+    return Array.Len<MemStream>(conn.streams);
+}
+
+/// Id of the `index`-th stream.
+i64 MemStreamAt(MemLink link, i64 index) {
+    MemConnection conn = link.conn;
+    MemStream s = Array.Get<MemStream>(conn.streams, index);
+    return s.id;
+}
+
+/// Writes `data` (and FIN when `fin`) to the send side of `id`. False when
+/// the connection is closed, the stream is unknown, not writable by this
+/// endpoint, already finished, or reset.
+bool MemWrite(MemLink link, i64 id, u8[] data, bool fin) {
+    if MemIsClosed(link) { return false; }
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return false; }
+    if IsUnidirectional(id) && IsServerInitiated(id) != link.isServer { return false; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    mut i64 finSlot = 2_i64;
+    mut i64 resetSlot = 4_i64;
+    if link.isServer { finSlot = 3_i64; resetSlot = 5_i64; }
+    if s.st[finSlot] == 1_i64 || s.st[resetSlot] >= 0_i64 { return false; }
+    mut u8[] buf = s.toServer;
+    if link.isServer { buf = s.toClient; }
+    buf = Mem.Join(buf, data, 0_i64, Slice.Len(data));
+    if link.isServer { s.toClient = buf; } else { s.toServer = buf; }
+    if fin { s.st[finSlot] = 1_i64; }
+    return true;
+}
+
+/// Reads and consumes up to `maxCount` available bytes of `id`.
+u8[] MemRead(MemLink link, i64 id, i64 maxCount) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return Slice.New(0_i64); }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    mut u8[] buf = s.toServer;
+    mut i64 posSlot = 0_i64;
+    if !link.isServer { buf = s.toClient; posSlot = 1_i64; }
+    i64 pos = s.st[posSlot];
+    mut i64 take = Slice.Len(buf) - pos;
+    if take > maxCount { take = maxCount; }
+    if take <= 0_i64 { return Slice.New(0_i64); }
+    u8[] out = Mem.Zeroed(take);
+    Mem.Copy(out, 0_i64, buf, pos, take);
+    if pos + take == Slice.Len(buf) {
+        // Everything was consumed: drop the backing buffer.
+        if link.isServer { s.toServer = Slice.New(0_i64); } else { s.toClient = Slice.New(0_i64); }
+        s.st[posSlot] = 0_i64;
+    } else {
+        s.st[posSlot] = pos + take;
+    }
+    return out;
+}
+
+/// The peer finished its send side and every byte has been read.
+bool MemIsFinished(MemLink link, i64 id) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return false; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { return s.st[2] == 1_i64 && Slice.Len(s.toServer) == s.st[0]; }
+    return s.st[3] == 1_i64 && Slice.Len(s.toClient) == s.st[1];
+}
+
+/// RESET_STREAM code the peer sent for its send side of `id`, or -1.
+i64 MemPeerResetCode(MemLink link, i64 id) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return -1_i64; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { return s.st[4]; }
+    return s.st[5];
+}
+
+/// STOP_SENDING code the peer sent for our send side of `id`, or -1.
+i64 MemPeerStopCode(MemLink link, i64 id) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return -1_i64; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { return s.st[7]; }
+    return s.st[6];
+}
+
+/// Abruptly ends our send side of `id` with `code` (RESET_STREAM).
+unit MemReset(MemLink link, i64 id, i64 code) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer {
+        if s.st[3] == 0_i64 && s.st[5] < 0_i64 { s.st[5] = code; s.toClient = Slice.New(0_i64); s.st[1] = 0_i64; }
+    } else {
+        if s.st[2] == 0_i64 && s.st[4] < 0_i64 { s.st[4] = code; s.toServer = Slice.New(0_i64); s.st[0] = 0_i64; }
+    }
+    return;
+}
+
+/// Asks the peer to stop sending on `id` with `code` (STOP_SENDING).
+unit MemStopSending(MemLink link, i64 id, i64 code) {
+    MemConnection conn = link.conn;
+    i64 at = Find(conn, id);
+    if at < 0_i64 { return; }
+    MemStream s = Array.Get<MemStream>(conn.streams, at);
+    if link.isServer { if s.st[6] < 0_i64 { s.st[6] = code; } } else { if s.st[7] < 0_i64 { s.st[7] = code; } }
+    return;
+}
+
+/// Closes the connection with an application error code (CONNECTION_CLOSE).
+unit MemClose(MemLink link, i64 code) {
+    MemConnection conn = link.conn;
+    if conn.st[4] < 0_i64 {
+        conn.st[4] = code;
+        if link.isServer { conn.st[5] = 1_i64; }
+    }
+    return;
+}
+
+/// The connection is closed (by either end).
+bool MemIsClosed(MemLink link) {
+    MemConnection conn = link.conn;
+    return conn.st[4] >= 0_i64;
+}
+
+/// The close code, or -1 while open.
+i64 MemCloseCode(MemLink link) {
+    MemConnection conn = link.conn;
+    return conn.st[4];
+}
+
+// ------------------------------------------------------------ QUIC transport
+
+/// One QUIC connection used by HTTP/3.
+pub type H3QuicSession {
+    pub Endpoint endpoint,
+    pub i64 handle,
+    pub bool isServer,
+    // Stream ids in discovery order (local opens and accepted peer streams).
+    i64[] ids,
+    // Per entry of `ids`: the peer's RESET_STREAM code once observed (-1).
+    i64[] resets,
+    u8[] scratch,
+    // [0] I/O timeout (ms) for writes and stream opens, [1] local close
+    // code (-1 open), [2] handle released (0/1), [3] stream buffer size.
+    i64[] n,
+    // Driver fibers owned by this session (a client owns its endpoint).
+    Fiber<unit>[] drivers,
+}
+
+/// A listening HTTP/3 QUIC endpoint (server).
+pub type H3QuicListener {
+    pub Endpoint endpoint,
+    Fiber<unit>[] drivers,
+    // [0] stopped (0/1).
+    i64[] n,
+}
+
+/// ALPN protocol id of HTTP/3 (RFC 9114 section 3.1).
+pub string AlpnH3() { return "h3"; }
+
+/// Default bound for blocking writes, stream opens and close drains (ms).
+pub i64 DefaultIoTimeoutMillis() { return 10000_i64; }
+
+// ------------------------------------------------------------ time
+
+pub i64 NowNanos() {
+    Instant now = Time.MonotonicNow();
+    return now.nanos;
+}
+
+/// Absolute monotonic deadline (ns); a negative timeout never expires.
+pub i64 DeadlineIn(i64 timeoutMillis) {
+    if timeoutMillis < 0_i64 { return 9223372036854775807_i64; }
+    return NowNanos() + timeoutMillis * 1000000_i64;
+}
+
+pub bool Expired(i64 deadline) { return NowNanos() >= deadline; }
+
+/// Yields for about a millisecond (lets the QUIC driver fiber run).
+pub unit Nap() {
+    match Time.Sleep(Time.FromMilliseconds(1_i64)) { Result::Ok(_) => (), Result::Error(_) => (), };
+    return;
+}
+
+// ------------------------------------------------------------ configuration
+
+/// A QUIC configuration fit for HTTP/3: each side allows the peer the three
+/// unidirectional streams HTTP/3 opens (control, QPACK encoder and decoder,
+/// RFC 9114 section 6.2) and up to eight concurrent request streams.
+pub QuicConfig ForH3(QuicConfig c) { return QuicConfig.WithStreamLimits(c, PeerBidiStreams(), PeerUniStreams()); }
+
+/// Concurrent request streams each side grants its peer (R18).
+pub i64 PeerBidiStreams() { return 8_i64; }
+
+/// Unidirectional streams each side grants its peer: control, QPACK encoder and decoder.
+pub i64 PeerUniStreams() { return 3_i64; }
+
+pub QuicConfig ClientConfig(TlsClientConfig tls) { return ForH3(QuicConfig.TlsClientConfigFor(tls, [AlpnH3()])); }
+
+pub QuicConfig ServerConfig(TlsServerConfig tls) { return ForH3(QuicConfig.TlsServerConfigFor(tls, [AlpnH3()])); }
+
+Port PortOf(i64 port) { return Network.Types.PortBytes(u8((port >> 8_i64) & 255_i64), u8(port & 255_i64)); }
+
+SocketAddress AddressOf(IpAddress address, i64 port) { return SocketAddress { address: address, port: PortOf(port) }; }
+
+// The unspecified address of the family of `address`.
+IpAddress AnyLike(IpAddress address) {
+    return match address {
+        IpAddress::V4(_, _, _, _) => IpAddress::V4(0_u8, 0_u8, 0_u8, 0_u8),
+        IpAddress::V6(_, _, _, _) => IpAddress::V6(0_u32, 0_u32, 0_u32, 0_u32),
+    };
+}
+
+bool ValidPort(i64 port) { return port >= 0_i64 && port <= 65535_i64; }
+
+H3Error FromQuic(QuicError error) {
+    return match error {
+        QuicError::TimedOut() => H3Error::Timeout(),
+        _ => H3Error::Transport(),
+    };
+}
+
+H3QuicSession NewSession(Endpoint endpoint, i64 handle, bool isServer, Fiber<unit>[] drivers, i64 buffer) {
+    mut i64[] n = [0_i64, -1_i64, 0_i64, 0_i64];
+    n[0] = DefaultIoTimeoutMillis();
+    n[3] = buffer;
+    u8[] scratch = Mem.Zeroed(buffer);
+    return H3QuicSession {
+        endpoint: endpoint, handle: handle, isServer: isServer, ids: Array.Empty<i64>(), resets: Array.Empty<i64>(),
+        scratch: scratch, n: n, drivers: drivers,
+    };
+}
+
+unit JoinDrivers(Fiber<unit>[] drivers) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<Fiber<unit>>(drivers) {
+        Fiber<unit> driver = Array.Get<Fiber<unit>>(drivers, i);
+        match driver.Join() { Result::Ok(_) => (), Result::Error(_) => (), };
+        i = i + 1_i64;
+    }
+    return;
+}
+
+unit Shutdown(Endpoint endpoint, Fiber<unit>[] drivers) {
+    QuicEndpoint.Stop(endpoint);
+    JoinDrivers(drivers);
+    return;
+}
+
+/// Parses an IP literal: dotted IPv4 ("127.0.0.1") or IPv6 ("::1", "[::1]").
+/// Host names are not resolved here (Transport error).
+pub Result<IpAddress, H3Error> ParseAddress(string text) {
+    string bare = Host.BareHost(text);
+    if Host.IsIpv4(bare) {
+        return match Host.ParseIpv4(bare) {
+            Result::Ok(v) => Result::Ok(V4Of(v)),
+            Result::Error(_) => Result::Error(H3Error::Transport()),
+        };
+    }
+    return match Host.ParseIpv6(bare) {
+        Result::Ok(b) => Result::Ok(V6Of(b)),
+        Result::Error(_) => Result::Error(H3Error::Transport()),
+    };
+}
+
+IpAddress V4Of(i64 v) {
+    return IpAddress::V4(u8((v >> 24_i64) & 255_i64), u8((v >> 16_i64) & 255_i64), u8((v >> 8_i64) & 255_i64), u8(v & 255_i64));
+}
+
+u32 WordAt(u8[] b, i64 at) {
+    return (u32(b[at]) << 24_u32) | (u32(b[at + 1_i64]) << 16_u32) | (u32(b[at + 2_i64]) << 8_u32) | u32(b[at + 3_i64]);
+}
+
+IpAddress V6Of(u8[] b) { return IpAddress::V6(WordAt(b, 0_i64), WordAt(b, 4_i64), WordAt(b, 8_i64), WordAt(b, 12_i64)); }
+
+/// Opens a client QUIC connection to `address` (an IP literal, see
+/// ParseAddress) and `port` with ALPN "h3" and waits for the handshake. The
+/// returned link owns its endpoint and driver fiber (released by
+/// `Release`). Fails closed when "h3" was not negotiated. Must run inside a
+/// fiber.
+pub Result<QuicLink, H3Error> ConnectClient(string address, i64 port, TlsClientConfig tls, i64 timeoutMillis) {
+    Result<IpAddress, H3Error> parsed = ParseAddress(address);
+    return match parsed {
+        Result::Ok(address) => ConnectAddress(address, port, tls, timeoutMillis),
+        Result::Error(e) => Result::Error(e),
+    };
+}
+
+/// Like ConnectClient, for an already resolved socket address (the Web
+/// facade resolves names with Network.Dns). Must run inside a fiber.
+pub Result<QuicLink, H3Error> ConnectSocket(SocketAddress remote, TlsClientConfig tls, i64 timeoutMillis) {
+    return ConnectAddress(remote.address, PortValue(remote), tls, timeoutMillis);
+}
+
+Result<QuicLink, H3Error> ConnectAddress(IpAddress address, i64 port, TlsClientConfig tls, i64 timeoutMillis) {
+    if !ValidPort(port) { return Result::Error(H3Error::Transport()); }
+    QuicConfig cfg = ClientConfig(tls);
+    Result<Endpoint, QuicError> bound = QuicEndpoint.Bind(AddressOf(AnyLike(address), 0_i64), cfg, false);
+    return match bound {
+        Result::Ok(endpoint) => Dial(endpoint, AddressOf(address, port), cfg.streamBuffer, timeoutMillis),
+        Result::Error(e) => Result::Error(FromQuic(e)),
+    };
+}
+
+Result<QuicLink, H3Error> Dial(Endpoint endpoint, SocketAddress remote, i64 buffer, i64 timeoutMillis) {
+    Fiber<unit> driver = QuicEndpoint.Start(endpoint);
+    mut Fiber<unit>[] drivers = Array.Empty<Fiber<unit>>();
+    Array.Append<Fiber<unit>>(drivers, driver);
+    Result<i64, QuicError> connected = QuicEndpoint.Connect(endpoint, remote, timeoutMillis);
+    return match connected {
+        Result::Ok(handle) => Established(endpoint, handle, false, drivers, buffer),
+        Result::Error(e) => Abort(endpoint, drivers, FromQuic(e)),
+    };
+}
+
+Result<QuicLink, H3Error> Abort(Endpoint endpoint, Fiber<unit>[] drivers, H3Error error) {
+    Shutdown(endpoint, drivers);
+    return Result::Error(error);
+}
+
+Result<QuicLink, H3Error> Established(Endpoint endpoint, i64 handle, bool isServer, Fiber<unit>[] drivers, i64 buffer) {
+    if QuicEndpoint.Alpn(endpoint, handle) != AlpnH3() {
+        // RFC 9114 section 3.1: HTTP/3 only over a connection that negotiated "h3".
+        Result<unit, QuicError> closed = QuicEndpoint.Close(endpoint, handle, H3Errors.VersionFallback(), 1000_i64);
+        if Array.Len<Fiber<unit>>(drivers) > 0_i64 { Shutdown(endpoint, drivers); }
+        return Result::Error(H3Error::Transport());
+    }
+    return Result::Ok(QuicLink::Quic(NewSession(endpoint, handle, isServer, drivers, buffer)));
+}
+
+/// Binds a server QUIC endpoint for HTTP/3 (ALPN "h3") on `address` (an IP
+/// literal) and starts its driver fiber. Port 0 picks a free port (see
+/// `ListenerPort`).
+pub Result<H3QuicListener, H3Error> Listen(string address, i64 port, TlsServerConfig tls) {
+    Result<IpAddress, H3Error> parsed = ParseAddress(address);
+    return match parsed {
+        Result::Ok(address) => ListenAddress(address, port, tls),
+        Result::Error(e) => Result::Error(e),
+    };
+}
+
+Result<H3QuicListener, H3Error> ListenAddress(IpAddress address, i64 port, TlsServerConfig tls) {
+    if !ValidPort(port) { return Result::Error(H3Error::Transport()); }
+    Result<Endpoint, QuicError> bound = QuicEndpoint.Bind(AddressOf(address, port), ServerConfig(tls), true);
+    return match bound {
+        Result::Ok(endpoint) => Result::Ok(StartListener(endpoint)),
+        Result::Error(e) => Result::Error(FromQuic(e)),
+    };
+}
+
+H3QuicListener StartListener(Endpoint endpoint) {
+    Fiber<unit> driver = QuicEndpoint.Start(endpoint);
+    mut Fiber<unit>[] drivers = Array.Empty<Fiber<unit>>();
+    Array.Append<Fiber<unit>>(drivers, driver);
+    return H3QuicListener { endpoint: endpoint, drivers: drivers, n: [0_i64] };
+}
+
+/// The bound UDP port of a listener (-1 when unknown).
+pub i64 ListenerPort(H3QuicListener listener) {
+    Result<SocketAddress, QuicError> local = QuicEndpoint.LocalAddress(listener.endpoint);
+    return match local {
+        Result::Ok(a) => PortValue(a),
+        Result::Error(_) => -1_i64,
+    };
+}
+
+i64 PortValue(SocketAddress a) {
+    Port port = a.port;
+    return port.Value();
+}
+
+/// Waits for the next established connection. Connections that did not
+/// negotiate "h3" are closed and reported as Transport errors.
+pub Result<QuicLink, H3Error> AcceptLink(H3QuicListener listener, i64 timeoutMillis) {
+    if listener.n[0] == 1_i64 { return Result::Error(H3Error::Transport()); }
+    Result<i64, QuicError> accepted = QuicEndpoint.Accept(listener.endpoint, timeoutMillis);
+    return match accepted {
+        Result::Ok(handle) => Established(listener.endpoint, handle, true, Array.Empty<Fiber<unit>>(), BufferOf(listener)),
+        Result::Error(e) => Result::Error(FromQuic(e)),
+    };
+}
+
+i64 BufferOf(H3QuicListener listener) { return 8192_i64; }
+
+/// Stops the listener's driver (open connections are abandoned) and joins it.
+pub unit StopListener(H3QuicListener listener) {
+    if listener.n[0] == 1_i64 { return; }
+    listener.n[0] = 1_i64;
+    Shutdown(listener.endpoint, listener.drivers);
+    return;
+}
+
+Connection Conn(H3QuicSession s) { return QuicEndpoint.ConnectionOf(s.endpoint, s.handle); }
+
+bool Released(H3QuicSession s) { return s.n[2] == 1_i64; }
+
+unit Remember(H3QuicSession s, i64 id) {
+    mut i64[] ids = s.ids;
+    mut i64[] resets = s.resets;
+    Array.Append<i64>(ids, id);
+    Array.Append<i64>(resets, -1_i64);
+    s.ids = ids;
+    s.resets = resets;
+    return;
+}
+
+i64 IndexOfId(H3QuicSession s, i64 id) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(s.ids) {
+        if s.ids[i] == id { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+bool Done(Result<unit, QuicError> r) {
+    return match r { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+i64 QOpen(H3QuicSession s, bool bidi) {
+    if Released(s) || s.n[1] >= 0_i64 { return -1_i64; }
+    Result<i64, QuicError> opened = QuicEndpoint.OpenStream(s.endpoint, s.handle, bidi, s.n[0]);
+    i64 id = match opened { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+    if id >= 0_i64 { Remember(s, id); }
+    return id;
+}
+
+i64 QStreamAt(H3QuicSession s, i64 index) { return s.ids[index]; }
+
+i64 QStreamCount(H3QuicSession s) {
+    if !Released(s) {
+        Connection c = Conn(s);
+        mut i64 id = QuicConnection.AcceptStream(c);
+        while id >= 0_i64 {
+            Remember(s, id);
+            id = QuicConnection.AcceptStream(c);
+        }
+    }
+    return Array.Len<i64>(s.ids);
+}
+
+bool QWrite(H3QuicSession s, i64 id, u8[] data, bool fin) {
+    if Released(s) || s.n[1] >= 0_i64 { return false; }
+    i64 count = Slice.Len(data);
+    if count > 0_i64 {
+        if !Done(QuicEndpoint.Write(s.endpoint, s.handle, id, data, 0_i64, count, s.n[0])) { return false; }
+    }
+    if fin { return Done(QuicEndpoint.Finish(s.endpoint, s.handle, id)); }
+    return true;
+}
+
+// Records a peer reset observed by a read.
+unit NoteReset(H3QuicSession s, i64 id, i64 code) {
+    i64 at = IndexOfId(s, id);
+    if at >= 0_i64 && s.resets[at] < 0_i64 { s.resets[at] = code; }
+    return;
+}
+
+u8[] QRead(H3QuicSession s, i64 id, i64 maxCount) {
+    if Released(s) { return Slice.New(0_i64); }
+    Connection c = Conn(s);
+    mut i64 want = maxCount;
+    if want > Slice.Len(s.scratch) { want = Slice.Len(s.scratch); }
+    i64 n = QuicConnection.StreamRead(c, id, s.scratch, 0_i64, want);
+    if n == -2_i64 {
+        NoteReset(s, id, QuicConnection.StreamResetCode(c, id));
+        return Slice.New(0_i64);
+    }
+    if n <= 0_i64 { return Slice.New(0_i64); }
+    u8[] out = Mem.Zeroed(n);
+    Mem.Copy(out, 0_i64, s.scratch, 0_i64, n);
+    return out;
+}
+
+bool QIsFinished(H3QuicSession s, i64 id) {
+    if Released(s) { return true; }
+    return QuicConnection.StreamAtEnd(Conn(s), id);
+}
+
+// The code is remembered once seen, because QUIC frees the stream slot after
+// the reset was read and both directions are done.
+i64 QPeerResetCode(H3QuicSession s, i64 id) {
+    i64 at = IndexOfId(s, id);
+    if at >= 0_i64 && s.resets[at] >= 0_i64 { return s.resets[at]; }
+    if Released(s) { return -1_i64; }
+    i64 code = QuicConnection.StreamResetCode(Conn(s), id);
+    if code >= 0_i64 { NoteReset(s, id, code); }
+    return code;
+}
+
+i64 QPeerStopCode(H3QuicSession s, i64 id) {
+    if Released(s) { return -1_i64; }
+    return QuicConnection.StreamPeerStopCode(Conn(s), id);
+}
+
+unit QReset(H3QuicSession s, i64 id, i64 code) {
+    if Released(s) { return; }
+    bool ok = Done(QuicEndpoint.Reset(s.endpoint, s.handle, id, code));
+    return;
+}
+
+unit QStopSending(H3QuicSession s, i64 id, i64 code) {
+    if Released(s) { return; }
+    bool ok = Done(QuicEndpoint.StopSending(s.endpoint, s.handle, id, code));
+    return;
+}
+
+// True when every locally sendable stream had all its written data acknowledged.
+bool Drained(H3QuicSession s) {
+    Connection c = Conn(s);
+    mut i64 i = 0_i64;
+    while i < Array.Len<i64>(s.ids) {
+        i64 id = s.ids[i];
+        if !IsUnidirectional(id) || IsServerInitiated(id) == s.isServer {
+            i64 space = QuicConnection.StreamSendSpace(c, id);
+            if space >= 0_i64 && space < s.n[3] && !QuicConnection.StreamSendDone(c, id) { return false; }
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+// Application close (CONNECTION_CLOSE 0x1d with `code`). Data already written
+// (a GOAWAY, the last response) is given a bounded chance to be acknowledged
+// first, because a closing connection sends no more stream data.
+unit QClose(H3QuicSession s, i64 code) {
+    if Released(s) || s.n[1] >= 0_i64 { return; }
+    Connection c = Conn(s);
+    i64 deadline = DeadlineIn(1000_i64);
+    while !QuicConnection.IsClosingOrClosed(c) && !Drained(s) && !Expired(deadline) { Nap(); }
+    s.n[1] = code;
+    QuicConnection.Close(c, code, NowNanos());
+    return;
+}
+
+bool QIsClosed(H3QuicSession s) {
+    if s.n[1] >= 0_i64 || Released(s) { return true; }
+    return QuicConnection.IsClosingOrClosed(Conn(s));
+}
+
+i64 CodeOfClose(QuicError error) {
+    return match error {
+        QuicError::Application(code) => code,
+        QuicError::PeerClosed(code, application) => PeerCode(code, application),
+        _ => H3Errors.InternalError(),
+    };
+}
+
+i64 PeerCode(i64 code, bool application) {
+    if application { return code; }
+    return H3Errors.InternalError();
+}
+
+i64 QCloseCode(H3QuicSession s) {
+    if s.n[1] >= 0_i64 { return s.n[1]; }
+    if Released(s) { return H3Errors.InternalError(); }
+    Connection c = Conn(s);
+    if !QuicConnection.IsClosingOrClosed(c) { return -1_i64; }
+    return CodeOfClose(QuicConnection.Error(c));
+}
+
+bool QTransportFailed(H3QuicSession s) {
+    if s.n[1] >= 0_i64 || Released(s) { return false; }
+    Connection c = Conn(s);
+    if !QuicConnection.IsClosingOrClosed(c) { return false; }
+    QuicError e = QuicConnection.Error(c);
+    return match e {
+        QuicError::Application(_) => false,
+        QuicError::PeerClosed(_, application) => !application,
+        _ => true,
+    };
+}
+
+unit QRelease(H3QuicSession s, i64 timeoutMillis) {
+    if Released(s) { return; }
+    mut i64 code = s.n[1];
+    if code < 0_i64 { code = H3Errors.NoError(); }
+    Result<unit, QuicError> closed = QuicEndpoint.Close(s.endpoint, s.handle, code, timeoutMillis);
+    if s.n[1] < 0_i64 { s.n[1] = code; }
+    s.n[2] = 1_i64;
+    if Array.Len<Fiber<unit>>(s.drivers) > 0_i64 { Shutdown(s.endpoint, s.drivers); }
+    return;
+}
+
+// ------------------------------------------------------------ dispatch
+
+/// This end is the server.
+pub bool IsServerSide(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => m.isServer,
+        QuicLink::Quic(s) => s.isServer,
+    };
+}
+
+/// Opens a bidirectional stream; returns its id, or -1 when closed.
+pub i64 OpenBidi(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => MemOpenBidi(m),
+        QuicLink::Quic(s) => QOpen(s, true),
+    };
+}
+
+/// Opens a unidirectional stream; returns its id, or -1 when closed.
+pub i64 OpenUni(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => MemOpenUni(m),
+        QuicLink::Quic(s) => QOpen(s, false),
+    };
+}
+
+/// Number of streams known to the connection; with StreamAt this lists them
+/// in discovery order, so callers discover new peer streams incrementally.
+pub i64 StreamCount(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => MemStreamCount(m),
+        QuicLink::Quic(s) => QStreamCount(s),
+    };
+}
+
+/// Id of the `index`-th stream.
+pub i64 StreamAt(QuicLink link, i64 index) {
+    return match link {
+        QuicLink::Memory(m) => MemStreamAt(m, index),
+        QuicLink::Quic(s) => QStreamAt(s, index),
+    };
+}
+
+/// Writes `data` (and FIN when `fin`) to the send side of `id`. False when
+/// the connection is closed, the stream is unknown, not writable by this
+/// endpoint, already finished, or reset. A QUIC link waits for buffer and
+/// flow-control credit up to its I/O timeout.
+pub bool Write(QuicLink link, i64 id, u8[] data, bool fin) {
+    return match link {
+        QuicLink::Memory(m) => MemWrite(m, id, data, fin),
+        QuicLink::Quic(s) => QWrite(s, id, data, fin),
+    };
+}
+
+/// Reads and consumes up to `maxCount` available bytes of `id` (never waits).
+pub u8[] Read(QuicLink link, i64 id, i64 maxCount) {
+    return match link {
+        QuicLink::Memory(m) => MemRead(m, id, maxCount),
+        QuicLink::Quic(s) => QRead(s, id, maxCount),
+    };
+}
+
+/// The peer finished its send side and every byte has been read.
+pub bool IsFinished(QuicLink link, i64 id) {
+    return match link {
+        QuicLink::Memory(m) => MemIsFinished(m, id),
+        QuicLink::Quic(s) => QIsFinished(s, id),
+    };
+}
+
+/// RESET_STREAM code the peer sent for its send side of `id`, or -1.
+pub i64 PeerResetCode(QuicLink link, i64 id) {
+    return match link {
+        QuicLink::Memory(m) => MemPeerResetCode(m, id),
+        QuicLink::Quic(s) => QPeerResetCode(s, id),
+    };
+}
+
+/// STOP_SENDING code the peer sent for our send side of `id`, or -1. A QUIC
+/// link reports -1 again once the stream slot is freed.
+pub i64 PeerStopCode(QuicLink link, i64 id) {
+    return match link {
+        QuicLink::Memory(m) => MemPeerStopCode(m, id),
+        QuicLink::Quic(s) => QPeerStopCode(s, id),
+    };
+}
+
+/// Abruptly ends our send side of `id` with `code` (RESET_STREAM).
+pub unit Reset(QuicLink link, i64 id, i64 code) {
+    match link {
+        QuicLink::Memory(m) => { MemReset(m, id, code); },
+        QuicLink::Quic(s) => { QReset(s, id, code); },
+    };
+    return;
+}
+
+/// Asks the peer to stop sending on `id` with `code` (STOP_SENDING).
+pub unit StopSending(QuicLink link, i64 id, i64 code) {
+    match link {
+        QuicLink::Memory(m) => { MemStopSending(m, id, code); },
+        QuicLink::Quic(s) => { QStopSending(s, id, code); },
+    };
+    return;
+}
+
+/// Closes the connection with an application error code (CONNECTION_CLOSE).
+pub unit Close(QuicLink link, i64 code) {
+    match link {
+        QuicLink::Memory(m) => { MemClose(m, code); },
+        QuicLink::Quic(s) => { QClose(s, code); },
+    };
+    return;
+}
+
+/// The connection is closed (by either end).
+pub bool IsClosed(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => MemIsClosed(m),
+        QuicLink::Quic(s) => QIsClosed(s),
+    };
+}
+
+/// The close code, or -1 while open. Application codes (local or peer) are
+/// returned unchanged; a transport-level end (QUIC error, idle timeout) is
+/// reported as H3_INTERNAL_ERROR and flagged by `TransportFailed`.
+pub i64 CloseCode(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => MemCloseCode(m),
+        QuicLink::Quic(s) => QCloseCode(s),
+    };
+}
+
+/// The connection ended below HTTP/3 (QUIC transport error, idle timeout).
+pub bool TransportFailed(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => false,
+        QuicLink::Quic(s) => QTransportFailed(s),
+    };
+}
+
+/// Negotiated ALPN protocol ("" for the in-memory link).
+pub string Alpn(QuicLink link) {
+    return match link {
+        QuicLink::Memory(m) => "",
+        QuicLink::Quic(s) => QuicEndpoint.Alpn(s.endpoint, s.handle),
+    };
+}
+
+/// Releases the transport: a QUIC link closes (H3_NO_ERROR unless already
+/// closed), waits up to `timeoutMillis` for the closing period, frees the
+/// connection handle and, for a client, stops and joins its endpoint driver.
+pub unit Release(QuicLink link, i64 timeoutMillis) {
+    match link {
+        QuicLink::Memory(m) => (),
+        QuicLink::Quic(s) => { QRelease(s, timeoutMillis); },
+    };
+    return;
+}

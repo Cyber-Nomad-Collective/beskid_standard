@@ -1,0 +1,73 @@
+use Core.IO.IoError;
+
+// RFC 9113 section 7 error codes and the typed HTTP/2 failures.
+
+pub i64 NoError() { return 0_i64; }
+pub i64 ProtocolError() { return 1_i64; }
+pub i64 InternalError() { return 2_i64; }
+pub i64 FlowControlError() { return 3_i64; }
+pub i64 SettingsTimeout() { return 4_i64; }
+pub i64 StreamClosed() { return 5_i64; }
+pub i64 FrameSizeError() { return 6_i64; }
+pub i64 RefusedStream() { return 7_i64; }
+pub i64 Cancel() { return 8_i64; }
+pub i64 CompressionError() { return 9_i64; }
+pub i64 ConnectError() { return 10_i64; }
+pub i64 EnhanceYourCalm() { return 11_i64; }
+pub i64 InadequateSecurity() { return 12_i64; }
+pub i64 Http11Required() { return 13_i64; }
+
+// A frame that cannot be accepted. `Connection` errors end the connection
+// with GOAWAY; `Stream` errors end one stream with RST_STREAM (section 5.4).
+pub enum FrameError {
+    Connection(i64 code),
+    Stream(i64 streamId, i64 code),
+}
+
+// Failures visible to HTTP/2 client and server callers.
+pub enum Http2Error {
+    // This endpoint detected a connection error and sent GOAWAY with `code`.
+    Connection(i64 code),
+    // This endpoint detected a stream error and sent RST_STREAM with `code`.
+    Stream(i64 streamId, i64 code),
+    // The peer reset the stream with RST_STREAM.
+    PeerReset(i64 streamId, i64 code),
+    // The peer sent GOAWAY; the stream was not processed when its id is above `lastStreamId`.
+    PeerGoAway(i64 lastStreamId, i64 code),
+    // The transport failed.
+    Transport(IoError error),
+    // The peer closed the transport, or this connection already failed.
+    Closed(),
+    // The request or response cannot be expressed in HTTP/2.
+    InvalidMessage(),
+    // A wait for a connection slot or a response exceeded the configured timeout.
+    Timeout(),
+    // The response body exceeded the configured limit.
+    BodyTooLarge(),
+}
+
+// The RFC 9113 error code carried by an error, or -1.
+pub i64 CodeOf(Http2Error error) {
+    return match error {
+        Http2Error::Connection(code) => code,
+        Http2Error::Stream(_, code) => code,
+        Http2Error::PeerReset(_, code) => code,
+        Http2Error::PeerGoAway(_, code) => code,
+        _ => -1_i64,
+    };
+}
+
+// A short name for diagnostics.
+pub string KindOf(Http2Error error) {
+    return match error {
+        Http2Error::Connection(_) => "connection",
+        Http2Error::Stream(_, _) => "stream",
+        Http2Error::PeerReset(_, _) => "peer-reset",
+        Http2Error::PeerGoAway(_, _) => "peer-goaway",
+        Http2Error::Transport(_) => "transport",
+        Http2Error::Closed => "closed",
+        Http2Error::InvalidMessage => "invalid-message",
+        Http2Error::Timeout => "timeout",
+        Http2Error::BodyTooLarge => "body-too-large",
+    };
+}

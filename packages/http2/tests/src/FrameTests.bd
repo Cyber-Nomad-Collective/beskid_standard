@@ -1,0 +1,259 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Frame;
+use Http2.FrameErrors;
+
+// Frame codec round trips (RFC 9113 sections 4 and 6).
+
+i64 Max() { return 16384_i64; }
+
+Frame Must(Result<Frame,FrameError> result) {
+    return match result {
+        Result::Ok(frame) => frame,
+        Result::Error(_) => Frame::Unknown(255_i64, -1_i64),
+    };
+}
+
+// Connection error code, stream error code * 1000 + stream id offset, or -1 for success.
+i64 ErrorCode(Result<Frame,FrameError> result) {
+    return match result {
+        Result::Ok(_) => -1_i64,
+        Result::Error(error) => ErrorCodeOf(error),
+    };
+}
+i64 ErrorCodeOf(FrameError error) {
+    return match error {
+        FrameError::Connection(code) => code,
+        FrameError::Stream(_, code) => 100_i64 + code,
+    };
+}
+
+u8[] Bytes3() { return [1_u8, 2_u8, 3_u8]; }
+
+test frame_header_layout {
+    u8[] bytes = Frame.DataFrame(5_i64, Bytes3(), true);
+    Assert.Equal<i64>(Slice.Len(bytes), 12_i64, "9 + 3");
+    Assert.Equal<u8>(bytes[2], 3_u8, "length");
+    Assert.Equal<u8>(bytes[3], 0_u8, "type");
+    Assert.Equal<u8>(bytes[4], 1_u8, "END_STREAM");
+    Assert.Equal<u8>(bytes[8], 5_u8, "stream id");
+}
+
+test frame_header_ignores_reserved_bit {
+    u8[] bytes = Frame.DataFrame(5_i64, Bytes3(), false);
+    bytes[5] = 128_u8;
+    FrameHeader header = Frame.ParseHeader(bytes, 0_i64);
+    Assert.Equal<i64>(header.streamId, 5_i64, "reserved bit masked");
+}
+
+test data_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.DataFrame(7_i64, Bytes3(), true), Max()));
+    match frame {
+        Frame::Data(id, end, flow, data) => {
+            Assert.Equal<i64>(id, 7_i64, "id");
+            Assert.True(end, "end stream");
+            Assert.Equal<i64>(flow, 3_i64, "flow length");
+            Assert.Equal<i64>(Slice.Len(data), 3_i64, "data");
+            Assert.Equal<u8>(data[2], 3_u8, "data byte");
+        },
+        _ => Assert.Fail("DATA"),
+    };
+}
+
+test data_padding_stripped_and_counted {
+    Frame frame = Must(Frame.Decode(Frame.PaddedDataFrame(3_i64, Bytes3(), 4_i64, false), Max()));
+    match frame {
+        Frame::Data(_, end, flow, data) => {
+            Assert.False(end, "no end stream");
+            Assert.Equal<i64>(flow, 8_i64, "1 + 3 + 4");
+            Assert.Equal<i64>(Slice.Len(data), 3_i64, "data");
+        },
+        _ => Assert.Fail("DATA"),
+    };
+}
+
+test data_padding_too_long_is_protocol_error {
+    u8[] bytes = Frame.PaddedDataFrame(3_i64, Bytes3(), 4_i64, false);
+    bytes[9] = 8_u8;
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(bytes, Max())), FrameErrors.ProtocolError(), "pad >= length");
+}
+
+test data_on_stream_zero_is_protocol_error {
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.DataFrame(0_i64, Bytes3(), false), Max())), FrameErrors.ProtocolError(), "stream 0");
+}
+
+test oversized_frame_is_frame_size_error {
+    u8[] big = Slice.New(100_i64);
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.DataFrame(1_i64, big, false), 64_i64)), FrameErrors.FrameSizeError(), "length > max");
+}
+
+test headers_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.HeadersFrame(1_i64, Bytes3(), false, true), Max()));
+    match frame {
+        Frame::Headers(id, end, endHeaders, prio, _, _, weight, fragment) => {
+            Assert.Equal<i64>(id, 1_i64, "id");
+            Assert.False(end, "end stream");
+            Assert.True(endHeaders, "end headers");
+            Assert.False(prio, "no priority");
+            Assert.Equal<i64>(weight, 16_i64, "default weight");
+            Assert.Equal<i64>(Slice.Len(fragment), 3_i64, "fragment");
+        },
+        _ => Assert.Fail("HEADERS"),
+    };
+}
+
+test headers_priority_and_padding {
+    Frame frame = Must(Frame.Decode(Frame.PriorityHeadersFrame(9_i64, Bytes3(), true, false, true, 3_i64, 200_i64, 2_i64), Max()));
+    match frame {
+        Frame::Headers(id, end, endHeaders, prio, exclusive, dependency, weight, fragment) => {
+            Assert.Equal<i64>(id, 9_i64, "id");
+            Assert.True(end, "end stream");
+            Assert.False(endHeaders, "continuation follows");
+            Assert.True(prio, "priority");
+            Assert.True(exclusive, "exclusive");
+            Assert.Equal<i64>(dependency, 3_i64, "dependency");
+            Assert.Equal<i64>(weight, 200_i64, "weight");
+            Assert.Equal<i64>(Slice.Len(fragment), 3_i64, "fragment without padding");
+            Assert.Equal<u8>(fragment[0], 1_u8, "fragment byte");
+        },
+        _ => Assert.Fail("HEADERS"),
+    };
+}
+
+test headers_self_dependency_is_stream_error {
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.PriorityHeadersFrame(9_i64, Bytes3(), true, true, false, 9_i64, 16_i64, 0_i64), Max())), 101_i64, "stream PROTOCOL_ERROR");
+}
+
+test headers_padding_exceeds_payload {
+    u8[] bytes = Frame.PriorityHeadersFrame(9_i64, Bytes3(), true, true, false, 1_i64, 16_i64, 1_i64);
+    bytes[9] = 50_u8;
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(bytes, Max())), FrameErrors.ProtocolError(), "padding");
+}
+
+test priority_round_trip_and_size {
+    Frame frame = Must(Frame.Decode(Frame.PriorityFrame(5_i64, false, 1_i64, 32_i64), Max()));
+    match frame {
+        Frame::Priority(id, exclusive, dependency, weight) => {
+            Assert.Equal<i64>(id, 5_i64, "id");
+            Assert.False(exclusive, "exclusive");
+            Assert.Equal<i64>(dependency, 1_i64, "dependency");
+            Assert.Equal<i64>(weight, 32_i64, "weight");
+        },
+        _ => Assert.Fail("PRIORITY"),
+    };
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypePriority(), 0_i64, 5_i64, Bytes3()), Max())), 106_i64, "stream FRAME_SIZE_ERROR");
+}
+
+test rst_stream_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.RstStreamFrame(3_i64, FrameErrors.Cancel()), Max()));
+    match frame {
+        Frame::RstStream(id, code) => { Assert.Equal<i64>(id, 3_i64, "id"); Assert.Equal<i64>(code, 8_i64, "CANCEL"); },
+        _ => Assert.Fail("RST_STREAM"),
+    };
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypeRstStream(), 0_i64, 3_i64, Bytes3()), Max())), FrameErrors.FrameSizeError(), "length 3");
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.RstStreamFrame(0_i64, 0_i64), Max())), FrameErrors.ProtocolError(), "stream 0");
+}
+
+test settings_round_trip {
+    i64[] ids = [4_i64, 5_i64];
+    i64[] values = [32768_i64, 20000_i64];
+    Frame frame = Must(Frame.Decode(Frame.SettingsFrame(ids, values), Max()));
+    match frame {
+        Frame::Settings(ack, gotIds, gotValues) => {
+            Assert.False(ack, "not ack");
+            Assert.Equal<i64>(Array.Len<i64>(gotIds), 2_i64, "count");
+            Assert.Equal<i64>(gotIds[1], 5_i64, "id");
+            Assert.Equal<i64>(gotValues[0], 32768_i64, "value");
+        },
+        _ => Assert.Fail("SETTINGS"),
+    };
+}
+
+test settings_malformed {
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypeSettings(), 0_i64, 0_i64, Bytes3()), Max())), FrameErrors.FrameSizeError(), "length % 6");
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypeSettings(), 1_i64, 0_i64, Slice.New(6_i64)), Max())), FrameErrors.FrameSizeError(), "ack with payload");
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypeSettings(), 0_i64, 1_i64, Slice.New(0_i64)), Max())), FrameErrors.ProtocolError(), "stream id");
+}
+
+test settings_ack_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.SettingsAckFrame(), Max()));
+    match frame {
+        Frame::Settings(ack, ids, _) => { Assert.True(ack, "ack"); Assert.Equal<i64>(Array.Len<i64>(ids), 0_i64, "empty"); },
+        _ => Assert.Fail("SETTINGS"),
+    };
+}
+
+test push_promise_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.PushPromiseFrame(1_i64, 2_i64, Bytes3(), true), Max()));
+    match frame {
+        Frame::PushPromise(id, endHeaders, promised, fragment) => {
+            Assert.Equal<i64>(id, 1_i64, "id");
+            Assert.True(endHeaders, "end headers");
+            Assert.Equal<i64>(promised, 2_i64, "promised");
+            Assert.Equal<i64>(Slice.Len(fragment), 3_i64, "fragment");
+        },
+        _ => Assert.Fail("PUSH_PROMISE"),
+    };
+}
+
+test ping_round_trip_and_size {
+    u8[] opaque = [1_u8, 2_u8, 3_u8, 4_u8, 5_u8, 6_u8, 7_u8, 8_u8];
+    Frame frame = Must(Frame.Decode(Frame.PingFrame(opaque, true), Max()));
+    match frame {
+        Frame::Ping(ack, data) => { Assert.True(ack, "ack"); Assert.Equal<u8>(data[7], 8_u8, "opaque"); },
+        _ => Assert.Fail("PING"),
+    };
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.PingFrame(Bytes3(), false), Max())), FrameErrors.FrameSizeError(), "length 3");
+}
+
+test goaway_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.GoAwayFrame(7_i64, FrameErrors.EnhanceYourCalm(), Bytes3()), Max()));
+    match frame {
+        Frame::GoAway(last, code, debug) => {
+            Assert.Equal<i64>(last, 7_i64, "last stream");
+            Assert.Equal<i64>(code, 11_i64, "code");
+            Assert.Equal<i64>(Slice.Len(debug), 3_i64, "debug");
+        },
+        _ => Assert.Fail("GOAWAY"),
+    };
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypeGoAway(), 0_i64, 0_i64, Bytes3()), Max())), FrameErrors.FrameSizeError(), "short");
+}
+
+test window_update_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.WindowUpdateFrame(3_i64, 2147483647_i64), Max()));
+    match frame {
+        Frame::WindowUpdate(id, increment) => { Assert.Equal<i64>(id, 3_i64, "id"); Assert.Equal<i64>(increment, 2147483647_i64, "max increment"); },
+        _ => Assert.Fail("WINDOW_UPDATE"),
+    };
+}
+
+test window_update_zero_increment {
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.WindowUpdateFrame(0_i64, 0_i64), Max())), FrameErrors.ProtocolError(), "connection");
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.WindowUpdateFrame(3_i64, 0_i64), Max())), 101_i64, "stream");
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Frame.Encode(Frame.TypeWindowUpdate(), 0_i64, 0_i64, Bytes3()), Max())), FrameErrors.FrameSizeError(), "size");
+}
+
+test continuation_round_trip {
+    Frame frame = Must(Frame.Decode(Frame.ContinuationFrame(3_i64, Bytes3(), true), Max()));
+    match frame {
+        Frame::Continuation(id, endHeaders, fragment) => {
+            Assert.Equal<i64>(id, 3_i64, "id");
+            Assert.True(endHeaders, "end headers");
+            Assert.Equal<i64>(Slice.Len(fragment), 3_i64, "fragment");
+        },
+        _ => Assert.Fail("CONTINUATION"),
+    };
+}
+
+test unknown_frame_type_is_kept {
+    Frame frame = Must(Frame.Decode(Frame.Encode(42_i64, 0_i64, 1_i64, Bytes3()), Max()));
+    Assert.Equal<i64>(Frame.KindOf(frame), 42_i64, "unknown kind ignored by caller");
+    Assert.Equal<i64>(Frame.StreamOf(frame), 1_i64, "stream");
+}
+
+test truncated_frame_bytes {
+    u8[] bytes = Frame.DataFrame(1_i64, Bytes3(), false);
+    Assert.Equal<i64>(ErrorCode(Frame.Decode(Slice.SubSlice(bytes, 0_i64, 10_i64), Max())), FrameErrors.FrameSizeError(), "length mismatch");
+}

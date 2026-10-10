@@ -1,0 +1,40 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.ConstantTime;
+use Crypto.Entropy;
+use Crypto.Errors;
+
+u8[] Draw(i64 n) {
+    return match Entropy.Bytes(n) { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
+}
+
+test entropy_fill_small {
+    u8[] a = Slice.New(32_i64);
+    bool ok = match Entropy.Fill(a) { Result::Ok(_) => true, Result::Error(_) => false, };
+    Assert.True(ok, "fill succeeded");
+    Assert.False(ConstantTime.Equal(a, Slice.New(32_i64)), "not all zero");
+}
+
+test entropy_two_fills_differ {
+    u8[] a = Draw(64_i64);
+    u8[] b = Draw(64_i64);
+    Assert.Equal<i64>(Slice.Len(a), 64_i64, "a length");
+    Assert.Equal<i64>(Slice.Len(b), 64_i64, "b length");
+    Assert.False(ConstantTime.Equal(a, b), "two fills differ");
+}
+
+test entropy_large_fill_crosses_chunks {
+    u8[] a = Draw(1000_i64);
+    Assert.Equal<i64>(Slice.Len(a), 1000_i64, "length");
+    // Each 256-byte chunk must be filled: check the tail chunk is not all zero.
+    Assert.False(ConstantTime.EqualRange(a, 768_i64, Slice.New(232_i64), 0_i64, 232_i64), "tail filled");
+    Assert.False(ConstantTime.EqualRange(a, 0_i64, a, 256_i64, 256_i64), "chunks differ");
+}
+
+test entropy_empty_and_negative {
+    bool emptyOk = match Entropy.Fill(Slice.New(0_i64)) { Result::Ok(_) => true, Result::Error(_) => false, };
+    Assert.True(emptyOk, "empty fill");
+    bool negative = match Entropy.Bytes(-1_i64) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidLength => true, _ => false, }, };
+    Assert.True(negative, "negative count");
+}

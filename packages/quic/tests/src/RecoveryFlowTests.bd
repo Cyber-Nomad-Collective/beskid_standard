@@ -1,0 +1,144 @@
+// In-memory connections under Retry, loss, flow control, key update, version negotiation
+// and idle timeout, with a simulated clock. One test keeps codegen to one pass.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Codec.Hex;
+use Quic.QuicConfig;
+use Quic.QuicConnection;
+use Quic.QuicErrors;
+use Quic.QuicPacket;
+use Quic.QuicProtection;
+use Quic.QuicWire;
+
+// Moves datagrams from `from` to `to`; drops the first `drop` of them. Returns how many moved.
+i64 Pump(Connection from, Connection to, i64 now, i64 drop) {
+    mut i64 moved = 0_i64;
+    mut i64 length = QuicConnection.BuildDatagram(from, now);
+    while length > 0_i64 && moved < 64_i64 {
+        if moved >= drop { QuicConnection.OnDatagram(to, QuicWire.CopyOf(from.out, 0_i64, length), length, now); }
+        moved = moved + 1_i64;
+        length = QuicConnection.BuildDatagram(from, now);
+    }
+    return moved;
+}
+
+i64 Earliest(Connection a, Connection b, i64 now) {
+    i64 x = QuicConnection.NextTimeout(a, now);
+    i64 y = QuicConnection.NextTimeout(b, now);
+    if x < 0_i64 { return y; }
+    if y < 0_i64 || x < y { return x; }
+    return y;
+}
+
+// Exchanges until quiet, advancing the clock to the next timer when nothing moves.
+// Returns the final clock.
+i64 Settle(Connection a, Connection b, i64 start, i64 rounds) {
+    mut i64 now = start;
+    mut i64 r = 0_i64;
+    while r < rounds {
+        i64 moved = Pump(a, b, now, 0_i64) + Pump(b, a, now, 0_i64);
+        if moved == 0_i64 {
+            i64 t = Earliest(a, b, now);
+            if t < 0_i64 || t - now > 2000000000_i64 { return now; }
+            if t > now { now = t; }
+            QuicConnection.OnTimeout(a, now);
+            QuicConnection.OnTimeout(b, now);
+        }
+        r = r + 1_i64;
+    }
+    return now;
+}
+
+test retry_loss_flow_control_key_update_and_timeouts {
+    QuicConfig cfg = QuicConfig.WithIdleTimeout(QuicConfig.InsecureLoopbackForTestsOnly(["h3"], 2_i64), 3000_i64);
+    mut i64 now = 5000000000_i64;
+    // Retry (RFC 9000 section 8.1): the client restarts with the token and the new ID.
+    Connection client = QuicConnection.NewClient(cfg, now);
+    i64 first = QuicConnection.BuildDatagram(client, now);
+    Header h = QuicPacket.ParseHeader(client.out, 0_i64, first, 0_i64);
+    u8[] retryScid = Hex.Of("a1a2a3a4a5a6a7a8");
+    u8[] retry = QuicProtection.BuildRetry(h.dcid, h.scid, retryScid, Hex.Of("746f6b"));
+    QuicConnection.OnDatagram(client, retry, Slice.Len(retry), now);
+    Assert.True(QuicConnection.Retried(client), "Retry accepted");
+    i64 second = QuicConnection.BuildDatagram(client, now);
+    Assert.Equal<i64>(second, 1200_i64, "Initial resent");
+    Header h2 = QuicPacket.ParseHeader(client.out, 0_i64, second, 0_i64);
+    Assert.True(QuicWire.Equal(h2.dcid, retryScid), "new destination ID");
+    Assert.Equal<string>(Hex.Encode(h2.token), "746f6b", "token echoed");
+    Connection server = QuicConnection.NewServer(cfg, h2.dcid, h2.scid, h.dcid, retryScid, now);
+    QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, second), second, now);
+    // Loss: the server's first flight never arrives; the client's PTO recovers.
+    Pump(server, client, now, 8_i64);
+    now = Settle(client, server, now, 60_i64);
+    Assert.True(QuicConnection.IsHandshakeConfirmed(client), "handshake completes after loss");
+    Assert.True(QuicConnection.IsEstablished(server), "server established");
+    Assert.True(QuicConnection.AddressValidated(server), "address validated by Retry");
+    // Flow control: 20000 bytes through 8 KiB stream windows.
+    i64 id = QuicConnection.OpenStream(client, true);
+    u8[] chunk = Slice.New(1000_i64);
+    u8[] sink = Slice.New(4096_i64);
+    mut i64 written = 0_i64;
+    mut i64 received = 0_i64;
+    mut i64 sid = -1_i64;
+    mut bool ok = true;
+    mut i64 guard = 0_i64;
+    while (written < 20000_i64 || received < 20000_i64) && guard < 400_i64 {
+        if written < 20000_i64 {
+            mut i64 k = 0_i64;
+            while k < 1000_i64 { chunk[k] = u8((written + k) & 255_i64); k = k + 1_i64; }
+            i64 n = QuicConnection.StreamWrite(client, id, chunk, 0_i64, 1000_i64);
+            if n > 0_i64 { written = written + n; }
+            if written == 20000_i64 { QuicConnection.StreamFinish(client, id); }
+        }
+        now = now + 1000000_i64;
+        Pump(client, server, now, 0_i64);
+        Pump(server, client, now, 0_i64);
+        if sid < 0_i64 { sid = QuicConnection.AcceptStream(server); }
+        if sid >= 0_i64 {
+            i64 got = QuicConnection.StreamRead(server, sid, sink, 0_i64, 4096_i64);
+            mut i64 j = 0_i64;
+            while j < got {
+                if i64(sink[j]) != ((received + j) & 255_i64) { ok = false; }
+                j = j + 1_i64;
+            }
+            if got > 0_i64 { received = received + got; }
+        }
+        guard = guard + 1_i64;
+    }
+    Assert.Equal<i64>(received, 20000_i64, "all bytes delivered");
+    Assert.True(ok, "bytes in order");
+    Assert.True(QuicConnection.StreamAtEnd(server, sid), "fin delivered");
+    // Key update initiated by the client, then data in both directions.
+    now = Settle(client, server, now, 20_i64);
+    Assert.True(QuicConnection.InitiateKeyUpdate(client), "key update allowed");
+    i64 id2 = QuicConnection.OpenStream(client, true);
+    QuicConnection.StreamWrite(client, id2, chunk, 0_i64, 100_i64);
+    QuicConnection.StreamFinish(client, id2);
+    now = Settle(client, server, now + 1000000_i64, 20_i64);
+    i64 sid2 = QuicConnection.AcceptStream(server);
+    Assert.Equal<i64>(QuicConnection.StreamRead(server, sid2, sink, 0_i64, 4096_i64), 100_i64, "data after key update");
+    Assert.Equal<i64>(QuicConnection.KeyUpdates(server), 1_i64, "server followed the key update");
+    Assert.Equal<i64>(QuicConnection.KeyUpdates(client), 1_i64, "client updated once");
+    // Idle timeout: no traffic for longer than 3 s closes both silently.
+    now = now + 10000000000_i64;
+    QuicConnection.OnTimeout(client, now);
+    QuicConnection.OnTimeout(server, now);
+    Assert.True(QuicConnection.IsClosed(client), "client idle-closed");
+    Assert.True(QuicConnection.IsClosed(server), "server idle-closed");
+    Assert.Equal<i64>(QuicErrors.WireCode(QuicConnection.Error(client)), 1_i64, "idle timeout is not a peer close");
+    // Version negotiation without version 1 ends a fresh client attempt.
+    Connection other = QuicConnection.NewClient(cfg, now);
+    i64 n3 = QuicConnection.BuildDatagram(other, now);
+    Header h3 = QuicPacket.ParseHeader(other.out, 0_i64, n3, 0_i64);
+    u8[] vn = Slice.New(64_i64);
+    Writer w = QuicWire.NewWriter(vn, 0_i64, 64_i64);
+    QuicWire.PutByte(w, 128_i64);
+    QuicWire.PutUint(w, 4_i64, 0_i64);
+    QuicWire.PutByte(w, 8_i64);
+    QuicWire.PutAll(w, h3.scid);
+    QuicWire.PutByte(w, 8_i64);
+    QuicWire.PutAll(w, h3.dcid);
+    QuicWire.PutUint(w, 4_i64, 0xff00001d_i64);
+    QuicConnection.OnDatagram(other, vn, QuicWire.WPos(w), now);
+    Assert.True(QuicConnection.IsClosed(other), "version negotiation failure");
+}

@@ -1,0 +1,90 @@
+use Core.Collections.Array;
+use Core.Results;
+use Http2.Frame;
+use Http2.FrameErrors;
+
+// RFC 9113 section 6.5: SETTINGS parameters, defaults and validation.
+
+pub i64 HeaderTableSizeId() { return 1_i64; }
+pub i64 EnablePushId() { return 2_i64; }
+pub i64 MaxConcurrentStreamsId() { return 3_i64; }
+pub i64 InitialWindowSizeId() { return 4_i64; }
+pub i64 MaxFrameSizeId() { return 5_i64; }
+pub i64 MaxHeaderListSizeId() { return 6_i64; }
+
+// "No limit" for MAX_CONCURRENT_STREAMS and MAX_HEADER_LIST_SIZE.
+pub i64 Unlimited() { return 4294967295_i64; }
+pub i64 DefaultInitialWindowSize() { return 65535_i64; }
+
+// One endpoint's settings values.
+pub type Settings {
+    pub i64 headerTableSize,
+    pub i64 enablePush,
+    pub i64 maxConcurrentStreams,
+    pub i64 initialWindowSize,
+    pub i64 maxFrameSize,
+    pub i64 maxHeaderListSize,
+}
+
+// The initial values every endpoint assumes before SETTINGS (section 6.5.2).
+pub Settings Defaults() {
+    return Settings { headerTableSize: 4096_i64, enablePush: 1_i64, maxConcurrentStreams: Unlimited(), initialWindowSize: DefaultInitialWindowSize(), maxFrameSize: Frame.MinMaxFrameSize(), maxHeaderListSize: Unlimited() };
+}
+
+pub Settings Copy(Settings s) {
+    return Settings { headerTableSize: s.headerTableSize, enablePush: s.enablePush, maxConcurrentStreams: s.maxConcurrentStreams, initialWindowSize: s.initialWindowSize, maxFrameSize: s.maxFrameSize, maxHeaderListSize: s.maxHeaderListSize };
+}
+
+// Checks one parameter (section 6.5.2). Unknown identifiers are accepted and ignored.
+pub Result<unit,FrameError> Validate(i64 id, i64 value) {
+    if id == EnablePushId() && value != 0_i64 && value != 1_i64 { return Result::Error(FrameError::Connection(FrameErrors.ProtocolError())); }
+    if id == InitialWindowSizeId() && value > Frame.MaxWindow() { return Result::Error(FrameError::Connection(FrameErrors.FlowControlError())); }
+    if id == MaxFrameSizeId() && (value < Frame.MinMaxFrameSize() || value > Frame.MaxMaxFrameSize()) { return Result::Error(FrameError::Connection(FrameErrors.ProtocolError())); }
+    return Result::Ok(());
+}
+
+// Applies parameters in order after validating all of them. `fromServer`
+// rejects ENABLE_PUSH other than 0, which a server must not send.
+pub Result<unit,FrameError> Apply(Settings target, i64[] ids, i64[] values, bool fromServer) {
+    i64 count = Array.Len<i64>(ids);
+    mut i64 i = 0_i64;
+    while i < count {
+        Result<unit,FrameError> checked = Validate(ids[i], values[i]);
+        match checked {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => (),
+        };
+        if fromServer && ids[i] == EnablePushId() && values[i] != 0_i64 { return Result::Error(FrameError::Connection(FrameErrors.ProtocolError())); }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while i < count {
+        Set(target, ids[i], values[i]);
+        i = i + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+pub unit Set(Settings target, i64 id, i64 value) {
+    if id == HeaderTableSizeId() { target.headerTableSize = value; }
+    if id == EnablePushId() { target.enablePush = value; }
+    if id == MaxConcurrentStreamsId() { target.maxConcurrentStreams = value; }
+    if id == InitialWindowSizeId() { target.initialWindowSize = value; }
+    if id == MaxFrameSizeId() { target.maxFrameSize = value; }
+    if id == MaxHeaderListSizeId() { target.maxHeaderListSize = value; }
+    return;
+}
+
+// The SETTINGS frame announcing every value of `s` that differs from the defaults.
+pub u8[] EncodeFrame(Settings s) {
+    Settings d = Defaults();
+    mut i64[] ids = Array.Empty<i64>();
+    mut i64[] values = Array.Empty<i64>();
+    if s.headerTableSize != d.headerTableSize { Array.Append<i64>(ids, HeaderTableSizeId()); Array.Append<i64>(values, s.headerTableSize); }
+    if s.enablePush != d.enablePush { Array.Append<i64>(ids, EnablePushId()); Array.Append<i64>(values, s.enablePush); }
+    if s.maxConcurrentStreams != d.maxConcurrentStreams { Array.Append<i64>(ids, MaxConcurrentStreamsId()); Array.Append<i64>(values, s.maxConcurrentStreams); }
+    if s.initialWindowSize != d.initialWindowSize { Array.Append<i64>(ids, InitialWindowSizeId()); Array.Append<i64>(values, s.initialWindowSize); }
+    if s.maxFrameSize != d.maxFrameSize { Array.Append<i64>(ids, MaxFrameSizeId()); Array.Append<i64>(values, s.maxFrameSize); }
+    if s.maxHeaderListSize != d.maxHeaderListSize { Array.Append<i64>(ids, MaxHeaderListSizeId()); Array.Append<i64>(values, s.maxHeaderListSize); }
+    return Frame.SettingsFrame(ids, values);
+}

@@ -1,0 +1,273 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Http2.Hpack;
+use Http2.HpackDecoder;
+use Http2.HpackEncoder;
+
+// Shared test helpers (each target is compiled on its own).
+
+i64 HexDigit(u8 b) {
+    if b >= 48_u8 && b <= 57_u8 { return i64(b - 48_u8); }
+    if b >= 97_u8 && b <= 102_u8 { return i64(b - 97_u8) + 10_i64; }
+    if b >= 65_u8 && b <= 70_u8 { return i64(b - 65_u8) + 10_i64; }
+    return -1_i64;
+}
+
+u8[] Hex(string text) {
+    mut u8[] out = [];
+    mut i64 high = -1_i64;
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 digit = HexDigit(String.ByteAt(text, i));
+        if digit >= 0_i64 {
+            if high < 0_i64 { high = digit; } else { Array.Append<u8>(out, u8(high * 16_i64 + digit)); high = -1_i64; }
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+string HexText(u8[] data) {
+    string digits = "0123456789abcdef";
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice(digits, b / 16_i64, 1_i64) + String.SubSlice(digits, b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+unit ExpectBytes(u8[] actual, string expectedHex, string because) {
+    Assert.True(Hpack.BytesEqual(actual, Hex(expectedHex)), because + ": got " + HexText(actual) + " want " + HexText(Hex(expectedHex)));
+    return;
+}
+
+string Text(u8[] data) {
+    return match Convert.BytesToString(data) { Result::Ok(text) => text, Result::Error(_) => "<binary " + HexText(data) + ">", };
+}
+
+unit ExpectField(HeaderField field, string name, string value, string because) {
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)) && Hpack.BytesEqual(field.value, Convert.StringToBytes(value)),
+        because + ": got " + Text(field.name) + ": " + Text(field.value) + " want " + name + ": " + value);
+    return;
+}
+
+/// `expected` alternates names and values.
+unit ExpectFields(HeaderField[] fields, string[] expected, string because) {
+    Assert.Equal<i64>(Array.Len<HeaderField>(fields) * 2_i64, Array.Len<string>(expected), because + ": field count");
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        ExpectField(Array.Get<HeaderField>(fields, i), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+HeaderField[] Fields(string[] pairs) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    mut i64 i = 0_i64;
+    while i + 1_i64 < Array.Len<string>(pairs) {
+        Array.Append<HeaderField>(out, Hpack.Field(Array.Get<string>(pairs, i), Array.Get<string>(pairs, i + 1_i64)));
+        i = i + 2_i64;
+    }
+    return out;
+}
+
+Decoder NewTestDecoder(i64 tableSize) {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.settingsTableSize = tableSize;
+    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
+    match created {
+        Result::Ok(decoder) => { return decoder; },
+        Result::Error(_) => { Assert.Fail("NewDecoder"); },
+    };
+    return NewTestDecoder(4096_i64);
+}
+
+Encoder NewTestEncoder(EncoderPolicy policy) {
+    Result<Encoder,HpackError> created = HpackEncoder.NewEncoder(policy);
+    match created {
+        Result::Ok(encoder) => { return encoder; },
+        Result::Error(_) => { Assert.Fail("NewEncoder"); },
+    };
+    return NewTestEncoder(HpackEncoder.DefaultEncoderPolicy());
+}
+
+HeaderField[] DecodeOk(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(fields) => { return fields; },
+        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
+    };
+    return Array.Empty<HeaderField>();
+}
+
+HpackError DecodeErr(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(_) => { Assert.Fail(because + ": decode succeeded"); },
+        Result::Error(error) => { return error; },
+    };
+    return HpackError::Truncated;
+}
+
+/// Dynamic table expectations: `expected` alternates names and values, newest first.
+unit ExpectTable(Decoder decoder, string[] expected, i64 size, string because) {
+    Assert.Equal<i64>(HpackDecoder.TableSize(decoder), size, because + ": table size");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder) * 2_i64, Array.Len<string>(expected), because + ": table count");
+    mut i64 i = 0_i64;
+    while i < HpackDecoder.TableCount(decoder) {
+        ExpectField(HpackDecoder.TableEntry(decoder, i + 1_i64), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because + ": table entry");
+        i = i + 1_i64;
+    }
+    return;
+}
+
+EncoderPolicy RfcPolicy(i64 tableSize, bool huffman) {
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    policy.tableSize = tableSize;
+    if huffman { policy.huffman = HuffmanMode::Always; } else { policy.huffman = HuffmanMode::Never; }
+    return policy;
+}
+
+/// Stable numbers for HpackError variants, for compact assertions.
+i64 ErrorCode(HpackError error) {
+    return match error {
+        HpackError::Truncated => 1_i64,
+        HpackError::IntegerOverflow => 2_i64,
+        HpackError::InvalidIndex(_) => 3_i64,
+        HpackError::StringTooLong(_) => 4_i64,
+        HpackError::HuffmanPaddingTooLong => 5_i64,
+        HpackError::HuffmanInvalidPadding => 6_i64,
+        HpackError::HuffmanEos => 7_i64,
+        HpackError::SizeUpdateNotAtStart => 8_i64,
+        HpackError::SizeUpdateExceedsLimit(_) => 9_i64,
+        HpackError::SizeUpdateMissing => 10_i64,
+        HpackError::HeaderListTooLarge(_) => 11_i64,
+        HpackError::TooManyFields => 12_i64,
+        HpackError::InvalidText => 13_i64,
+        HpackError::DecoderFailed => 14_i64,
+        HpackError::InvalidLimit(_) => 15_i64,
+    };
+}
+
+unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string because) {
+    HpackError error = DecodeErr(decoder, blockHex, because);
+    Assert.Equal<i64>(ErrorCode(error), code, because);
+    return;
+}
+
+use Http2.HpackInteger;
+
+// A `mut` parameter needs a place argument; a literal `[]` is an ICE (COMPILER-GAPS.md).
+u8[] EncodeInt(u8 flags, i64 prefix, i64 value) {
+    mut u8[] out = [];
+    out = HpackInteger.EncodeInteger(out, flags, prefix, value);
+    return out;
+}
+
+Decoded DecodeInt(string hex, i64 prefix, string because) {
+    Result<Decoded,HpackError> r = HpackInteger.DecodeInteger(Hex(hex), 0_i64, prefix);
+    match r {
+        Result::Ok(d) => { return d; },
+        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
+    };
+    return Decoded { value: -1_i64, next: -1_i64 };
+}
+
+i64 DecodedValue(Decoded d) { return d.value; }
+
+bool IntOverflows(string hex, i64 prefix) {
+    Result<Decoded,HpackError> r = HpackInteger.DecodeInteger(Hex(hex), 0_i64, prefix);
+    match r {
+        Result::Ok(_) => { return false; },
+        Result::Error(e) => { return match e { HpackError::IntegerOverflow => true, _ => false, }; },
+    };
+    return false;
+}
+
+bool IntTruncated(string hex, i64 prefix) {
+    Result<Decoded,HpackError> r = HpackInteger.DecodeInteger(Hex(hex), 0_i64, prefix);
+    match r {
+        Result::Ok(_) => { return false; },
+        Result::Error(e) => { return match e { HpackError::Truncated => true, _ => false, }; },
+    };
+    return false;
+}
+
+test c1_1_encode_10_with_5_bit_prefix {
+    ExpectBytes(EncodeInt(0_u8, 5_i64, 10_i64), "0a", "10/5");
+    Decoded d = DecodeInt("0a", 5_i64, "10/5");
+    Assert.Equal<i64>(d.value, 10_i64, "value");
+    Assert.Equal<i64>(d.next, 1_i64, "next");
+}
+
+test c1_2_encode_1337_with_5_bit_prefix {
+    ExpectBytes(EncodeInt(0_u8, 5_i64, 1337_i64), "1f9a0a", "1337/5");
+    Decoded d = DecodeInt("1f9a0a", 5_i64, "1337/5");
+    Assert.Equal<i64>(d.value, 1337_i64, "value");
+    Assert.Equal<i64>(d.next, 3_i64, "next");
+}
+
+test c1_3_encode_42_at_octet_boundary {
+    ExpectBytes(EncodeInt(0_u8, 8_i64, 42_i64), "2a", "42/8");
+    Assert.Equal<i64>(DecodedValue(DecodeInt("2a", 8_i64, "42/8")), 42_i64, "value");
+}
+
+test prefix_flags_are_kept_and_ignored {
+    ExpectBytes(EncodeInt(224_u8, 5_i64, 10_i64), "ea", "flags kept");
+    Assert.Equal<i64>(DecodedValue(DecodeInt("ea", 5_i64, "flags ignored")), 10_i64, "value");
+    ExpectBytes(EncodeInt(128_u8, 7_i64, 127_i64), "ff00", "exact mask needs a zero continuation");
+    Assert.Equal<i64>(DecodedValue(DecodeInt("ff00", 7_i64, "mask")), 127_i64, "mask value");
+}
+
+test prefix_integer_boundaries_round_trip {
+    i64[] values = [0_i64, 1_i64, 30_i64, 31_i64, 32_i64, 127_i64, 128_i64, 158_i64, 16383_i64, 16384_i64, 2097151_i64, 268435455_i64, 2147483647_i64];
+    mut i64 prefix = 1_i64;
+    while prefix <= 8_i64 {
+        mut i64 i = 0_i64;
+        while i < Array.Len<i64>(values) {
+            i64 v = Array.Get<i64>(values, i);
+            u8[] wire = EncodeInt(0_u8, prefix, v);
+            Decoded d = DecodeInt(HexText(wire), prefix, "round trip");
+            Assert.Equal<i64>(d.value, v, "round trip value");
+            Assert.Equal<i64>(d.next, Slice.Len(wire), "round trip length");
+            i = i + 1_i64;
+        }
+        prefix = prefix + 1_i64;
+    }
+}
+
+test max_integer_is_accepted_and_one_more_overflows {
+    u8[] wire = EncodeInt(0_u8, 5_i64, 2147483647_i64);
+    Assert.Equal<i64>(DecodedValue(DecodeInt(HexText(wire), 5_i64, "max")), 2147483647_i64, "max value");
+    // 2^31 with a 5-bit prefix: 31 + 2147483617.
+    Assert.True(IntOverflows("1fe1ffffff07", 5_i64), "2^31 overflows");
+}
+
+test overlong_zero_continuations_overflow {
+    Assert.True(IntOverflows("1f8080808080808001", 5_i64), "too many continuation octets");
+}
+
+test huge_integer_overflows {
+    Assert.True(IntOverflows("1fffffffffffffffff7f", 5_i64), "huge value");
+}
+
+
+test truncated_integers_are_rejected {
+    Assert.True(IntTruncated("", 5_i64), "empty");
+    Assert.True(IntTruncated("1f", 5_i64), "missing continuation");
+    Assert.True(IntTruncated("1f9a", 5_i64), "continuation bit set at end");
+}
+
+
+
+test zero_padded_8_bit_integer_overflows {
+    Assert.True(IntOverflows("ff808080808000", 8_i64), "zero padding past 28 bits");
+}

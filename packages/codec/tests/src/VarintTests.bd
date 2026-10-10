@@ -1,0 +1,85 @@
+use Testing.Assert;
+use Core.Results;
+use Codec.Errors;
+use Codec.Hex;
+use Codec.Varint;
+
+i64 Dec(string hex) {
+    Result<Varint.Varint, CodecError> r = Varint.Read(Hex.Of(hex), 0_i64);
+    return match r { Result::Ok(v) => v.value, Result::Error(_) => -999_i64, };
+}
+i64 DecLen(string hex) {
+    Result<Varint.Varint, CodecError> r = Varint.Read(Hex.Of(hex), 0_i64);
+    return match r { Result::Ok(v) => v.length, Result::Error(_) => -999_i64, };
+}
+string Enc(i64 v) {
+    Result<u8[], CodecError> r = Varint.Encode(v);
+    return match r { Result::Ok(b) => Hex.Encode(b), Result::Error(_) => "ERR", };
+}
+i64 ErrCode(Result<Varint.Varint, CodecError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }; }
+
+test rfc9000_a1_sample_decodings {
+    Assert.Equal<i64>(Dec("c2197c5eff14e88c"), 151288809941952652_i64, "8 byte sample");
+    Assert.Equal<i64>(Dec("9d7f3e7d"), 494878333_i64, "4 byte sample");
+    Assert.Equal<i64>(Dec("7bbd"), 15293_i64, "2 byte sample");
+    Assert.Equal<i64>(Dec("25"), 37_i64, "1 byte sample");
+    Assert.Equal<i64>(Dec("4025"), 37_i64, "non-minimal 2 byte encoding of 37");
+}
+
+test rfc9000_a1_sample_lengths {
+    Assert.Equal<i64>(DecLen("c2197c5eff14e88c"), 8_i64, "len8");
+    Assert.Equal<i64>(DecLen("9d7f3e7d"), 4_i64, "len4");
+    Assert.Equal<i64>(DecLen("7bbd"), 2_i64, "len2");
+    Assert.Equal<i64>(DecLen("25"), 1_i64, "len1");
+    Assert.Equal<i64>(DecLen("4025"), 2_i64, "non-minimal len2");
+}
+
+test rfc9000_a1_sample_encodings {
+    Assert.Equal<string>(Enc(151288809941952652_i64), "c2197c5eff14e88c", "enc8");
+    Assert.Equal<string>(Enc(494878333_i64), "9d7f3e7d", "enc4");
+    Assert.Equal<string>(Enc(15293_i64), "7bbd", "enc2");
+    Assert.Equal<string>(Enc(37_i64), "25", "enc1");
+}
+
+test boundaries {
+    Assert.Equal<string>(Enc(0_i64), "00", "0");
+    Assert.Equal<string>(Enc(63_i64), "3f", "63");
+    Assert.Equal<string>(Enc(64_i64), "4040", "64");
+    Assert.Equal<string>(Enc(16383_i64), "7fff", "16383");
+    Assert.Equal<string>(Enc(16384_i64), "80004000", "16384");
+    Assert.Equal<string>(Enc(1073741823_i64), "bfffffff", "2^30-1");
+    Assert.Equal<string>(Enc(1073741824_i64), "c000000040000000", "2^30");
+    Assert.Equal<string>(Enc(4611686018427387903_i64), "ffffffffffffffff", "2^62-1");
+    Assert.Equal<i64>(Dec("ffffffffffffffff"), 4611686018427387903_i64, "max decode");
+}
+
+test overflow_and_negative_rejected {
+    Assert.Equal<string>(Enc(4611686018427387904_i64), "ERR", "2^62");
+    Assert.Equal<string>(Enc(-1_i64), "ERR", "negative");
+    Assert.Equal<i64>(Varint.EncodedLength(4611686018427387904_i64), -1_i64, "length of 2^62");
+    Assert.Equal<i64>(Varint.EncodedLength(64_i64), 2_i64, "length of 64");
+}
+
+test truncated_reads {
+    Assert.Equal<i64>(ErrCode(Varint.Read(Hex.Of(""), 0_i64)), 1_i64, "empty");
+    Assert.Equal<i64>(ErrCode(Varint.Read(Hex.Of("7b"), 0_i64)), 1_i64, "2 byte cut");
+    Assert.Equal<i64>(ErrCode(Varint.Read(Hex.Of("9d7f3e"), 0_i64)), 1_i64, "4 byte cut");
+    Assert.Equal<i64>(ErrCode(Varint.Read(Hex.Of("c2197c5eff14e8"), 0_i64)), 1_i64, "8 byte cut");
+    Assert.Equal<i64>(ErrCode(Varint.Read(Hex.Of("25"), 1_i64)), 1_i64, "offset past end");
+}
+
+test write_at_offset_and_round_trip {
+    u8[] b = Hex.Of("aa aa aa aa aa aa");
+    Result<i64, CodecError> w = Varint.Write(b, 1_i64, 15293_i64);
+    match w {
+        Result::Ok(n) => { Assert.Equal<i64>(n, 2_i64, "written"); },
+        Result::Error(_) => { Assert.Fail("write failed"); },
+    };
+    Assert.Equal<string>(Hex.Encode(b), "aa7bbdaaaaaa", "layout");
+    Result<i64, CodecError> small = Varint.Write(b, 5_i64, 15293_i64);
+    match small {
+        Result::Ok(_) => { Assert.Fail("expected truncated"); },
+        Result::Error(e) => { Assert.Equal<i64>(Errors.Code(e), 1_i64, "no room"); },
+    };
+    Assert.Equal<string>(Hex.Encode(b), "aa7bbdaaaaaa", "failed write unchanged");
+}

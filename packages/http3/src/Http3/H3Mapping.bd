@@ -1,0 +1,439 @@
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Encoding.EncodingError;
+use Core.Results;
+use Core.String;
+use Http.Codec;
+use Http.Types;
+use Http.Types.Header;
+use Http3.H3Errors;
+use Http2.Hpack;
+
+// RFC 9114 section 4: HTTP semantics over HTTP/3. Maps corelib
+// `Http.Types.Request`/`Response` to and from field lists and validates
+// received field sections (section 4.3). Validation results are 0 (valid)
+// or H3_MESSAGE_ERROR for a malformed message (section 4.1.2).
+
+// Field-name kinds used by the validators.
+bool IsConnectionSpecific(HeaderField field) {
+    return Hpack.NameIs(field, "connection") || Hpack.NameIs(field, "proxy-connection") || Hpack.NameIs(field, "keep-alive")
+        || Hpack.NameIs(field, "transfer-encoding") || Hpack.NameIs(field, "upgrade");
+}
+
+bool IsPseudo(HeaderField field) {
+    return Slice.Len(field.name) > 0_i64 && field.name[0] == 58_u8;
+}
+
+// Field name octets: lowercase token characters (RFC 9110 section 5.6.2), or a
+// leading ':' for pseudo-headers. Uppercase is malformed (section 4.2).
+bool ValidName(u8[] name) {
+    i64 count = Slice.Len(name);
+    if count == 0_i64 { return false; }
+    mut i64 i = 0_i64;
+    while i < count {
+        u8 b = name[i];
+        bool lower = b >= 97_u8 && b <= 122_u8;
+        bool digit = b >= 48_u8 && b <= 57_u8;
+        bool symbol = b == 33_u8 || b == 35_u8 || b == 36_u8 || b == 37_u8 || b == 38_u8 || b == 39_u8 || b == 42_u8 || b == 43_u8
+            || b == 45_u8 || b == 46_u8 || b == 94_u8 || b == 95_u8 || b == 96_u8 || b == 124_u8 || b == 126_u8;
+        bool colon = b == 58_u8 && i == 0_i64;
+        if !lower && !digit && !symbol && !colon { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+// Field values must not contain NUL, CR or LF, nor start or end with SP or HTAB.
+bool ValidValue(u8[] value) {
+    i64 count = Slice.Len(value);
+    mut i64 i = 0_i64;
+    while i < count {
+        u8 b = value[i];
+        if b == 0_u8 || b == 10_u8 || b == 13_u8 { return false; }
+        i = i + 1_i64;
+    }
+    if count > 0_i64 {
+        u8 first = value[0];
+        u8 last = value[count - 1_i64];
+        if first == 32_u8 || first == 9_u8 || last == 32_u8 || last == 9_u8 { return false; }
+    }
+    return true;
+}
+
+bool ValueIs(HeaderField field, string text) { return Hpack.BytesEqual(field.value, Convert.StringToBytes(text)); }
+
+// Checks names, values, connection-specific fields and TE. Pseudo-headers are
+// checked by the callers.
+i64 CheckRegular(HeaderField field) {
+    if !ValidName(field.name) || !ValidValue(field.value) { return H3Errors.MessageError(); }
+    if IsConnectionSpecific(field) { return H3Errors.MessageError(); }
+    if Hpack.NameIs(field, "te") && !ValueIs(field, "trailers") { return H3Errors.MessageError(); }
+    return 0_i64;
+}
+
+// Index of pseudo-header `name`, or -1. Duplicates set `duplicate`.
+i64 FindPseudo(HeaderField[] fields, string name) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        if Hpack.NameIs(field, name) { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+// Validates a request header section (section 4.3.1).
+pub i64 ValidateRequest(HeaderField[] fields) {
+    mut bool regular = false;
+    mut i64 method = 0_i64;
+    mut i64 scheme = 0_i64;
+    mut i64 path = 0_i64;
+    mut i64 authority = 0_i64;
+    mut bool connect = false;
+    mut bool emptyPath = false;
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        if IsPseudo(field) {
+            if regular { return H3Errors.MessageError(); }
+            if !ValidValue(field.value) { return H3Errors.MessageError(); }
+            if Hpack.NameIs(field, ":method") {
+                method = method + 1_i64;
+                if ValueIs(field, "CONNECT") { connect = true; }
+            } else {
+                if Hpack.NameIs(field, ":scheme") { scheme = scheme + 1_i64; }
+                else {
+                    if Hpack.NameIs(field, ":path") {
+                        path = path + 1_i64;
+                        if Slice.Len(field.value) == 0_i64 { emptyPath = true; }
+                    } else {
+                        if Hpack.NameIs(field, ":authority") { authority = authority + 1_i64; }
+                        else { return H3Errors.MessageError(); }
+                    }
+                }
+            }
+        } else {
+            regular = true;
+            i64 code = CheckRegular(field);
+            if code != 0_i64 { return code; }
+        }
+        i = i + 1_i64;
+    }
+    if method != 1_i64 || scheme > 1_i64 || path > 1_i64 || authority > 1_i64 { return H3Errors.MessageError(); }
+    if connect {
+        if scheme != 0_i64 || path != 0_i64 || authority != 1_i64 { return H3Errors.MessageError(); }
+        return 0_i64;
+    }
+    if scheme != 1_i64 || path != 1_i64 || emptyPath { return H3Errors.MessageError(); }
+    return CheckAuthority(fields);
+}
+
+// http and https requests carry a non-empty :authority or Host; when both
+// are present they are equal (section 4.3.1).
+i64 CheckAuthority(HeaderField[] fields) {
+    i64 authorityAt = FindPseudo(fields, ":authority");
+    i64 hostAt = FindPseudo(fields, "host");
+    i64 schemeAt = FindPseudo(fields, ":scheme");
+    HeaderField scheme = Array.Get<HeaderField>(fields, schemeAt);
+    bool web = ValueIs(scheme, "http") || ValueIs(scheme, "https");
+    mut bool present = false;
+    if authorityAt >= 0_i64 {
+        HeaderField authority = Array.Get<HeaderField>(fields, authorityAt);
+        if Slice.Len(authority.value) > 0_i64 { present = true; }
+        if hostAt >= 0_i64 {
+            HeaderField hostField = Array.Get<HeaderField>(fields, hostAt);
+            if !Hpack.BytesEqual(authority.value, hostField.value) { return H3Errors.MessageError(); }
+        }
+    }
+    if hostAt >= 0_i64 {
+        HeaderField hostField = Array.Get<HeaderField>(fields, hostAt);
+        if Slice.Len(hostField.value) > 0_i64 { present = true; }
+    }
+    if web && !present { return H3Errors.MessageError(); }
+    return 0_i64;
+}
+
+// Validates a response header section (section 4.3.2).
+pub i64 ValidateResponse(HeaderField[] fields) {
+    mut bool regular = false;
+    mut i64 status = 0_i64;
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        if IsPseudo(field) {
+            if regular { return H3Errors.MessageError(); }
+            if !Hpack.NameIs(field, ":status") { return H3Errors.MessageError(); }
+            if ParseStatus(field.value) < 0_i64 { return H3Errors.MessageError(); }
+            status = status + 1_i64;
+        } else {
+            regular = true;
+            i64 code = CheckRegular(field);
+            if code != 0_i64 { return code; }
+        }
+        i = i + 1_i64;
+    }
+    if status != 1_i64 { return H3Errors.MessageError(); }
+    return 0_i64;
+}
+
+// Validates a trailer section: no pseudo-headers (section 4.1).
+pub i64 ValidateTrailers(HeaderField[] fields) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        if IsPseudo(field) { return H3Errors.MessageError(); }
+        i64 code = CheckRegular(field);
+        if code != 0_i64 { return code; }
+        i = i + 1_i64;
+    }
+    return 0_i64;
+}
+
+// A three-digit status 100..599, or -1.
+pub i64 ParseStatus(u8[] value) {
+    if Slice.Len(value) != 3_i64 { return -1_i64; }
+    mut i64 result = 0_i64;
+    mut i64 i = 0_i64;
+    while i < 3_i64 {
+        u8 b = value[i];
+        if b < 48_u8 || b > 57_u8 { return -1_i64; }
+        result = result * 10_i64 + i64(b - 48_u8);
+        i = i + 1_i64;
+    }
+    if result < 100_i64 || result > 599_i64 { return -1_i64; }
+    return result;
+}
+
+// The :status of a validated response section, or -1.
+pub i64 StatusOf(HeaderField[] fields) {
+    i64 index = FindPseudo(fields, ":status");
+    if index < 0_i64 { return -1_i64; }
+    HeaderField field = Array.Get<HeaderField>(fields, index);
+    return ParseStatus(field.value);
+}
+
+// The content-length value: -1 when absent, -2 when invalid or conflicting.
+pub i64 ContentLength(HeaderField[] fields) {
+    mut i64 result = -1_i64;
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        if Hpack.NameIs(field, "content-length") {
+            i64 count = Slice.Len(field.value);
+            if count == 0_i64 || count > 15_i64 { return -2_i64; }
+            mut i64 value = 0_i64;
+            mut i64 k = 0_i64;
+            while k < count {
+                u8 b = field.value[k];
+                if b < 48_u8 || b > 57_u8 { return -2_i64; }
+                value = value * 10_i64 + i64(b - 48_u8);
+                k = k + 1_i64;
+            }
+            if result >= 0_i64 && result != value { return -2_i64; }
+            result = value;
+        }
+        i = i + 1_i64;
+    }
+    return result;
+}
+
+// The text value of pseudo-header `name`, or "".
+pub string PseudoText(HeaderField[] fields, string name) {
+    i64 index = FindPseudo(fields, name);
+    if index < 0_i64 { return ""; }
+    HeaderField field = Array.Get<HeaderField>(fields, index);
+    return match Convert.BytesToString(field.value) {
+        Result::Ok(text) => text,
+        Result::Error(_) => "",
+    };
+}
+
+pub string DecimalText(i64 value) {
+    if value == 0_i64 { return "0"; }
+    mut string out = "";
+    mut i64 rest = value;
+    while rest > 0_i64 {
+        out = String.DigitChar(rest % 10_i64) + out;
+        rest = rest / 10_i64;
+    }
+    return out;
+}
+
+bool StartsWith(string text, string prefix) {
+    i64 count = String.Len(prefix);
+    if String.Len(text) < count { return false; }
+    return String.SubSlice(text, 0_i64, count) == prefix;
+}
+
+bool HeaderNamed(Header header, string lowerName) { return Codec.LowerAscii(header.name) == lowerName; }
+
+bool DropOutgoing(Header header) {
+    string name = Codec.LowerAscii(header.name);
+    if name == "connection" || name == "proxy-connection" || name == "keep-alive" || name == "transfer-encoding" || name == "upgrade" || name == "host" { return true; }
+    if name == "te" && Codec.LowerAscii(header.value) != "trailers" { return true; }
+    return false;
+}
+
+// Appends the regular fields of `headers` with lowercase names, dropping
+// connection-specific fields and Host (carried by :authority).
+HeaderField[] AppendRegular(mut HeaderField[] out, Header[] headers) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header header = Array.Get<Header>(headers, i);
+        if !DropOutgoing(header) { Array.Append<HeaderField>(out, Hpack.FromHttpHeader(header)); }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+string HostOf(Header[] headers) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header header = Array.Get<Header>(headers, i);
+        if HeaderNamed(header, "host") { return header.value; }
+        i = i + 1_i64;
+    }
+    return "";
+}
+
+bool HasHeader(Header[] headers, string lowerName) {
+    mut i64 i = 0_i64;
+    while i < Array.Len<Header>(headers) {
+        Header header = Array.Get<Header>(headers, i);
+        if HeaderNamed(header, lowerName) { return true; }
+        i = i + 1_i64;
+    }
+    return false;
+}
+
+// Maps a corelib request to an HTTP/3 header list (section 4.3.1).
+// An absolute-form target supplies :scheme, :authority and :path; otherwise
+// :authority comes from the Host header and :scheme from `scheme`.
+pub Result<HeaderField[],H3Error> RequestFields(Request request, string scheme) {
+    string method = request.method;
+    string target = request.target;
+    if String.Len(method) == 0_i64 || String.Len(target) == 0_i64 { return Result::Error(H3Error::InvalidMessage); }
+    mut string useScheme = scheme;
+    mut string authority = HostOf(request.headers);
+    mut string path = target;
+    mut bool absolute = false;
+    if StartsWith(target, "http://") { useScheme = "http"; absolute = true; }
+    if StartsWith(target, "https://") { useScheme = "https"; absolute = true; }
+    if absolute {
+        i64 start = String.IndexOfFrom(target, 0_i64, "//") + 2_i64;
+        i64 slash = String.IndexOfFrom(target, start, "/");
+        if slash < 0_i64 {
+            authority = String.SubSlice(target, start, String.Len(target) - start);
+            path = "/";
+        } else {
+            authority = String.SubSlice(target, start, slash - start);
+            path = String.SubSlice(target, slash, String.Len(target) - slash);
+        }
+    }
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(out, Hpack.Field(":method", method));
+    if method == "CONNECT" {
+        if absolute { return Result::Error(H3Error::InvalidMessage); }
+        Array.Append<HeaderField>(out, Hpack.Field(":authority", target));
+    } else {
+        if !absolute && !StartsWith(target, "/") && target != "*" { return Result::Error(H3Error::InvalidMessage); }
+        Array.Append<HeaderField>(out, Hpack.Field(":scheme", useScheme));
+        if String.Len(authority) > 0_i64 { Array.Append<HeaderField>(out, Hpack.Field(":authority", authority)); }
+        Array.Append<HeaderField>(out, Hpack.Field(":path", path));
+    }
+    out = AppendRegular(out, request.headers);
+    if Slice.Len(request.body) > 0_i64 && !HasHeader(request.headers, "content-length") {
+        Array.Append<HeaderField>(out, Hpack.Field("content-length", DecimalText(Slice.Len(request.body))));
+    }
+    if ValidateRequest(out) != 0_i64 { return Result::Error(H3Error::InvalidMessage); }
+    i64 declared = ContentLength(out);
+    if declared == -2_i64 || (declared >= 0_i64 && declared != Slice.Len(request.body)) { return Result::Error(H3Error::InvalidMessage); }
+    return Result::Ok(out);
+}
+
+// Maps a corelib response to an HTTP/3 header list (section 4.3.2). A
+// content-length is added for a non-empty body when the handler gave none.
+pub Result<HeaderField[],H3Error> ResponseFields(Response response) {
+    if response.status < 200_i64 || response.status > 599_i64 { return Result::Error(H3Error::InvalidMessage); }
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    Array.Append<HeaderField>(out, Hpack.Field(":status", DecimalText(response.status)));
+    out = AppendRegular(out, response.headers);
+    if Slice.Len(response.body) > 0_i64 && !HasHeader(response.headers, "content-length") {
+        Array.Append<HeaderField>(out, Hpack.Field("content-length", DecimalText(Slice.Len(response.body))));
+    }
+    if ValidateResponse(out) != 0_i64 { return Result::Error(H3Error::InvalidMessage); }
+    if ContentLength(out) == -2_i64 { return Result::Error(H3Error::InvalidMessage); }
+    return Result::Ok(out);
+}
+
+// Converts the regular fields of a section to corelib headers.
+Result<Header[],H3Error> RegularHeaders(HeaderField[] fields) {
+    mut Header[] out = Array.Empty<Header>();
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        HeaderField field = Array.Get<HeaderField>(fields, i);
+        if !IsPseudo(field) {
+            Result<Header,HpackError> converted = Hpack.ToHttpHeader(field);
+            match converted {
+                Result::Error(_) => { return Result::Error(H3Error::InvalidMessage); },
+                Result::Ok(header) => { Array.Append<Header>(out, header); },
+            };
+        }
+        i = i + 1_i64;
+    }
+    return Result::Ok(out);
+}
+
+// Builds a corelib request from a validated section. :path becomes the
+// target (the authority for CONNECT) and :authority becomes a leading Host
+// header unless the section already has one.
+pub Result<Request,H3Error> RequestFromFields(HeaderField[] fields, u8[] body) {
+    string method = PseudoText(fields, ":method");
+    string authority = PseudoText(fields, ":authority");
+    mut string target = PseudoText(fields, ":path");
+    if method == "CONNECT" { target = authority; }
+    Result<Header[],H3Error> regular = RegularHeaders(fields);
+    match regular {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(headers) => {
+            mut Header[] out = Array.Empty<Header>();
+            if String.Len(authority) > 0_i64 && !HasHeader(headers, "host") { Array.Append<Header>(out, Header { name: "host", value: authority }); }
+            mut i64 i = 0_i64;
+            while i < Array.Len<Header>(headers) { Array.Append<Header>(out, Array.Get<Header>(headers, i)); i = i + 1_i64; }
+            return Result::Ok(Request { method: method, target: target, headers: out, body: body });
+        },
+    };
+    return Result::Error(H3Error::InvalidMessage);
+}
+
+// Builds a corelib response from a validated section.
+pub Result<Response,H3Error> ResponseFromFields(HeaderField[] fields, u8[] body) {
+    i64 status = StatusOf(fields);
+    Result<Header[],H3Error> regular = RegularHeaders(fields);
+    return match regular {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(headers) => Result::Ok(Response { status: status, reason: ReasonPhrase(status), headers: headers, body: body }),
+    };
+}
+
+// HTTP/3 carries no reason phrase; responses get the RFC 9110 default phrase.
+pub string ReasonPhrase(i64 status) {
+    if status == 200_i64 { return "OK"; }
+    if status == 201_i64 { return "Created"; }
+    if status == 202_i64 { return "Accepted"; }
+    if status == 204_i64 { return "No Content"; }
+    if status == 301_i64 { return "Moved Permanently"; }
+    if status == 302_i64 { return "Found"; }
+    if status == 304_i64 { return "Not Modified"; }
+    if status == 400_i64 { return "Bad Request"; }
+    if status == 401_i64 { return "Unauthorized"; }
+    if status == 403_i64 { return "Forbidden"; }
+    if status == 404_i64 { return "Not Found"; }
+    if status == 405_i64 { return "Method Not Allowed"; }
+    if status == 413_i64 { return "Content Too Large"; }
+    if status == 500_i64 { return "Internal Server Error"; }
+    if status == 502_i64 { return "Bad Gateway"; }
+    if status == 503_i64 { return "Service Unavailable"; }
+    return "";
+}

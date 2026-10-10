@@ -1,0 +1,240 @@
+use Concurrency.Fiber;
+use Core.Bytes.Slice;
+use Core.Bytes.Convert;
+use Core.Collections.Array;
+use Core.IO;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Core.Time.Deadline;
+use Core.Optional.Option;
+use Network.Types;
+use Network.Tcp.TcpListener;
+use Network.Tcp.TcpStream;
+use Testing.Assert;
+use WebSocket.WsErrors;
+use WebSocket.WsConnection;
+
+// A raw TCP client drives the Beskid server with hand-made bytes: frame-level
+// violations must be answered with the right close code, bad upgrade requests
+// with 400/426.
+
+SocketAddress Loopback4(i64 port) {
+    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+}
+
+Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
+        Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
+        Result::Error(_) => Option.Empty<Deadline>(),
+    };
+}
+
+string Crlf() { return String.FromUtf8CodeUnits([13_u8, 10_u8]); }
+
+u8[] Upgrade(string version, bool withKey) {
+    string nl = Crlf();
+    mut string head = "GET /raw HTTP/1.1" + nl + "Host: 127.0.0.1" + nl + "Upgrade: websocket" + nl + "Connection: Upgrade" + nl;
+    if withKey { head = head + "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==" + nl; }
+    head = head + "Sec-WebSocket-Version: " + version + nl + nl;
+    return Convert.StringToBytes(head);
+}
+
+bool WriteRaw(TcpStream s, u8[] bytes) {
+    return match IO.WriteAll(s, bytes, 0_i64, Slice.Len(bytes)) { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+// Reads a head byte by byte up to and including CRLF CRLF (at most 4096 bytes).
+string ReadHeadRaw(TcpStream s) {
+    mut u8[] out = Array.Empty<u8>();
+    u8[] one = Slice.New(1_i64);
+    mut i64 n = 0_i64;
+    while n < 4096_i64 {
+        match IO.ReadExact(s, one, 0_i64, 1_i64) {
+            Result::Error(_) => { return String.FromUtf8CodeUnits(out); },
+            Result::Ok(_) => {},
+        };
+        Array.Append<u8>(out, one[0]);
+        n = n + 1_i64;
+        if n >= 4_i64 && out[n - 1_i64] == 10_u8 && out[n - 2_i64] == 13_u8 && out[n - 3_i64] == 10_u8 && out[n - 4_i64] == 13_u8 {
+            return String.FromUtf8CodeUnits(out);
+        }
+    }
+    return String.FromUtf8CodeUnits(out);
+}
+
+// Close code of the server's close frame (unmasked, 2-byte payload), or a negative marker.
+i64 ReadCloseCode(TcpStream s) {
+    u8[] frame = Slice.New(4_i64);
+    return match IO.ReadExact(s, frame, 0_i64, 4_i64) {
+        Result::Error(_) => -1_i64,
+        Result::Ok(_) => CloseCodeIn(frame),
+    };
+}
+
+i64 CloseCodeIn(u8[] frame) {
+    if frame[0] != 0x88_u8 || frame[1] != 0x02_u8 { return -2_i64; }
+    return (i64(frame[2]) << 8_i64) | i64(frame[3]);
+}
+
+// Server: accepts `count` connections; per connection records the close code it
+// sent after its first Receive failed (or the handshake error code as 9000 + code).
+unit ServeMany(TcpListener listener, i64 count, i64[] results) {
+    WsOptions options = WsConnection.WithTimeouts(WsConnection.WithMaxMessageBytes(WsConnection.DefaultOptions(), 16_i64), 5000_i64, 2000_i64, 5000_i64);
+    mut i64 i = 0_i64;
+    while i < count {
+        match listener.Accept(Within(10000_i64)) {
+            Result::Error(_) => { results[i] = -100_i64; },
+            Result::Ok(stream) => { results[i] = ServeOne(stream, options); },
+        };
+        i = i + 1_i64;
+    }
+    return;
+}
+
+i64 ServeOne(TcpStream stream, WsOptions options) {
+    return match WsConnection.Accept(stream, options) {
+        Result::Error(e) => 9000_i64 + WsErrors.Code(e) * 100_i64 + WsErrors.Detail(e),
+        Result::Ok(conn) => FirstFailure(conn),
+    };
+}
+
+i64 FirstFailure(WsConnection conn) {
+    return match conn.Receive() {
+        Result::Error(e) => WsErrors.CloseCodeFor(e),
+        Result::Ok(_) => 0_i64,
+    };
+}
+
+// Zero masking key keeps the payload readable.
+u8[] Case(i64 index) {
+    if index == 0_i64 { return [0x81_u8, 0x02_u8, 0x48_u8, 0x69_u8]; }
+    if index == 1_i64 { return [0x81_u8, 0x82_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0xC0_u8, 0xAF_u8]; }
+    if index == 2_i64 { return [0x80_u8, 0x80_u8, 0_u8, 0_u8, 0_u8, 0_u8]; }
+    if index == 3_i64 { return [0xC1_u8, 0x80_u8, 0_u8, 0_u8, 0_u8, 0_u8]; }
+    if index == 4_i64 { return [0x88_u8, 0x82_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0x03_u8, 0xED_u8]; }
+    if index == 5_i64 { return [0x82_u8, 0x91_u8, 0_u8, 0_u8, 0_u8, 0_u8]; }
+    if index == 6_i64 { return [0x01_u8, 0x81_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0x61_u8, 0x81_u8, 0x81_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0x62_u8]; }
+    if index == 7_i64 { return [0x89_u8, 0xFE_u8, 0x00_u8, 0x7E_u8, 0_u8, 0_u8, 0_u8, 0_u8]; }
+    if index == 8_i64 { return [0x09_u8, 0x80_u8, 0_u8, 0_u8, 0_u8, 0_u8]; }
+    if index == 9_i64 { return [0x8B_u8, 0x80_u8, 0_u8, 0_u8, 0_u8, 0_u8]; }
+    if index == 10_i64 { return [0x01_u8, 0x82_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0xED_u8, 0xA0_u8]; }
+    return [0x88_u8, 0x81_u8, 0_u8, 0_u8, 0_u8, 0_u8, 0x03_u8];
+}
+
+i64 Expected(i64 index) {
+    if index == 1_i64 || index == 10_i64 { return 1007_i64; }
+    if index == 5_i64 { return 1009_i64; }
+    return 1002_i64;
+}
+
+i64 CaseCount() { return 12_i64; }
+
+i64 RunCase(SocketAddress address, i64 index) {
+    return match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(2000_i64)) {
+        Result::Error(_) => -10_i64,
+        Result::Ok(s) => DriveCase(s, index),
+    };
+}
+
+i64 DriveCase(TcpStream s, i64 index) {
+    s.SetDeadlines(TransferDeadlines { read: Within(5000_i64), write: Within(5000_i64) });
+    WriteRaw(s, Upgrade("13", true));
+    string head = ReadHeadRaw(s);
+    if !String.Contains(head, "HTTP/1.1 101 ") { s.Close(); return -20_i64; }
+    WriteRaw(s, Case(index));
+    i64 code = ReadCloseCode(s);
+    s.Close();
+    return code;
+}
+
+unit FrameViolations(TcpListener listener) {
+    match listener.LocalAddress() {
+        Result::Error(_) => { Assert.Fail("address"); },
+        Result::Ok(address) => {
+            SocketAddress target = address;
+            TcpListener l = listener;
+            i64 count = CaseCount();
+            i64[] results = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
+            Fiber<unit> server = spawn (() => ServeMany(l, count, results));
+            mut i64 i = 0_i64;
+            while i < count {
+                Assert.Equal<i64>(RunCase(target, i) * 100_i64 + i, Expected(i) * 100_i64 + i, "client sees the close code");
+                i = i + 1_i64;
+            }
+            server.Join();
+            i = 0_i64;
+            while i < count {
+                Assert.Equal<i64>(results[i] * 100_i64 + i, Expected(i) * 100_i64 + i, "server reports the close code");
+                i = i + 1_i64;
+            }
+            l.Close();
+        },
+    };
+    return;
+}
+
+unit RunFrameViolations() {
+    match TcpListener.Bind(Loopback4(0_i64), 16_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => { FrameViolations(listener); },
+    };
+    return;
+}
+
+test server_closes_on_frame_violations {
+    Fiber<unit> scenario = spawn RunFrameViolations();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}
+
+string Reply(SocketAddress address, u8[] request) {
+    return match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(2000_i64)) {
+        Result::Error(_) => "<connect>",
+        Result::Ok(s) => ReplyOn(s, request),
+    };
+}
+
+string ReplyOn(TcpStream s, u8[] request) {
+    s.SetDeadlines(TransferDeadlines { read: Within(5000_i64), write: Within(5000_i64) });
+    WriteRaw(s, request);
+    string head = ReadHeadRaw(s);
+    s.Close();
+    return head;
+}
+
+unit HandshakeRejections(TcpListener listener) {
+    match listener.LocalAddress() {
+        Result::Error(_) => { Assert.Fail("address"); },
+        Result::Ok(address) => {
+            SocketAddress target = address;
+            TcpListener l = listener;
+            i64[] results = [0_i64, 0_i64, 0_i64];
+            Fiber<unit> server = spawn (() => ServeMany(l, 3_i64, results));
+            string v8 = Reply(target, Upgrade("8", true));
+            Assert.True(String.Contains(v8, "HTTP/1.1 426 Upgrade Required"), "version 8 gets 426");
+            Assert.True(String.Contains(v8, "Sec-WebSocket-Version: 13"), "426 lists version 13");
+            Assert.True(String.Contains(Reply(target, Upgrade("13", false)), "HTTP/1.1 400 Bad Request"), "missing key gets 400");
+            Assert.True(String.Contains(Reply(target, Convert.StringToBytes("POST /raw HTTP/1.1" + Crlf() + Crlf())), "HTTP/1.1 400 Bad Request"), "POST gets 400");
+            server.Join();
+            Assert.Equal<i64>(results[0], 9000_i64 + 711_i64, "server error: unsupported version");
+            Assert.Equal<i64>(results[1], 9000_i64 + 710_i64, "server error: bad key");
+            Assert.Equal<i64>(results[2], 9000_i64 + 708_i64, "server error: bad request line");
+            l.Close();
+        },
+    };
+    return;
+}
+
+unit RunHandshakeRejections() {
+    match TcpListener.Bind(Loopback4(0_i64), 8_i64) {
+        Result::Error(_) => { Assert.Fail("bind"); },
+        Result::Ok(listener) => { HandshakeRejections(listener); },
+    };
+    return;
+}
+
+test server_rejects_bad_upgrades {
+    Fiber<unit> scenario = spawn RunHandshakeRejections();
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
+}

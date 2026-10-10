@@ -1,0 +1,390 @@
+/// Runs the crypto known-answer vectors (FIPS 180-4, RFC 4231, NIST GCM, RFC 8439, and the
+/// SymLongVectors digests) through both providers (ruling R27): `P*` helpers force the pure
+/// kernels with `BESKID_CRYPTO_PROVIDER=pure`, `N*` helpers clear the switch so the native
+/// OpenSSL provider serves the call. Also checks tag rejection, the no-plaintext-on-failure
+/// rule, offsets, and provider selection. Needs a host with OpenSSL 3 (`libcrypto.so.3`).
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Crypto.AesGcm;
+use Crypto.ChaCha20Poly1305;
+use Crypto.Errors;
+use Crypto.Hmac;
+use Crypto.Sha256;
+use Crypto.Sha512;
+use Crypto.Provider;
+
+unit UsePure() { Provider.ForcePure(true); return; }
+unit UseNative() { Provider.ForcePure(false); return; }
+u8[] PSha256(u8[] m) { UsePure(); u8[] r = Sha256.Hash(m); UseNative(); return r; }
+u8[] NSha256(u8[] m) { UseNative(); return Sha256.Hash(m); }
+u8[] PSha512(u8[] m) { UsePure(); u8[] r = Sha512.Hash512(m); UseNative(); return r; }
+u8[] NSha512(u8[] m) { UseNative(); return Sha512.Hash512(m); }
+u8[] PSha384(u8[] m) { UsePure(); u8[] r = Sha512.Hash384(m); UseNative(); return r; }
+u8[] NSha384(u8[] m) { UseNative(); return Sha512.Hash384(m); }
+u8[] PHmac(HashAlgorithm a, u8[] k, u8[] m) { UsePure(); u8[] r = Hmac.Compute(a, k, m); UseNative(); return r; }
+u8[] NHmac(HashAlgorithm a, u8[] k, u8[] m) { UseNative(); return Hmac.Compute(a, k, m); }
+u8[] PDigest(HashAlgorithm a, u8[] m) { UsePure(); u8[] r = Hmac.Digest(a, m); UseNative(); return r; }
+u8[] NDigest(HashAlgorithm a, u8[] m) { UseNative(); return Hmac.Digest(a, m); }
+Result<AesGcmKey, CryptoError> PAesKey(u8[] k) { UsePure(); Result<AesGcmKey, CryptoError> r = AesGcm.New(k); UseNative(); return r; }
+Result<AesGcmKey, CryptoError> NAesKey(u8[] k) { UseNative(); return AesGcm.New(k); }
+Result<u8[], CryptoError> PChaSeal(u8[] k, u8[] n, u8[] a, u8[] m) { UsePure(); Result<u8[], CryptoError> r = ChaCha20Poly1305.Seal(k, n, a, m); UseNative(); return r; }
+Result<u8[], CryptoError> NChaSeal(u8[] k, u8[] n, u8[] a, u8[] m) { UseNative(); return ChaCha20Poly1305.Seal(k, n, a, m); }
+Result<u8[], CryptoError> PChaOpen(u8[] k, u8[] n, u8[] a, u8[] m) { UsePure(); Result<u8[], CryptoError> r = ChaCha20Poly1305.Open(k, n, a, m); UseNative(); return r; }
+Result<u8[], CryptoError> NChaOpen(u8[] k, u8[] n, u8[] a, u8[] m) { UseNative(); return ChaCha20Poly1305.Open(k, n, a, m); }
+Result<unit, CryptoError> PChaSealInto(u8[] k, u8[] n, u8[] a, u8[] i, i64 io, i64 c, u8[] o, i64 oo) { UsePure(); Result<unit, CryptoError> r = ChaCha20Poly1305.SealInto(k, n, a, i, io, c, o, oo); UseNative(); return r; }
+Result<unit, CryptoError> NChaSealInto(u8[] k, u8[] n, u8[] a, u8[] i, i64 io, i64 c, u8[] o, i64 oo) { UseNative(); return ChaCha20Poly1305.SealInto(k, n, a, i, io, c, o, oo); }
+Result<i64, CryptoError> NChaOpenInto(u8[] k, u8[] n, u8[] a, u8[] i, i64 io, i64 c, u8[] o, i64 oo) { UseNative(); return ChaCha20Poly1305.OpenInto(k, n, a, i, io, c, o, oo); }
+
+u8 Nibble(u8 c) {
+    if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
+    if c >= 97_u8 && c <= 102_u8 { return c - 87_u8; }
+    return c - 55_u8;
+}
+u8[] Hex(string text) {
+    i64 n = String.Len(text) / 2_i64;
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = Nibble(String.ByteAt(text, 2_i64 * i)) * 16_u8 + Nibble(String.ByteAt(text, 2_i64 * i + 1_i64)); i = i + 1_i64; }
+    return out;
+}
+u8[] Ascii(string text) {
+    i64 n = String.Len(text);
+    u8[] out = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { out[i] = String.ByteAt(text, i); i = i + 1_i64; }
+    return out;
+}
+bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
+u8[] Prefix(u8[] data, i64 n) { u8[] o = Slice.New(n); Slice.Copy(o, 0_i64, data, 0_i64, n); return o; }
+u8[] Pattern(i64 n, i64 mul, i64 add) {
+    u8[] o = Slice.New(n);
+    mut i64 i = 0_i64;
+    while i < n { o[i] = u8((i * mul + add) & 255_i64); i = i + 1_i64; }
+    return o;
+}
+u8[] Unwrap(Result<u8[], CryptoError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
+}
+bool AuthFailBytes(Result<u8[], CryptoError> r) {
+    return match r { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::AuthenticationFailed => true, _ => false, }, };
+}
+bool AuthFailLen(Result<i64, CryptoError> r) {
+    return match r { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::AuthenticationFailed => true, _ => false, }, };
+}
+u8 Flip(u8 b) { return (b | 1_u8) - (b & 1_u8); }
+
+string Msg448() { return "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"; }
+string Msg896() { return "abcdefghbcdefghicdefghijdefghijkefghijklfghijklmghijklmnhijklmnoijklmnopjklmnopqklmnopqrlmnopqrsmnopqrstnopqrstu"; }
+string Sunscreen() { return "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."; }
+
+unit CheckSha256(u8[] message, string expected) {
+    Assert.True(Same(PSha256(message), Hex(expected)), "pure sha256");
+    Assert.True(Same(NSha256(message), Hex(expected)), "native sha256");
+    return;
+}
+unit CheckSha512(u8[] message, string expected) {
+    Assert.True(Same(PSha512(message), Hex(expected)), "pure sha512");
+    Assert.True(Same(NSha512(message), Hex(expected)), "native sha512");
+    return;
+}
+unit CheckSha384(u8[] message, string expected) {
+    Assert.True(Same(PSha384(message), Hex(expected)), "pure sha384");
+    Assert.True(Same(NSha384(message), Hex(expected)), "native sha384");
+    return;
+}
+
+unit CheckHmac(HashAlgorithm algorithm, string key, string message, i64 n, string expected) {
+    u8[] pure = PHmac(algorithm, Hex(key), Hex(message));
+    u8[] native = NHmac(algorithm, Hex(key), Hex(message));
+    Assert.True(Same(Prefix(pure, n), Hex(expected)), "pure hmac");
+    Assert.True(Same(pure, native), "native hmac equals pure");
+    return;
+}
+
+unit CheckAes(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext, string expected) {
+    match PAesKey(key) {
+        Result::Error(_) => { Assert.Fail("pure key"); },
+        Result::Ok(pure) => {
+            match NAesKey(key) {
+                Result::Error(_) => { Assert.Fail("native key"); },
+                Result::Ok(native) => {
+                    u8[] a = Unwrap(AesGcm.Seal(pure, nonce, aad, plaintext));
+                    u8[] b = Unwrap(AesGcm.Seal(native, nonce, aad, plaintext));
+                    Assert.True(Same(a, Hex(expected)), "pure aes-gcm");
+                    Assert.True(Same(b, Hex(expected)), "native aes-gcm");
+                    Assert.True(Same(Unwrap(AesGcm.Open(native, nonce, aad, a)), plaintext), "native opens pure");
+                    Assert.True(Same(Unwrap(AesGcm.Open(pure, nonce, aad, b)), plaintext), "pure opens native");
+                },
+            };
+        },
+    };
+    return;
+}
+
+unit CheckChaCha(u8[] key, u8[] nonce, u8[] aad, u8[] plaintext, string expected) {
+    u8[] a = Unwrap(PChaSeal(key, nonce, aad, plaintext));
+    u8[] b = Unwrap(NChaSeal(key, nonce, aad, plaintext));
+    Assert.True(Same(a, Hex(expected)), "pure chacha20-poly1305");
+    Assert.True(Same(b, Hex(expected)), "native chacha20-poly1305");
+    Assert.True(Same(Unwrap(NChaOpen(key, nonce, aad, a)), plaintext), "native opens pure");
+    Assert.True(Same(Unwrap(PChaOpen(key, nonce, aad, b)), plaintext), "pure opens native");
+    return;
+}
+
+/// SymLongVectors inputs: key 00 01 .., nonce 000000090000004a00000000, aad 00 .. 0c,
+/// message byte i = (7 i + 3) mod 256; expected value is SHA-256(ciphertext || tag).
+unit CheckLongChaCha(i64 n, string expected) {
+    u8[] key = Pattern(32_i64, 1_i64, 0_i64);
+    u8[] nonce = Hex("000000090000004a00000000");
+    u8[] aad = Pattern(13_i64, 1_i64, 0_i64);
+    u8[] message = Pattern(n, 7_i64, 3_i64);
+    u8[] a = Unwrap(PChaSeal(key, nonce, aad, message));
+    u8[] b = Unwrap(NChaSeal(key, nonce, aad, message));
+    Assert.True(Same(PSha256(a), Hex(expected)), "pure long chacha");
+    Assert.True(Same(a, b), "native long chacha equals pure");
+    Assert.True(Same(Unwrap(NChaOpen(key, nonce, aad, b)), message), "native long chacha open");
+    return;
+}
+unit CheckLongAes(i64 keyLength, i64 n, string expected) {
+    u8[] key = Pattern(keyLength, 1_i64, 0_i64);
+    u8[] nonce = Hex("000000090000004a00000000");
+    u8[] aad = Pattern(13_i64, 1_i64, 0_i64);
+    u8[] message = Pattern(n, 7_i64, 3_i64);
+    match PAesKey(key) {
+        Result::Error(_) => { Assert.Fail("pure key"); },
+        Result::Ok(pure) => {
+            match NAesKey(key) {
+                Result::Error(_) => { Assert.Fail("native key"); },
+                Result::Ok(native) => {
+                    u8[] a = Unwrap(AesGcm.Seal(pure, nonce, aad, message));
+                    u8[] b = Unwrap(AesGcm.Seal(native, nonce, aad, message));
+                    Assert.True(Same(PSha256(a), Hex(expected)), "pure long aes");
+                    Assert.True(Same(a, b), "native long aes equals pure");
+                    Assert.True(Same(Unwrap(AesGcm.Open(native, nonce, aad, b)), message), "native long aes open");
+                },
+            };
+        },
+    };
+    return;
+}
+
+test provider_sha256_abc { CheckSha256(Ascii("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"); }
+test provider_sha256_empty { CheckSha256(Ascii(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"); }
+test provider_sha256_448 { CheckSha256(Ascii(Msg448()), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"); }
+test provider_sha256_896 { CheckSha256(Ascii(Msg896()), "cf5b16a778af8380036ce59e7b0492370b249b11e8f07a51afac45037afee9d1"); }
+test provider_sha512_abc { CheckSha512(Ascii("abc"), "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f"); }
+test provider_sha512_empty { CheckSha512(Ascii(""), "cf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e"); }
+test provider_sha512_448 { CheckSha512(Ascii(Msg448()), "204a8fc6dda82f0a0ced7beb8e08a41657c16ef468b228a8279be331a703c33596fd15c13b1b07f9aa1d3bea57789ca031ad85c7a71dd70354ec631238ca3445"); }
+test provider_sha512_896 { CheckSha512(Ascii(Msg896()), "8e959b75dae313da8cf4f72814fc143f8f7779c6eb9f7fa17299aeadb6889018501d289e4900f7e4331b99dec4b5433ac7d329eeb6dd26545e96e55b874be909"); }
+test provider_sha384_abc { CheckSha384(Ascii("abc"), "cb00753f45a35e8bb5a03d699ac65007272c32ab0eded1631a8b605a43ff5bed8086072ba1e7cc2358baeca134c825a7"); }
+test provider_sha384_empty { CheckSha384(Ascii(""), "38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b"); }
+test provider_sha384_448 { CheckSha384(Ascii(Msg448()), "3391fdddfc8dc7393707a65b1b4709397cf8b1d162af05abfe8f450de5f36bc6b0455a8520bc4e6f5fe95b1fe3c8452b"); }
+test provider_sha384_896 { CheckSha384(Ascii(Msg896()), "09330c33f71147e83d192fc782cd1b4753111b173b3b05d22fa08086e3b0f712fcc7c71a557e2db966c3e9fa91746039"); }
+test provider_hmac_sha256_rfc4231 {
+    CheckHmac(HashAlgorithm::Sha256(), "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "4869205468657265", 32_i64, "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    CheckHmac(HashAlgorithm::Sha256(), "4a656665", "7768617420646f2079612077616e7420666f72206e6f7468696e673f", 32_i64, "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    CheckHmac(HashAlgorithm::Sha256(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", 32_i64, "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+    CheckHmac(HashAlgorithm::Sha256(), "0102030405060708090a0b0c0d0e0f10111213141516171819", "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", 32_i64, "82558a389a443c0ea4cc819899f2083a85f0faa3e578f8077a2e3ff46729665b");
+    CheckHmac(HashAlgorithm::Sha256(), "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c", "546573742057697468205472756e636174696f6e", 16_i64, "a3b6167473100ee06e0c796c2955552b");
+    CheckHmac(HashAlgorithm::Sha256(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "54657374205573696e67204c6172676572205468616e20426c6f636b2d53697a65204b6579202d2048617368204b6579204669727374", 32_i64, "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    CheckHmac(HashAlgorithm::Sha256(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "5468697320697320612074657374207573696e672061206c6172676572207468616e20626c6f636b2d73697a65206b657920616e642061206c6172676572207468616e20626c6f636b2d73697a6520646174612e20546865206b6579206e6565647320746f20626520686173686564206265666f7265206265696e6720757365642062792074686520484d414320616c676f726974686d2e", 32_i64, "9b09ffa71b942fcb27635fbcd5b0e944bfdc63644f0713938a7f51535c3a35e2");
+}
+test provider_hmac_sha384_rfc4231 {
+    CheckHmac(HashAlgorithm::Sha384(), "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "4869205468657265", 48_i64, "afd03944d84895626b0825f4ab46907f15f9dadbe4101ec682aa034c7cebc59cfaea9ea9076ede7f4af152e8b2fa9cb6");
+    CheckHmac(HashAlgorithm::Sha384(), "4a656665", "7768617420646f2079612077616e7420666f72206e6f7468696e673f", 48_i64, "af45d2e376484031617f78d2b58a6b1b9c7ef464f5a01b47e42ec3736322445e8e2240ca5e69e2c78b3239ecfab21649");
+    CheckHmac(HashAlgorithm::Sha384(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", 48_i64, "88062608d3e6ad8a0aa2ace014c8a86f0aa635d947ac9febe83ef4e55966144b2a5ab39dc13814b94e3ab6e101a34f27");
+    CheckHmac(HashAlgorithm::Sha384(), "0102030405060708090a0b0c0d0e0f10111213141516171819", "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", 48_i64, "3e8a69b7783c25851933ab6290af6ca77a9981480850009cc5577c6e1f573b4e6801dd23c4a7d679ccf8a386c674cffb");
+    CheckHmac(HashAlgorithm::Sha384(), "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c", "546573742057697468205472756e636174696f6e", 16_i64, "3abf34c3503b2a23a46efc619baef897");
+    CheckHmac(HashAlgorithm::Sha384(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "54657374205573696e67204c6172676572205468616e20426c6f636b2d53697a65204b6579202d2048617368204b6579204669727374", 48_i64, "4ece084485813e9088d2c63a041bc5b44f9ef1012a2b588f3cd11f05033ac4c60c2ef6ab4030fe8296248df163f44952");
+    CheckHmac(HashAlgorithm::Sha384(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "5468697320697320612074657374207573696e672061206c6172676572207468616e20626c6f636b2d73697a65206b657920616e642061206c6172676572207468616e20626c6f636b2d73697a6520646174612e20546865206b6579206e6565647320746f20626520686173686564206265666f7265206265696e6720757365642062792074686520484d414320616c676f726974686d2e", 48_i64, "6617178e941f020d351e2f254e8fd32c602420feb0b8fb9adccebb82461e99c5a678cc31e799176d3860e6110c46523e");
+}
+test provider_hmac_sha512_rfc4231 {
+    CheckHmac(HashAlgorithm::Sha512(), "0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b", "4869205468657265", 64_i64, "87aa7cdea5ef619d4ff0b4241a1d6cb02379f4e2ce4ec2787ad0b30545e17cdedaa833b7d6b8a702038b274eaea3f4e4be9d914eeb61f1702e696c203a126854");
+    CheckHmac(HashAlgorithm::Sha512(), "4a656665", "7768617420646f2079612077616e7420666f72206e6f7468696e673f", 64_i64, "164b7a7bfcf819e2e395fbe73b56e0a387bd64222e831fd610270cd7ea2505549758bf75c05a994a6d034f65f8f0e6fdcaeab1a34d4a6b4b636e070a38bce737");
+    CheckHmac(HashAlgorithm::Sha512(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd", 64_i64, "fa73b0089d56a284efb0f0756c890be9b1b5dbdd8ee81a3655f83e33b2279d39bf3e848279a722c806b485a47e67c807b946a337bee8942674278859e13292fb");
+    CheckHmac(HashAlgorithm::Sha512(), "0102030405060708090a0b0c0d0e0f10111213141516171819", "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd", 64_i64, "b0ba465637458c6990e5a8c5f61d4af7e576d97ff94b872de76f8050361ee3dba91ca5c11aa25eb4d679275cc5788063a5f19741120c4f2de2adebeb10a298dd");
+    CheckHmac(HashAlgorithm::Sha512(), "0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c", "546573742057697468205472756e636174696f6e", 16_i64, "415fad6271580a531d4179bc891d87a6");
+    CheckHmac(HashAlgorithm::Sha512(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "54657374205573696e67204c6172676572205468616e20426c6f636b2d53697a65204b6579202d2048617368204b6579204669727374", 64_i64, "80b24263c7c1a3ebb71493c1dd7be8b49b46d1f41b4aeec1121b013783f8f3526b56d037e05f2598bd0fd2215d6a1e5295e64f73f63f0aec8b915a985d786598");
+    CheckHmac(HashAlgorithm::Sha512(), "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "5468697320697320612074657374207573696e672061206c6172676572207468616e20626c6f636b2d73697a65206b657920616e642061206c6172676572207468616e20626c6f636b2d73697a6520646174612e20546865206b6579206e6565647320746f20626520686173686564206265666f7265206265696e6720757365642062792074686520484d414320616c676f726974686d2e", 64_i64, "e37b6a775dc87dbaa4dfa9f96e5e3ffddebd71f8867289865df5a32d20cdc944b6022cac3c4982b10d5eeb55c3e4de15134676fb6de0446065c97440fa8c6a58");
+}
+test provider_aes_gcm_tc1 { CheckAes(Hex("00000000000000000000000000000000"), Hex("000000000000000000000000"), Hex(""), Hex(""), "58e2fccefa7e3061367f1d57a4e7455a"); }
+test provider_aes_gcm_tc2 { CheckAes(Hex("00000000000000000000000000000000"), Hex("000000000000000000000000"), Hex(""), Hex("00000000000000000000000000000000"), "0388dace60b6a392f328c2b971b2fe78ab6e47d42cec13bdf53a67b21257bddf"); }
+test provider_aes_gcm_tc3 { CheckAes(Hex("feffe9928665731c6d6a8f9467308308"), Hex("cafebabefacedbaddecaf888"), Hex(""), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255"), "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e091473f59854d5c2af327cd64a62cf35abd2ba6fab4"); }
+test provider_aes_gcm_tc4 { CheckAes(Hex("feffe9928665731c6d6a8f9467308308"), Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"), "42831ec2217774244b7221b784d0d49ce3aa212f2c02a4e035c17e2329aca12e21d514b25466931c7d8f6a5aac84aa051ba30b396a0aac973d58e0915bc94fbc3221a5db94fae95ae7121a47"); }
+test provider_aes_gcm_tc13 { CheckAes(Hex("0000000000000000000000000000000000000000000000000000000000000000"), Hex("000000000000000000000000"), Hex(""), Hex(""), "530f8afbc74536b9a963b4f1c4cb738b"); }
+test provider_aes_gcm_tc14 { CheckAes(Hex("0000000000000000000000000000000000000000000000000000000000000000"), Hex("000000000000000000000000"), Hex(""), Hex("00000000000000000000000000000000"), "cea7403d4d606b6e074ec5d3baf39d18d0d1c8a799996bf0265b98b5d48ab919"); }
+test provider_aes_gcm_tc15 { CheckAes(Hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308"), Hex("cafebabefacedbaddecaf888"), Hex(""), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b391aafd255"), "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f662898015adb094dac5d93471bdec1a502270e3cc6c"); }
+test provider_aes_gcm_tc16 { CheckAes(Hex("feffe9928665731c6d6a8f9467308308feffe9928665731c6d6a8f9467308308"), Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39"), "522dc1f099567d07f47f37a32a84427d643a8cdcbfe5c0c97598a2bd2555d1aa8cb08e48590dbb3da7b08b1056828838c5f61e6393ba7a0abcc9f66276fc6ece0f4e1768cddf8853bb2d551b"); }
+test provider_aes_gcm_4000_bytes { CheckAes(Pattern(16_i64, 1_i64, 0_i64), Pattern(12_i64, 1_i64, 0_i64), Pattern(37_i64, 1_i64, 0_i64), Pattern(4000_i64, 31_i64, 7_i64), "944ae2aae5b936b4b4cc5cd64d39c9d044302fb2207f4c26092fdc617fce0ba462a2feb3970216239f0a14db9bf34e2a1b6901c457f5a7cbe1a07ffee1269f4c5de8f06a1c2e4bbe9cee8c43476071c3df7a707f3aceec5259332adb9703e380c7e3ae103549bef43fe1a323e8d38f634c656e14b07f5b89aa12539ec7c0b511e9124527bc7563f88b363989a4731e36e43bc6e66986d89643303f74be9f157af060dd1f89672e8ac280af955453ef398217d2b9ccfb728305617d4e77effcbb4f3729aa12434351b388de24aaa9afea0bc0d463285685c8bb90fd2dca7c29418580222d6b8231cc74d1fbadd35d191e187c937d518b0133c0b578e12c230b3cf0f1c477b42df4a164f0c16402b5217e9a46a86eaa1fe43e874838cf2464d5fde3c0a1050bc1fd05f3184e2df1d837e1c1468ba22f5a340373bb25537852fb7f7b63a87dc4e0ad8e6ba541b8fc3a14e45d725613ea7d96367d665796154ba8ff3dbcc270a56529a12ab70ad5778548e6dd4b8677bc37244b55fc1ade49a015143545dd2ff591f354a57badf2f352e57bf3c886135e4624fc61f212ea542fad9101d812f48de9cf4350e870aa71812849f9f60f62ca5efa54e7fde5d75c5f06e1b2128da56a69ba93fedbc91acb0cfe2962149d4339c619d566c9f26d901249a2ed276cd5ec7252bf1f2241fbb11a2a06a8a9acdadabc81036e16c01091ae5ad1b961935da32e24afbeba3b4580f5c6564114295983d3bda4064527355fdf65a5f7f6c597f822d3074f563e28829aae5e3fc3d3014a1abc57abd38dcec4dd210ee0f5af4dcd78459c0490674636e6a77027ea75a17f1ee9c085d66952d45ffae40466cab62016ef9416bf08521c5eeedadc5e7abefc88df708be2dbc212539681919e5c174640ec65278ff9d537ef184c22039199c1eaea96043f47d2181883d970043b6f05df118688a7faca4f7edd42bf7648a1a9449120a2d7506485e45e126077c9a07a05524836239654d5c5df4e42cd22d6180be25459218611f9262d9e0769270d71169b04c935a627a4c4feb198e7e1242723fd9b2e6cf8cad8cc79664961c27efa615d6eb1a4cb10663712c450bb1ba7bd071d660e466947b811835e9a13f6590051d3dcacb7238711cabf9b0a3917c086f66d4c5016a6679062b464c64145c83bb4e0a86ec11d9c282bbd5891061f11e896ed12564313a6c7a2b5abcccc122df2fb75cc01c23a3a0ec4247201650f95815fdc1289b741696430b7c813f11afc3e06d13608ed4b1e5bb9541932cfc08c20d56f1a4488ab049f2ff9262a7a0db93d78569bc670d0f373ad80c438fedd65b753298419a70a20a4e1f6ebb63056c3ef1488516c0818e14191f212787d5b318b82d1a3abdc7b5e75842593be2a2b38b7800e0edfbf313ecffd01cb6da34adbe28894088d160d6de633767d433073ddef4d411799f5e62c72d502b70e7508549aa86a9e3000398243d2e87a7ba0da006cea6ef4bd4e7702a6514d368bdb7805a192c053cf44510e4f1cffbbc4e1abc66ec979fd9982f5d1c7ebf25fcbb4c070ce7a0e75e55d3c166a640c9480bab00fb3d414455632404997254c0b097a74c39a5f13dcbc5eb1c4e305fb3898aa7a86dbb5598248437dff7846a78a13eb5af361aa0288711f0e0d48a41fc95de9f587b6e9b9730c84ad4f66aa508de74ec42de3725a1610f5662cc9004eda97a2a45f6dd73a2c795b2d25729354ffde5acebf4da3920f00f92a802de355e450b2836f8033305d6f92a652cfbb605cdc1971b670904bde3c784af1709d94b7b314ee893a69b992ea1e8383bd9894dbaef79b8b0979cf60bbf3dede2f4abac63318fbc5ea64468c5ca60ec4eac9367ce323feba36ef4b0033e5ed59cbc3c1d5e174ce4e219f6ef970329b6f80afa724ef20683520efa5a7fe0ab388fb7ade2d057763acddf0f77f5fbecd2e9d68b26eb2359eafdba910d890645b87bced7a02df44d303729eb321765990f2d2b33324d0020053d55d93f043ca850f604edc31324c6c360b1d7918f07db13691e172bfbc10806dca850cea553981d6cd2a32189df57888a541f4beab0309c29ce70d8aebbcf9ee350c93f9928c57d68088aff17b1801ab7cf4531816845bf62b1f42d5a36886f059642632be02523bbb54b77904aa02fd715daaf7449e84cbb9d80de75f2eda33a0e911fc323e19d7b6596b17f39cc1fd5c483530d7c6c2b74b6c12cac4998045022adedb63e1731def3ba2008ae00440cbb1da11b3cbc92f0f1e07f666101db4bb9ebb032c336b30250139c96e2c86ea37df6f03319b83f454c7a301d7e46ed61b2872b11c2fcad4dda53179b02b9564abf539b8662841253b7c3f4e9952d0a2cc4353c67cef685d3db751ed6f9577dc54607e4ef8808b0ec7464cf9b383f0d859cac45cd93ec0ccf8d5632d5b585c5df3c3f2b072008e87507796c12cff0045e8adb6d5c6192c53020c0ae6585f0c2f109f44234037dea716d037a106d4efd0e12ad49dce41e160da6ecff69679c1fe2c70f26edd535b5a9e38a40835c2803a66685adc6cb4c56101df3bafce464534659bd69d788f0d252b00a67695da2157bf00846e062795f30eddfdd087d0d38a79d800fe3ce067b1b6605c129e3e78e159aa75b82862b4625f603368589ab9dcb286e9a3f32e170513b8e6bfd044cc1289c23696ed0368518212ff311b23e28ec6ae2f7bcf166c352113a66cd456a4f5e607fcaec9b81a8b24f829249e469ff9a17679b028de1768a66a625254f165b63a863c79caae78f2370ee64b4da8fe2a3147a97d4b4224af8b1674f7b1976d7253031660b6e8564cac81db0d7fb271cb2fbd56acaaf09a98f987a1f1008caa48a5bb0f4e4c305f67e2b2572468ef98462fab89aaeb0c852bc97b311d340676bded57a87fb5526e3d8b28dfcb083ba2696f1c58f7787cd4aceda4ac663c5cb0d2db73c95c2087fa3706b0d04f5e12a1a4505870809b49e6e249be43f2524b58ddae02bf7323454e7d3c705bc6ac65050797e936d5091bc20ce6994b3f0ef9de7697c12dffbf28a7856d6f31e95998c9eaf45313c4e191710e6f7ceb5495b1c4c89c5269447a8609019ee8a31c8a311969ed43b344e43779f8ee162aedfa2559af0dbb95fcd3e8371da925dc1f8eeb7ea323d4a62fe235f5b0d60c86dcdf64f89251d298b4773585ada6020dec334a12bd9d374b3843fc825beff3c6cd6f3d87c0a5309d724bb5c2b1e87e215fc81884005a5d3f3413cc4496bae4dc35b96108acf184b8aa375e126a4f829ae80781b0ac1f023395ffa45e96d94853523bfd33488b729588f2a69931b77f0cf4d883ce81b8904ebd6481647cd8091bd0377a3183d9b62b09eb21c813d61b7ae8045b9edbe399d35e0bd6c10b5b992728884d749f12715cd5fc689e3e1d50b8499c68b1f97c428a2499fd6f48c3cb410cbf1d889fb52d178ef25e5a966cde2259bc2bf09b4def7764685b1d0c672c5220d64d711a571f188cdea0f9a1ca88a29bc273657aa30c96d3db1881e18a9eb32f6d43e36fbdcd0eb9ca0492bf627a36e19a48a1202536cca80be1c40bc72df8ddc1d6280c8303c4c9da64caa1d56d313be1e5777293a2066cfb6b4f2babeec90265aaea69d353621b64ac27ae7146f1f09fc5917759938bb24bd17511d030796146998d2a66d5707ce181877ae6b1d3dfbc000e26f02f4725f5c8ff7b1a174247ddf44b7c36ac8a9ea54a517362d7bbba9ec77968ee28ac8e12ea0c3ecb1a4ad69e3f659cca820f07759f2f2d06710d69d08c1f49462e7df1829723506e11a8cff45dd8e30d40749dc70b563e0bf9095de7261d5401b022b216a3bcfe98913ecd18b7c2a5af7a9524e0e1ea283c93f590fb98e0b160b1c3bc5697566b1ec277973d48eb49c50025fead1e790dd0fce22da333087d47cbb99fd3c0e27c595e817e046f04e02e57c3df0e8affa4567a747b732134b83625901bc54544c8309ce9ab928beb6c7692a7830a14e3814a788ca2610e31660aaf1a91e1f15a7b6439647b7d625f4cf77ff28f102dc03d45bb0d26017535ca60f01e4d3b3775ee8f399f715a8fc8e83ccc97cf252ebda4ce4242b9514b9e101ee0749db87cfeb74cddec80769460d69e252fca42a0bc620965c53b42b9a44cde9978bc6682259d6dfdfeff71f16b6b5be9f974bd32570d7695274bf77e5b0df9ea2dc9d6a5f4b2dcb6d8c985d0f31938fb63cb5113304f4670d143065e2a7c8748b3b45e579730cc7853c0adebe836227d0c1ab57e091a3bf5548d143f2b5c00d387f0fd593334c033875aeeca3363eafa9d5053772982fb80a6c7e4fd45d7715a34348d90d8d9dff01ee7a510c3e584a9f8e8f1829768b228b305c7c49dea9bd2749adae25eb4b7b2dbc41d25637479cbfa637a07171936b8a66a9accb06aa5f25cf6f98704aa2086fedab76157c1651eea7908fa64e5d478fdbd91ee90affd6576318daade320c88f9375c02f80dc27b1f6177b2f33a96cf85ddf182811ff5f6f52af167cef804939397ebe0e7bd4aacd9fa5ba8b96ddff961177847ba3229aef36fba80daf47784c803586a9c55c2cb77fef92105db2a4474c47a3dd36718c892e9630544b533b9224b3291ed16c5ae1eb91a140474eb092c153a944a0313f60fddd46c5bdd78548aabaa72971bccaa9b79522c75a6b7b2f1d217b8e7571e4792b94bf28bc71175ca5b4241c79d4bf247d42d2c77142009d13a976d42186ed6f2199f9ab7c54e649f652f6ccc474dddde8090f1f135cb5ca37cbc85583983b36c982b91e375dbf707f0a3c1ef08351f561610e220c75519694c84d2595e34e53a1572b643adf5969ecea863af11664c56ad34e8c32758f6c440833ff718db04bb6290a4286caf3c5a5eafacd333ff6e173681ce8c0e7e8e77c1af3214befc96ffbad67cdae2b03f277f2ffeb225b02cbaecfbc36430c16eb48c4dae2304bf9747a9f77323b613264a4e2369900d8cd19dadf50dc2089efd594ea30350fc3461af5e553fb144a701c185aa6c8cc3b4254c354ceb18d10e6eaaf4025ef425566cc3b82dbf7efea56816ae4257d3a7e5a843d8bd166056bfc71d420d397fdc5506b868edac141bc797d4b0f3dca989cfa640530d8dfa8c7c635650cc3812291189a6d1457e87a727e6db07d7d848f3dddc2cb1c231e471b062dd8eae4027f7c7de271d23f5dc5902ee0480a32c38bb79df7f563e766ca783cb2383db805c7fa7009714dd21d175edd091cc1c2ba46e4dfb7fb93301c2563f7090155268282f683053301f9a991aa564f744ce0d8b161e5ecea735f2d0058dd0a550a5df34282843351e59ccaa51d5bbb18e73e4b0b3f4a76e50af1f8814893eee3fb9dc999914c10f8ec70e77cbf10c55461f06a21e544533577a6962ab34655c1d65d478e22893c409397142c9289dd5ec6faa3b353157cf92096cc43e150e6d5cec10c4eac632d3b77c46410d3694a7adef5df5eb7226067d6ec6c4f1a516d8f8c1a358fd35e6320cf1b4fdc5440b9fcd89f429ef94ce33cdc18480048ccb3b0cd812dcdfaf6719211eac7a8e19c2cd098c82a99ae219354ffb06af51b768507f5ee04c0e20a531053d806313d4fac928b3455d64f7fbae28cbaa95219f43b568570d46b6824afce31d5816d8fd6ff998"); }
+test provider_chacha20poly1305_rfc8439_2_8_2 { CheckChaCha(Pattern(32_i64, 1_i64, 128_i64), Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Ascii(Sunscreen()), "d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b61161ae10b594f09e26a7e902ecbd0600691"); }
+test provider_chacha20poly1305_multi_block_no_aad { CheckChaCha(Pattern(32_i64, 1_i64, 128_i64), Hex("070000004041424344454647"), Hex(""), Pattern(1500_i64, 13_i64, 5_i64), "9a69f67138bb13da7898086f972fb166142267c300174deee0c087e324fc883deb2c74f47568ad2bb5c0953bbb95098000863df217dfae9fbd4e72cb00a63061b9e39b333b9f7d0c41d01917af8892709bf96ef8d5f562915a6a3b0f8afa7217b9744499f94d3eb2dd40d13165257d8aa0fac3df27c36fc7bb5c54bf8cb1941cf066e0fac0581e23b296214b706d4b6b95eb7b3a924e43ea48dd024ac858f1aca27f4dbc80dc4a4bf2c2c34f3a15a290a3a3510714258a5a37c0110746972d0e46a015ff0015314ca3ad7c37b92aed9b10b315e4624830b302f2e7f2816aa94a714c67c39f7bc633e665a5a2e70ee2722b4a135a03aca678d43143c4889d2c90e4bc421f5a69c6e52e134ff0a37290526c543cfc0a8ff8d7ae17b0c8c284b48d95da9ac275f3d1ffbd4e513610268ccbeb840a42b18919f65837e663663017c8835a73fa41078ecf0e6f57c8cdaa939a72e3aed0156eff1f092dd38f7e21b5f2c9f314b4cd75aff7625535b2a6d7814a6765bb0f551640884e2f391e4a5457c2cf850a65b129d58c61f71c901250bfd6122b051fdf37a25e05cd1682653d1d25a19bab1d0b18d5dd1ff0990d694f14bc24e105b8e9b7532e11183250f78b8df2b0fe71ffe6b28b39022f8ce2f70a9b5a686ff2bfe1d86c952d16418025f31d303c26702e70b1037de93c526a78d0b7a77788a6a8b73a321b8b6744eb1c5c92af72080d3a30bd538704b7d0c379bb9e296f3c5f39947ffeb75c274b38307ed08bcccbed8976bf7a67d67bf139896925ce1da2d369e15c482d8b92ae42fee578ff77bd68c9b3a5294ca9cd7ac09273a06f888dc1cad9f46dfea2b3731decf491fb7087c6b06051f7886da6bbbbaf1d51ef7edc8e236167635eedec1d120d91a13ebfc179df0aa733338f382be4677267c4c5ff9c8d6bc46e3748d67d5761bf1123f34f92e30ef2683d40c762b2dbdbd6ca2bccb39787757a0b392fcff5207a55f059abdb39da7539256fbcb1de223e655f034dd337841dfd4567be8ac2c94c87562ec56c805642acf1eea489104d7551d3a969f6db9fc3f698d881e5a9ef1193431efc88657634acab9b071216140a36ea1f9df12736029e014c088b310030d1d60d828c67a1f80e683ed329f0dd3a203dd7a47aedabd8c0c3e4b06430149f42fb33037d414db1f1a7a819e21715b125869358f8ebf2d7199586f067ad6d8d5d94d0abd23b889fd44fbd921872c1732fd13404398fae6978df1b168f6c71d2313e1427ccf44825f9abdb1403439f4eca0ec0bc3324036d2254c720831652ad59e7577609d75bc32b90e2ff5cf6a0454f0b72f97e040fc2c4340c7cf9380b6b8bd8414f07f64d0ae7c99d4d9897f4cbbad10facdc7874c4fbb0e3f3022c75eb2e7165410d75c310f6eeb9449f66af31897da573d60d3a8491cc6bd0caeba3f1765a528f5c10a595b909eea564ca7c71739de09faddec5ee29013a21b0740ecabdef065d0c81b899f5c64f397367fcb549529bd49d370b93b2061f9dff75d71c3275a35b65a78c2e4c668bdc34c0e685b3ad2c9f79a23e9bf2134a5253a9752c5e126f5977352305486e0af48940354d9c7bd6cbc74a411b0188fffebf921ba09c4128e7717f833cdd95dd6e0d5486d3515d5f77e09e50e9d5721a2aca66a7439caa505d882275d7ea74fe0170e89e94f9e470c079e630a18a32250bfd6f78ce4d2f99ac83a8d6456894b654b7ba75126895a25dacc0142eb8ec536947a0abef6235840576dbb9b91dbfc4520d539179a888f5ac4326dc797124c2c2e7bad6df457f1526aafdd87e47e76da249b2c5fb5b630e9d6e28e56ebd5791126f23493fb7b454d2f8e06f3e34b94222d7f7320d1e3bed3df50f8afa77e75997560587da11fd4d67e321c5bb1ae72c3bd3c343e66c89446356e7ea61b8f8381c79ab842c1da1a3e3303b11c2d2c220334173e10dda34eb9cf9951984174cae533e2ed3e35fde23d61c03a294ba587a77053b96729abec09f7d770d0d7a8d3ec095a65567eb1820b3f6046540f2aa010f93ffa4f067a76d2c2e7b0046a863d44d55bf23a33a8218d309f28b858ba34578ae5fd222ff49c3bcb5311d1f8f461fda13e15684414ebd03496b4a7e6cf69be2d497"); }
+test provider_long_chacha20poly1305_1000 { CheckLongChaCha(1000_i64, "6fd7dbdd4ed19f5c49bcc8101f937a571b23dd77e0a5508a1f1c210c6c99e6c0"); }
+test provider_long_chacha20poly1305_4109 { CheckLongChaCha(4109_i64, "7af36d463a1fa9e9023062cf632cbf25930a378edccd8fb448d0155ed763e479"); }
+test provider_long_aes128gcm_1000 { CheckLongAes(16_i64, 1000_i64, "fa4a80f1f6af61dcaada5747a1783d44f5fc4a1ff9265d940a69dc295fc848a7"); }
+test provider_long_aes128gcm_4109 { CheckLongAes(16_i64, 4109_i64, "5fb9b60f8dfcf08ea27e712dc74ec131cb0f220dee9a1ecdd21ba0db015259df"); }
+test provider_long_aes256gcm_1000 { CheckLongAes(32_i64, 1000_i64, "688bd10e4d7c68fee1194e385c1c743fd3dcb1728a724e92ae6617b916093a97"); }
+test provider_long_aes256gcm_4109 { CheckLongAes(32_i64, 4109_i64, "e60f2974413eb4551722ad646ff090c9fdf59beaf2084ebf133e93beb2bec7a1"); }
+
+test provider_sha_length_sweep {
+    mut i64 n = 0_i64;
+    while n <= 300_i64 {
+        u8[] m = Pattern(n, 11_i64, 5_i64);
+        Assert.True(Same(PSha256(m), NSha256(m)), "sha256 sweep");
+        Assert.True(Same(PSha384(m), NSha384(m)), "sha384 sweep");
+        Assert.True(Same(PSha512(m), NSha512(m)), "sha512 sweep");
+        n = n + 13_i64;
+    }
+}
+
+test provider_hmac_long_key_sweep {
+    u8[] data = Pattern(1000_i64, 3_i64, 1_i64);
+    mut i64 k = 0_i64;
+    while k <= 200_i64 {
+        u8[] key = Pattern(k, 5_i64, 7_i64);
+        Assert.True(Same(PHmac(HashAlgorithm::Sha256(), key, data), NHmac(HashAlgorithm::Sha256(), key, data)), "hmac-sha256 key sweep");
+        Assert.True(Same(PHmac(HashAlgorithm::Sha512(), key, data), NHmac(HashAlgorithm::Sha512(), key, data)), "hmac-sha512 key sweep");
+        Assert.True(Same(PDigest(HashAlgorithm::Sha384(), key), NDigest(HashAlgorithm::Sha384(), key)), "digest sweep");
+        k = k + 25_i64;
+    }
+}
+
+test provider_aead_offsets_in_place {
+    u8[] key = Pattern(32_i64, 1_i64, 0_i64);
+    u8[] nonce = Pattern(12_i64, 2_i64, 1_i64);
+    u8[] aad = Pattern(5_i64, 1_i64, 9_i64);
+    u8[] pureBuf = Pattern(300_i64, 7_i64, 1_i64);
+    u8[] nativeBuf = Pattern(300_i64, 7_i64, 1_i64);
+    u8[] original = Pattern(300_i64, 7_i64, 1_i64);
+    // ChaCha20-Poly1305 in place at offset 9, 200 bytes.
+    Assert.True(match PChaSealInto(key, nonce, aad, pureBuf, 9_i64, 200_i64, pureBuf, 9_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "pure seal into");
+    Assert.True(match NChaSealInto(key, nonce, aad, nativeBuf, 9_i64, 200_i64, nativeBuf, 9_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "native seal into");
+    Assert.True(Same(pureBuf, nativeBuf), "chacha in place equal");
+    i64 opened = match NChaOpenInto(key, nonce, aad, nativeBuf, 9_i64, 216_i64, nativeBuf, 9_i64) { Result::Ok(n) => n, Result::Error(_) => -1_i64, };
+    Assert.Equal<i64>(opened, 200_i64, "native open into length");
+    Assert.True(Same(Prefix(nativeBuf, 209_i64), Prefix(original, 209_i64)), "native open into restores plaintext");
+    match PAesKey(Pattern(16_i64, 1_i64, 0_i64)) {
+        Result::Error(_) => { Assert.Fail("pure key"); },
+        Result::Ok(pure) => {
+            match NAesKey(Pattern(16_i64, 1_i64, 0_i64)) {
+                Result::Error(_) => { Assert.Fail("native key"); },
+                Result::Ok(native) => {
+                    u8[] p = Pattern(300_i64, 7_i64, 1_i64);
+                    u8[] q = Pattern(300_i64, 7_i64, 1_i64);
+                    Assert.True(match AesGcm.SealInto(pure, nonce, aad, p, 31_i64, 150_i64, p, 31_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "pure aes seal into");
+                    Assert.True(match AesGcm.SealInto(native, nonce, aad, q, 31_i64, 150_i64, q, 31_i64) { Result::Ok(_) => true, Result::Error(_) => false, }, "native aes seal into");
+                    Assert.True(Same(p, q), "aes in place equal");
+                    i64 n = match AesGcm.OpenInto(native, nonce, aad, q, 31_i64, 166_i64, q, 31_i64) { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+                    Assert.Equal<i64>(n, 150_i64, "native aes open into length");
+                    Assert.True(Same(Prefix(q, 181_i64), Prefix(original, 181_i64)), "native aes open into restores plaintext");
+                },
+            };
+        },
+    };
+}
+
+test provider_aead_length_sweep {
+    u8[] key = Pattern(32_i64, 3_i64, 2_i64);
+    u8[] nonce = Pattern(12_i64, 5_i64, 4_i64);
+    match PAesKey(key) {
+        Result::Error(_) => { Assert.Fail("pure key"); },
+        Result::Ok(pure) => {
+            match NAesKey(key) {
+                Result::Error(_) => { Assert.Fail("native key"); },
+                Result::Ok(native) => {
+                    mut i64 n = 0_i64;
+                    while n <= 130_i64 {
+                        u8[] m = Pattern(n, 9_i64, 1_i64);
+                        u8[] aad = Pattern(n % 37_i64, 1_i64, 3_i64);
+                        Assert.True(Same(Unwrap(AesGcm.Seal(pure, nonce, aad, m)), Unwrap(AesGcm.Seal(native, nonce, aad, m))), "aes sweep");
+                        Assert.True(Same(Unwrap(PChaSeal(key, nonce, aad, m)), Unwrap(NChaSeal(key, nonce, aad, m))), "chacha sweep");
+                        n = n + 7_i64;
+                    }
+                },
+            };
+        },
+    };
+}
+
+test provider_native_aes_gcm_rejects_tampering {
+    u8[] nonce = Hex("cafebabefacedbaddecaf888");
+    u8[] aad = Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2");
+    match NAesKey(Hex("feffe9928665731c6d6a8f9467308308")) {
+        Result::Error(_) => { Assert.Fail("key"); },
+        Result::Ok(key) => {
+            u8[] sealed = Unwrap(AesGcm.Seal(key, nonce, aad, Pattern(60_i64, 1_i64, 0_i64)));
+            mut i64 position = 0_i64;
+            while position < Slice.Len(sealed) {
+                u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+                copy[position] = Flip(copy[position]);
+                Assert.True(AuthFailBytes(AesGcm.Open(key, nonce, aad, copy)), "tampered byte rejected");
+                position = position + 7_i64;
+            }
+            Assert.True(AuthFailBytes(AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), aad, sealed)), "nonce bound");
+            Assert.True(AuthFailBytes(AesGcm.Open(key, nonce, Hex("feedface"), sealed)), "aad bound");
+            Assert.True(AuthFailBytes(AesGcm.Open(key, nonce, aad, Slice.New(15_i64))), "short input");
+            bool badNonce = match AesGcm.Seal(key, Hex("cafebabe"), aad, sealed) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidNonceLength => true, _ => false, }, };
+            Assert.True(badNonce, "nonce length");
+            // A failed OpenInto leaves no plaintext in the output range.
+            u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+            copy[70] = Flip(copy[70]);
+            u8[] output = Pattern(64_i64, 0_i64, 170_i64);
+            Assert.True(AuthFailLen(AesGcm.OpenInto(key, nonce, aad, copy, 0_i64, 76_i64, output, 2_i64)), "open into rejected");
+            Assert.True(Same(Prefix(output, 2_i64), Pattern(2_i64, 0_i64, 170_i64)), "bytes before the range untouched");
+            Assert.True(Same(Slice.SubSlice(output, 2_i64, 60_i64), Slice.New(60_i64)), "output range zeroed");
+            Assert.True(Same(Slice.SubSlice(output, 62_i64, 2_i64), Pattern(2_i64, 0_i64, 170_i64)), "bytes after the range untouched");
+        },
+    };
+    bool badKey = match NAesKey(Slice.New(20_i64)) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
+    Assert.True(badKey, "key length");
+}
+
+test provider_native_chacha20poly1305_rejects_tampering {
+    u8[] key = Pattern(32_i64, 1_i64, 128_i64);
+    u8[] nonce = Hex("070000004041424344454647");
+    u8[] aad = Hex("50515253c0c1c2c3c4c5c6c7");
+    u8[] sealed = Unwrap(NChaSeal(key, nonce, aad, Ascii(Sunscreen())));
+    mut i64 position = 0_i64;
+    while position < Slice.Len(sealed) {
+        u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+        copy[position] = Flip(copy[position]);
+        Assert.True(AuthFailBytes(NChaOpen(key, nonce, aad, copy)), "tampered byte rejected");
+        position = position + 17_i64;
+    }
+    Assert.True(AuthFailBytes(NChaOpen(key, nonce, Hex("50515253c0c1c2c3c4c5c6c8"), sealed)), "aad bound");
+    Assert.True(AuthFailBytes(NChaOpen(key, Hex("070000004041424344454648"), aad, sealed)), "nonce bound");
+    Assert.True(AuthFailBytes(NChaOpen(key, nonce, aad, Slice.New(15_i64))), "short input");
+    u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+    copy[0] = Flip(copy[0]);
+    i64 total = Slice.Len(copy);
+    Assert.True(AuthFailLen(NChaOpenInto(key, nonce, aad, copy, 0_i64, total, copy, 0_i64)), "in-place open rejected");
+    Assert.True(Same(Prefix(copy, total - 16_i64), Slice.New(total - 16_i64)), "in-place range zeroed");
+    bool badKey = match NChaSeal(Slice.New(31_i64), nonce, aad, sealed) { Result::Ok(_) => false, Result::Error(e) => match e { CryptoError::InvalidKeyLength => true, _ => false, }, };
+    Assert.True(badKey, "key length");
+}
+
+test provider_native_is_selected_on_this_host {
+    Assert.True(Provider.NativeAvailable(), "libcrypto.so.3 resolved");
+    Assert.True(Provider.SelfTest(), "native self-test");
+    UseNative();
+    Assert.True(Provider.IsNative(), "native provider selected");
+    match NAesKey(Pattern(16_i64, 1_i64, 0_i64)) {
+        Result::Error(_) => { Assert.Fail("native key"); },
+        Result::Ok(k) => { Assert.True(AesGcm.UsesNative(k), "key bound to the native provider"); },
+    };
+}
+
+test provider_selection {
+    Assert.True(Provider.SelfTest(), "native self-test");
+    UsePure();
+    bool forced = match Provider.Current() { ProviderKind::Pure => true, ProviderKind::Native => false, };
+    Assert.True(forced, "BESKID_CRYPTO_PROVIDER=pure forces Pure");
+    match AesGcm.New(Pattern(16_i64, 1_i64, 0_i64)) {
+        Result::Error(_) => { Assert.Fail("pure key"); },
+        Result::Ok(k) => { Assert.False(AesGcm.UsesNative(k), "key created under the switch stays pure"); },
+    };
+    UseNative();
+    bool native = match Provider.Current() { ProviderKind::Pure => false, ProviderKind::Native => true, };
+    Assert.True(native, "Native when the self-test passes");
+}

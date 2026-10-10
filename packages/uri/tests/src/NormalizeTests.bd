@@ -1,0 +1,36 @@
+use Testing.Assert;
+use Core.Results;
+use Uri.Errors;
+use Uri.Format;
+use Uri.Normalize;
+use Uri.Parse;
+use Uri.Types;
+
+string N(string text) {
+    Result<UriRef, UriError> r = Parse.ParseReference(text);
+    return match r { Result::Ok(u) => Format.Format(Normalize.Normalize(u)), Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+string NS(string text) {
+    Result<UriRef, UriError> r = Parse.ParseReference(text);
+    return match r { Result::Ok(u) => Format.Format(Normalize.NormalizeForScheme(u)), Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+bool Eq(string a, string b) {
+    Result<UriRef, UriError> x = Parse.ParseReference(a);
+    Result<UriRef, UriError> y = Parse.ParseReference(b);
+    match x {
+        Result::Error(_) => { return false; },
+        Result::Ok(ux) => {
+            match y {
+                Result::Error(_) => { return false; },
+                Result::Ok(uy) => { return Normalize.Equivalent(ux, uy); },
+            };
+        },
+    };
+}
+test normalize_http_example_com_group { Assert.Equal<string>(N("HTTP://Example.COM/"), "http://example.com/", "syntax-based"); Assert.Equal<string>(N("http://example.com/%7euser"), "http://example.com/~user", "syntax-based"); Assert.Equal<string>(N("http://example.com/%7Euser"), "http://example.com/~user", "syntax-based"); Assert.Equal<string>(N("http://example.com/a%2fb"), "http://example.com/a%2Fb", "syntax-based"); Assert.Equal<string>(N("http://example.com/%41%5a%61%7a"), "http://example.com/AZaz", "syntax-based"); Assert.Equal<string>(N("http://example.com/a/./b/../c"), "http://example.com/a/c", "syntax-based"); Assert.Equal<string>(N("http://example.com/a/b/../../../c"), "http://example.com/c", "syntax-based"); Assert.Equal<string>(N("http://User:Pw@EXAMPLE.com:8080/p?Q=%2f#F%7e"), "http://User:Pw@example.com:8080/p?Q=%2F#F~", "syntax-based"); }
+test normalize_http_ex_41mple_com_group { Assert.Equal<string>(N("http://ex%41mple.com/"), "http://example.com/", "syntax-based"); Assert.Equal<string>(N("http://[ABCD::EF01]/"), "http://[abcd::ef01]/", "syntax-based"); Assert.Equal<string>(N("http://h:/p"), "http://h/p", "syntax-based"); Assert.Equal<string>(N("http://h/p?"), "http://h/p?", "syntax-based"); Assert.Equal<string>(N("http://h/p#"), "http://h/p#", "syntax-based"); Assert.Equal<string>(N("example://a/./b/../b/%63/%7bfoo%7d"), "example://a/b/c/%7Bfoo%7D", "syntax-based"); Assert.Equal<string>(N("eXAMPLE://a/b/c/%7Bfoo%7D"), "example://a/b/c/%7Bfoo%7D", "syntax-based"); Assert.Equal<string>(N("../a/./b"), "../a/./b", "syntax-based"); }
+test normalize_a_b_1_group { Assert.Equal<string>(N("./a/../b"), "./a/../b", "syntax-based"); Assert.Equal<string>(N("mailto:Joe@Example.COM"), "mailto:Joe@Example.COM", "syntax-based"); Assert.Equal<string>(N("http://h/%e2%82%ac"), "http://h/%E2%82%AC", "syntax-based"); Assert.Equal<string>(N("http://h/a%2Db%2eC%5f%7E"), "http://h/a-b.C_~", "syntax-based"); Assert.Equal<string>(NS("HTTP://Example.COM:80"), "http://example.com/", "scheme-based"); Assert.Equal<string>(NS("http://example.com:80/"), "http://example.com/", "scheme-based"); Assert.Equal<string>(NS("https://h:443/x"), "https://h/x", "scheme-based"); Assert.Equal<string>(NS("http://h:8080"), "http://h:8080/", "scheme-based"); }
+test scheme_normalize_https_h_80_group { Assert.Equal<string>(NS("https://h:80/"), "https://h:80/", "scheme-based"); Assert.Equal<string>(NS("ws://h:80"), "ws://h/", "scheme-based"); Assert.Equal<string>(NS("wss://h:443/c"), "wss://h/c", "scheme-based"); Assert.Equal<string>(NS("ftp://h:21"), "ftp://h:21", "scheme-based"); Assert.Equal<string>(NS("http://h"), "http://h/", "scheme-based"); Assert.Equal<string>(NS("http://h?q"), "http://h/?q", "scheme-based"); Assert.Equal<string>(NS("file:///x"), "file:///x", "scheme-based"); Assert.True(Eq("http://Example.com", "http://example.com:80/"), "equivalence"); }
+test equivalent_http_example_com_a_b_http_example_com_a_b_group { Assert.True(Eq("HTTP://example.com/a/./b", "http://EXAMPLE.com/a/b"), "equivalence"); Assert.True(Eq("http://example.com/%7euser", "http://example.com/~user"), "equivalence"); Assert.False(Eq("http://example.com/a", "http://example.com/b"), "equivalence"); Assert.False(Eq("http://example.com/a/", "http://example.com/a"), "equivalence"); Assert.False(Eq("http://example.com/", "https://example.com/"), "equivalence"); Assert.False(Eq("http://example.com/?a=1", "http://example.com/?a=2"), "equivalence"); Assert.Equal<string>(Normalize.RemoveDotSegments("/a/b/c/./../../g"), "/a/g", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("mid/content=5/../6"), "mid/6", "remove_dot_segments"); }
+test dots_a_4_group { Assert.Equal<string>(Normalize.RemoveDotSegments("/./a"), "/a", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("/../a"), "/a", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("a/.."), "/", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("/a/.."), "/", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("/a/."), "/a/", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments(".."), "", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("."), "", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("../a"), "a", "remove_dot_segments"); }
+test dots_a_3_group { Assert.Equal<string>(Normalize.RemoveDotSegments("./a"), "a", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("/a/b/.."), "/a/", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments("/a/b/../"), "/a/", "remove_dot_segments"); Assert.Equal<string>(Normalize.RemoveDotSegments(""), "", "remove_dot_segments"); }

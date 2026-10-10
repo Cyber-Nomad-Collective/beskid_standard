@@ -1,0 +1,45 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use X509.Certificate;
+use X509.Pem;
+use X509.X509Errors;
+use TestSupport;
+
+string ParseError(u8[] der) {
+    Result<Certificate, X509Error> r = Certificate.Parse(der);
+    return match r { Result::Ok(_) => "None", Result::Error(e) => X509Errors.Name(e), };
+}
+
+u8[] DerOf(string name) {
+    PemStep step = Pem.Next(TestSupport.Fixture(name), 0_i64);
+    Assert.True(step.found, "pem block");
+    return step.der;
+}
+
+unit CheckCriticalExtension() {
+    Assert.True(ParseError(DerOf("ec-crit.pem")) == "UnknownCriticalExtension", "critical private extension");
+    return;
+}
+
+unit CheckCorruptedEncodings() {
+    u8[] der = DerOf("ec-leaf.pem");
+    i64 n = Slice.Len(der);
+    Assert.True(ParseError(der) == "None", "original parses");
+    // Trailing byte after the certificate.
+    u8[] longer = Slice.New(n + 1_i64);
+    Slice.Copy(longer, 0_i64, der, 0_i64, n);
+    Assert.True(ParseError(longer) == "TrailingData", "trailing data");
+    // Truncated certificate.
+    Assert.True(ParseError(Slice.SubSlice(der, 0_i64, n - 1_i64)) == "Truncated", "truncated");
+    // Outer SEQUENCE length rewritten in a non-minimal form is caught.
+    u8[] copy = Slice.SubSlice(der, 0_i64, n);
+    copy[0] = 0x31_u8;
+    Assert.True(ParseError(copy) == "UnexpectedTag", "outer SET");
+    return;
+}
+
+test rejects_bad_certificates {
+    CheckCriticalExtension();
+    CheckCorruptedEncodings();
+}

@@ -1,0 +1,99 @@
+use Testing.Assert;
+use Core.Results;
+use Codec.Cursor;
+use Codec.Errors;
+use Codec.Hex;
+
+i64 Val(Result<i64, CodecError> r) { return match r { Result::Ok(v) => v, Result::Error(_) => -999_i64, }; }
+i64 Err<T>(Result<T, CodecError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }; }
+
+test sequential_reads_advance {
+    Cursor c = Cursor.New(Hex.Of("01 0203 040506 0708090a 0b0c0d0e0f10 1112131415161718"));
+    Assert.Equal<i64>(Val(c.U8()), 1_i64, "u8");
+    Assert.Equal<i64>(Val(c.U16()), 0x0203_i64, "u16");
+    Assert.Equal<i64>(Val(c.U24()), 0x040506_i64, "u24");
+    Assert.Equal<i64>(Val(c.U32()), 0x0708090a_i64, "u32");
+    Assert.Equal<i64>(Val(c.U48()), 0x0b0c0d0e0f10_i64, "u48");
+    Assert.Equal<i64>(Val(c.U64()), 0x1112131415161718_i64, "u64");
+    Assert.True(c.IsEnd(), "consumed");
+    Assert.Equal<i64>(c.Position(), 24_i64, "position");
+}
+
+test failed_read_keeps_position {
+    Cursor c = Cursor.New(Hex.Of("01 02 03"));
+    Assert.Equal<i64>(Err(c.U32()), 1_i64, "truncated");
+    Assert.Equal<i64>(c.Position(), 0_i64, "unchanged");
+    Assert.Equal<i64>(Val(c.U24()), 0x010203_i64, "still readable");
+    Assert.Equal<i64>(Err(c.U8()), 1_i64, "now empty");
+    Assert.Equal<i64>(Err(c.Peek8()), 1_i64, "peek empty");
+}
+
+test bytes_skip_rest_peek {
+    Cursor c = Cursor.New(Hex.Of("aa bb cc dd ee"));
+    Assert.Equal<i64>(Val(c.Peek8()), 0xaa_i64, "peek");
+    Assert.Equal<i64>(c.Position(), 0_i64, "peek does not move");
+    Result<u8[], CodecError> two = c.Bytes(2_i64);
+    match two {
+        Result::Ok(b) => { Assert.Equal<string>(Hex.Encode(b), "aabb", "bytes"); },
+        Result::Error(_) => { Assert.Fail("bytes"); },
+    };
+    Assert.Equal<i64>(Err(c.Skip(9_i64)), 1_i64, "skip too far");
+    Assert.Equal<i64>(Err(c.Skip(-1_i64)), 6_i64, "negative skip");
+    Result<unit, CodecError> ok = c.Skip(1_i64);
+    Assert.Equal<i64>(Err(ok), 0_i64, "skip ok");
+    Assert.Equal<string>(Hex.Encode(c.Rest()), "ddee", "rest");
+    Assert.True(c.IsEnd(), "end after rest");
+}
+
+test sub_cursor_is_bounded {
+    Cursor c = Cursor.New(Hex.Of("01 02 03 04 05"));
+    Result<Cursor, CodecError> sub = c.Sub(2_i64);
+    match sub {
+        Result::Error(_) => { Assert.Fail("sub"); },
+        Result::Ok(s) => {
+            Assert.Equal<i64>(Val(s.U8()), 1_i64, "first");
+            Assert.Equal<i64>(Err(s.U16()), 1_i64, "cannot read past the sub bound");
+            Assert.Equal<i64>(Val(s.U8()), 2_i64, "second");
+            Assert.True(s.IsEnd(), "sub end");
+        },
+    };
+    Assert.Equal<i64>(Val(c.U8()), 3_i64, "parent continues after sub");
+    Assert.Equal<i64>(Err(c.Sub(5_i64)), 1_i64, "sub too large");
+}
+
+test range_cursor_and_expect_end {
+    u8[] b = Hex.Of("ff 11 22 ff");
+    Result<Cursor, CodecError> r = Cursor.Range(b, 1_i64, 2_i64);
+    match r {
+        Result::Error(_) => { Assert.Fail("range"); },
+        Result::Ok(c) => {
+            Assert.Equal<i64>(Val(c.U16()), 0x1122_i64, "inner");
+            Assert.Equal<i64>(Err(c.ExpectEnd()), 0_i64, "exhausted");
+        },
+    };
+    Assert.Equal<i64>(Err(Cursor.Range(b, 3_i64, 2_i64)), 6_i64, "range outside");
+    Cursor d = Cursor.New(b);
+    Assert.Equal<i64>(Err(d.ExpectEnd()), 3_i64, "trailing bytes rejected");
+}
+
+test quic_varint_through_cursor {
+    Cursor c = Cursor.New(Hex.Of("c2197c5eff14e88c 9d7f3e7d 7bbd 25"));
+    Assert.Equal<i64>(Val(c.QuicVarint()), 151288809941952652_i64, "8");
+    Assert.Equal<i64>(Val(c.QuicVarint()), 494878333_i64, "4");
+    Assert.Equal<i64>(Val(c.QuicVarint()), 15293_i64, "2");
+    Assert.Equal<i64>(Val(c.QuicVarint()), 37_i64, "1");
+    Assert.Equal<i64>(Err(c.QuicVarint()), 1_i64, "empty");
+    Cursor cut = Cursor.New(Hex.Of("9d7f"));
+    Assert.Equal<i64>(Err(cut.QuicVarint()), 1_i64, "cut");
+    Assert.Equal<i64>(cut.Position(), 0_i64, "unchanged after cut");
+}
+
+test cursor_lines {
+    Cursor c = Cursor.New(Hex.Of("41 42 0d 0a 43 0d 0a 44"));
+    Result<u8[], CodecError> a = c.ReadLine(16_i64);
+    match a { Result::Ok(b) => { Assert.Equal<string>(Hex.Encode(b), "4142", "line1"); }, Result::Error(_) => { Assert.Fail("l1"); }, };
+    Result<u8[], CodecError> b2 = c.ReadLine(16_i64);
+    match b2 { Result::Ok(b) => { Assert.Equal<string>(Hex.Encode(b), "43", "line2"); }, Result::Error(_) => { Assert.Fail("l2"); }, };
+    Assert.Equal<i64>(Err(c.ReadLine(16_i64)), 1_i64, "unterminated tail");
+    Assert.Equal<i64>(c.Position(), 7_i64, "tail not consumed");
+}

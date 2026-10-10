@@ -1,0 +1,120 @@
+/// Production adapters between the public-key half (`Rsa.PssDigest`, `Ecdsa.NonceMac`)
+/// and the symmetric half (SHA-2, HMAC), plus one-call helpers for X.509 and TLS callers.
+///
+/// All functions take message digests, never messages, except the `Hash*` helpers.
+use Core.Results;
+use Crypto.Ecdsa;
+use Crypto.Hmac;
+use Crypto.PkErrors;
+use Crypto.Rsa;
+use Crypto.Sha256;
+use Crypto.Sha512;
+
+/// PSS hash (MGF1 and H') backed by SHA-256.
+pub type PssSha256: PssDigest {
+    i64 unused,
+    pub u8[] Digest(u8[] data) { return Sha256.Hash(data); }
+}
+
+/// PSS hash backed by SHA-384.
+pub type PssSha384: PssDigest {
+    i64 unused,
+    pub u8[] Digest(u8[] data) { return Sha512.Hash384(data); }
+}
+
+/// PSS hash backed by SHA-512.
+pub type PssSha512: PssDigest {
+    i64 unused,
+    pub u8[] Digest(u8[] data) { return Sha512.Hash512(data); }
+}
+
+/// RFC 6979 nonce MAC: HMAC-SHA-256.
+pub type NonceHmacSha256: NonceMac {
+    i64 unused,
+    pub u8[] Mac(u8[] key, u8[] data) { return Hmac.Compute(HashAlgorithm::Sha256(), key, data); }
+}
+
+/// RFC 6979 nonce MAC: HMAC-SHA-384.
+pub type NonceHmacSha384: NonceMac {
+    i64 unused,
+    pub u8[] Mac(u8[] key, u8[] data) { return Hmac.Compute(HashAlgorithm::Sha384(), key, data); }
+}
+
+/// RFC 6979 nonce MAC: HMAC-SHA-512.
+pub type NonceHmacSha512: NonceMac {
+    i64 unused,
+    pub u8[] Mac(u8[] key, u8[] data) { return Hmac.Compute(HashAlgorithm::Sha512(), key, data); }
+}
+
+/// The digest of `data` with the hash named by `hash`.
+pub u8[] HashRsa(RsaHash hash, u8[] data) {
+    return match hash {
+        RsaHash::Sha256() => Sha256.Hash(data),
+        RsaHash::Sha384() => Sha512.Hash384(data),
+        RsaHash::Sha512() => Sha512.Hash512(data),
+    };
+}
+
+/// The digest of `data` with the hash named by `algorithm`.
+pub u8[] HashWith(HashAlgorithm algorithm, u8[] data) {
+    return Hmac.Digest(algorithm, data);
+}
+
+/// RSASSA-PSS verification (MGF1 with the same hash) of `digest`, which is the digest of
+/// the signed message under `hash`.
+pub Result<unit, PkError> VerifyRsaPss(PublicKey key, RsaHash hash, u8[] digest, u8[] signature, i64 saltLength) {
+    PssSha256 s256 = PssSha256 { unused: 0_i64 };
+    PssSha384 s384 = PssSha384 { unused: 0_i64 };
+    PssSha512 s512 = PssSha512 { unused: 0_i64 };
+    return match hash {
+        RsaHash::Sha256() => Rsa.VerifyPss(key, s256, digest, signature, saltLength),
+        RsaHash::Sha384() => Rsa.VerifyPss(key, s384, digest, signature, saltLength),
+        RsaHash::Sha512() => Rsa.VerifyPss(key, s512, digest, signature, saltLength),
+    };
+}
+
+/// RSASSA-PSS verification of a whole message: hashes it, then verifies.
+pub Result<unit, PkError> VerifyRsaPssMessage(PublicKey key, RsaHash hash, u8[] message, u8[] signature, i64 saltLength) {
+    return VerifyRsaPss(key, hash, HashRsa(hash, message), signature, saltLength);
+}
+
+/// RSASSA-PKCS1-v1_5 verification of a whole message.
+pub Result<unit, PkError> VerifyRsaPkcs1Message(PublicKey key, RsaHash hash, u8[] message, u8[] signature) {
+    return Rsa.VerifyPkcs1v15(key, hash, HashRsa(hash, message), signature);
+}
+
+/// Deterministic (RFC 6979) ECDSA P-256 signature over `digest` as raw `r || s`, with
+/// HMAC-SHA-256 as the nonce MAC (use for SHA-256 digests).
+pub Result<u8[], PkError> SignEcdsaP256(u8[] privateKey, u8[] digest) {
+    NonceHmacSha256 mac = NonceHmacSha256 { unused: 0_i64 };
+    return Ecdsa.Sign(privateKey, digest, mac);
+}
+
+/// As `SignEcdsaP256`, DER-encoded (TLS CertificateVerify, X.509).
+pub Result<u8[], PkError> SignEcdsaP256Der(u8[] privateKey, u8[] digest) {
+    NonceHmacSha256 mac = NonceHmacSha256 { unused: 0_i64 };
+    return Ecdsa.SignDer(privateKey, digest, mac);
+}
+
+/// Deterministic ECDSA P-256 signature over a SHA-384 digest (nonce MAC HMAC-SHA-384).
+pub Result<u8[], PkError> SignEcdsaP256Sha384(u8[] privateKey, u8[] digest) {
+    NonceHmacSha384 mac = NonceHmacSha384 { unused: 0_i64 };
+    return Ecdsa.Sign(privateKey, digest, mac);
+}
+
+/// As `SignEcdsaP256Sha384`, DER-encoded.
+pub Result<u8[], PkError> SignEcdsaP256Sha384Der(u8[] privateKey, u8[] digest) {
+    NonceHmacSha384 mac = NonceHmacSha384 { unused: 0_i64 };
+    return Ecdsa.SignDer(privateKey, digest, mac);
+}
+
+/// ECDSA P-256 signature over the SHA-256 hash of `message`, DER-encoded.
+pub Result<u8[], PkError> SignEcdsaP256MessageDer(u8[] privateKey, u8[] message) {
+    return SignEcdsaP256Der(privateKey, Sha256.Hash(message));
+}
+
+/// ECDSA P-256 verification of a DER signature over the hash of `message`.
+/// `hash` selects SHA-256 or SHA-384 (SHA-512 is also accepted; digests are truncated to 256 bits).
+pub Result<unit, PkError> VerifyEcdsaP256Message(u8[] publicKey, RsaHash hash, u8[] message, u8[] derSignature) {
+    return Ecdsa.VerifyDer(publicKey, HashRsa(hash, message), derSignature);
+}

@@ -1,0 +1,35 @@
+// GAP: the runtime channel table holds 64 channels per process; Channel.Close and GC never release a slot.
+// variant C (Close + CollectGarbage each iteration): creates, sends, receives, closes, collects garbage up to 70 channels and reports the first iteration whose Receive fails.
+use Concurrency.Channel;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Testing.Assert;
+
+string Num(i64 n) {
+    if n < 10_i64 { return String.DigitChar(n); }
+    return Num(n / 10_i64) + String.DigitChar(n % 10_i64);
+}
+
+// Returns the 1-based iteration of the first failed Receive, or 0 if all 70 succeeded.
+i64 FirstFailure() {
+    mut i64 i = 0_i64;
+    while i < 70_i64 {
+        Channel<i64> ch = Channel<i64>.Create();
+        Channel<i64>.Send(ch, 1_i64);
+        match Channel<i64>.Receive(ch) {
+            Result::Ok(_) => (),
+            Result::Error(_) => { return i + 1_i64; },
+        };
+        Channel<i64>.Close(ch);
+        Testing.Assert.CollectGarbage();
+        i = i + 1_i64;
+    }
+    return 0_i64;
+}
+
+test variant_c_close_gc {
+    i64 at = FirstFailure();
+    Output.WriteLine("variant C (Close + CollectGarbage each iteration): first failing Receive at iteration " + Num(at) + " (0 means none of 70 failed)");
+    Assert.Equal<i64>(at, 0_i64, "all 70 channels are usable");
+}

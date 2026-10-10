@@ -1,0 +1,240 @@
+use Testing.Assert;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Http2.Hpack;
+use Http2.HpackDecoder;
+use Http2.HpackEncoder;
+
+// Shared test helpers (each target is compiled on its own).
+
+i64 HexDigit(u8 b) {
+    if b >= 48_u8 && b <= 57_u8 { return i64(b - 48_u8); }
+    if b >= 97_u8 && b <= 102_u8 { return i64(b - 97_u8) + 10_i64; }
+    if b >= 65_u8 && b <= 70_u8 { return i64(b - 65_u8) + 10_i64; }
+    return -1_i64;
+}
+
+u8[] Hex(string text) {
+    mut u8[] out = [];
+    mut i64 high = -1_i64;
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 digit = HexDigit(String.ByteAt(text, i));
+        if digit >= 0_i64 {
+            if high < 0_i64 { high = digit; } else { Array.Append<u8>(out, u8(high * 16_i64 + digit)); high = -1_i64; }
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+string HexText(u8[] data) {
+    string digits = "0123456789abcdef";
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice(digits, b / 16_i64, 1_i64) + String.SubSlice(digits, b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+unit ExpectBytes(u8[] actual, string expectedHex, string because) {
+    Assert.True(Hpack.BytesEqual(actual, Hex(expectedHex)), because + ": got " + HexText(actual) + " want " + HexText(Hex(expectedHex)));
+    return;
+}
+
+string Text(u8[] data) {
+    return match Convert.BytesToString(data) { Result::Ok(text) => text, Result::Error(_) => "<binary " + HexText(data) + ">", };
+}
+
+unit ExpectField(HeaderField field, string name, string value, string because) {
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)) && Hpack.BytesEqual(field.value, Convert.StringToBytes(value)),
+        because + ": got " + Text(field.name) + ": " + Text(field.value) + " want " + name + ": " + value);
+    return;
+}
+
+/// `expected` alternates names and values.
+unit ExpectFields(HeaderField[] fields, string[] expected, string because) {
+    Assert.Equal<i64>(Array.Len<HeaderField>(fields) * 2_i64, Array.Len<string>(expected), because + ": field count");
+    mut i64 i = 0_i64;
+    while i < Array.Len<HeaderField>(fields) {
+        ExpectField(Array.Get<HeaderField>(fields, i), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+HeaderField[] Fields(string[] pairs) {
+    mut HeaderField[] out = Array.Empty<HeaderField>();
+    mut i64 i = 0_i64;
+    while i + 1_i64 < Array.Len<string>(pairs) {
+        Array.Append<HeaderField>(out, Hpack.Field(Array.Get<string>(pairs, i), Array.Get<string>(pairs, i + 1_i64)));
+        i = i + 2_i64;
+    }
+    return out;
+}
+
+Decoder NewTestDecoder(i64 tableSize) {
+    mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
+    limits.settingsTableSize = tableSize;
+    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
+    match created {
+        Result::Ok(decoder) => { return decoder; },
+        Result::Error(_) => { Assert.Fail("NewDecoder"); },
+    };
+    return NewTestDecoder(4096_i64);
+}
+
+Encoder NewTestEncoder(EncoderPolicy policy) {
+    Result<Encoder,HpackError> created = HpackEncoder.NewEncoder(policy);
+    match created {
+        Result::Ok(encoder) => { return encoder; },
+        Result::Error(_) => { Assert.Fail("NewEncoder"); },
+    };
+    return NewTestEncoder(HpackEncoder.DefaultEncoderPolicy());
+}
+
+HeaderField[] DecodeOk(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(fields) => { return fields; },
+        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
+    };
+    return Array.Empty<HeaderField>();
+}
+
+HpackError DecodeErr(mut Decoder decoder, string blockHex, string because) {
+    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match result {
+        Result::Ok(_) => { Assert.Fail(because + ": decode succeeded"); },
+        Result::Error(error) => { return error; },
+    };
+    return HpackError::Truncated;
+}
+
+/// Dynamic table expectations: `expected` alternates names and values, newest first.
+unit ExpectTable(Decoder decoder, string[] expected, i64 size, string because) {
+    Assert.Equal<i64>(HpackDecoder.TableSize(decoder), size, because + ": table size");
+    Assert.Equal<i64>(HpackDecoder.TableCount(decoder) * 2_i64, Array.Len<string>(expected), because + ": table count");
+    mut i64 i = 0_i64;
+    while i < HpackDecoder.TableCount(decoder) {
+        ExpectField(HpackDecoder.TableEntry(decoder, i + 1_i64), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because + ": table entry");
+        i = i + 1_i64;
+    }
+    return;
+}
+
+EncoderPolicy RfcPolicy(i64 tableSize, bool huffman) {
+    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+    policy.tableSize = tableSize;
+    if huffman { policy.huffman = HuffmanMode::Always; } else { policy.huffman = HuffmanMode::Never; }
+    return policy;
+}
+
+/// Stable numbers for HpackError variants, for compact assertions.
+i64 ErrorCode(HpackError error) {
+    return match error {
+        HpackError::Truncated => 1_i64,
+        HpackError::IntegerOverflow => 2_i64,
+        HpackError::InvalidIndex(_) => 3_i64,
+        HpackError::StringTooLong(_) => 4_i64,
+        HpackError::HuffmanPaddingTooLong => 5_i64,
+        HpackError::HuffmanInvalidPadding => 6_i64,
+        HpackError::HuffmanEos => 7_i64,
+        HpackError::SizeUpdateNotAtStart => 8_i64,
+        HpackError::SizeUpdateExceedsLimit(_) => 9_i64,
+        HpackError::SizeUpdateMissing => 10_i64,
+        HpackError::HeaderListTooLarge(_) => 11_i64,
+        HpackError::TooManyFields => 12_i64,
+        HpackError::InvalidText => 13_i64,
+        HpackError::DecoderFailed => 14_i64,
+        HpackError::InvalidLimit(_) => 15_i64,
+    };
+}
+
+unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string because) {
+    HpackError error = DecodeErr(decoder, blockHex, because);
+    Assert.Equal<i64>(ErrorCode(error), code, because);
+    return;
+}
+
+// RFC 7541 Appendix C.3 and C.4 request sequences (generated from the RFC text).
+
+test c3_requests_without_huffman_decode {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] block1 = DecodeOk(decoder, "828684410f7777772e6578616d706c652e636f6d", "C.3.1");
+    ExpectFields(block1, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"], "C.3.1 header list");
+    ExpectTable(decoder, [":authority", "www.example.com"], 57_i64, "C.3.1");
+    HeaderField[] block2 = DecodeOk(decoder, "828684be58086e6f2d6361636865", "C.3.2");
+    ExpectFields(block2, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"], "C.3.2 header list");
+    ExpectTable(decoder, ["cache-control", "no-cache", ":authority", "www.example.com"], 110_i64, "C.3.2");
+    HeaderField[] block3 = DecodeOk(decoder, "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565", "C.3.3");
+    ExpectFields(block3, [":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"], "C.3.3 header list");
+    ExpectTable(decoder, ["custom-key", "custom-value", "cache-control", "no-cache", ":authority", "www.example.com"], 164_i64, "C.3.3");
+}
+
+test c3_requests_without_huffman_encode {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"])), "828684410f7777772e6578616d706c652e636f6d", "C.3.1");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 57_i64, "C.3.1 encoder table size");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"])), "828684be58086e6f2d6361636865", "C.3.2");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 110_i64, "C.3.2 encoder table size");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"])), "828785bf400a637573746f6d2d6b65790c637573746f6d2d76616c7565", "C.3.3");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 164_i64, "C.3.3 encoder table size");
+}
+
+test c3_requests_without_huffman_round_trip {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    u8[] wire1 = HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"]));
+    Result<HeaderField[],HpackError> decoded1 = HpackDecoder.Decode(decoder, wire1);
+    match decoded1 { Result::Ok(fields) => { ExpectFields(fields, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"], "C.3.1 round trip"); }, Result::Error(_) => { Assert.Fail("C.3.1 round trip decode"); }, };
+    u8[] wire2 = HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"]));
+    Result<HeaderField[],HpackError> decoded2 = HpackDecoder.Decode(decoder, wire2);
+    match decoded2 { Result::Ok(fields) => { ExpectFields(fields, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"], "C.3.2 round trip"); }, Result::Error(_) => { Assert.Fail("C.3.2 round trip decode"); }, };
+    u8[] wire3 = HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"]));
+    Result<HeaderField[],HpackError> decoded3 = HpackDecoder.Decode(decoder, wire3);
+    match decoded3 { Result::Ok(fields) => { ExpectFields(fields, [":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"], "C.3.3 round trip"); }, Result::Error(_) => { Assert.Fail("C.3.3 round trip decode"); }, };
+}
+
+test c4_requests_with_huffman_decode {
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    HeaderField[] block1 = DecodeOk(decoder, "828684418cf1e3c2e5f23a6ba0ab90f4ff", "C.4.1");
+    ExpectFields(block1, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"], "C.4.1 header list");
+    ExpectTable(decoder, [":authority", "www.example.com"], 57_i64, "C.4.1");
+    HeaderField[] block2 = DecodeOk(decoder, "828684be5886a8eb10649cbf", "C.4.2");
+    ExpectFields(block2, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"], "C.4.2 header list");
+    ExpectTable(decoder, ["cache-control", "no-cache", ":authority", "www.example.com"], 110_i64, "C.4.2");
+    HeaderField[] block3 = DecodeOk(decoder, "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf", "C.4.3");
+    ExpectFields(block3, [":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"], "C.4.3 header list");
+    ExpectTable(decoder, ["custom-key", "custom-value", "cache-control", "no-cache", ":authority", "www.example.com"], 164_i64, "C.4.3");
+}
+
+test c4_requests_with_huffman_encode {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, true));
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"])), "828684418cf1e3c2e5f23a6ba0ab90f4ff", "C.4.1");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 57_i64, "C.4.1 encoder table size");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"])), "828684be5886a8eb10649cbf", "C.4.2");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 110_i64, "C.4.2 encoder table size");
+    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"])), "828785bf408825a849e95ba97d7f8925a849e95bb8e8b4bf", "C.4.3");
+    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 164_i64, "C.4.3 encoder table size");
+}
+
+test c4_requests_with_huffman_round_trip {
+    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, true));
+    mut Decoder decoder = NewTestDecoder(4096_i64);
+    u8[] wire1 = HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"]));
+    Result<HeaderField[],HpackError> decoded1 = HpackDecoder.Decode(decoder, wire1);
+    match decoded1 { Result::Ok(fields) => { ExpectFields(fields, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com"], "C.4.1 round trip"); }, Result::Error(_) => { Assert.Fail("C.4.1 round trip decode"); }, };
+    u8[] wire2 = HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"]));
+    Result<HeaderField[],HpackError> decoded2 = HpackDecoder.Decode(decoder, wire2);
+    match decoded2 { Result::Ok(fields) => { ExpectFields(fields, [":method", "GET", ":scheme", "http", ":path", "/", ":authority", "www.example.com", "cache-control", "no-cache"], "C.4.2 round trip"); }, Result::Error(_) => { Assert.Fail("C.4.2 round trip decode"); }, };
+    u8[] wire3 = HpackEncoder.Encode(encoder, Fields([":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"]));
+    Result<HeaderField[],HpackError> decoded3 = HpackDecoder.Decode(decoder, wire3);
+    match decoded3 { Result::Ok(fields) => { ExpectFields(fields, [":method", "GET", ":scheme", "https", ":path", "/index.html", ":authority", "www.example.com", "custom-key", "custom-value"], "C.4.3 round trip"); }, Result::Error(_) => { Assert.Fail("C.4.3 round trip decode"); }, };
+}

@@ -1,0 +1,313 @@
+// HTTP/3 over real QUIC + TLS 1.3 on 127.0.0.1: a Beskid HTTP/3 client and
+// server (RFC 9114) over the Beskid QUIC endpoint (RFC 9000/9001). One heavy
+// test (codegen reaches TLS, X.509, QUIC and HTTP/3): ALPN "h3", a GET with a
+// response body, a POST with a 20000-byte body, the server's GOAWAY, then the
+// client's GOAWAY and CONNECTION_CLOSE with H3_NO_ERROR.
+use Testing.Assert;
+use Concurrency.Fiber;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use Codec.Hex;
+use Http.Types;
+use Http2.Hpack;
+use Http3.H3Client;
+use Http3.H3Connection;
+use Http3.H3Errors;
+use Http3.H3Quic;
+use Quic.QuicEndpoint;
+use Http3.H3Server;
+use Tls.PeerKeys;
+use Tls.TlsConfig;
+use X509.X509Errors;
+
+// Progress marks on stdout (assertions inside fibers are not reported, W4).
+[Extern(Abi:"C", Library:"libc")]
+contract Diag { i32 putchar(i32 c); i32 fflush(i64 s); }
+
+i64[] Started() { return [0_i64]; }
+
+unit Mark(i64[] t0, string tag) {
+    if t0[0] == 0_i64 { t0[0] = H3Quic.NowNanos(); }
+    u8[] text = Convert.StringToBytes("[h3q " + tag + " t=" + Dec((H3Quic.NowNanos() - t0[0]) / 1000000_i64) + "ms]");
+    mut i64 i = 0_i64;
+    while i < Slice.Len(text) { i32 r = Diag.putchar(i32(text[i])); i = i + 1_i64; }
+    i32 nl = Diag.putchar(10_i32);
+    i32 f = Diag.fflush(0_i64);
+    return;
+}
+
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+// Datagram counters of the link's endpoint: a gap between one side's tx and the
+// other side's rx is loss (WEB7).
+string Counts(QuicLink link) {
+    return match link {
+        QuicLink::Quic(s) => "rx=" + Dec(QuicEndpoint.DatagramsReceived(s.endpoint)) + " tx=" + Dec(QuicEndpoint.DatagramsSent(s.endpoint)) + " senderr=" + Dec(QuicEndpoint.Diagnostic(s.endpoint, 8_i64)),
+        QuicLink::Memory(_) => "memory",
+    };
+}
+
+string LocalIp() { return "127.0.0.1"; }
+
+i64 PostSize() { return 20000_i64; }
+
+u8 PatternAt(i64 i) { return u8((i * 7_i64 + 3_i64) & 255_i64); }
+
+u8[] Payload() {
+    u8[] out = Slice.New(PostSize());
+    mut i64 i = 0_i64;
+    while i < PostSize() { out[i] = PatternAt(i); i = i + 1_i64; }
+    return out;
+}
+
+Header[] HostOnly() {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Host", value: "localhost" });
+    return headers;
+}
+
+Request Get(string path) { return Request { method: "GET", target: path, headers: HostOnly(), body: Slice.New(0_i64) }; }
+
+Request Post(string path, u8[] body) { return Request { method: "POST", target: path, headers: HostOnly(), body: body }; }
+
+i64 Tag(H3Error e) {
+    return match e {
+        H3Error::Connection(_) => 1_i64,
+        H3Error::Stream(_) => 2_i64,
+        H3Error::InvalidMessage() => 3_i64,
+        H3Error::GoingAway() => 4_i64,
+        H3Error::Timeout() => 5_i64,
+        H3Error::Transport() => 6_i64,
+    };
+}
+
+// step * 100000 + kind * 1000 + wire code (low bits).
+i64 Failure(i64 step, H3Error e) { return step * 100000_i64 + Tag(e) * 1000_i64 + (H3Errors.CodeOf(e) & 511_i64); }
+
+H3Config Config() { return H3Connection.DefaultConfig(); }
+
+TlsServerConfig ServerTls() {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    return TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key);
+}
+
+// The client verifies the server chain against the test root and "localhost".
+TlsClientConfig ClientTls() {
+    Result<CertificateVerification, X509Error> v = TlsConfig.Anchors(TlsConfig.Chain1(RootCertDer()));
+    return match v {
+        Result::Ok(mode) => TlsConfig.Client("localhost", mode),
+        Result::Error(_) => NoClientTls(),
+    };
+}
+
+TlsClientConfig NoClientTls() {
+    Assert.Fail("test root does not parse");
+    return NoClientTls();
+}
+
+// ------------------------------------------------------------ server
+
+i64 Serve(H3Listener listener, i64[] t0) {
+    Mark(t0, "server accepting");
+    Result<H3Conn,H3Error> accepted = H3Server.AcceptQuic(listener, 15000_i64);
+    return match accepted {
+        Result::Ok(conn) => ServeConn(conn, t0),
+        Result::Error(e) => Failure(50_i64, e),
+    };
+}
+
+i64 ServeConn(H3Conn start, i64[] t0) {
+    mut H3Conn conn = start;
+    Mark(t0, "server accepted alpn=" + H3Quic.Alpn(conn.link));
+    if H3Quic.Alpn(conn.link) != "h3" { return 51_i64; }
+    mut i64 served = 0_i64;
+    while served < 2_i64 {
+        H3Incoming incoming = H3Server.NextRequest(conn, 15000_i64);
+        if incoming.streamId < 0_i64 { Mark(t0, "server no request err=" + Dec(H3Connection.ErrorCode(conn))); return 52_i64 + served; }
+        Mark(t0, "server request stream=" + Dec(incoming.streamId));
+        Request request = incoming.request;
+        Response response = Answer(request);
+        Result<unit,H3Error> sent = H3Server.Respond(conn, incoming.streamId, response);
+        i64 failed = match sent { Result::Ok(_) => 0_i64, Result::Error(e) => Failure(55_i64, e), };
+        if failed != 0_i64 { return failed; }
+        Mark(t0, "server responded " + Counts(conn.link));
+        served = served + 1_i64;
+    }
+    // Graceful shutdown: GOAWAY naming the first unprocessed request stream (8).
+    if !H3Server.Shutdown(conn) { return 56_i64; }
+    Mark(t0, "server sent GOAWAY");
+    H3Incoming none = H3Server.NextRequest(conn, 15000_i64);
+    Mark(t0, "server sees close code=" + Dec(H3Connection.ErrorCode(conn)));
+    if none.streamId >= 0_i64 { return 57_i64; }
+    i64 code = H3Connection.ErrorCode(conn);
+    H3Server.Release(conn, 2000_i64);
+    Mark(t0, "server released");
+    if code != H3Errors.NoError() { return 58000_i64 + code; }
+    return 0_i64;
+}
+
+Response Answer(Request request) {
+    mut Header[] headers = Array.Empty<Header>();
+    Array.Append<Header>(headers, Header { name: "Content-Type", value: "application/octet-stream" });
+    if request.method == "GET" && request.target == "/hello" {
+        return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("hello over h3") };
+    }
+    if request.method == "POST" && request.target == "/upload" {
+        u8[] body = request.body;
+        i64 n = Slice.Len(body);
+        mut i64 good = 1_i64;
+        mut i64 i = 0_i64;
+        while i < n { if body[i] != PatternAt(i) { good = 0_i64; } i = i + 1_i64; }
+        u8[] summary = Slice.New(3_i64);
+        summary[0] = u8((n >> 8_i64) & 255_i64);
+        summary[1] = u8(n & 255_i64);
+        summary[2] = u8(good);
+        return Response { status: 201_i64, reason: "Created", headers: headers, body: summary };
+    }
+    return Response { status: 404_i64, reason: "Not Found", headers: headers, body: Slice.New(0_i64) };
+}
+
+// ------------------------------------------------------------ client
+
+i64 Client(i64 port, i64[] t0) {
+    Mark(t0, "client connecting port=" + Dec(port));
+    Result<H3Conn,H3Error> connected = H3Client.ConnectQuic(LocalIp(), port, ClientTls(), Config(), 15000_i64);
+    return match connected {
+        Result::Ok(conn) => Talk(conn, t0),
+        Result::Error(e) => Failure(1_i64, e),
+    };
+}
+
+i64 CheckGet(Result<Response,H3Error> got) {
+    return match got {
+        Result::Ok(response) => GetBody(response),
+        Result::Error(e) => Failure(3_i64, e),
+    };
+}
+
+i64 GetBody(Response response) {
+    if response.status != 200_i64 { return 4_i64; }
+    if !Hpack.BytesEqual(response.body, Convert.StringToBytes("hello over h3")) { return 5_i64; }
+    return 0_i64;
+}
+
+i64 CheckPost(Result<Response,H3Error> got) {
+    return match got {
+        Result::Ok(response) => PostBody(response),
+        Result::Error(e) => Failure(6_i64, e),
+    };
+}
+
+i64 PostBody(Response response) {
+    if response.status != 201_i64 { return 7_i64; }
+    u8[] body = response.body;
+    if Slice.Len(body) != 3_i64 { return 8_i64; }
+    i64 n = i64(body[0]) * 256_i64 + i64(body[1]);
+    if n != PostSize() { return 9_i64; }
+    if body[2] != 1_u8 { return 10_i64; }
+    return 0_i64;
+}
+
+bool IsGoingAway(Result<i64,H3Error> r) {
+    return match r {
+        Result::Ok(_) => false,
+        Result::Error(e) => Tag(e) == 4_i64,
+    };
+}
+
+i64 Talk(H3Conn start, i64[] t0) {
+    mut H3Conn conn = start;
+    Mark(t0, "client connected alpn=" + H3Quic.Alpn(conn.link));
+    if H3Quic.Alpn(conn.link) != "h3" { return 2_i64; }
+    i64 a = CheckGet(H3Client.Send(conn, Get("/hello"), 15000_i64));
+    Mark(t0, "client GET=" + Dec(a) + " " + Counts(conn.link));
+    if a != 0_i64 { return a; }
+    i64 b = CheckPost(H3Client.Send(conn, Post("/upload", Payload()), 20000_i64));
+    Mark(t0, "client POST=" + Dec(b) + " " + Counts(conn.link));
+    if b != 0_i64 { return b; }
+    // The server's GOAWAY names stream 8: requests 0 and 4 were processed.
+    i64 deadline = H3Quic.DeadlineIn(15000_i64);
+    while H3Connection.GoawayReceived(conn) < 0_i64 && !H3Quic.Expired(deadline) {
+        i64 pumped = H3Connection.Pump(conn);
+        H3Quic.Nap();
+    }
+    i64 goaway = H3Connection.GoawayReceived(conn);
+    Mark(t0, "client GOAWAY id=" + Dec(goaway));
+    if goaway != 8_i64 { return 11000_i64 + goaway; }
+    if !IsGoingAway(H3Client.Start(conn, Get("/late"))) { return 12_i64; }
+    if H3Connection.ErrorCode(conn) != -1_i64 { return 13_i64; }
+    H3Client.Close(conn);
+    Mark(t0, "client closed code=" + Dec(H3Quic.CloseCode(conn.link)));
+    if H3Quic.CloseCode(conn.link) != H3Errors.NoError() { return 14_i64; }
+    return 0_i64;
+}
+
+// ------------------------------------------------------------ scenario
+
+// Runs inside a fiber (the test root is not a fiber). Returns 0 or a step code.
+i64 Scenario() {
+    Result<H3Listener,H3Error> bound = H3Server.ListenQuic(LocalIp(), 0_i64, ServerTls(), Config());
+    return match bound {
+        Result::Ok(listener) => WithListener(listener),
+        Result::Error(e) => Failure(90_i64, e),
+    };
+}
+
+i64 WithListener(H3Listener listener) {
+    i64[] t0 = Started();
+    Mark(t0, "listening");
+    i64 port = H3Server.ListenPort(listener);
+    if port <= 0_i64 {
+        H3Server.StopListening(listener);
+        return 91_i64;
+    }
+    Fiber<i64> server = spawn (() => Serve(listener, t0));
+    i64 step = Client(port, t0);
+    Mark(t0, "client step=" + Dec(step));
+    i64 served = match server.Join() { Result::Ok(v) => v, Result::Error(_) => -9_i64, };
+    Mark(t0, "server result=" + Dec(served));
+    H3Server.StopListening(listener);
+    if step != 0_i64 { return step; }
+    if served != 0_i64 { return 9000000_i64 + served; }
+    return 0_i64;
+}
+
+test h3_over_quic_tls_loopback {
+    Fiber<i64> scenario = spawn Scenario();
+    i64 result = match scenario.Join() { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+    if result != 0_i64 { Assert.Fail("HTTP/3 over QUIC loopback failed at step " + Dec(result)); }
+    Assert.Equal<i64>(result, 0_i64, "HTTP/3 over QUIC loopback");
+}
+
+u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}
+
+u8[] RootCertDer() {
+    string s = "3082019b30820141a00302010202143cc5b42faaa832daa7def808045536bbb6ddf944300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a301b3119301706035504030c104265736b6964205465737420526f6f743059301306072a8648ce3d020106082a8648ce3d030107034200048f4684a2e70c8677b376730c494a3546e98fb943810d320fcfffa26392a5110bc6e1f045"
+        + "ac328a4017509ec27c8201c8e65d18f99bafb9e40ef52c7821d5d50aa3633061301d0603551d0e0416041446dda763d1978ccc27a6f76bd7519ff9619f4eb7301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300f0603"
+        + "551d130101ff040530030101ff300e0603551d0f0101ff040403020204300a06082a8648ce3d040302034800304502200c22ab56867a1fda253fb2c517682802dd87d91a6f152a0fd8ff2c4572d11bb2022100e8f98b28d498dfc5f8aae457d71cd4f433"
+        + "94ab8ac6d6ca6d526e21bc35bd1e7a"
+        ;
+    return Hex.Of(s);
+}

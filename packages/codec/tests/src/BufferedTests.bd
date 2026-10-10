@@ -1,0 +1,171 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.IO.IoError;
+use Core.IO.Reader;
+use Core.IO.TransferFailure;
+use Core.Results;
+use Codec.Buffered;
+use Codec.Errors;
+use Codec.Hex;
+
+// In-memory reader that yields at most `chunk` bytes per call (partial reads).
+pub type MemReader: Reader {
+    u8[] data,
+    i64 pos,
+    i64 chunk,
+    i64 reads,
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) { return DoMemRead(this, destination, offset, count); }
+}
+Result<i64, IoError> DoMemRead(MemReader self, u8[] destination, i64 offset, i64 count) {
+    self.reads = self.reads + 1_i64;
+    i64 left = Slice.Len(self.data) - self.pos;
+    mut i64 n = count;
+    if left < n { n = left; }
+    if self.chunk < n { n = self.chunk; }
+    if n > 0_i64 { Slice.Copy(destination, offset, self.data, self.pos, n); }
+    self.pos = self.pos + n;
+    return Result::Ok(n);
+}
+// Reader that always fails.
+pub type FailReader: Reader {
+    i64 unused,
+    pub Result<i64, IoError> Read(u8[] destination, i64 offset, i64 count) { return Result::Error(IoError::ReadFailed(TransferFailure::Unspecified())); }
+}
+
+MemReader Mem(string hex, i64 chunk) { return MemReader { data: Hex.Of(hex), pos: 0_i64, chunk: chunk, reads: 0_i64 }; }
+i64 Err<T>(Result<T, CodecError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }; }
+string Body(Result<u8[], CodecError> r) { return match r { Result::Ok(b) => Hex.Encode(b), Result::Error(_) => "ERR", }; }
+i64 Val(Result<i64, CodecError> r) { return match r { Result::Ok(v) => v, Result::Error(_) => -999_i64, }; }
+
+test fill_reports_progress_and_eof {
+    MemReader rm = Mem("01 02 03", 2_i64);
+    BufferedReader r = Buffered.New(8_i64);
+    Assert.Equal<i64>(Val(Buffered.Fill(r, rm)), 2_i64, "first chunk");
+    Assert.Equal<i64>(Val(Buffered.Fill(r, rm)), 1_i64, "second chunk");
+    Assert.Equal<i64>(r.Buffered(), 3_i64, "buffered");
+    Assert.Equal<i64>(Val(Buffered.Fill(r, rm)), 0_i64, "eof");
+    Assert.True(r.AtEof(), "eof flag");
+}
+
+test peek_does_not_consume {
+    MemReader rm = Mem("aa bb cc dd", 1_i64);
+    BufferedReader r = Buffered.New(8_i64);
+    Assert.Equal<string>(Body(Buffered.Peek(r, rm, 3_i64)), "aabbcc", "peek 3 across 1-byte reads");
+    Assert.Equal<string>(Body(Buffered.Peek(r, rm, 2_i64)), "aabb", "peek again");
+    Assert.Equal<i64>(Val(Buffered.Peek8(r, rm)), 0xaa_i64, "peek8");
+    Assert.Equal<string>(Body(Buffered.ReadExact(r, rm, 4_i64, 16_i64)), "aabbccdd", "read after peek");
+    Assert.Equal<i64>(Err(Buffered.Peek(r, rm, 1_i64)), 1_i64, "eof is truncated");
+}
+
+test peek_beyond_capacity_is_buffer_full {
+    MemReader rm = Mem("01 02 03 04 05 06", 6_i64);
+    BufferedReader r = Buffered.New(4_i64);
+    Assert.Equal<i64>(Err(Buffered.Peek(r, rm, 5_i64)), 7_i64, "capacity 4");
+    Assert.Equal<string>(Body(Buffered.Peek(r, rm, 4_i64)), "01020304", "capacity ok");
+}
+
+test read_exact_small_and_truncated {
+    MemReader rm = Mem("01 02 03 04 05", 2_i64);
+    BufferedReader r = Buffered.New(8_i64);
+    Assert.Equal<string>(Body(Buffered.ReadExact(r, rm, 2_i64, 8_i64)), "0102", "first");
+    Assert.Equal<string>(Body(Buffered.ReadExact(r, rm, 3_i64, 8_i64)), "030405", "second");
+    Assert.Equal<i64>(Err(Buffered.ReadExact(r, rm, 1_i64, 8_i64)), 1_i64, "truncated");
+    MemReader sm = Mem("01 02", 1_i64);
+    BufferedReader s = Buffered.New(8_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadExact(s, sm, 3_i64, 8_i64)), 1_i64, "short stream");
+}
+
+test read_exact_above_capacity_streams_directly {
+    MemReader rm = Mem("01 02 03 04 05 06 07 08 09 0a", 3_i64);
+    BufferedReader r = Buffered.New(4_i64);
+    Assert.Equal<string>(Body(Buffered.Peek(r, rm, 2_i64)), "0102", "prime buffer");
+    Assert.Equal<string>(Body(Buffered.ReadExact(r, rm, 9_i64, 32_i64)), "010203040506070809", "drains buffer then source");
+    Assert.Equal<string>(Body(Buffered.ReadExact(r, rm, 1_i64, 32_i64)), "0a", "tail");
+}
+
+test read_exact_limit {
+    MemReader rm = Mem("01 02 03 04 05", 5_i64);
+    BufferedReader r = Buffered.New(8_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadExact(r, rm, 5_i64, 4_i64)), 3_i64, "limit exceeded");
+    Assert.Equal<i64>(Err(Buffered.ReadExact(r, rm, -1_i64, 4_i64)), 6_i64, "negative");
+    Assert.Equal<string>(Body(Buffered.ReadExact(r, rm, 5_i64, 5_i64)), "0102030405", "at limit");
+}
+
+test read_until_delimiter {
+    MemReader rm = Mem("61 62 3a 63 3a 3a 64", 2_i64);
+    BufferedReader r = Buffered.New(16_i64);
+    Assert.Equal<string>(Body(Buffered.ReadUntil(r, rm, u8(58), 10_i64)), "6162", "first field");
+    Assert.Equal<string>(Body(Buffered.ReadUntil(r, rm, u8(58), 10_i64)), "63", "second field");
+    Assert.Equal<string>(Body(Buffered.ReadUntil(r, rm, u8(58), 10_i64)), "", "empty field");
+    Assert.Equal<i64>(Err(Buffered.ReadUntil(r, rm, u8(58), 10_i64)), 1_i64, "eof before delimiter");
+}
+
+test read_until_limits {
+    MemReader rm = Mem("61 62 63 64 65 3a", 6_i64);
+    BufferedReader r = Buffered.New(16_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadUntil(r, rm, u8(58), 4_i64)), 3_i64, "5 bytes before delimiter, limit 4");
+    MemReader sm = Mem("61 62 63 64 65 66 67 68 3a", 2_i64);
+    BufferedReader s = Buffered.New(4_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadUntil(s, sm, u8(58), 100_i64)), 3_i64, "bounded by buffer capacity");
+    MemReader tm = Mem("61 62 3a", 3_i64);
+    BufferedReader t = Buffered.New(16_i64);
+    Assert.Equal<string>(Body(Buffered.ReadUntil(t, tm, u8(58), 2_i64)), "6162", "exactly at limit");
+}
+
+test read_line_crlf {
+    MemReader rm = Mem("48 54 54 50 0d 0a 0d 0a 78 0d 0a", 1_i64);
+    BufferedReader r = Buffered.New(16_i64);
+    Assert.Equal<string>(Body(Buffered.ReadLine(r, rm, 16_i64)), "48545450", "line");
+    Assert.Equal<string>(Body(Buffered.ReadLine(r, rm, 16_i64)), "", "empty line");
+    Assert.Equal<string>(Body(Buffered.ReadLine(r, rm, 16_i64)), "78", "last line");
+    Assert.Equal<i64>(Err(Buffered.ReadLine(r, rm, 16_i64)), 1_i64, "eof");
+}
+
+test read_line_errors {
+    MemReader am = Mem("41 0a", 2_i64);
+    BufferedReader a = Buffered.New(16_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadLine(a, am, 16_i64)), 5_i64, "bare lf");
+    MemReader bm = Mem("41 42 43 44 45 0d 0a", 2_i64);
+    BufferedReader b = Buffered.New(16_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadLine(b, bm, 4_i64)), 3_i64, "too long");
+    MemReader cm = Mem("41 42", 2_i64);
+    BufferedReader c = Buffered.New(16_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadLine(c, cm, 16_i64)), 1_i64, "eof mid line");
+    MemReader dm = Mem("41 42 43 44 45 46 47 48 49", 9_i64);
+    BufferedReader d = Buffered.New(4_i64);
+    Assert.Equal<i64>(Err(Buffered.ReadLine(d, dm, 100_i64)), 7_i64, "line longer than buffer");
+}
+
+test read_some_serves_buffer_then_source {
+    MemReader rm = Mem("01 02 03 04 05", 5_i64);
+    BufferedReader r = Buffered.New(8_i64);
+    Assert.Equal<string>(Body(Buffered.Peek(r, rm, 2_i64)), "0102", "buffer two");
+    u8[] dst = Slice.New(8_i64);
+    Result<i64, IoError> a = Buffered.ReadSome(r, rm, dst, 0_i64, 8_i64);
+    match a {
+        Result::Ok(n) => { Assert.Equal<i64>(n, 5_i64, "serves buffered bytes first"); },
+        Result::Error(_) => { Assert.Fail("read"); },
+    };
+    Assert.Equal<string>(Hex.Encode(Slice.SubSlice(dst, 0_i64, 5_i64)), "0102030405", "content");
+    Result<i64, IoError> b = Buffered.ReadSome(r, rm, dst, 0_i64, 8_i64);
+    match b {
+        Result::Ok(n) => { Assert.Equal<i64>(n, 0_i64, "eof"); },
+        Result::Error(_) => { Assert.Fail("eof read"); },
+    };
+}
+
+test io_failure_keeps_cause {
+    FailReader rm = FailReader { unused: 0_i64 };
+    BufferedReader r = Buffered.New(8_i64);
+    Result<u8[], CodecError> p = Buffered.Peek(r, rm, 1_i64);
+    match p {
+        Result::Ok(_) => { Assert.Fail("expected failure"); },
+        Result::Error(e) => {
+            Assert.Equal<i64>(Errors.Code(e), 8_i64, "io error");
+            match e {
+                CodecError::Io(cause) => { match cause { IoError::ReadFailed(_) => {}, _ => { Assert.Fail("wrong cause"); }, }; },
+                _ => { Assert.Fail("not io"); },
+            };
+        },
+    };
+}

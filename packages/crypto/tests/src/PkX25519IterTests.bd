@@ -1,0 +1,70 @@
+/// X25519 RFC 7748 section 5.2 iterated vector (1000 iterations); slow, kept in its own target.
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Output;
+use Core.Results;
+use Core.String;
+use Core.Time;
+use Crypto.X25519;
+use Crypto.PkErrors;
+
+pub u8 PkNibble(u8 c) {
+    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
+    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
+    if c >= u8(65) && c <= u8(70) { return c - u8(55); }
+    return u8(0);
+}
+
+/// Test-only hex decoder; an odd-length string gets an implicit leading zero nibble.
+pub u8[] Hex(string text) {
+    i64 len = String.Len(text);
+    i64 odd = len % 2_i64;
+    u8[] out = Slice.New((len + 1_i64) / 2_i64);
+    mut i64 i = 0_i64;
+    while i < len {
+        i64 pos = i + odd;
+        u8 nib = PkNibble(String.ByteAt(text, i));
+        i64 index = pos / 2_i64;
+        if pos % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string HexDigit(u8 v) {
+    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
+    return String.CodeUnitChar(v + u8(87));
+}
+
+pub string ToHex(u8[] bytes) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(bytes) {
+        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string Dec(i64 v) {
+    if v < 10_i64 { return String.DigitChar(v); }
+    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
+}
+
+pub i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
+
+test pk_x25519_1000_iterations {
+    mut u8[] k = Hex("0900000000000000000000000000000000000000000000000000000000000000");
+    mut u8[] u = Hex("0900000000000000000000000000000000000000000000000000000000000000");
+    i64 start = NowNanos();
+    mut i64 i = 0_i64;
+    while i < 1000_i64 {
+        Result<u8[], PkError> r = X25519.ScalarMult(k, u);
+        u8[] next = match r { Result::Ok(v) => v, Result::Error(_) => Slice.New(32_i64), };
+        u = k;
+        k = next;
+        i = i + 1_i64;
+    }
+    Output.WriteLine("x25519 1000 iterations: " + Dec((NowNanos() - start) / 1000000_i64) + " ms");
+    Assert.Equal<string>(ToHex(k), "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51", "RFC 7748 5.2 after 1000 iterations");
+}

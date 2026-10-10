@@ -1,0 +1,142 @@
+use Core.String;
+
+// ASCII character classes of RFC 3986 and small string helpers shared by the package.
+// Bytes are compared as i64 values.
+
+/// Concatenation that never joins two empty strings: in 0.5.2 `"" + ""` is not equal to
+/// the literal "" (see COMPILER-GAPS.md).
+pub string Cat(string a, string b) {
+    if String.Len(a) == 0_i64 { return b; }
+    if String.Len(b) == 0_i64 { return a; }
+    return a + b;
+}
+
+/// Byte of `text` at `index` as i64.
+pub i64 B(string text, i64 index) { return i64(String.ByteAt(text, index)); }
+
+/// Substring [start, stop) with the range clamped to the text.
+pub string Sub(string text, i64 start, i64 stop) {
+    i64 n = String.Len(text);
+    mut i64 a = start;
+    mut i64 z = stop;
+    if a < 0_i64 { a = 0_i64; }
+    if z > n { z = n; }
+    if z <= a { return ""; }
+    return String.SubSlice(text, a, z - a);
+}
+
+/// One-character string for a printable ASCII byte (32..126), else the empty string.
+pub string CharOf(i64 c) {
+    if c < 32_i64 || c > 126_i64 { return ""; }
+    return String.SubSlice(" !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~", c - 32_i64, 1_i64);
+}
+
+/// One-byte string of `text` at `index`.
+pub string CharAt(string text, i64 index) { return String.SubSlice(text, index, 1_i64); }
+
+/// True when `literal` occurs in `text` at byte offset `at`.
+pub bool StartsAt(string text, i64 at, string literal) {
+    i64 n = String.Len(literal);
+    if at < 0_i64 || at + n > String.Len(text) { return false; }
+    mut i64 i = 0_i64;
+    while i < n {
+        if B(text, at + i) != B(literal, i) { return false; }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+/// Index of the first `target` byte in [from, stop), or -1.
+pub i64 IndexOf(string text, i64 target, i64 from, i64 stop) {
+    mut i64 i = from;
+    while i < stop {
+        if B(text, i) == target { return i; }
+        i = i + 1_i64;
+    }
+    return -1_i64;
+}
+
+/// Index of the last `target` byte in [from, stop), or -1.
+pub i64 LastIndexOf(string text, i64 target, i64 from, i64 stop) {
+    mut i64 i = stop - 1_i64;
+    while i >= from {
+        if B(text, i) == target { return i; }
+        i = i - 1_i64;
+    }
+    return -1_i64;
+}
+
+pub bool IsAlpha(i64 c) { return (c >= 65_i64 && c <= 90_i64) || (c >= 97_i64 && c <= 122_i64); }
+pub bool IsDigit(i64 c) { return c >= 48_i64 && c <= 57_i64; }
+pub bool IsHex(i64 c) { return IsDigit(c) || (c >= 65_i64 && c <= 70_i64) || (c >= 97_i64 && c <= 102_i64); }
+
+/// Value 0..15 of a hexadecimal digit, or -1.
+pub i64 HexValue(i64 c) {
+    if IsDigit(c) { return c - 48_i64; }
+    if c >= 65_i64 && c <= 70_i64 { return c - 55_i64; }
+    if c >= 97_i64 && c <= 102_i64 { return c - 87_i64; }
+    return -1_i64;
+}
+
+/// ALPHA DIGIT - . _ ~
+pub bool IsUnreserved(i64 c) {
+    return IsAlpha(c) || IsDigit(c) || c == 45_i64 || c == 46_i64 || c == 95_i64 || c == 126_i64;
+}
+
+/// ! $ & ' ( ) * + , ; =
+pub bool IsSubDelim(i64 c) {
+    return c == 33_i64 || c == 36_i64 || c == 38_i64 || c == 39_i64 || c == 40_i64 || c == 41_i64 || c == 42_i64 || c == 43_i64 || c == 44_i64 || c == 59_i64 || c == 61_i64;
+}
+
+/// : / ? # [ ] @
+pub bool IsGenDelim(i64 c) {
+    return c == 58_i64 || c == 47_i64 || c == 63_i64 || c == 35_i64 || c == 91_i64 || c == 93_i64 || c == 64_i64;
+}
+
+/// pchar without the percent form: unreserved / sub-delims / ":" / "@"
+pub bool IsPchar(i64 c) { return IsUnreserved(c) || IsSubDelim(c) || c == 58_i64 || c == 64_i64; }
+
+/// Any byte that may appear in a URI reference at all (percent signs included).
+pub bool IsUriByte(i64 c) { return IsUnreserved(c) || IsSubDelim(c) || IsGenDelim(c) || c == 37_i64; }
+
+pub string LowerAscii(string text) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 c = B(text, i);
+        if c >= 65_i64 && c <= 90_i64 {
+            out = out + String.SubSlice("abcdefghijklmnopqrstuvwxyz", c - 65_i64, 1_i64);
+        } else {
+            out = out + CharAt(text, i);
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+pub string UpperAscii(string text) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < String.Len(text) {
+        i64 c = B(text, i);
+        if c >= 97_i64 && c <= 122_i64 {
+            out = out + String.SubSlice("ABCDEFGHIJKLMNOPQRSTUVWXYZ", c - 97_i64, 1_i64);
+        } else {
+            out = out + CharAt(text, i);
+        }
+        i = i + 1_i64;
+    }
+    return out;
+}
+
+/// Decimal text of a non-negative integer.
+pub string DecimalText(i64 value) {
+    if value <= 0_i64 { return "0"; }
+    mut string out = "";
+    mut i64 v = value;
+    while v > 0_i64 {
+        out = String.SubSlice("0123456789", v % 10_i64, 1_i64) + out;
+        v = v / 10_i64;
+    }
+    return out;
+}

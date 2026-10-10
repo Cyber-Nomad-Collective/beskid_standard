@@ -1,0 +1,122 @@
+// RFC 9002: RTT estimation, ACK processing, packet/time threshold loss, PTO and NewReno.
+use Testing.Assert;
+use Quic.QuicCongestion;
+use Quic.QuicRecovery;
+
+i64 Ms(i64 v) { return v * 1000000_i64; }
+
+test rtt_estimation_follows_rfc9002 {
+    Recovery rec = QuicRecovery.New(8_i64, 8_i64, 16_i64, 1200_i64);
+    Assert.Equal<i64>(QuicRecovery.SmoothedRtt(rec), Ms(333_i64), "initial rtt");
+    QuicRecovery.UpdateRtt(rec, Ms(100_i64), 0_i64, true, Ms(1_i64));
+    Assert.Equal<i64>(QuicRecovery.SmoothedRtt(rec), Ms(100_i64), "first sample");
+    Assert.Equal<i64>(QuicRecovery.RttVar(rec), Ms(50_i64), "rttvar half");
+    Assert.Equal<i64>(QuicRecovery.MinRtt(rec), Ms(100_i64), "min");
+    QuicRecovery.SetMaxAckDelay(rec, Ms(25_i64));
+    QuicRecovery.UpdateRtt(rec, Ms(160_i64), Ms(40_i64), true, Ms(2_i64));
+    // ack delay capped to 25 ms: adjusted 135; rttvar = (3*50 + 35)/4; smoothed = (7*100 + 135)/8.
+    Assert.Equal<i64>(QuicRecovery.SmoothedRtt(rec), (Ms(700_i64) + Ms(135_i64)) / 8_i64, "smoothed");
+    Assert.Equal<i64>(QuicRecovery.RttVar(rec), (Ms(150_i64) + Ms(35_i64)) / 4_i64, "rttvar");
+    QuicRecovery.UpdateRtt(rec, Ms(110_i64), Ms(20_i64), true, Ms(3_i64));
+    Assert.Equal<i64>(QuicRecovery.LatestRtt(rec), Ms(110_i64), "latest");
+    Assert.Equal<i64>(QuicRecovery.MinRtt(rec), Ms(100_i64), "min unchanged");
+    // latest < min + delay: the ack delay is not subtracted.
+    QuicRecovery.UpdateRtt(rec, Ms(90_i64), Ms(20_i64), true, Ms(4_i64));
+    Assert.Equal<i64>(QuicRecovery.MinRtt(rec), Ms(90_i64), "new min");
+}
+
+test ack_processing_and_packet_threshold_loss {
+    Recovery rec = QuicRecovery.New(8_i64, 8_i64, 16_i64, 1200_i64);
+    mut i64 pn = 0_i64;
+    while pn < 6_i64 {
+        i64 record = QuicRecovery.OnPacketSent(rec, 2_i64, pn, Ms(pn), 1200_i64, true, true);
+        Assert.True(QuicRecovery.AddItem(rec, 2_i64, record, 0_i64, pn * 1000_i64, 1000_i64, 0_i64), "item");
+        pn = pn + 1_i64;
+    }
+    Assert.Equal<i64>(QuicCongestion.BytesInFlight(rec.cc), 7200_i64, "in flight");
+    Assert.Equal<i64>(QuicRecovery.AckElicitingInFlight(rec, 2_i64), 6_i64, "eliciting in flight");
+    // ACK 4..5: packets 0..2 are 3+ below the largest acked and are lost; 3 waits.
+    Assert.Equal<i64>(QuicRecovery.OnAckReceived(rec, 2_i64, [5_i64, 4_i64], 0_i64, Ms(50_i64), true), 2_i64, "two newly acked");
+    Assert.Equal<i64>(QuicRecovery.LatestRtt(rec), Ms(45_i64), "rtt from largest");
+    Assert.Equal<i64>(QuicRecovery.LargestAcked(rec, 2_i64), 5_i64, "largest acked");
+    mut i64 lost = 0_i64;
+    mut i64 r = QuicRecovery.NextMarked(rec, 2_i64, QuicRecovery.StateLost());
+    while r >= 0_i64 {
+        Assert.True(QuicRecovery.RecordPn(rec, 2_i64, r) <= 2_i64, "lost packets are 0..2");
+        Assert.Equal<i64>(QuicRecovery.RecordItems(rec, 2_i64, r), 1_i64, "item kept");
+        lost = lost + 1_i64;
+        QuicRecovery.Release(rec, 2_i64, r);
+        r = QuicRecovery.NextMarked(rec, 2_i64, QuicRecovery.StateLost());
+    }
+    Assert.Equal<i64>(lost, 3_i64, "three lost");
+    // Congestion response: window halved from 12000 + 2400 acked growth in slow start.
+    Assert.Equal<i64>(QuicCongestion.Window(rec.cc), 7200_i64, "window after loss");
+    Assert.Equal<i64>(QuicCongestion.BytesInFlight(rec.cc), 1200_i64, "one left in flight");
+    // Packet 3 gets a time-threshold loss timer.
+    i64[] t = [0_i64, 0_i64, 0_i64];
+    QuicRecovery.Timer(rec, true, false, Ms(50_i64), t);
+    Assert.Equal<i64>(t[2], 0_i64, "loss timer, not PTO");
+    Assert.Equal<i64>(t[0], Ms(3_i64) + QuicRecovery.LossDelay(rec), "loss time of packet 3");
+    Assert.Equal<i64>(QuicRecovery.OnTimeout(rec, true, false, t[0]), 2_i64, "loss detection ran");
+    Assert.Equal<i64>(QuicCongestion.BytesInFlight(rec.cc), 0_i64, "all lost or acked");
+    Assert.Equal<i64>(QuicCongestion.Window(rec.cc), 7200_i64, "one reduction per recovery period");
+}
+
+test pto_backoff_and_space_discard {
+    Recovery rec = QuicRecovery.New(8_i64, 8_i64, 16_i64, 1200_i64);
+    QuicRecovery.OnPacketSent(rec, 0_i64, 0_i64, Ms(0_i64), 1200_i64, true, true);
+    i64[] t = [0_i64, 0_i64, 0_i64];
+    QuicRecovery.Timer(rec, false, false, 0_i64, t);
+    // smoothed 333 + 4 * 166.5 = 999 ms.
+    Assert.Equal<i64>(t[0], Ms(999_i64), "initial PTO");
+    Assert.Equal<i64>(t[1], 0_i64, "Initial space");
+    Assert.Equal<i64>(t[2], 1_i64, "is PTO");
+    Assert.Equal<i64>(QuicRecovery.OnTimeout(rec, false, false, Ms(998_i64)), -1_i64, "not yet");
+    Assert.Equal<i64>(QuicRecovery.OnTimeout(rec, false, false, Ms(999_i64)), 10_i64, "PTO in Initial");
+    Assert.Equal<i64>(QuicRecovery.PtoCount(rec), 1_i64, "backoff");
+    QuicRecovery.Timer(rec, false, false, 0_i64, t);
+    Assert.Equal<i64>(t[0], Ms(1998_i64), "doubled");
+    // Application packets do not arm a PTO before the handshake is confirmed.
+    QuicRecovery.OnPacketSent(rec, 2_i64, 0_i64, Ms(10_i64), 1200_i64, true, true);
+    QuicRecovery.DiscardSpace(rec, 0_i64);
+    Assert.Equal<i64>(QuicCongestion.BytesInFlight(rec.cc), 1200_i64, "discarded bytes left flight");
+    QuicRecovery.Timer(rec, false, false, 0_i64, t);
+    Assert.Equal<i64>(t[0], -1_i64, "no timer before confirmation");
+    QuicRecovery.Timer(rec, false, true, Ms(100_i64), t);
+    Assert.Equal<i64>(t[1], 1_i64, "anti-deadlock PTO in Handshake after Initial discard");
+    QuicRecovery.Timer(rec, true, false, 0_i64, t);
+    Assert.Equal<i64>(t[0], Ms(10_i64) + Ms(999_i64) + Ms(25_i64), "application PTO adds max_ack_delay");
+}
+
+test newreno_window_evolution_and_persistent_congestion {
+    i64[] cc = QuicCongestion.New(1200_i64);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 12000_i64, "initial window");
+    QuicCongestion.OnPacketSent(cc, 12000_i64);
+    Assert.False(QuicCongestion.CanSend(cc, 1_i64), "window full");
+    QuicCongestion.OnPacketAcked(cc, 1200_i64, Ms(1_i64), false);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 13200_i64, "slow start growth");
+    QuicCongestion.OnPacketsLost(cc, 1200_i64, Ms(2_i64), Ms(10_i64), false);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 6600_i64, "halved");
+    Assert.False(QuicCongestion.InSlowStart(cc), "congestion avoidance");
+    QuicCongestion.OnPacketAcked(cc, 1200_i64, Ms(5_i64), false);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 6600_i64, "no growth for packets sent before recovery");
+    QuicCongestion.OnPacketAcked(cc, 6600_i64, Ms(11_i64), false);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 7800_i64, "additive increase of one datagram per window");
+    QuicCongestion.OnPacketsLost(cc, 1200_i64, Ms(9_i64), Ms(20_i64), false);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 7800_i64, "loss inside recovery ignored");
+    QuicCongestion.OnEcnCe(cc, 1_i64, Ms(12_i64), Ms(30_i64));
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 3900_i64, "ECN-CE reduces");
+    QuicCongestion.OnPacketsLost(cc, 0_i64, Ms(31_i64), Ms(40_i64), true);
+    Assert.Equal<i64>(QuicCongestion.Window(cc), 2400_i64, "persistent congestion collapses to minimum");
+    // Persistent congestion detected from the loss pattern.
+    Recovery rec = QuicRecovery.New(8_i64, 8_i64, 16_i64, 1200_i64);
+    QuicRecovery.OnPacketSent(rec, 2_i64, 0_i64, Ms(0_i64), 1200_i64, true, true);
+    QuicRecovery.OnAckReceived(rec, 2_i64, [0_i64, 0_i64], 0_i64, Ms(10_i64), true);
+    QuicRecovery.OnPacketSent(rec, 2_i64, 1_i64, Ms(20_i64), 1200_i64, true, true);
+    QuicRecovery.OnPacketSent(rec, 2_i64, 2_i64, Ms(2000_i64), 1200_i64, true, true);
+    QuicRecovery.OnPacketSent(rec, 2_i64, 3_i64, Ms(2100_i64), 1200_i64, true, true);
+    QuicRecovery.OnPacketSent(rec, 2_i64, 4_i64, Ms(2200_i64), 1200_i64, true, true);
+    QuicRecovery.OnPacketSent(rec, 2_i64, 5_i64, Ms(2300_i64), 1200_i64, true, true);
+    QuicRecovery.OnAckReceived(rec, 2_i64, [5_i64, 5_i64], 0_i64, Ms(2310_i64), true);
+    Assert.Equal<i64>(QuicCongestion.Window(rec.cc), 2400_i64, "persistent congestion");
+}

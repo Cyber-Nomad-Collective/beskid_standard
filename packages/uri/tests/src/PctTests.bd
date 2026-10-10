@@ -1,0 +1,28 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Core.String;
+use Uri.Errors;
+use Core.Encoding.Utf8;
+use Uri.Pct;
+
+string DecHex(string text) {
+    Result<u8[], UriError> r = Pct.Decode(text);
+    return match r { Result::Ok(data) => HexOf(data), Result::Error(e) => "ERR" + Errors.Code(e), };
+}
+string HexOf(u8[] data) {
+    mut string out = "";
+    mut i64 i = 0_i64;
+    while i < Slice.Len(data) {
+        i64 b = i64(data[i]);
+        out = out + String.SubSlice("0123456789abcdef", b / 16_i64, 1_i64) + String.SubSlice("0123456789abcdef", b % 16_i64, 1_i64);
+        i = i + 1_i64;
+    }
+    return out;
+}
+test decode_41_42_group { Assert.Equal<string>(DecHex("%41%42"), "4142", "octets"); Assert.Equal<string>(DecHex("a%20b"), "612062", "octets"); Assert.Equal<string>(DecHex("%00%ff%FF"), "00ffff", "octets"); Assert.Equal<string>(DecHex("abc"), "616263", "octets"); Assert.Equal<string>(DecHex(""), "", "octets"); Assert.Equal<string>(DecHex("%e2%82%ac"), "e282ac", "octets"); Assert.Equal<string>(DecHex("%"), "ERR3", "malformed escape"); Assert.Equal<string>(DecHex("%4"), "ERR3", "malformed escape"); }
+test decode_bad_zz_group { Assert.Equal<string>(DecHex("%zz"), "ERR3", "malformed escape"); Assert.Equal<string>(DecHex("a%2"), "ERR3", "malformed escape"); Assert.Equal<string>(DecHex("%g1"), "ERR3", "malformed escape"); Assert.Equal<string>(DecHex("100%"), "ERR3", "malformed escape"); Assert.Equal<string>(DecHex("%%41"), "ERR3", "malformed escape"); }
+test decode_string_utf8 { Result<string, UriError> r = Pct.DecodeString("caf%C3%A9"); match r { Result::Ok(s) => { Assert.Equal<i64>(String.Len(s), 5_i64, "five utf8 bytes"); }, Result::Error(_) => { Assert.Fail("decode"); }, }; }
+test encode_encodecomponent_a_b_c_d_e_f_group { Assert.Equal<string>(Pct.EncodeComponent("a b/c?d=e&f"), "a%20b%2Fc%3Fd%3De%26f", "encoded"); Assert.Equal<string>(Pct.EncodeComponent("AZaz09-._~"), "AZaz09-._~", "encoded"); Assert.Equal<string>(Pct.EncodeComponent("100%"), "100%25", "encoded"); Assert.Equal<string>(Pct.EncodePath("a/b c:d@e"), "a/b%20c:d@e", "encoded"); Assert.Equal<string>(Pct.EncodePath("a?b#c"), "a%3Fb%23c", "encoded"); Assert.Equal<string>(Pct.EncodeQuery("a b?c/d#e"), "a%20b?c/d%23e", "encoded"); Assert.Equal<string>(Pct.EncodeFragment("a b?c/d#e"), "a%20b?c/d%23e", "encoded"); Assert.Equal<string>(Pct.EncodeUserinfo("u s:er@h"), "u%20s:er%40h", "encoded"); }
+test encode_encodecomponent_empty_group { Assert.Equal<string>(Pct.EncodeComponent("[]"), "%5B%5D", "encoded"); Assert.Equal<string>(Pct.EncodeComponent("\\\""), "%5C%22", "encoded"); Assert.Equal<string>(Pct.EncodeComponent(String.FromUtf8CodeUnits([195_u8, 169_u8, 226_u8, 130_u8, 172_u8])), "%C3%A9%E2%82%AC", "utf8"); Assert.Equal<string>(Pct.EncodeBytes([0_u8, 255_u8, 65_u8, 47_u8, 126_u8], ""), "%00%FFA%2F~", "raw"); Assert.Equal<string>(Pct.EncodeBytes([47_u8, 63_u8], "/"), "/%3F", "extra"); }
+test encode_then_decode_round_trip { string text = "a b&c=d/e?f#g%h+i"; Assert.Equal<string>(DecHex(Pct.EncodeComponent(text)), HexOf(Utf8.CopyCodeUnits(text)), "round trip"); }

@@ -1,0 +1,120 @@
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.Ecdsa;
+use Crypto.Entropy;
+use Crypto.Errors;
+use Crypto.P256;
+use Crypto.PkAdapters;
+use Crypto.PkErrors;
+use Crypto.Rsa;
+use Crypto.X25519;
+use Tls.Alert;
+use Tls.PeerKeys;
+use Tls.TlsErrors;
+use Tls.Wire;
+
+// Adapter between the handshake and public-key cryptography: (EC)DHE key shares and
+// CertificateVerify signatures.
+
+pub type KeyShare { pub i64 group, pub u8[] privateKey, pub u8[] publicKey, }
+
+pub bool IsSupportedGroup(i64 group) { return group == Wire.GroupX25519() || group == Wire.GroupSecp256r1(); }
+
+Result<u8[], TlsError> Random32() {
+    Result<u8[], CryptoError> r = Entropy.Bytes(32_i64);
+    return match r { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.InternalError())), };
+}
+
+Result<u8[], TlsError> Pub(i64 group, u8[] privateKey) {
+    if group == Wire.GroupX25519() {
+        Result<u8[], PkError> p = X25519.PublicKey(privateKey);
+        return match p { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.InternalError())), };
+    }
+    Result<u8[], PkError> q = P256.PublicKey(privateKey);
+    return match q { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.InternalError())), };
+}
+
+/// A key share for `group` from an explicit private key (tests and trace replay).
+pub Result<KeyShare, TlsError> FromPrivate(i64 group, u8[] privateKey) {
+    if !IsSupportedGroup(group) { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigUnsupportedGroup())); }
+    u8[] publicKey = Pub(group, privateKey)?;
+    return Result::Ok(KeyShare { group: group, privateKey: privateKey, publicKey: publicKey });
+}
+
+/// A fresh ephemeral key share. P-256 retries the (2^-32 likely) out-of-range scalar.
+pub Result<KeyShare, TlsError> Generate(i64 group) {
+    if !IsSupportedGroup(group) { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigUnsupportedGroup())); }
+    mut i64 attempt = 0_i64;
+    while attempt < 4_i64 {
+        u8[] secret = Random32()?;
+        Result<KeyShare, TlsError> share = FromPrivate(group, secret);
+        match share {
+            Result::Ok(s) => { return Result::Ok(s); },
+            Result::Error(_) => {},
+        };
+        attempt = attempt + 1_i64;
+    }
+    return Result::Error(TlsErrors.Fatal(Alert.InternalError()));
+}
+
+/// The (EC)DHE shared secret. A malformed or small-order peer share is illegal_parameter.
+pub Result<u8[], TlsError> Agree(KeyShare mine, u8[] peerPublic) {
+    if mine.group == Wire.GroupX25519() {
+        if Slice.Len(peerPublic) != 32_i64 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+        Result<u8[], PkError> s = X25519.SharedSecret(mine.privateKey, peerPublic);
+        return match s { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())), };
+    }
+    if Slice.Len(peerPublic) != 65_i64 || peerPublic[0] != 4_u8 { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+    Result<u8[], PkError> t = P256.SharedSecret(mine.privateKey, peerPublic);
+    return match t { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())), };
+}
+
+/// Signature schemes allowed in CertificateVerify by this implementation.
+pub bool IsVerifyScheme(i64 scheme) {
+    return scheme == Wire.SchemeEcdsaSecp256r1Sha256() || scheme == Wire.SchemeRsaPssRsaeSha256()
+        || scheme == Wire.SchemeRsaPssRsaeSha384() || scheme == Wire.SchemeRsaPssRsaeSha512();
+}
+
+/// Schemes offered in signature_algorithms. rsa_pkcs1 is listed for certificate signatures only.
+pub i64[] OfferedSchemes() {
+    return [0x0403_i64, 0x0804_i64, 0x0805_i64, 0x0806_i64, 0x0401_i64, 0x0501_i64, 0x0601_i64];
+}
+
+TlsError DecryptError() { return TlsErrors.Fatal(Alert.DecryptError()); }
+
+/// Verifies a CertificateVerify signature over `content`. RSA keys below `minRsaBits` are
+/// insufficient_security. A scheme that does not match the
+/// key type is illegal_parameter; a bad signature is decrypt_error.
+pub Result<unit, TlsError> Verify(PeerKey key, i64 scheme, u8[] content, u8[] signature, i64 minRsaBits) {
+    if scheme == Wire.SchemeEcdsaSecp256r1Sha256() {
+        if key.kind != PeerKeys.KindP256() { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+        Result<unit, PkError> r = PkAdapters.VerifyEcdsaP256Message(key.point, RsaHash::Sha256, content, signature);
+        return match r { Result::Ok(_) => Result::Ok(()), Result::Error(_) => Result::Error(DecryptError()), };
+    }
+    if key.kind != PeerKeys.KindRsa() || !IsVerifyScheme(scheme) { return Result::Error(TlsErrors.Fatal(Alert.IllegalParameter())); }
+    Result<PublicKey, PkError> made = Rsa.NewPublicKey(key.modulus, key.exponent);
+    match made {
+        Result::Error(_) => { return Result::Error(TlsErrors.Fatal(Alert.BadCertificate())); },
+        Result::Ok(pk) => {
+            if pk.bits < minRsaBits { return Result::Error(TlsErrors.Fatal(Alert.InsufficientSecurity())); }
+            mut RsaHash hash = RsaHash::Sha256;
+            mut i64 salt = 32_i64;
+            if scheme == Wire.SchemeRsaPssRsaeSha384() { hash = RsaHash::Sha384; salt = 48_i64; }
+            if scheme == Wire.SchemeRsaPssRsaeSha512() { hash = RsaHash::Sha512; salt = 64_i64; }
+            Result<unit, PkError> v = PkAdapters.VerifyRsaPssMessage(pk, hash, content, signature, salt);
+            return match v { Result::Ok(_) => Result::Ok(()), Result::Error(_) => Result::Error(DecryptError()), };
+        },
+    };
+}
+
+/// ecdsa_secp256r1_sha256 signature (DER) over `content` with a 32-byte P-256 private key.
+pub Result<u8[], TlsError> SignP256(u8[] privateKey, u8[] content) {
+    Result<u8[], PkError> s = PkAdapters.SignEcdsaP256MessageDer(privateKey, content);
+    return match s { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.InternalError())), };
+}
+
+/// Fresh random bytes (ClientHello/ServerHello random, session ids).
+pub Result<u8[], TlsError> RandomBytes(i64 count) {
+    Result<u8[], CryptoError> r = Entropy.Bytes(count);
+    return match r { Result::Ok(v) => Result::Ok(v), Result::Error(_) => Result::Error(TlsErrors.Fatal(Alert.InternalError())), };
+}

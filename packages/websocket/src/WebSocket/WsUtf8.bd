@@ -1,0 +1,67 @@
+// Incremental UTF-8 validation (RFC 3629) for text messages that arrive in
+// fragments. A sequence may split across fragments; overlongs, surrogates
+// (U+D800..U+DFFF) and code points above U+10FFFF fail at the first bad byte.
+
+/// Validator state: `[0]` continuation bytes still needed, `[1]` lowest and `[2]`
+/// highest allowed value of the next continuation byte.
+pub i64[] New() { return [0_i64, 128_i64, 191_i64]; }
+
+/// Resets the state for a new message.
+pub unit Reset(i64[] state) {
+    state[0] = 0_i64; state[1] = 128_i64; state[2] = 191_i64;
+    return;
+}
+
+/// Feeds `count` bytes from `offset`. Returns false at the first invalid byte.
+pub bool Feed(i64[] state, u8[] data, i64 offset, i64 count) {
+    mut i64 need = state[0];
+    mut i64 lo = state[1];
+    mut i64 hi = state[2];
+    mut i64 i = offset;
+    i64 end = offset + count;
+    while i < end {
+        i64 b = i64(data[i]);
+        if need == 0_i64 {
+            if b < 128_i64 {
+                // ASCII
+            } else if b >= 0xC2_i64 && b <= 0xDF_i64 {
+                need = 1_i64; lo = 128_i64; hi = 191_i64;
+            } else if b == 0xE0_i64 {
+                need = 2_i64; lo = 0xA0_i64; hi = 191_i64;
+            } else if b == 0xED_i64 {
+                need = 2_i64; lo = 128_i64; hi = 0x9F_i64;
+            } else if b >= 0xE1_i64 && b <= 0xEF_i64 {
+                need = 2_i64; lo = 128_i64; hi = 191_i64;
+            } else if b == 0xF0_i64 {
+                need = 3_i64; lo = 0x90_i64; hi = 191_i64;
+            } else if b >= 0xF1_i64 && b <= 0xF3_i64 {
+                need = 3_i64; lo = 128_i64; hi = 191_i64;
+            } else if b == 0xF4_i64 {
+                need = 3_i64; lo = 128_i64; hi = 0x8F_i64;
+            } else {
+                state[0] = need; state[1] = lo; state[2] = hi;
+                return false;
+            }
+        } else {
+            if b < lo || b > hi {
+                state[0] = need; state[1] = lo; state[2] = hi;
+                return false;
+            }
+            need = need - 1_i64;
+            lo = 128_i64; hi = 191_i64;
+        }
+        i = i + 1_i64;
+    }
+    state[0] = need; state[1] = lo; state[2] = hi;
+    return true;
+}
+
+/// True when the bytes fed so far end on a code point boundary.
+pub bool Complete(i64[] state) { return state[0] == 0_i64; }
+
+/// One-shot validation of a whole buffer.
+pub bool IsValid(u8[] data, i64 offset, i64 count) {
+    i64[] state = New();
+    if !Feed(state, data, offset, count) { return false; }
+    return Complete(state);
+}

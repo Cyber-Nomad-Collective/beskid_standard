@@ -96,6 +96,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `List.Of` builds its list with `List.FromArray`: one sized copy instead of a
+  `Push` per element.
 - Unify helpers with the same behavior so each exists once. `Core.String.Ascii`
   holds the ASCII byte classes and hex digit values; `Number.DigitsAt` reads
   fixed-width digit fields; `Search.StartsWithAt` and `Search.SkipWhitespace`
@@ -180,6 +182,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Channel and Mutex wrappers with the canonical Optional/Results modules.
 
 ### Fixed
+
+- `Time.ToUtcDateTime` and the calendar helpers declare their reassigned
+  locals `mut`, matching the `Time.bd` the 0.5.4 compiler embeds. Corelib
+  `main` therefore pairs with compiler 0.5.4 or later.
 
 - Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
   when two versions grow from one base. `Array.Append` grows storage in place

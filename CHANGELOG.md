@@ -183,6 +183,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `Time.ToUtcDateTime` and the calendar helpers declare their reassigned
+  locals `mut`, matching the `Time.bd` the 0.5.4 compiler embeds. Corelib
+  `main` therefore pairs with compiler 0.5.4 or later.
+
 - Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
   when two versions grow from one base. `Array.Append` grows storage in place
   with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place

@@ -1,0 +1,790 @@
+//! `CoreSuite`: the core tests of corelib_tests, merged into one target so the matrix lowers
+//! the core closure once. Each section keeps the tests of one former target unchanged.
+
+use Core.Results;
+use Testing.Assert;
+use Core.Optional.Option;
+use Core.Bytes.Convert;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Time;
+use Core.Time.Instant;
+use Core.Encoding;
+use Core.Encoding.EncodingError;
+use Core.Collections.List;
+use Core.Collections.Stack;
+use Core.Math;
+use Core.Random;
+use Core.Args;
+use Core.ErrorHandling;
+use Core.String;
+use Core.Json;
+use Core.Json.JsonError;
+use Core.Json.JsonValue;
+use Testing.Expect;
+use Core.String.Builder;
+use Core.Process;
+use Core.Threading.Thread;
+use Core.Threading.ThreadError;
+
+// ---- ResultsTests.bd (formerly target `CoreResultsTests`) ----
+
+// Real tests for Core.Results.Result predicates.
+
+test result_ok_is_ok {
+    Result<i64, string> r = Results.Success<i64, string>(42_i64);
+    Assert.True(Results.IsOk(r), "Result::Ok(42) should return true from IsOk");
+}
+
+test result_error_is_error {
+    Result<i64, string> r = Results.Failure<i64, string>("fail");
+    Assert.True(Results.IsError(r), "Result::Error(\"fail\") should return true from IsError");
+}
+
+test result_error_is_not_ok {
+    Result<i64, string> r = Results.Failure<i64, string>("fail");
+    Assert.False(Results.IsOk(r), "Result::Error should return false from IsOk");
+}
+
+test result_ok_is_not_error {
+    Result<i64, string> r = Results.Success<i64, string>(42_i64);
+    Assert.False(Results.IsError(r), "Result::Ok(42) should return false from IsError");
+}
+
+test result_unit_ok_is_canonical_success {
+    Result<unit, string> r = Result::Ok(());
+    Assert.True(Results.IsOk(r), "Result<unit, E>::Ok must use the canonical success variant");
+    Assert.False(Results.IsError(r), "Result<unit, E>::Ok must not be encoded as failure");
+}
+
+test result_unit_ok_matches_without_fabricated_payload {
+    Result<unit, string> r = Result::Ok(());
+    bool matched = match r {
+        Result::Ok(()) => true,
+        Result::Error(_) => false,
+    };
+    Assert.True(matched, "Result<unit, E>::Ok must match its empty success payload");
+}
+
+Result<unit, string> UnitSuccess() {
+    return Result::Ok(());
+}
+
+Result<unit, string> UnitFailure(string message) {
+    return Result::Error(message);
+}
+
+test result_unit_success_propagates_through_return {
+    Result<unit, string> r = UnitSuccess();
+    Assert.True(Results.IsOk(r), "Result<unit, E> must propagate through typed returns");
+}
+
+test result_unit_error_payload_is_preserved {
+    Result<unit, string> result = UnitFailure("original error");
+    string error = match result {
+        Result::Ok(()) => "wrong variant",
+        Result::Error(message) => message,
+    };
+    Assert.Equal(error, "original error", "typed Error(E) payload must survive return propagation");
+}
+
+test result_map_preserves_error_and_maps_success {
+    Result<i64, string> ok = Results.Map<unit, i64, string>(Result::Ok(()), 7);
+    Result<i64, string> error = Results.Map<unit, i64, string>(Result::Error("kept"), 7);
+    i64 mapped = match ok { Result::Ok(value) => value, Result::Error(_) => -1 };
+    string preserved = match error { Result::Ok(_) => "wrong variant", Result::Error(message) => message };
+    Assert.Equal(mapped, 7, "Map changes only the success payload");
+    Assert.Equal(preserved, "kept", "Map preserves the original error payload");
+}
+
+// ---- OptionalTests.bd (formerly target `CoreOptionalTests`) ----
+
+// Real tests for Core.Optional.Option helpers.
+
+test option_some_has_value {
+    Option<i64> opt = Option.FromValue<i64>(42_i64);
+    Assert.True(Option.HasValue<i64>(opt), "Some(42) should have a value");
+}
+
+test option_none_has_no_value {
+    Option<i64> opt = Option.Empty<i64>();
+    Assert.False(Option.HasValue<i64>(opt), "None should not have a value");
+}
+
+test option_unwrap_or_returns_value_on_some {
+    Option<i64> opt = Option.FromValue<i64>(99_i64);
+    i64 val = Option.UnwrapOr<i64>(opt, 0_i64);
+    Assert.Equal(val, 99, "UnwrapOr on Some should return the inner value");
+}
+
+test option_unwrap_or_returns_default_on_none {
+    Option<i64> opt = Option.Empty<i64>();
+    i64 val = Option.UnwrapOr<i64>(opt, 77_i64);
+    Assert.Equal(val, 77, "UnwrapOr on None should return the default");
+}
+
+// ---- BytesTests.bd (formerly target `CoreBytesTests`) ----
+
+test bytes_new_has_length {
+    u8[] buf = Slice.New(4);
+    i64 len = Slice.Len(buf);
+    Assert.Equal(len, 4, "bytes New length mismatch");
+}
+
+test bytes_from_string_matches_utf8_length {
+    u8[] buf = Convert.StringToBytes("abc");
+    Assert.Equal(Slice.Len(buf), 3, "StringToBytes byte length");
+    Assert.Equal(Slice.Get(buf, 0), 97_u8, "first byte");
+}
+
+test bytes_fill_sets_range {
+    u8[] buf = Slice.New(4);
+    Slice.Fill(buf, 0, 4, 42);
+    Assert.Equal(Slice.Get(buf, 0), 42_u8, "Fill first byte");
+    Assert.Equal(Slice.Get(buf, 3), 42_u8, "Fill last byte");
+}
+
+test bytes_subslice_copies_window {
+    u8[] buf = Convert.StringToBytes("hello");
+    u8[] sub = Slice.SubSlice(buf, 1, 3);
+    Assert.Equal(Slice.Len(sub), 3, "SubSlice length");
+    Assert.Equal(Slice.Get(sub, 0), 101_u8, "SubSlice first byte is e");
+}
+
+test bytes_compare_lexicographic {
+    u8[] left = Convert.StringToBytes("abc");
+    u8[] right = Convert.StringToBytes("abd");
+    Assert.Equal(Slice.Compare(left, right), -1_i64, "Compare less");
+}
+
+test bytes_copy_range {
+    u8[] dst = Slice.New(3);
+    u8[] src = Convert.StringToBytes("xyz");
+    Slice.Copy(dst, 0, src, 0, 3);
+    Assert.Equal(Slice.Get(dst, 2), 122_u8, "Copy third byte");
+}
+
+i64 ElapsedNanos(Instant start) {
+    Instant now = Time.MonotonicNow();
+    return now.nanos - start.nanos;
+}
+
+// PERF1 / C53-5: Slice.New is one zeroed allocation, not one append per byte.
+test bytes_new_one_mebibyte_is_one_zeroed_allocation {
+    Instant start = Time.MonotonicNow();
+    u8[] buf = Slice.New(1048576);
+    i64 elapsed = ElapsedNanos(start);
+    Assert.Equal(Slice.Len(buf), 1048576, "1 MiB length");
+    Assert.Equal(Array.Capacity<u8>(buf), 1048576, "sized allocation has exact capacity");
+    Assert.Equal(Slice.Get(buf, 0), 0, "first byte is zero");
+    Assert.Equal(Slice.Get(buf, 524288), 0, "middle byte is zero");
+    Assert.Equal(Slice.Get(buf, 1048575), 0, "last byte is zero");
+    Assert.True(elapsed < 50000000, "Slice.New(1 MiB) takes less than 50 ms");
+}
+
+test bytes_new_non_positive_length_is_empty {
+    Assert.Equal(Slice.Len(Slice.New(0)), 0, "zero length");
+    Assert.Equal(Slice.Len(Slice.New(-5)), 0, "negative length");
+}
+
+// A 4 MiB buffer stays live and intact through 16 KiB churn and forced collections.
+test bytes_four_mebibyte_live_buffer_survives_churn {
+    u8[] big = Slice.New(4194304);
+    mut i64 i = 0;
+    while i < 4194304 {
+        i64 value = i % 251;
+        big[i] = u8(value);
+        i = i + 4099;
+    }
+    mut i64 round = 0;
+    while round < 1000 {
+        u8[] scratch = Slice.New(16384);
+        i64 marker = round % 256;
+        scratch[16383] = u8(marker);
+        Assert.Equal(Slice.Get(scratch, 0), 0, "fresh scratch is zeroed");
+        round = round + 1;
+    }
+    Assert.CollectGarbage();
+    i = 0;
+    while i < 4194304 {
+        u8 stored = big[i];
+        i64 expected = i % 251;
+        i64 storedWide = i64(stored);
+        Assert.Equal(storedWide, expected, "live 4 MiB buffer keeps its contents");
+        i = i + 4099;
+    }
+}
+
+// HQ3 / W5: three live 64 KiB buffers plus repeated 16-20 KiB garbage stay far below the cap.
+test bytes_three_live_64k_buffers_with_garbage_do_not_exhaust_heap {
+    u8[] a = Slice.New(65536);
+    u8[] b = Slice.New(65536);
+    u8[] c = Slice.New(65536);
+    a[65535] = 1_u8;
+    b[65535] = 2_u8;
+    c[65535] = 3_u8;
+    mut i64 round = 0;
+    while round < 1000 {
+        u8[] x = Slice.New(16384);
+        u8[] y = Slice.New(20000);
+        u8[] z = Slice.New(18432);
+        x[0] = 1_u8;
+        y[0] = 1_u8;
+        z[0] = 1_u8;
+        if round % 250 == 0 { Assert.CollectGarbage(); }
+        round = round + 1;
+    }
+    Assert.CollectGarbage();
+    u8 lastA = a[65535];
+    u8 lastB = b[65535];
+    u8 lastC = c[65535];
+    i64 sum = i64(lastA) + i64(lastB) + i64(lastC);
+    Assert.Equal(sum, 6, "live 64 KiB buffers keep their contents");
+}
+
+// ---- EncodingUtf8Tests.bd (formerly target `CoreEncodingUtf8Tests`) ----
+
+// Encoding module tests — UTF-8, Hex, Base64 codecs.
+
+test utf8_is_valid_ascii {
+    u8[] bytes = Convert.StringToBytes("hello");
+    Assert.True(Encoding.Utf8.IsValid(bytes), "ascii is valid utf8");
+}
+
+test utf8_is_valid_two_byte {
+    u8[] bytes = Slice.New(2);
+    Slice.Set(bytes, 0, 195);
+    Slice.Set(bytes, 1, 169);
+    Assert.True(Encoding.Utf8.IsValid(bytes), "two byte e-acute is valid");
+}
+
+test utf8_is_invalid_solo_continuation {
+    u8[] bytes = Slice.New(1);
+    Slice.Set(bytes, 0, 169);
+    Assert.False(Encoding.Utf8.IsValid(bytes), "solo continuation is invalid");
+}
+
+test utf8_decode_from_bytes_roundtrip {
+    u8[] bytes = Convert.StringToBytes("abc");
+    Core.Results.Result<string, EncodingError> result = Encoding.Utf8.DecodeFromBytes(bytes);
+    Assert.True(Results.IsOk(result), "decode valid bytes succeeds");
+    match result {
+        Result::Ok(text) => { Assert.Equal(text, "abc", "roundtrip text matches"); },
+        Result::Error(_) => { },
+    };
+}
+
+test utf8_encode_to_bytes_roundtrip {
+    Core.Results.Result<u8[], EncodingError> result = Encoding.Utf8.EncodeToBytes("test");
+    Assert.True(Results.IsOk(result), "encode succeeds");
+    match result {
+        Result::Ok(bytes) => { Assert.Equal(Slice.Len(bytes), 4, "four bytes"); },
+        Result::Error(_) => { },
+    };
+}
+
+test hex_encode_bytes_roundtrip {
+    u8[] input = Convert.StringToBytes("AB");
+    Core.Results.Result<u8[], EncodingError> encoded = Encoding.Hex.EncodeBytes(input);
+    Assert.True(Results.IsOk(encoded), "hex encode succeeds");
+    match encoded {
+        Result::Ok(hex) => {
+            Assert.Equal(Slice.Len(hex), 4, "two bytes encode to four hex chars");
+            Core.Results.Result<u8[], EncodingError> decoded = Encoding.Hex.DecodeBytes(hex);
+            Assert.True(Results.IsOk(decoded), "hex decode succeeds");
+            match decoded {
+                Result::Ok(raw) => { Assert.Equal(Slice.Compare(raw, input), 0, "hex roundtrip preserves data"); },
+                Result::Error(_) => { },
+            };
+        },
+        Result::Error(_) => { },
+    };
+}
+
+test hex_decode_odd_length_rejected {
+    u8[] odd = Slice.New(3);
+    Slice.Set(odd, 0, 97);
+    Slice.Set(odd, 1, 97);
+    Slice.Set(odd, 2, 97);
+    Core.Results.Result<u8[], EncodingError> result = Encoding.Hex.DecodeBytes(odd);
+    Assert.True(Results.IsError(result), "odd-length hex rejected");
+}
+
+test base64_encode_bytes_roundtrip {
+    u8[] input = Convert.StringToBytes("Man");
+    Core.Results.Result<u8[], EncodingError> encoded = Encoding.Base64.EncodeBytes(input);
+    Assert.True(Results.IsOk(encoded), "base64 encode succeeds");
+    match encoded {
+        Result::Ok(b64) => {
+            Core.Results.Result<u8[], EncodingError> decoded = Encoding.Base64.DecodeBytes(b64);
+            Assert.True(Results.IsOk(decoded), "base64 decode succeeds");
+            match decoded {
+                Result::Ok(raw) => { Assert.Equal(Slice.Compare(raw, input), 0, "base64 roundtrip preserves data"); },
+                Result::Error(_) => { },
+            };
+        },
+        Result::Error(_) => { },
+    };
+}
+
+test base64_decode_invalid_length_rejected {
+    u8[] bad = Convert.StringToBytes("abc");
+    Core.Results.Result<u8[], EncodingError> result = Encoding.Base64.DecodeBytes(bad);
+    Assert.True(Results.IsError(result), "non-multiple-of-4 base64 rejected");
+    match result {
+        Result::Ok(_) => { },
+        Result::Error(error) => match error {
+            EncodingError::InvalidPadding(_) => { },
+            EncodingError::InvalidSequence(_) => { },
+            EncodingError::OddLength(_) => { },
+        },
+    };
+}
+
+// ---- ExpressionBodyTests.bd (formerly target `CoreExpressionBodyTests`) ----
+
+// Parse/analyze smoke for expression-bodied methods (`=>`) on inline collection methods.
+
+test expression_body_inline_methods_import {
+    bool inline_methods_linked = true;
+    Assert.True(inline_methods_linked, "List and Stack inline => methods are linked");
+}
+
+// ---- RandomTests.bd (formerly target `CoreRandomTests`) ----
+
+// Random module tests — PCG PRNG generator.
+
+test random_new_creates_generator {
+    mut Random rng = Random.New();
+    Assert.True(!Random.IsExhausted(rng), "new generator should not be exhausted");
+}
+
+test random_exhausted_guard {
+    // NewSeeded adds the PCG increment, so this seed yields the exhausted zero state.
+    Random rng = Random.NewSeeded(-1442695040888963407);
+    Assert.True(Random.IsExhausted(rng), "zero state is exhausted");
+}
+
+test random_seeded_deterministic {
+    mut Random a = Random.NewSeeded(42);
+    mut Random b = Random.NewSeeded(42);
+    i64 va = Random.NextI64(a, 100);
+    i64 vb = Random.NextI64(b, 100);
+    Assert.Equal(va, vb, "same seed same output");
+}
+
+test random_seeded_diverge {
+    mut Random a = Random.NewSeeded(1);
+    mut Random b = Random.NewSeeded(1099511627776);
+    i64 va = Random.NextI64(a, 10000);
+    i64 vb = Random.NextI64(b, 10000);
+    Assert.True(va != vb, "different seeds diverge");
+}
+
+test random_next_i64_in_bounds {
+    mut Random rng = Random.NewSeeded(100);
+    i64 v = Random.NextI64(rng, 11);
+    Assert.True(v >= 0, "next i64 lower bound");
+    Assert.True(v < 11, "next i64 exclusive upper bound");
+}
+
+test random_next_i64_range_in_bounds {
+    mut Random rng = Random.NewSeeded(100);
+    i64 v = Random.NextI64Range(rng, 10, 20);
+    Assert.True(v >= 10, "range lower bound");
+    Assert.True(v <= 20, "range upper bound");
+}
+
+test random_next_f64_unit_interval {
+    mut Random rng = Random.NewSeeded(200);
+    f64 v = Random.NextF64(rng);
+    Assert.True(v >= 0.0, "f64 >= 0");
+    Assert.True(v < 1.0, "f64 < 1");
+}
+
+test random_next_bool_produces_boolean {
+    mut Random rng = Random.NewSeeded(300);
+    bool b = Random.NextBool(rng);
+    Assert.Equal(b, false, "seeded bool is deterministic");
+}
+
+test random_next_bytes_fills_buffer {
+    u8[] buf = Slice.New(8);
+    mut Random rng = Random.NewSeeded(400);
+    Random.NextBytes(rng, buf, 0, 4);
+    u8 b0 = buf[0];
+    u8 b1 = buf[1];
+    u8 b2 = buf[2];
+    u8 b3 = buf[3];
+    u8 expected0 = 24;
+    u8 expected1 = 191;
+    u8 expected2 = 1;
+    u8 expected3 = 0;
+    Assert.Equal(b0, expected0, "seeded byte 0 is deterministic");
+    Assert.Equal(b1, expected1, "seeded byte 1 is deterministic");
+    Assert.Equal(b2, expected2, "seeded byte 2 is deterministic");
+    Assert.Equal(b3, expected3, "seeded byte 3 is deterministic");
+}
+
+// ---- ArgsTests.bd (formerly target `CoreArgsTests`) ----
+
+// Args module tests — CLI argument access.
+
+test args_count_at_least_one {
+    i64 count = Args.Count();
+    Assert.True(count >= 1, "at least argv[0] present");
+}
+
+test args_program_name_non_empty {
+    string name = Args.ProgramName();
+    Assert.True(name != "", "program name should not be empty");
+}
+
+test args_get_zero_is_program_name {
+    Core.Results.Result<string, Core.Args.ArgsError> result = Args.Get(0);
+    Assert.True(Results.IsOk(result), "args[0] should be valid");
+}
+
+test args_get_out_of_range {
+    Core.Results.Result<string, Core.Args.ArgsError> result = Args.Get(99999);
+    Assert.True(Results.IsError(result), "out-of-range index should error");
+}
+
+test args_get_negative_index {
+    Core.Results.Result<string, Core.Args.ArgsError> result = Args.Get(-1);
+    Assert.True(Results.IsError(result), "negative index should error");
+}
+
+test args_has_flag_absent {
+    bool found = Args.HasFlag("--nonexistent-flag-xyz");
+    Assert.False(found, "absent flag should return false");
+}
+
+test args_all_returns_array {
+    string[] all = Args.All();
+    i64 len = Array.Len<string>(all);
+    Assert.Equal(len, Args.Count(), "All() length matches Count()");
+}
+
+// ---- ErrorHandlingTests.bd (formerly target `CoreErrorHandlingTests`) ----
+
+// ErrorHandling module tests — ErrorInfo construction and emptiness predicate.
+
+test error_info_new_populates_fields {
+    ErrorHandling.ErrorInfo info = ErrorHandling.NewErrorInfo("E1", "boom");
+    Assert.Equal(info.code, "E1", "code should be populated");
+    Assert.Equal(info.message, "boom", "message should be populated");
+}
+
+test error_info_empty_when_both_blank {
+    Assert.True(ErrorHandling.IsErrorInfoEmpty(ErrorHandling.NewErrorInfo("", "")),
+        "IsErrorInfoEmpty should be true when both fields are blank");
+}
+
+test error_info_not_empty_when_code_set {
+    Assert.False(ErrorHandling.IsErrorInfoEmpty(ErrorHandling.NewErrorInfo("E1", "")),
+        "IsErrorInfoEmpty should be false when code is set");
+}
+
+test error_info_not_empty_when_message_set {
+    Assert.False(ErrorHandling.IsErrorInfoEmpty(ErrorHandling.NewErrorInfo("", "x")),
+        "IsErrorInfoEmpty should be false when message is set");
+}
+
+// ---- StringTests.bd (formerly target `CoreStringTests`) ----
+
+// String module tests — pure string helpers, char tables, and UTF-8 rune sizing.
+
+test string_len_basic {
+    Assert.Equal(String.Len("hello"), 5, "Len of \"hello\" is 5");
+}
+
+test string_is_empty {
+    Assert.True(String.IsEmpty(""), "empty string is empty");
+    Assert.False(String.IsEmpty("x"), "non-empty string is not empty");
+}
+
+test string_indexof_found {
+    Assert.Equal(String.IndexOfFrom("hello", 0, "ll"), 2, "IndexOfFrom finds \"ll\" at 2");
+}
+
+test string_indexof_not_found {
+    Assert.Equal(String.IndexOfFrom("hello", 0, "z"), -1, "IndexOfFrom returns -1 when not found");
+}
+
+test string_indexof_empty_needle_returns_start {
+    Assert.Equal(String.IndexOfFrom("hello", 2, ""), 2, "empty needle returns the start index");
+}
+
+test string_contains_true_false {
+    Assert.True(String.Contains("hello", "ell"), "Contains finds \"ell\"");
+    Assert.False(String.Contains("hello", "xyz"), "Contains misses \"xyz\"");
+}
+
+test string_subslice {
+    Assert.Equal(String.SubSlice("hello", 1, 3), "ell", "SubSlice(1,3) of \"hello\" is \"ell\"");
+}
+
+test string_trim_spaces {
+    Assert.Equal(String.Trim("  hi  "), "hi", "Trim trims surrounding spaces");
+}
+
+test string_trim_empty {
+    Assert.Equal(String.Trim("   "), "", "Trim of all spaces is empty");
+}
+
+test string_byte_at {
+    Assert.Equal(String.ByteAt("ABC", 0), 65, "ByteAt(0) of \"ABC\" is 65");
+}
+
+test string_digit_char {
+    Assert.Equal(String.DigitChar(0), "0", "DigitChar(0) is \"0\"");
+    Assert.Equal(String.DigitChar(9), "9", "DigitChar(9) is \"9\"");
+    Assert.Equal(String.DigitChar(10), "9", "DigitChar(10) clamps to \"9\"");
+}
+
+test string_lower_char {
+    Assert.Equal(String.LowerChar(0), "a", "LowerChar(0) is \"a\"");
+    Assert.Equal(String.LowerChar(25), "z", "LowerChar(25) is \"z\"");
+    Assert.Equal(String.LowerChar(26), "z", "LowerChar(26) clamps to \"z\"");
+}
+
+test string_upper_char {
+    Assert.Equal(String.UpperChar(0), "A", "UpperChar(0) is \"A\"");
+    Assert.Equal(String.UpperChar(25), "Z", "UpperChar(25) is \"Z\"");
+}
+
+test string_utf8_rune_byte_len {
+    Assert.Equal(String.Utf8RuneByteLen(65_u8), 1, "ASCII lead is 1 byte");
+    Assert.Equal(String.Utf8RuneByteLen(128_u8), 0, "continuation byte is 0");
+    Assert.Equal(String.Utf8RuneByteLen(192_u8), 2, "192 lead is 2 bytes");
+    Assert.Equal(String.Utf8RuneByteLen(224_u8), 3, "224 lead is 3 bytes");
+    Assert.Equal(String.Utf8RuneByteLen(240_u8), 4, "240 lead is 4 bytes");
+}
+
+test string_from_utf8_code_units_ascii {
+    u8[] arr = Slice.New(2);
+    Slice.Set(arr, 0, 72);
+    Slice.Set(arr, 1, 105);
+    Assert.Equal(String.FromUtf8CodeUnits(arr), "Hi", "FromUtf8CodeUnits([72,105]) is \"Hi\"");
+}
+
+test string_ordering_follows_utf8_bytes {
+    string a = "a";
+    string b = "b";
+    string ab = "ab";
+    string empty = "";
+    Assert.True(a < b, "a < b");
+    Assert.False(b < a, "b < a is false");
+    Assert.True(b > a, "b > a");
+    Assert.True(a <= a, "a <= a");
+    Assert.True(a >= a, "a >= a");
+    Assert.False(a < a, "a < a is false");
+    Assert.True(a < ab, "a proper prefix sorts first");
+    Assert.True(ab > a, "a longer string with the same prefix sorts last");
+    Assert.True(empty < a, "the empty string sorts first");
+    Assert.True(empty <= empty, "the empty string equals itself");
+    Assert.True("Z" < "a", "ordinal order puts uppercase ASCII before lowercase");
+    Assert.True("z" < "é", "a two-byte code point sorts after ASCII");
+}
+
+test string_interpolation_spells_bools {
+    bool yes = true;
+    bool no = false;
+    Assert.Equal("${yes}", "true", "true interpolates as true");
+    Assert.Equal("${no}", "false", "false interpolates as false");
+    Assert.Equal("flag=${yes}/${no}", "flag=true/false", "bools inside text");
+}
+
+test string_interpolation_formats_minimum_i64 {
+    i64 minimum = -9223372036854775807 - 1;
+    i64 maximum = 9223372036854775807;
+    i64 negative = -42;
+    Assert.Equal("${minimum}", "-9223372036854775808", "minimum i64");
+    Assert.Equal("${maximum}", "9223372036854775807", "maximum i64");
+    Assert.Equal("${negative}", "-42", "negative i64");
+}
+
+test string_interpolation_formats_f64_as_shortest_round_trip_text {
+    f64 one = 1.0;
+    f64 tenth = 0.1;
+    f64 sum = 0.1 + 0.2;
+    f64 negative = -2.5;
+    f64 plainLimit = 100000000000000000000.0;
+    f64 exponentLimit = 1.0e21;
+    f64 small = 0.000001;
+    f64 smaller = 1.0e-7;
+    f64 largest = 1.7976931348623157e308;
+    f64 zero = 0.0;
+    Assert.Equal("${one}", "1", "integral values print without a fraction");
+    Assert.Equal("${tenth}", "0.1", "shortest digits of 0.1");
+    Assert.Equal("${sum}", "0.30000000000000004", "shortest digits of 0.1 + 0.2");
+    Assert.Equal("${negative}", "-2.5", "negative value");
+    Assert.Equal("${plainLimit}", "100000000000000000000", "plain decimal below 1e21");
+    Assert.Equal("${exponentLimit}", "1e+21", "exponent form from 1e21");
+    Assert.Equal("${small}", "0.000001", "plain decimal from 1e-6");
+    Assert.Equal("${smaller}", "1e-7", "exponent form below 1e-6");
+    Assert.Equal("${largest}", "1.7976931348623157e+308", "largest finite f64");
+    Assert.Equal("${zero}", "0", "zero");
+    Assert.Equal("${zero / zero}", "NaN", "NaN");
+    Assert.Equal("${one / zero}", "Infinity", "positive infinity");
+    Assert.Equal("${negative / zero}", "-Infinity", "negative infinity");
+}
+
+test string_interpolation_formats_f32_through_exact_widening {
+    f32 half = 1.5_f32;
+    f32 tenth = 0.1_f32;
+    Assert.Equal("${half}", "1.5", "an exactly representable f32");
+    Assert.Equal("${tenth}", "0.10000000149011612", "an f32 prints the shortest text of its exact binary64 value");
+}
+
+// ---- StringOpsTests.bd (formerly target `CoreStringOpsTests`) ----
+
+// Core.String search, transform, and builder tests.
+
+test string_starts_ends_with {
+    Assert.True(String.StartsWith("beskid", "bes"), "prefix matches");
+    Assert.True(String.StartsWith("beskid", ""), "empty prefix matches");
+    Assert.False(String.StartsWith("be", "bes"), "longer prefix misses");
+    Assert.True(String.EndsWith("beskid", "kid"), "suffix matches");
+    Assert.False(String.EndsWith("beskid", "bes"), "wrong suffix misses");
+}
+
+test string_index_and_last_index {
+    Assert.Equal(String.IndexOf("abcabc", "bc"), 1, "first occurrence");
+    Assert.Equal(String.LastIndexOf("abcabc", "bc"), 4, "last occurrence");
+    Assert.Equal(String.LastIndexOf("abc", "x"), -1, "missing needle");
+    Assert.Equal(String.LastIndexOf("abc", ""), 3, "empty needle matches at end");
+}
+
+test string_count_non_overlapping {
+    Assert.Equal(String.Count("aaaa", "aa"), 2, "non-overlapping count");
+    Assert.Equal(String.Count("abc", ""), 0, "empty needle counts zero");
+}
+
+test string_compare_ordinal {
+    Assert.Equal(String.Compare("apple", "banana"), -1, "a before b");
+    Assert.Equal(String.Compare("b", "a"), 1, "b after a");
+    Assert.Equal(String.Compare("ab", "abc"), -1, "prefix sorts first");
+    Assert.Equal(String.Compare("same", "same"), 0, "equal strings");
+    Assert.True(String.Less("Z", "a"), "uppercase ASCII sorts before lowercase");
+}
+
+test string_is_blank {
+    Assert.True(String.IsBlank(""), "empty is blank");
+    Assert.True(String.IsBlank(" " + String.Tab() + String.Newline()), "whitespace is blank");
+    Assert.False(String.IsBlank(" x "), "text is not blank");
+}
+
+test string_split_keeps_empty_fields {
+    string[] parts = String.Split("a,,b,", ",");
+    Assert.Equal(Array.Len<string>(parts), 4, "n separators give n + 1 parts");
+    Assert.Equal(Array.Get<string>(parts, 0), "a", "first field");
+    Assert.Equal(Array.Get<string>(parts, 1), "", "empty middle field");
+    Assert.Equal(Array.Get<string>(parts, 2), "b", "third field");
+    Assert.Equal(Array.Get<string>(parts, 3), "", "empty trailing field");
+}
+
+test string_split_multibyte_separator_and_empty_separator {
+    string[] parts = String.Split("x::y", "::");
+    Assert.Equal(Array.Len<string>(parts), 2, "two parts");
+    Assert.Equal(Array.Get<string>(parts, 1), "y", "second part");
+    string[] whole = String.Split("xy", "");
+    Assert.Equal(Array.Len<string>(whole), 1, "empty separator returns input");
+}
+
+test string_lines_strip_cr_and_trailing_newline {
+    string nl = String.Newline();
+    string cr = String.FromAscii(13);
+    string[] lines = String.Lines("one" + cr + nl + "two" + nl);
+    Assert.Equal(Array.Len<string>(lines), 2, "trailing newline adds no line");
+    Assert.Equal(Array.Get<string>(lines, 0), "one", "CR removed");
+    Assert.Equal(Array.Get<string>(lines, 1), "two", "second line");
+    Assert.Equal(Array.Len<string>(String.Lines("")), 0, "empty text has no lines");
+}
+
+test string_join_round_trips_split {
+    string[] parts = String.Split("a-b-c", "-");
+    Assert.Equal(String.Join(parts, "+"), "a+b+c", "join with new separator");
+    Assert.Equal(String.Join(Array.Empty<string>(), ","), "", "join of nothing is empty");
+}
+
+test string_replace {
+    Assert.Equal(String.Replace("a.b.c", ".", "::"), "a::b::c", "replace all");
+    Assert.Equal(String.Replace("aaa", "aa", "b"), "ba", "left-to-right non-overlapping");
+    Assert.Equal(String.Replace("abc", "", "x"), "abc", "empty pattern is a no-op");
+}
+
+test string_repeat_and_pad {
+    Assert.Equal(String.Repeat("ab", 3), "ababab", "repeat");
+    Assert.Equal(String.Repeat("ab", 0), "", "zero repeat");
+    Assert.Equal(String.PadLeft("7", 3, "0"), "007", "pad left");
+    Assert.Equal(String.PadRight("ab", 4, "."), "ab..", "pad right");
+    Assert.Equal(String.PadLeft("long", 2, "0"), "long", "no truncation");
+}
+
+test string_ascii_case {
+    Assert.Equal(String.ToUpperAscii("Beskid 0.5!"), "BESKID 0.5!", "upper");
+    Assert.Equal(String.ToLowerAscii("BesKID"), "beskid", "lower");
+}
+
+test string_trim_start_end_and_affixes {
+    Assert.Equal(String.TrimStart("  x "), "x ", "trim start");
+    Assert.Equal(String.TrimEnd(" x" + String.Newline()), " x", "trim end includes LF");
+    Assert.Equal(String.RemovePrefix("v1.2", "v"), "1.2", "prefix removed");
+    Assert.Equal(String.RemovePrefix("1.2", "v"), "1.2", "absent prefix kept");
+    Assert.Equal(String.RemoveSuffix("main.bd", ".bd"), "main", "suffix removed");
+}
+
+test string_builder_appends {
+    mut StringBuilder b = Builder.New();
+    b = b.Append("x=");
+    b = b.AppendI64(42);
+    b = b.AppendAscii(59);
+    b = b.AppendBool(true);
+    Assert.Equal(b.ToString(), "x=42;true", "builder output");
+    Assert.Equal(b.Length(), 9, "builder length");
+}
+
+test string_builder_lines {
+    mut StringBuilder b = Builder.From("a");
+    b = b.AppendLine("");
+    b = b.AppendLine("b");
+    Assert.Equal(b.ToString(), "a" + String.Newline() + "b" + String.Newline(), "lines");
+    Assert.True(Builder.New().IsEmpty(), "new builder is empty");
+}
+
+// ---- ProcessTests.bd (formerly target `CoreProcessTests`) ----
+
+// Process module tests for the exact v0.4 current-process surface.
+
+test process_id_returns_positive {
+    Assert.True(Core.Process.Id() > 0, "pid should be positive");
+}
+
+test process_current_id_matches_id {
+    Assert.Equal(Core.Process.CurrentId(), Core.Process.Id(), "CurrentId aliases Id");
+}
+
+test process_is_current_process_true_for_self {
+    Assert.True(Core.Process.IsCurrentProcess(Core.Process.Id()), "self pid is current");
+}
+
+test process_is_current_process_false_for_other {
+    Assert.False(Core.Process.IsCurrentProcess(999999), "alien pid is not current");
+}
+
+// ---- ThreadingTests.bd (formerly target `CoreThreadingTests`) ----
+
+// Threading module tests — OS-thread surface (gate-level; Spawn/Join bodies not evaluated).
+
+test thread_yield_returns_unit {
+    Thread.Yield();
+    Assert.True(true, "Yield returns unit without crashing");
+}
+
+test thread_surface_imports {
+    Core.Results.Result<Thread, ThreadError> result =
+        Result::Error(ThreadError::SpawnFailed(1_i64));
+    Assert.True(Results.IsError(result), "Thread and ThreadError are exposed from their canonical modules");
+}

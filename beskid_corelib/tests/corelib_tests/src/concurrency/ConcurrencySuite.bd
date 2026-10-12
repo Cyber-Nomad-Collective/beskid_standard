@@ -1,0 +1,340 @@
+//! `ConcurrencySuite`: the concurrency tests of corelib_tests, merged into one target so the matrix lowers
+//! the concurrency closure once. Each section keeps the tests of one former target unchanged.
+
+use Concurrency.Status;
+use Testing.Assert;
+use Concurrency.Channel;
+use Concurrency.TryResult;
+use Core.Results;
+use Concurrency.Mutex;
+use Concurrency.MutexError;
+use Concurrency;
+use Concurrency.Hub;
+use Concurrency.HubError;
+use Concurrency.WaitGroup;
+use Concurrency.Fiber;
+use Concurrency.FiberError;
+
+// ---- StatusAbiTests.bd (formerly target `ConcurrencyStatusAbiTests`) ----
+
+// ABI contract for Concurrency.Status discriminated union mapping.
+// The Status enum now carries its payload as variant arguments; the
+// bidirectional ToI64/FromI64 codec is replaced by FromCode (decode) and
+// Discriminant (encode).
+
+test discriminant_ok_is_zero {
+    Assert.Equal(Status.Discriminant(Status::Ok), 0, "Ok maps to 0");
+}
+
+test discriminant_closed_is_one {
+    Assert.Equal(Status.Discriminant(Status::Closed(0)), 1, "Closed maps to 1");
+}
+
+test discriminant_cancelled_is_two {
+    Assert.Equal(Status.Discriminant(Status::Cancelled(0)), 2, "Cancelled maps to 2");
+}
+
+test discriminant_would_block_is_three {
+    Assert.Equal(Status.Discriminant(Status::WouldBlock), 3, "WouldBlock maps to 3");
+}
+
+test discriminant_hub_empty_is_four {
+    Assert.Equal(Status.Discriminant(Status::HubEmpty), 4, "HubEmpty maps to 4");
+}
+
+test discriminant_hub_limit_is_five {
+    Assert.Equal(Status.Discriminant(Status::HubLimit(256)), 5, "HubLimit maps to 5");
+}
+
+test discriminant_hub_not_found_is_six {
+    Assert.Equal(Status.Discriminant(Status::HubNotFound(7)), 6, "HubNotFound maps to 6");
+}
+
+test fromcode_zero_is_ok {
+    Status status = Status.FromCode(0);
+    i64 label = match status {
+        Status::Ok => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(0) is Ok");
+}
+
+test fromcode_one_is_closed {
+    Status status = Status.FromCode(1);
+    i64 label = match status {
+        Status::Closed(_) => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(1) is Closed");
+}
+
+test fromcode_two_is_cancelled {
+    Status status = Status.FromCode(2);
+    i64 label = match status {
+        Status::Cancelled(_) => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(2) is Cancelled");
+}
+
+test fromcode_three_is_would_block {
+    Status status = Status.FromCode(3);
+    i64 label = match status {
+        Status::WouldBlock => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(3) is WouldBlock");
+}
+
+test fromcode_four_is_hub_empty {
+    Status status = Status.FromCode(4);
+    i64 label = match status {
+        Status::HubEmpty => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(4) is HubEmpty");
+}
+
+test fromcode_five_is_hub_limit {
+    Status status = Status.FromCode(5);
+    i64 label = match status {
+        Status::HubLimit(_) => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(5) is HubLimit");
+}
+
+test fromcode_six_is_hub_not_found {
+    Status status = Status.FromCode(6);
+    i64 label = match status {
+        Status::HubNotFound(_) => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "FromCode(6) is HubNotFound");
+}
+
+test discriminant_roundtrip {
+    Assert.Equal(Status.Discriminant(Status.FromCode(2)), 2, "Discriminant(FromCode(2)) is 2");
+}
+
+test discriminant_unknown_code_defaults_to_ok {
+    Status status = Status.FromCode(999);
+    i64 label = match status {
+        Status::Ok => 0,
+        _ => 1,
+    };
+    Assert.Equal(label, 0, "unknown code falls back to Ok");
+}
+
+// ---- ChannelApiTests.bd (formerly target `ConcurrencyChannelApiTests`) ----
+
+// Channel wrapper surface tests.
+
+test channel_create_returns_handle {
+    Channel<i64> ch = Channel<i64>.Create();
+    bool ok = true;
+    Assert.True(ok, "Channel.Create returns a handle");
+}
+
+test channel_send_returns_result {
+    Channel<i64> ch = Channel<i64>.Create();
+    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.Send(ch, 42);
+    Assert.True(Results.IsOk(result) || Results.IsError(result), "Send returns a valid result");
+}
+
+test channel_receive_returns_result {
+    Channel<i64> ch = Channel<i64>.Create();
+    i64 sent = 42;
+    i64 discarded = sent;
+    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> s = Channel<i64>.Send(ch, discarded);
+    Core.Results.Result<i64, Concurrency.ChannelError> result = Channel<i64>.Receive(ch);
+    Assert.True(Results.IsOk(result) || Results.IsError(result), "Receive returns a valid result");
+}
+
+test channel_try_send_returns_try_result {
+    Channel<i64> ch = Channel<i64>.Create();
+    TryResult<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.TrySend(ch, 99);
+    match result {
+        TryResult::Ok(_) => Assert.True(true, "empty channel accepts a non-blocking send"),
+        _ => Assert.True(false, "empty channel must not reject its first non-blocking send"),
+    };
+}
+
+test channel_try_receive_distinguishes_empty_and_claimed_values {
+    Channel<i64> ch = Channel<i64>.Create();
+    TryResult<i64, Concurrency.ChannelError> empty = Channel<i64>.TryReceive(ch);
+    match empty {
+        TryResult::WouldBlock => Assert.True(true, "empty channel reports WouldBlock"),
+        _ => Assert.True(false, "empty channel must not manufacture a value"),
+    };
+
+    TryResult<Channel.SendOk, Concurrency.ChannelError> sent = Channel<i64>.TrySend(ch, 99_i64);
+    match sent {
+        TryResult::Ok(_) => Assert.True(true, "empty channel accepts the published value"),
+        _ => Assert.True(false, "empty channel must accept one published value"),
+    };
+    TryResult<i64, Concurrency.ChannelError> received = Channel<i64>.TryReceive(ch);
+    match received {
+        TryResult::Ok(value) => Assert.Equal(value, 99_i64, "try receive returns the single claimed value"),
+        _ => Assert.True(false, "published value must be claimed exactly once"),
+    };
+    TryResult<i64, Concurrency.ChannelError> consumed = Channel<i64>.TryReceive(ch);
+    match consumed {
+        TryResult::WouldBlock => Assert.True(true, "claimed value is removed from the queue"),
+        _ => Assert.True(false, "one publication cannot satisfy two receivers"),
+    };
+}
+
+test channel_close_is_idempotent {
+    Channel<i64> ch = Channel<i64>.Create();
+    Channel<i64>.Close(ch);
+    Assert.True(true, "Close completes without panic");
+}
+
+test channel_close_drains_committed_value {
+    Channel<i64> ch = Channel<i64>.Create();
+    let sent = Channel.Send<i64>(ch, 42_i64);
+    Assert.True(Results.IsOk(sent), "send commits once");
+    Channel.Close<i64>(ch);
+    Channel.Close<i64>(ch);
+    match Channel.TryReceive<i64>(ch) {
+        TryResult::Ok(value) => Assert.Equal(value, 42_i64, "close retains committed value"),
+        _ => Assert.True(false, "close must not drain queue storage"),
+    };
+    match Channel.TryReceive<i64>(ch) {
+        TryResult::Err(Concurrency.ChannelError::Closed(_)) => Assert.True(true, "closed after drain"),
+        _ => Assert.True(false, "one committed value is delivered exactly once"),
+    };
+}
+
+// ---- MutexTryLockTests.bd (formerly target `ConcurrencyMutexTryLockTests`) ----
+
+// Mutex wrapper surface tests.
+
+test mutex_create_returns_handle {
+    Mutex mutex = Mutex.Create();
+    Assert.True(true, "Mutex.Create returns a handle");
+}
+
+test mutex_try_lock_returns_try_result {
+    Mutex mutex = Mutex.Create();
+    TryResult<Concurrency.MutexGuard, Concurrency.MutexError> result = Mutex.TryLock(mutex);
+    match result {
+        TryResult::Ok(_) => { },
+        TryResult::Err(MutexError::Cancelled(_)) => { },
+        TryResult::WouldBlock => { },
+    };
+    Assert.True(true, "TryLock returns TryResult<MutexGuard, MutexError>");
+}
+
+test mutex_lock_returns_result {
+    Mutex mutex = Mutex.Create();
+    Core.Results.Result<Concurrency.MutexGuard, Concurrency.MutexError> result = Mutex.Lock(mutex);
+    match result {
+        Result::Ok(_) => { },
+        Result::Error(MutexError::Cancelled(_)) => { },
+    };
+    Assert.True(true, "Lock returns Result");
+}
+
+// ---- ConcurrencyClockTests.bd (formerly target `ConcurrencyClockTests`) ----
+
+// Scheduler clock and yield wrappers.
+
+test now_millis_non_negative {
+    i64 now = Concurrency.NowMillis();
+    Assert.True(now >= 0, "NowMillis should be non-negative");
+}
+
+test processor_count_positive {
+    i64 count = Concurrency.ProcessorCount();
+    Assert.True(count >= 1, "ProcessorCount should be at least 1");
+}
+
+test yield_invokes_builtin {
+    Concurrency.Yield();
+    return;
+}
+
+// ---- HubRegisterTests.bd (formerly target `ConcurrencyHubRegisterTests`) ----
+
+// Hub registration tests.
+
+test hub_create_returns_handle {
+    Hub<i64> hub = Hub<i64>.Create();
+    Assert.True(true, "Hub.Create returns a handle");
+}
+
+test hub_register_returns_result {
+    Hub<i64> hub = Hub<i64>.Create();
+    Channel<i64> ch = Channel<i64>.Create();
+    Core.Results.Result<Channel.SendOk, Concurrency.HubError> result = Hub.Register<i64>(hub, 0_i64, ch);
+    Assert.True(Results.IsOk(result) || Results.IsError(result), "Register returns a valid result");
+    match result {
+        Result::Ok(_) => { },
+        Result::Error(HubError::Limit(_, _)) => { },
+        Result::Error(HubError::Cancelled(_)) => { },
+        Result::Error(HubError::Closed(_)) => { },
+    };
+}
+
+test hub_unregister_does_not_panic {
+    Hub<i64> hub = Hub<i64>.Create();
+    Channel<i64> ch = Channel<i64>.Create();
+    Core.Results.Result<Channel.SendOk, Concurrency.HubError> registered = Hub.Register<i64>(hub, 0_i64, ch);
+    match registered {
+        Result::Ok(_) => { },
+        Result::Error(HubError::Limit(_, _)) => { },
+        Result::Error(HubError::Cancelled(_)) => { },
+        Result::Error(HubError::Closed(_)) => { },
+    };
+    Hub.Unregister<i64>(hub, 0_i64);
+    Assert.True(true, "Unregister completes");
+}
+
+// ---- WaitGroupTests.bd (formerly target `ConcurrencyWaitGroupTests`) ----
+
+// WaitGroup wrapper surface.
+
+test wait_group_add_done_wait {
+    WaitGroup group = WaitGroup.Create();
+    WaitGroup.Add(group, 2);
+    WaitGroup.Done(group);
+    WaitGroup.Done(group);
+    WaitGroup.Wait(group);
+    Assert.True(true, "wait group should complete after matching Done calls");
+}
+
+// ---- FiberHandleTests.bd (formerly target `ConcurrencyFiberHandleTests`) ----
+
+// Fiber handle runtime tests, exercised through the public Fiber API only.
+
+i64 ProduceValue() {
+    return 42_i64;
+}
+
+test spawned_fiber_join_returns_its_value {
+    Fiber<i64> fiber = spawn ProduceValue();
+    Core.Results.Result<i64, FiberError> result = fiber.Join();
+    match result {
+        Result::Ok(value) => Assert.True(value == 42_i64, "Fiber.Join returns the typed terminal value"),
+        Result::Error(_) => Assert.True(false, "a completed fiber must join with a value"),
+    };
+}
+
+test repeated_cancel_then_join_is_safe {
+    Fiber<i64> fiber = spawn ProduceValue();
+    fiber.Cancel();
+    fiber.Cancel();
+    Core.Results.Result<i64, FiberError> result = fiber.Join();
+    match result {
+        Result::Ok(value) => Assert.True(value == 42_i64, "a fiber that finished before cancellation keeps its value"),
+        Result::Error(FiberError::Cancelled(_, _)) => Assert.True(true, "a cancelled fiber joins as cancelled"),
+        Result::Error(_) => Assert.True(false, "cancellation must not produce another error kind"),
+    };
+}
+
+test detach_relinquishes_the_join_obligation {
+    Fiber<i64> fiber = spawn ProduceValue();
+    fiber.Detach();
+}

@@ -1,0 +1,627 @@
+//! `SystemSuite`: the system tests of corelib_tests, merged into one target so the matrix lowers
+//! the system closure once. Each section keeps the tests of one former target unchanged.
+
+use Testing.Assert;
+use Core.Syscall;
+use Core.Results;
+use Core.Syscall.Descriptor;
+use Core.Syscall.StandardStream;
+use Core.Syscall.WriteRequest;
+use Core.Syscall.ReadRequest;
+use Core.Syscall.ReadLimit;
+use Core.FS;
+use Core.FS.FsError;
+use Core.Time;
+use Core.Time.Date;
+use Core.Time.Duration;
+use Core.Time.Deadline;
+use Core.Time.Instant;
+use Core.Time.TimerError;
+use Core.Environment;
+use Core.Environment.EnvironmentError;
+use Core.Optional.Option;
+use Runtime.Init;
+use Testing.Expect;
+use Core.Path.Lexical;
+use Core.Time.Calendar;
+use Core.Time.TimeError;
+
+// ---- SyscallWriteTests.bd (formerly target `SystemSyscallWriteTests`) ----
+
+// Syscall write smoke tests via `Core.Syscall` facade.
+
+test syscall_write_empty_string_returns_non_negative {
+    Core.Results.Result<i64, Core.Syscall.SyscallError> result =
+        Core.Syscall.Write(Core.Syscall.StdoutFd(), "");
+    Assert.True(Results.IsOk(result), "empty Write should succeed");
+    match result {
+        Result::Ok(written) => {
+            Assert.True(written >= 0, "empty write byte count should be non-negative");
+        },
+        Result::Error(_) => {},
+    };
+}
+
+test syscall_write_stdout_smoke {
+    Core.Results.Result<i64, Core.Syscall.SyscallError> result =
+        Core.Syscall.Write(Core.Syscall.StdoutFd(), "corelib");
+    Assert.True(Results.IsOk(result), "stdout Write should succeed");
+    match result {
+        Result::Ok(written) => {
+            Assert.True(written >= 1, "non-empty write should return at least one byte");
+        },
+        Result::Error(_) => {},
+    };
+}
+
+test syscall_write_prints_newline {
+    Core.Results.Result<i64, Core.Syscall.SyscallError> letter =
+        Core.Syscall.Write(Core.Syscall.StdoutFd(), "a");
+    Core.Results.Result<i64, Core.Syscall.SyscallError> newline =
+        Core.Syscall.Write(Core.Syscall.StdoutFd(), "\\n");
+    Assert.True(Results.IsOk(letter), "letter write should succeed");
+    Assert.True(Results.IsOk(newline), "newline write should succeed");
+    match letter {
+        Result::Ok(written) => {
+            Assert.True(written >= 1, "expected one byte for letter a");
+        },
+        Result::Error(_) => {},
+    };
+    match newline {
+        Result::Ok(written) => {
+            Assert.True(written >= 1, "expected one byte for newline");
+        },
+        Result::Error(_) => {},
+    };
+}
+
+// ---- SyscallApiTests.bd (formerly target `SystemSyscallApiTests`) ----
+
+// Syscall API contract checks for `Core.Syscall` read boundaries.
+
+test syscall_read_rejects_unsupported_fd {
+    Core.Results.Result<string, Core.Syscall.SyscallError> result =
+        Core.Syscall.Read(99_i64, 8_i64);
+    Assert.True(Results.IsError(result), "Read on non-stdin fd should fail");
+}
+
+test syscall_read_rejects_invalid_limit {
+    Core.Results.Result<string, Core.Syscall.SyscallError> result =
+        Core.Syscall.Read(Core.Syscall.StdinFd(), 0_i64);
+    Assert.True(Results.IsError(result), "non-positive read limit should fail");
+}
+
+// ---- SyscallErgonomicsTests.bd (formerly target `SystemSyscallErgonomicsTests`) ----
+
+// Runtime-backed syscall contract checks via `Core.Syscall` typed requests.
+
+test syscall_write_stdout_typed_smoke {
+    StandardStream stream = StandardStream::Stdout;
+    Descriptor descriptor = Descriptor::Standard(stream);
+    Core.Results.Result<i64, Core.Syscall.SyscallError> result =
+        Core.Syscall.WriteWith(
+            WriteRequest {
+                descriptor: descriptor,
+                data: "ergonomic-write"
+            }
+        );
+    Assert.True(Results.IsOk(result), "stdout WriteWith should succeed");
+    match result {
+        Result::Ok(written) => {
+            Assert.True(written >= 1, "stdout write should return at least one byte");
+        },
+        Result::Error(_) => {},
+    };
+}
+
+test syscall_read_unsupported_fd_returns_error {
+    StandardStream stream = StandardStream::Stdout;
+    Descriptor descriptor = Descriptor::Standard(stream);
+    Core.Results.Result<string, Core.Syscall.SyscallError> result =
+        Core.Syscall.ReadWith(
+            ReadRequest {
+                descriptor: descriptor,
+                limit: ReadLimit::UpTo(4_i64)
+            }
+        );
+    Assert.True(Results.IsError(result), "read from stdout should fail in v1");
+}
+
+test syscall_write_invalid_fd_returns_error {
+    Core.Results.Result<i64, Core.Syscall.SyscallError> result =
+        Core.Syscall.Write(-1_i64, "x");
+    Assert.True(Results.IsError(result), "invalid fd write should return error");
+}
+
+// ---- OutputWriteLineTests.bd (formerly target `SystemOutputWriteLineTests`) ----
+
+// Smoke test for stdout line output via `Core.Output.WriteLine`.
+
+test output_writeline_smoke {
+    Core.Output.WriteLine("corelib-output-writeline-smoke");
+}
+
+// ---- OutputWriteTests.bd (formerly target `SystemOutputWriteTests`) ----
+
+// Smoke test for stdout output via `Core.Output.Write`.
+
+test output_write_smoke {
+    Core.Output.Write("corelib-output-write-smoke");
+}
+
+// ---- InputReadTests.bd (formerly target `SystemInputReadTests`) ----
+
+// Input module tests — stdin read operations.
+
+test input_read_returns_result {
+    Core.Results.Result<string, Core.Syscall.SyscallError> result = Core.Input.Read();
+    Assert.True(Results.IsOk(result) || Results.IsError(result), "read returns a valid result");
+}
+
+test input_read_byte_returns_result {
+    Core.Results.Result<string, Core.Syscall.SyscallError> result = Core.Input.ReadByte();
+    Assert.True(Results.IsOk(result) || Results.IsError(result), "read byte returns a valid result");
+}
+
+test input_read_line_returns_result {
+    Core.Results.Result<string, Core.Syscall.SyscallError> result = Core.Input.ReadLine();
+    Assert.True(Results.IsOk(result) || Results.IsError(result), "read line returns a valid result");
+}
+
+test input_is_empty_is_boolean {
+    bool empty = Core.Input.IsEmpty();
+    Assert.True(empty == true || empty == false, "IsEmpty returns bool");
+}
+
+// ---- ErrorWriteTests.bd (formerly target `SystemErrorWriteTests`) ----
+
+// Smoke test for stderr line output via `Core.Error.WriteLine`.
+
+test error_writeline_smoke {
+    Core.Error.WriteLine("corelib-error-writeline-smoke");
+}
+
+// ---- FsTests.bd (formerly target `SystemFsTests`) ----
+
+// Native-only public API fixtures for canonical `Core.FS` behavior.
+
+/// @native-only
+test fs_write_read_empty_and_non_empty_files {
+    string path = "beskid-corelib-fs-read.txt";
+    Result<unit, FsError> emptyWrite = FS.WriteAllText(path, "");
+    Assert.True(Results.IsOk(emptyWrite), "native adapter writes an empty file");
+    Result<string, FsError> emptyRead = FS.ReadAllText(path);
+    string empty = match emptyRead { Result::Ok(text) => text, Result::Error(_) => "error" };
+    Assert.Equal(empty, "", "public ReadAllText returns a non-null canonical empty string");
+
+    Result<unit, FsError> textWrite = FS.WriteAllText(path, "beskid");
+    Assert.True(Results.IsOk(textWrite), "native adapter overwrites text");
+    Result<string, FsError> textRead = FS.ReadAllText(path);
+    string text = match textRead { Result::Ok(value) => value, Result::Error(_) => "error" };
+    Assert.Equal(text, "beskid", "public ReadAllText returns persisted content");
+    Assert.True(Results.IsOk(FS.Delete(path)), "public Delete removes the fixture file");
+}
+
+/// @native-only
+test fs_exists_and_missing_read_preserve_typed_results {
+    string path = "beskid-corelib-fs-missing.txt";
+    FS.Delete(path);
+    Result<bool, FsError> missing = FS.Exists(path);
+    bool absent = match missing { Result::Ok(value) => !value, Result::Error(_) => false };
+    Assert.True(absent, "Exists maps NotFound to Ok(false)");
+    Result<string, FsError> missingRead = FS.ReadAllText(path);
+    FsError missingError = match missingRead {
+        Result::Ok(_) => FsError::IOError("unexpected success"),
+        Result::Error(error) => error,
+    };
+    bool notFound = match missingError {
+        FsError::NotFound(errorPath) => errorPath == path,
+        _ => false,
+    };
+    Assert.True(notFound, "ReadAllText preserves the missing path in FsError::NotFound");
+}
+
+/// @native-only
+test fs_directory_copy_and_delete_use_unit_success {
+    string directory = "beskid-corelib-fs-dir";
+    string source = "beskid-corelib-fs-dir/source.txt";
+    string destination = "beskid-corelib-fs-dir/copy.txt";
+    FS.Delete(source);
+    FS.Delete(destination);
+    Result<unit, FsError> created = FS.CreateDirectory(directory);
+    bool createAccepted = match created {
+        Result::Ok(_) => true,
+        Result::Error(error) => match error {
+            FsError::AlreadyExists(errorPath) => errorPath == directory,
+            _ => false,
+        },
+    };
+    Assert.True(createAccepted, "CreateDirectory returns success or the expected existing-directory error");
+    Result<bool, FsError> directoryExists = FS.Exists(directory);
+    bool directoryReady = match directoryExists {
+        Result::Ok(exists) => exists,
+        Result::Error(_) => false,
+    };
+    Assert.True(directoryReady, "CreateDirectory leaves the fixture directory available");
+    Assert.True(Results.IsOk(FS.WriteAllText(source, "copy me")), "source fixture is written");
+    Assert.True(Results.IsOk(FS.Copy(source, destination)), "Copy propagates public read/write success");
+    string copied = match FS.ReadAllText(destination) { Result::Ok(text) => text, Result::Error(_) => "error" };
+    Assert.Equal(copied, "copy me", "Copy preserves file content");
+    Assert.True(Results.IsOk(FS.Delete(source)), "source deletion returns unit success");
+    Assert.True(Results.IsOk(FS.Delete(destination)), "destination deletion returns unit success");
+}
+
+// ---- PathTests.bd (formerly target `SystemPathTests`) ----
+
+// Tier 2 (Supported) coverage for `Core.Path` composition helpers.
+
+test path_combine_short_circuits_empty_left {
+    string left = "";
+    string right = "foo";
+    mut string combined = right;
+    if left == "" {
+        combined = right;
+    } else {
+        combined = left + "/" + right;
+    }
+    Assert.Equal(combined, right, "Path.Combine must return right when left is empty");
+}
+
+test path_combine_short_circuits_empty_right {
+    string left = "foo";
+    string right = "";
+    mut string combined = left;
+    if right == "" {
+        combined = left;
+    } else {
+        combined = left + "/" + right;
+    }
+    Assert.Equal(combined, left, "Path.Combine must return left when right is empty");
+}
+
+test path_combine_joins_with_forward_slash {
+    string left = "etc";
+    string right = "hosts";
+    string combined = left + "/" + right;
+    string expected = left + "/" + right;
+    Assert.Equal(combined, expected, "Path.Combine must join with forward slash");
+}
+
+test path_is_empty_predicate {
+    string empty = "";
+    bool isEmpty = empty == "";
+    Assert.True(isEmpty, "Path.IsEmpty must be true for empty string");
+
+    string populated = "/tmp";
+    bool populatedEmpty = populated == "";
+    Assert.False(populatedEmpty, "Path.IsEmpty must be false for non-empty string");
+}
+
+test path_is_absolute_root_only {
+    string root = "/";
+    bool isRoot = root == "/";
+    Assert.True(isRoot, "Path.IsAbsolute must accept /");
+
+    string empty = "";
+    bool emptyAbsolute = empty == "/";
+    Assert.False(emptyAbsolute, "Path.IsAbsolute must reject empty");
+
+    string relative = "etc";
+    bool relativeAbsolute = relative == "/";
+    Assert.False(relativeAbsolute, "Path.IsAbsolute must reject relative paths in v1 heuristic");
+}
+
+// ---- TimeTests.bd (formerly target `SystemTimeTests`) ----
+
+// Time module tests — UTC civil helpers.
+
+test time_date_struct_smoke {
+    Date date = Date { year: 1970, month: 1, day: 1 };
+    Assert.Equal(date.year, 1970, "year");
+    Assert.Equal(date.month, 1, "month");
+    Assert.Equal(date.day, 1, "day");
+}
+
+test time_is_leap_year_divisible_by_4 {
+    Assert.True(Time.IsLeapYear(2024), "2024 is leap");
+    Assert.False(Time.IsLeapYear(2023), "2023 is not leap");
+}
+
+test time_is_leap_year_divisible_by_400 {
+    Assert.True(Time.IsLeapYear(2000), "2000 is leap");
+}
+
+test time_days_in_month_february_leap {
+    Assert.Equal(Time.DaysInMonth(2024, 2), 29, "feb 2024 has 29 days");
+}
+
+test time_days_in_month_february_non_leap {
+    Assert.Equal(Time.DaysInMonth(2023, 2), 28, "feb 2023 has 28 days");
+}
+
+test time_days_in_month_standard {
+    Assert.Equal(Time.DaysInMonth(2023, 1), 31, "jan has 31");
+    Assert.Equal(Time.DaysInMonth(2023, 4), 30, "apr has 30");
+}
+
+test time_now_utc_returns_instant {
+    Instant now = Time.NowUtc();
+    Assert.True(now.nanos > 0, "NowUtc should be positive");
+}
+
+test time_monotonic_now_returns_instant {
+    Instant first = Time.MonotonicNow();
+    Instant second = Time.MonotonicNow();
+    Assert.True(second.nanos >= first.nanos, "MonotonicNow should not move backward");
+}
+
+test time_from_milliseconds {
+    Duration d = Time.FromMilliseconds(1000);
+    Assert.Equal(Time.DurationToMilliseconds(d), 1000, "1000 ms roundtrip");
+}
+
+test time_from_seconds {
+    Duration d = Time.FromSeconds(5);
+    Assert.Equal(Time.DurationToMilliseconds(d), 5000, "5 seconds = 5000 ms");
+}
+
+test time_subtract_instants {
+    Instant earlier = Instant { nanos: 1000 };
+    Instant later = Instant { nanos: 1750 };
+    Duration delta = Time.SubtractInstants(later, earlier);
+    Assert.Equal(Time.DurationToNanoseconds(delta), 750, "subtract instants returns elapsed nanos");
+}
+
+test time_sleep_rejects_negative_duration_with_closed_error {
+    Result<unit, TimerError> result = Time.Sleep(Duration { nanos: -1_i64 });
+    i64 outcome = match result {
+        Result::Ok(_) => 0_i64,
+        Result::Error(TimerError::InvalidDuration()) => 1_i64,
+        Result::Error(TimerError::DeadlineOverflow()) => 2_i64,
+        Result::Error(TimerError::Unavailable()) => 3_i64,
+        Result::Error(TimerError::Cancelled()) => 4_i64,
+    };
+    Assert.Equal(outcome, 1_i64, "negative duration is invalid before admission");
+}
+
+test time_deadline_after_accepts_zero_duration {
+    Result<Deadline, TimerError> result = Deadline.After(Duration { nanos: 0_i64 });
+    i64 outcome = match result {
+        Result::Ok(_) => 1_i64,
+        Result::Error(_) => 0_i64,
+    };
+    Assert.Equal(outcome, 1_i64, "zero duration is a valid monotonic deadline");
+}
+
+test time_deadline_after_rejects_negative_duration {
+    Result<Deadline, TimerError> result = Deadline.After(Duration { nanos: -1_i64 });
+    i64 outcome = match result {
+        Result::Error(TimerError::InvalidDuration()) => 1_i64,
+        Result::Ok(_) => 0_i64,
+        Result::Error(_) => 2_i64,
+    };
+    Assert.Equal(outcome, 1_i64, "negative duration is invalid");
+}
+
+test time_deadline_after_rejects_monotonic_overflow {
+    Result<Deadline, TimerError> result = Deadline.After(Duration { nanos: 9223372036854775807_i64 });
+    i64 outcome = match result {
+        Result::Error(TimerError::DeadlineOverflow()) => 1_i64,
+        Result::Ok(_) => 0_i64,
+        Result::Error(_) => 2_i64,
+    };
+    Assert.Equal(outcome, 1_i64, "deadline addition must reject overflow");
+}
+
+test time_format_date_iso_formats_minimum_i64_year {
+    // The year digits come from the signed value, so the minimum i64 (whose negation overflows)
+    // formats like every other year.
+    Date date = Date { year: -9223372036854775807 - 1, month: 1, day: 2 };
+    Assert.Equal(Time.FormatDateIso(date), "-9223372036854775808-01-02", "minimum i64 year");
+    Date negative = Date { year: -44, month: 3, day: 15 };
+    Assert.Equal(Time.FormatDateIso(negative), "-44-03-15", "negative year");
+}
+
+// ---- EnvironmentTests.bd (formerly target `SystemEnvironmentTests`) ----
+
+// Environment module tests — read-only getters and empty-name error paths.
+// Hermetic: never mutates real environment variables.
+
+test env_get_empty_name_returns_invalid_name_error {
+    Core.Results.Result<string, EnvironmentError> result = Environment.Get("");
+    Assert.True(Results.IsError(result), "Get with empty name should be an error");
+}
+
+test env_tryget_empty_name_returns_none {
+    Option<string> opt = Environment.TryGet("");
+    Assert.False(Option.HasValue<string>(opt), "TryGet with empty name should be None");
+}
+
+test env_has_empty_name_returns_false {
+    Assert.Equal(Environment.Has(""), false, "Has with empty name should be false");
+}
+
+test env_set_empty_name_returns_invalid_name_error {
+    Core.Results.Result<bool, EnvironmentError> result = Environment.Set("", "x");
+    Assert.True(Results.IsError(result), "Set with empty name should be an error");
+}
+
+test env_getvariable_alias_returns_error_for_empty {
+    Core.Results.Result<string, EnvironmentError> result = Environment.GetVariable("");
+    Assert.True(Results.IsError(result), "GetVariable alias with empty name should be an error");
+}
+
+test env_expand_alias_returns_error_for_empty {
+    Core.Results.Result<string, EnvironmentError> result = Environment.Expand("");
+    Assert.True(Results.IsError(result), "Expand alias with empty name should be an error");
+}
+
+test env_current_directory_nonempty {
+    Assert.True(Environment.CurrentDirectory() != "", "CurrentDirectory should be non-empty");
+}
+
+test env_get_missing_var_returns_not_found {
+    Core.Results.Result<string, EnvironmentError> result =
+        Environment.Get("BESKID_DEFINITELY_NOT_SET_XYZ");
+    Assert.True(Results.IsError(result), "Get of an unset variable should be an error");
+}
+
+// ---- RuntimeInitTests.bd (formerly target `SystemRuntimeInitTests`) ----
+
+// Runtime.Init module tests — RegisterHandlers stable no-op contract.
+
+test runtime_register_handlers_returns_zero {
+    Assert.Equal(Init.RegisterHandlers(), 0, "RegisterHandlers is a stable no-op returning 0");
+}
+
+// ---- PathLexicalTests.bd (formerly target `SystemPathLexicalTests`) ----
+
+// Core.Path.Lexical tests.
+
+string RelativeOr(Option<string> value, string fallback) {
+    return match value {
+        Option::Some(path) => path,
+        Option::None => fallback,
+    };
+}
+
+test path_normalize {
+    Expect.EqualString(Lexical.Normalize("/a//b/./c/"), "/a/b/c", "collapse and drop dots");
+    Expect.EqualString(Lexical.Normalize("a/b/../c"), "a/c", "resolve parent");
+    Expect.EqualString(Lexical.Normalize("/../a"), "/a", "rooted path stays under root");
+    Expect.EqualString(Lexical.Normalize("../../a/.."), "../..", "relative keeps leading parents");
+    Expect.EqualString(Lexical.Normalize("a/.."), ".", "empty relative is dot");
+    Expect.EqualString(Lexical.Normalize("/"), "/", "root");
+    Expect.EqualString(Lexical.Normalize(""), ".", "empty");
+}
+
+test path_segments_and_rooted {
+    Expect.EqualStringArray(Lexical.Segments("/a//b/./c"), ["a", "b", "c"], "segments");
+    Expect.EqualBool(Lexical.IsRooted("/x"), true, "rooted");
+    Expect.EqualBool(Lexical.IsRooted("x"), false, "relative");
+    Expect.EqualString(Lexical.ToForwardSlashes("a\\b\\c"), "a/b/c", "backslashes");
+}
+
+test path_join_all {
+    Expect.EqualString(Lexical.JoinAll(["src", "core", "../lib.bd"]), "src/lib.bd", "join and normalize");
+    Expect.EqualString(Lexical.JoinAll(["a", "/b", "c"]), "/b/c", "rooted part resets");
+    Expect.EqualString(Lexical.JoinAll(["", "x"]), "x", "empty parts skipped");
+}
+
+test path_relative {
+    Expect.EqualString(RelativeOr(Lexical.Relative("/a/b/c", "/a/d"), "?"), "../../d", "up and over");
+    Expect.EqualString(RelativeOr(Lexical.Relative("/a", "/a/b/c"), "?"), "b/c", "down");
+    Expect.EqualString(RelativeOr(Lexical.Relative("a/b", "a/b"), "?"), ".", "same");
+    Expect.EqualString(RelativeOr(Lexical.Relative("/a", "b"), "none"), "none", "mixed rootedness");
+    Expect.EqualString(RelativeOr(Lexical.Relative("../x", "y"), "none"), "none", "unresolvable parent");
+}
+
+test path_stem_and_parent {
+    Expect.EqualString(Lexical.Stem("dir/archive.tar.gz"), "archive.tar", "last extension");
+    Expect.EqualString(Lexical.Stem(".profile"), ".profile", "dotfile");
+    Expect.EqualString(Lexical.Stem("noext"), "noext", "no extension");
+    Expect.EqualString(Lexical.Parent("/a/b"), "/a", "parent");
+    Expect.EqualString(Lexical.Parent("/a"), "/", "parent of top level");
+    Expect.EqualString(Lexical.Parent("a"), ".", "parent of relative");
+    Expect.EqualString(Lexical.Parent("/"), "/", "root parent");
+    Expect.EqualString(Lexical.Parent(".."), "../..", "parent of parent");
+}
+
+// ---- CalendarTests.bd (formerly target `SystemCalendarTests`) ----
+
+// Core.Time.Calendar tests.
+
+Date D(i64 year, i64 month, i64 day) {
+    return Date { year: year, month: month, day: day };
+}
+
+string DateText(Date date) {
+    return Calendar.FormatDate(date);
+}
+
+i64 NanosOr(Result<Instant, TimeError> parsed) {
+    return match parsed {
+        Result::Ok(instant) => instant.nanos,
+        Result::Error(_) => -1_i64,
+    };
+}
+
+string FailureOf(Result<Instant, TimeError> parsed) {
+    return match parsed {
+        Result::Ok(_) => "ok",
+        Result::Error(error) => match error {
+            TimeError::InvalidFormat(_) => "format",
+            TimeError::OutOfRange(field) => field,
+        },
+    };
+}
+
+test calendar_days_round_trip {
+    Expect.EqualI64(Calendar.DaysFromCivil(1970, 1, 1), 0, "epoch");
+    Expect.EqualI64(Calendar.DaysFromCivil(2000, 3, 1), 11017, "2000-03-01");
+    Expect.EqualI64(Calendar.DaysFromCivil(1969, 12, 31), -1, "day before epoch");
+    Expect.EqualString(DateText(Calendar.CivilFromDays(11016)), "2000-02-29", "leap day");
+    Expect.EqualString(DateText(Calendar.CivilFromDays(-719468)), "0000-03-01", "era boundary");
+    Expect.EqualString(DateText(Calendar.CivilFromDays(Calendar.DaysFromCivil(-44, 3, 15))), "-0044-03-15", "negative year");
+}
+
+test calendar_leap_years_and_validity {
+    Expect.EqualBool(Calendar.IsLeapYear(2000), true, "divisible by 400");
+    Expect.EqualBool(Calendar.IsLeapYear(1900), false, "century");
+    Expect.EqualBool(Calendar.IsLeapYear(2024), true, "every fourth");
+    Expect.EqualBool(Calendar.IsLeapYear(-4), true, "proleptic negative");
+    Expect.EqualBool(Calendar.IsValidDate(2023, 2, 29), false, "no Feb 29 in 2023");
+    Expect.EqualBool(Calendar.IsValidDate(2024, 2, 29), true, "Feb 29 in 2024");
+    Expect.EqualI64(Calendar.DaysInMonth(2024, 13), 0, "invalid month");
+}
+
+test calendar_weekday_and_day_of_year {
+    Expect.EqualI64(Calendar.IsoWeekday(D(1970, 1, 1)), 4, "Thursday");
+    Expect.EqualI64(Calendar.IsoWeekday(D(2026, 10, 6)), 2, "Tuesday");
+    Expect.EqualI64(Calendar.IsoWeekday(D(1969, 12, 28)), 7, "Sunday before epoch");
+    Expect.EqualI64(Calendar.DayOfYear(D(2024, 12, 31)), 366, "leap year end");
+    Expect.EqualI64(Calendar.DayOfYear(D(2023, 3, 1)), 60, "March 1st common year");
+}
+
+test calendar_arithmetic {
+    Expect.EqualString(DateText(Calendar.AddDays(D(2024, 2, 28), 2)), "2024-03-01", "across leap day");
+    Expect.EqualString(DateText(Calendar.AddDays(D(2024, 1, 1), -1)), "2023-12-31", "backwards");
+    Expect.EqualString(DateText(Calendar.AddMonths(D(2024, 1, 31), 1)), "2024-02-29", "clamp to leap February");
+    Expect.EqualString(DateText(Calendar.AddMonths(D(2024, 3, 15), -15)), "2022-12-15", "negative months");
+    Expect.EqualString(DateText(Calendar.AddYears(D(2024, 2, 29), 1)), "2025-02-28", "leap day clamps");
+    Expect.EqualI64(Calendar.DaysBetween(D(2024, 1, 1), D(2025, 1, 1)), 366, "leap year length");
+    Expect.EqualI64(Calendar.CompareDates(D(2024, 1, 1), D(2023, 12, 31)), 1, "after");
+    Expect.EqualI64(Calendar.CompareDates(D(2024, 1, 1), D(2024, 1, 1)), 0, "equal");
+}
+
+test calendar_format_instant {
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: 0 }), "1970-01-01T00:00:00Z", "epoch");
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: 1500000000 }), "1970-01-01T00:00:01.500Z", "milliseconds");
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: -1 }), "1969-12-31T23:59:59.999999999Z", "nanoseconds before epoch");
+    Expect.EqualString(Calendar.FormatDate(D(12345, 1, 2)), "+12345-01-02", "expanded year");
+}
+
+test calendar_parse_instant {
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-01T00:00:00Z")), 0, "epoch");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-01T01:00:00+01:00")), 0, "positive offset");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1969-12-31 19:00:00.25-05:00")), 250000000, "space, fraction, negative offset");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-02")), 86400000000000_i64, "date only");
+    Expect.EqualI64(NanosOr(Calendar.ParseInstant("1970-01-01t00:00:00.000000001z")), 1, "lowercase separators");
+    Expect.EqualString(Calendar.FormatInstant(Instant { nanos: NanosOr(Calendar.ParseInstant("2026-10-06T12:30:00Z")) }), "2026-10-06T12:30:00Z", "round trip");
+}
+
+test calendar_parse_failures {
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-02-29T00:00:00Z")), "day", "invalid day");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-13-01")), "month", "invalid month");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T24:00:00Z")), "hour", "hour 24");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T00:00:60Z")), "second", "leap second rejected");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T00:00:00")), "format", "missing zone");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023-01-01T00:00:00.Z")), "format", "empty fraction");
+    Expect.EqualString(FailureOf(Calendar.ParseInstant("2023/01/01")), "format", "wrong separator");
+}
+
+test calendar_parse_date {
+    Result<Date, TimeError> parsed = Calendar.ParseDate("2024-02-29");
+    Expect.IsOk<Date, TimeError>(parsed, "valid date");
+    Expect.IsError<Date, TimeError>(Calendar.ParseDate("2024-02-29T00:00:00Z"), "date only");
+}

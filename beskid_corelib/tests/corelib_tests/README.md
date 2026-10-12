@@ -39,6 +39,16 @@ python3 corelib/ci/normalize_corelib_test_imports.py
 python3 corelib/ci/normalize_corelib_test_imports.py --check  # CI drift guard
 ```
 
+## Targets
+
+Tests are grouped into one `Lib` target per package area (`SystemSuite`, `ConsoleSuite`, `CoreSuite`, ...)
+so the matrix lowers each area's Corelib closure once. A suite file keeps the tests of each former target in
+its own section, marked `// ---- <File>.bd (formerly target ...) ----`; specification traceability refers
+to a section as `<Suite>.bd#<File>`. A file stays a separate target when it declares a helper name already
+used in its area, when it does not yet compile merged (the `network` tests), or when it needs native
+library externs (`CoreMathTests`, `CoreJsonTests`, `TestingExpectTests`, `TextNumberTests`), so that one
+link failure cannot hide a whole suite.
+
 ## Source fixtures
 
 Negative namespace and native-only overflow fixtures live under `fixtures/`; see `fixtures/README.md`. They are not ordinary `Lib` targets and must be selected by the compile-fail or installed-runtime fixture harness.
@@ -48,12 +58,12 @@ Negative namespace and native-only overflow fixtures live under `fixtures/`; see
 ```bash
 just corelib
 # or single target:
-./target/release/beskid_cli test --project corelib/beskid_corelib/tests/corelib_tests --target ConsoleFormatMarkdownTests --plain
+./target/release/beskid_cli test --project corelib/beskid_corelib/tests/corelib_tests --target ConsoleSuite --plain
 ```
 
 Filter matrix during development:
 
 ```bash
-export BESKID_CORELIB_TEST_TARGETS=ConsoleAnsiEscapeTests,ConsoleFormatMarkdownTests
+export BESKID_CORELIB_TEST_TARGETS=ConsoleSuite,TextSuite
 just corelib
 ```

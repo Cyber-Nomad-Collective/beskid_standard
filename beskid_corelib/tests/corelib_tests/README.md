@@ -45,7 +45,7 @@ Tests are grouped into one `Lib` target per package area (`SystemSuite`, `Consol
 so the matrix lowers each area's Corelib closure once. A suite file keeps the tests of each former target in
 its own section, marked `// ---- <File>.bd (formerly target ...) ----`; specification traceability refers
 to a section as `<Suite>.bd#<File>`. A file stays a separate target when it declares a helper name already
-used in its area, when it does not yet compile merged (the `network` tests), or when it needs native
+used in its area, or when it needs native
 library externs (`CoreMathTests`, `CoreJsonTests`, `TestingExpectTests`, `TextNumberTests`), so that one
 link failure cannot hide a whole suite.
 

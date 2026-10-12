@@ -338,3 +338,95 @@ test detach_relinquishes_the_join_obligation {
     Fiber<i64> fiber = spawn ProduceValue();
     fiber.Detach();
 }
+
+// ---- Runtime limits: every runtime table grows on demand (v06-runtime-limits) ----
+
+// A chain of nested spawn+join keeps `depth` fibers alive at once; the scheduler's chunked fiber
+// table has to grow past its first chunk, and every finished slot is reused afterwards.
+i64 SpawnChain(i64 depth) {
+    if depth == 0_i64 { return 0_i64; }
+    Fiber<i64> child = spawn (() => SpawnChain(depth - 1_i64));
+    Core.Results.Result<i64, FiberError> joined = child.Join();
+    return match joined {
+        Result::Ok(below) => below + 1_i64,
+        Result::Error(_) => -100000_i64,
+    };
+}
+
+test ten_thousand_fibers_spawn_and_join_with_bounded_concurrency {
+    mut i64 total = 0_i64;
+    mut i64 round = 0_i64;
+    while round < 50_i64 {
+        i64 chain = SpawnChain(200_i64);
+        Assert.Equal(chain, 200_i64, "every fiber in a chain of 200 joins with its value");
+        total = total + chain;
+        round = round + 1_i64;
+    }
+    Assert.Equal(total, 10000_i64, "10,000 fibers spawned and joined through a growable table");
+}
+
+test one_thousand_channels_each_deliver_one_value {
+    mut i64 index = 0_i64;
+    mut i64 delivered = 0_i64;
+    while index < 1000_i64 {
+        Channel<i64> ch = Channel<i64>.Create();
+        let sent = Channel.Send<i64>(ch, index);
+        Assert.True(Results.IsOk(sent), "a fresh channel beyond the old 64-slot table accepts a send");
+        match Channel.TryReceive<i64>(ch) {
+            TryResult::Ok(value) => { if value == index { delivered = delivered + 1_i64; } },
+            _ => Assert.True(false, "the committed value is claimed from its own channel"),
+        };
+        Channel.Close<i64>(ch);
+        index = index + 1_i64;
+    }
+    Assert.Equal(delivered, 1000_i64, "1,000 channels created and used in one scheduler");
+}
+
+test one_thousand_mutexes_lock_and_unlock {
+    mut i64 index = 0_i64;
+    mut i64 locked = 0_i64;
+    while index < 1000_i64 {
+        Mutex mutex = Mutex.Create();
+        match Mutex.Lock(mutex) {
+            Result::Ok(guard) => { locked = locked + 1_i64; Mutex.Unlock(guard); },
+            Result::Error(_) => Assert.True(false, "a fresh mutex beyond the old 32-slot table locks"),
+        };
+        index = index + 1_i64;
+    }
+    Assert.Equal(locked, 1000_i64, "1,000 mutexes created and locked in one scheduler");
+}
+
+test one_thousand_wait_groups_complete {
+    mut i64 index = 0_i64;
+    while index < 1000_i64 {
+        WaitGroup group = WaitGroup.Create();
+        WaitGroup.Add(group, 1_i64);
+        WaitGroup.Done(group);
+        WaitGroup.Wait(group);
+        index = index + 1_i64;
+    }
+    Assert.True(true, "1,000 wait groups beyond the old 16-slot table complete");
+}
+
+test one_hub_registers_one_thousand_channels_and_receives_from_the_last {
+    Hub<i64> hub = Hub<i64>.Create();
+    mut i64 index = 0_i64;
+    mut i64 registered = 0_i64;
+    Channel<i64> last = Channel<i64>.Create();
+    while index < 1000_i64 {
+        mut Channel<i64> member = Channel<i64>.Create();
+        if index == 999_i64 { member = last; }
+        match Hub.Register<i64>(hub, index, member) {
+            Result::Ok(_) => { registered = registered + 1_i64; },
+            Result::Error(_) => Assert.True(false, "registrations beyond the old 256-entry cap succeed"),
+        };
+        index = index + 1_i64;
+    }
+    Assert.Equal(registered, 1000_i64, "1,000 registrations on one hub");
+    let sent = Channel.Send<i64>(last, 7_i64);
+    Assert.True(Results.IsOk(sent), "the last member accepts a value");
+    match Hub.WaitReceive<i64>(hub) {
+        Result::Ok(received) => Assert.Equal(received.index, 999_i64, "the hub delivers from the only ready member"),
+        Result::Error(_) => Assert.True(false, "a ready member satisfies WaitReceive"),
+    };
+}

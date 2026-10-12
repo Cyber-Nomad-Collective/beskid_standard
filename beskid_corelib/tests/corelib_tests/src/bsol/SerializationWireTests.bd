@@ -184,7 +184,7 @@ test bsol_serialization_wire_rejects_unknown_duplicate_and_malformed_fields
     match (Serialization.ReadValue(Envelope(shape, "value \"string\" { data = \"a\" data = \"b\" }"), shape, table, Limits.DefaultLimits())) {
         Result::Ok(_) => Assert.Fail("duplicate has checked source diagnostics"),
         Result::Error(error) => {
-            Assert.Equal(Errors.Code(error), "DuplicateField");
+            Assert.Equal(Errors.Code(error), "DuplicateField", "duplicate field is a checked diagnostic");
             Assert.True(Errors.HasRelated(error), "duplicate retains first declaration span");
             Assert.True(Errors.RelatedStart(error) >= 0_i64 && Errors.RelatedEnd(error) > Errors.RelatedStart(error), "related span is nonempty");
             Assert.True(Errors.Start(error) > Errors.RelatedEnd(error) && Errors.End(error) > Errors.Start(error), "primary span belongs to second field");
@@ -528,7 +528,7 @@ test bsol_serialization_active_path_rejects_cycle_not_shared_siblings {
     Array.Set<DataValue>(items, 0_i64, cycle);
     match Serialization.WriteValue(recursive, cycle, table, Limits.DefaultLimits()) {
         Result::Ok(_) => Assert.Fail("cyclic managed arena must reject before output"),
-        Result::Error(error) => Assert.Equal(Errors.Code(error), "CycleDetected"),
+        Result::Error(error) => Assert.Equal(Errors.Code(error), "CycleDetected", "cyclic arena rejects with the cycle code"),
     };
     ShapeId scalar = Register(table, "identity-string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
     ShapeId sequence = Register(table, "identity-string-array", ShapeKind::Array, 0_u8, [scalar]);
@@ -540,31 +540,31 @@ test bsol_serialization_active_path_rejects_cycle_not_shared_siblings {
 test checked_array_append_publishes_scalar_and_managed_owners {
     mut i64[] scalar = Array.Empty<i64>();
     Assert.True(Array.TryAppend<i64>(scalar, 7_i64), "checked scalar append admitted");
-    Assert.Equal(Array.Len<i64>(scalar), 1_i64);
-    Assert.Equal(scalar[0_i64], 7_i64);
+    Assert.Equal(Array.Len<i64>(scalar), 1_i64, "scalar append publishes one element");
+    Assert.Equal(scalar[0_i64], 7_i64, "appended scalar is readable");
     mut DataValue[] managed = Array.Empty<DataValue>();
     DataValue value = DataValue::String("typed rooted payload");
     Assert.True(Array.TryAppend<DataValue>(managed, value), "checked managed append admitted");
-    Assert.Equal(Array.Len<DataValue>(managed), 1_i64);
-    match managed[0_i64] { DataValue::String(text) => Assert.Equal(text, "typed rooted payload"), _ => Assert.Fail("exact traced payload preserved"), };
+    Assert.Equal(Array.Len<DataValue>(managed), 1_i64, "managed append publishes one element");
+    match managed[0_i64] { DataValue::String(text) => Assert.Equal(text, "typed rooted payload", "managed payload survives append"), _ => Assert.Fail("exact traced payload preserved"), };
 }
 
 
 test serialization_failure_publication_has_no_mutable_payload {
     SerializationError failure = SerializationError::AllocationFailure;
-    Assert.Equal(Errors.Code(failure), "AllocationFailed");
-    Assert.Equal(Errors.Path(failure), "");
-    Assert.Equal(Errors.Start(failure), -1_i64);
-    Assert.Equal(Errors.End(failure), -1_i64);
+    Assert.Equal(Errors.Code(failure), "AllocationFailed", "reserved failure code");
+    Assert.Equal(Errors.Path(failure), "", "reserved failure has no path");
+    Assert.Equal(Errors.Start(failure), -1_i64, "reserved failure has no start");
+    Assert.Equal(Errors.End(failure), -1_i64, "reserved failure has no end");
     Assert.True(!Errors.HasRelated(failure), "reserved allocation failure has no borrowed diagnostic");
     SerializationError first = Errors.Diagnostic("DuplicateField", "root.field", 20_i64, 30_i64, true, 0_i64, 10_i64);
     SerializationError second = Errors.NumericError("Range");
-    Assert.Equal(Errors.Code(first), "DuplicateField");
-    Assert.Equal(Errors.Code(second), "Range");
-    Assert.Equal(Errors.RelatedStart(first), 0_i64);
-    Assert.Equal(Errors.RelatedEnd(first), 10_i64);
+    Assert.Equal(Errors.Code(first), "DuplicateField", "diagnostic code retained");
+    Assert.Equal(Errors.Code(second), "Range", "numeric code retained");
+    Assert.Equal(Errors.RelatedStart(first), 0_i64, "related start retained");
+    Assert.Equal(Errors.RelatedEnd(first), 10_i64, "related end retained");
     Assert.True(Errors.HasRelated(first), "ordinary immutable diagnostics retain related source");
-    Assert.Equal(Errors.Code(failure), "AllocationFailed");
+    Assert.Equal(Errors.Code(failure), "AllocationFailed", "reserved failure code is immutable");
 }
 
 test wire_encoder_prepares_fallible_work_before_nonallocating_commit {

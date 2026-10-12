@@ -1801,8 +1801,14 @@ Result<Profile, Diagnostic[]> ParseUncomposedMode(string source, Limits.BsolLimi
                 LoadError(loader, "ProfileRootRequired", root.span, "", "");
             }
 
+            // A profile without a `version` property is version 1 (the reference loader's default,
+            // which every canonical `*.v1` profile relies on); a declared version must be exact.
             string version = TextProperty(document, root, "version", "");
-            if (version == "1")
+            if (Property(document, root, "version") < 0_i64)
+            {
+                loader.profile.version = 1_i64;
+            }
+            else if (version == "1")
             {
                 loader.profile.version = 1_i64;
             }
@@ -3243,11 +3249,10 @@ unit ComposeRule(mut Composition state, i64 index, i64 depth, string path)
         {
             result.label = inheritedLabel;
         }
-        if (Property(state.loader.document, declaration, "cardinality") >= 0_i64 && original.cardinality != inheritedCardinality)
-        {
-            CompositionConflict(state, original.span, inheritedSpan, "cardinality", original.name);
-        }
-        else
+        // Cardinality is the extending rule's own occurrence policy: an explicit declaration
+        // replaces the inherited one (the canonical runtime.v2 `dispatch_*` rules extend a
+        // zero_or_one base as many), and only an undeclared cardinality is inherited.
+        if (Property(state.loader.document, declaration, "cardinality") < 0_i64)
         {
             result.cardinality = inheritedCardinality;
         }

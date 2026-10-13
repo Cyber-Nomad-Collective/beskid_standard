@@ -246,11 +246,45 @@ Result<Planned, Eligibility.Rejection> PlanEnum(Syntax.Builder builder, NodeRef 
     };
 }
 
+/// Declared (syntactic) eligibility of a target, before any semantic authority or
+/// canonical path planning: a rejected field type is reported at its own span even
+/// when the target could never be planned in its compilation.
+Result<unit, Eligibility.Rejection> DeclaredTarget(Syntax.Builder builder, NodeRef target) {
+    match Query.AsTypeDefinition(target) {
+        Option::Some(record) => {
+            match Policies.Fields(builder, record.fields.items) {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(policies) => { return DeclaredProofs(record.fields.items, policies); },
+            };
+        },
+        _ => { },
+    };
+    match Query.AsEnumDefinition(target) {
+        Option::Some(enumeration) => {
+            SpannedEnumVariant[] variants = enumeration.variants.items;
+            mut i64 variant = 0_i64;
+            while (variant < Array.Len(variants)) {
+                SpannedField[] fields = variants[variant].node.fields.items;
+                match Policies.Variant(builder, fields) {
+                    Result::Error(error) => { return Result::Error(error); },
+                    Result::Ok(policies) => {
+                        match DeclaredProofs(fields, policies) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
+                    },
+                };
+                variant = variant + 1_i64;
+            }
+        },
+        _ => { },
+    };
+    return Result::Ok(());
+}
+
 /// One shared plan for Generate and Analyze: eligibility, policies, factory
 /// proofs, semantic closure, generation and target authority. A failure is a
 /// source-spanned rejection, never a panic and never a partial contribution.
 Result<Planned, Eligibility.Rejection> Plan(Syntax.Builder builder, NodeRef target, NodeRef caller) {
     NodeSpan span = Query.Span(target);
+    match DeclaredTarget(builder, target) { Result::Error(error) => { return Result::Error(error); }, _ => { }, };
     match Paths(target) {
         Result::Error(error) => { return Result::Error(Located(error, span)); },
         Result::Ok(paths) => { Syntax.Rebind(builder, span, paths); },
@@ -275,7 +309,7 @@ bool Fits(i64 current, i64 added) {
 /// A rejected target contributes nothing; Analyze reports the same rejection
 /// with its source span, so a missing adapter never passes silently.
 pub GeneratedSyntaxContribution Generate(GenerationRequest request) {
-    mut GeneratedSyntaxContribution output = GeneratedSyntaxContribution { items: [], codeOutputs: [], targetBindings: [], templateBindings: [] };
+    mut GeneratedSyntaxContribution output = GeneratedSyntaxContribution { items: [], targetBindings: [], templateBindings: [] };
     NodeRef[] targets = Selection.Selected(request.context);
     Syntax.Builder builder = Syntax.Create(Query.Span(request.context.compilation.entryRoot));
     NodeRef caller = request.context.compilation.entryRoot;

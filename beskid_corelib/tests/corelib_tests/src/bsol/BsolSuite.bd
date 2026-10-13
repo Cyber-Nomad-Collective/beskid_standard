@@ -60,6 +60,35 @@ test bsol_ordered_blocks_assignments_and_byte_spans
     };
 }
 
+test bsol_identifier_reference_and_assignment_spans_cover_exactly_their_tokens
+{
+    string source = "cfg { mode = fast  # trailing
+  next = @a/b   
+  flag = true 	
+}";
+    match Parser.Parse(source, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("native parser accepts identifier, reference and boolean values"),
+
+        Result::Ok(document) => {
+            Syntax.Node root = document.nodes[document.roots[0]];
+            Assert.Equal(Array.Len<i64>(root.children), 3_i64, "three assignments");
+            Syntax.Node mode = document.nodes[root.children[0]];
+            Syntax.Node fast = document.nodes[mode.children[0]];
+            Assert.Equal(fast.raw, "fast", "identifier raw excludes trailing whitespace and comment");
+            Assert.Equal(fast.span.start, String.IndexOf(source, "fast"), "identifier span starts at the token");
+            Assert.Equal(fast.span.end - fast.span.start, 4_i64, "identifier span covers exactly the token");
+            Assert.Equal(String.SubSlice(source, mode.span.start, mode.span.end - mode.span.start), "mode = fast", "assignment span ends at its value token");
+            Syntax.Node next = document.nodes[root.children[1]];
+            Syntax.Node reference = document.nodes[next.children[0]];
+            Assert.Equal(reference.raw, "@a/b", "reference raw excludes trailing whitespace");
+            Syntax.Node flag = document.nodes[root.children[2]];
+            Assert.Equal(document.nodes[flag.children[0]].raw, "true", "boolean raw excludes trailing whitespace");
+            Assert.Equal(String.SubSlice(source, root.span.start, root.span.end - root.span.start), source, "block span still ends at its closing brace");
+        },
+    };
+}
+
 test bsol_strict_escaped_unicode_and_invalid_surrogates
 {
     mut Lexer.State plainState = Lexer.Start("\"A\"", Limits.DefaultLimits());

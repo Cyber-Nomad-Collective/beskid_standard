@@ -23,6 +23,13 @@ pub type State
     pub bool failed,
 
     pub Errors.BsolError error,
+
+    /// Last whitespace/comment run consumed by Skip, as [skipFrom, skipTo).
+    /// Finish ends a node before a run that directly precedes the cursor, so
+    /// spans cover exactly their tokens and never trailing trivia.
+    pub i64 skipFrom,
+
+    pub i64 skipTo,
 }
 
 pub State Start(string source, Limits.BsolLimits limits)
@@ -54,6 +61,10 @@ pub State Start(string source, Limits.BsolLimits limits)
 
             message: "",
         },
+
+        skipFrom: -1_i64,
+
+        skipTo: -1_i64,
     };
 }
 
@@ -113,6 +124,17 @@ pub bool IdByte(u8 b)
 }
 
 pub unit Skip(mut State state)
+{
+    i64 begin = state.pos;
+    SkipTrivia(state);
+    if (state.pos > begin)
+    {
+        state.skipFrom = begin;
+        state.skipTo = state.pos;
+    }
+}
+
+unit SkipTrivia(mut State state)
 {
     mut bool more = true;
     while (more && !state.failed)
@@ -255,7 +277,12 @@ pub unit Finish(mut State state, i64 index, mut Syntax.Node node)
         Fail(state, Errors.ErrorKind::ScalarLimit, "number byte limit");
         return;
     }
-    node.span.end = state.pos;
+    mut i64 end = state.pos;
+    if (state.skipTo == state.pos && state.skipFrom >= node.span.start)
+    {
+        end = state.skipFrom;
+    }
+    node.span.end = end;
     node.raw = String.SubSlice(state.source, node.span.start, node.span.end - node.span.start);
     Array.Set<Syntax.Node>(state.nodes, index, node);
 }

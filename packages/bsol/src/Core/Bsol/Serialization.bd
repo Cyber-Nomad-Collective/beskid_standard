@@ -722,10 +722,40 @@ pub Result<string, SerializationError> WriteValue(ShapeId shape, DataValue value
         return Result::Error(output.error);
     }
     string text = String.FromUtf8CodeUnits(ByteSlice.SubSlice(output.bytes, 0_i64, output.used));
-    match ReadValue(text, shape, table, limits) {
+    match ReadOwnOutput(text, shape, table, limits) {
         Result::Error(error) => { return Result::Error(error); },
         Result::Ok(_) => { return Result::Ok(text); },
     };
+}
+
+/// Writer self-check. The caller's limits already bounded the value graph
+/// (value nodes, depth, scalars) and the output bytes while emitting, and the
+/// value-level re-read below charges them again. The syntax arena of the
+/// produced text has more nodes and nesting than the value graph, so its
+/// budget is bounded by the text itself; a syntax budget can then never mask
+/// the value-level CollectionLimit/ScalarLimit with InvalidSyntax.
+Result<DataValue, SerializationError> ReadOwnOutput(string text, ShapeId shape, Registry.ShapeRegistry table, SerializationLimits limits)
+{
+    i64 bytes = String.Len(text);
+    BsolPolicy.BsolLimits syntaxLimits = BsolPolicy.BsolLimits
+    {
+        maxInputBytes: bytes,
+
+        maxOutputBytes: bytes,
+
+        maxDepth: bytes,
+
+        maxNodes: bytes,
+
+        maxScalarBytes: bytes,
+
+        maxImports: 0_i64,
+
+        maxImportDepth: 0_i64,
+
+        maxResolvedSchemaBytes: 0_i64,
+    };
+    return ReadValueBounded(text, shape, table, limits, syntaxLimits);
 }
 
 type Input
@@ -1280,7 +1310,12 @@ DataValue Take(mut Input input, Registry.ShapeRegistry table, ShapeId expected, 
 pub Result<DataValue, SerializationError> ReadValue(string text, ShapeId expected, Registry.ShapeRegistry table, SerializationLimits limits)
 {
     if (limits.maxInputBytes < 0_i64 || limits.maxOutputBytes < 0_i64 || limits.maxDepth < 1_i64 || limits.maxNodes < 1_i64 || limits.maxScalarBytes < 0_i64) { return Result::Error(NoSource("InvalidLimits")); }
-    BsolPolicy.BsolLimits syntaxLimits = Typed.FormatLimits(limits);
+    return ReadValueBounded(text, expected, table, limits, Typed.FormatLimits(limits));
+}
+
+/// Value-level accounting uses `limits`; syntax accounting uses `syntaxLimits`.
+Result<DataValue, SerializationError> ReadValueBounded(string text, ShapeId expected, Registry.ShapeRegistry table, SerializationLimits limits, BsolPolicy.BsolLimits syntaxLimits)
+{
     match Parser.Parse(text, syntaxLimits)
     {
         Result::Error(error) => {
@@ -1400,7 +1435,7 @@ Result<unit, SerializationError> Status(mut StreamState state) {
             return state.publicationStatus;
         }
         string text = String.FromUtf8CodeUnits(ByteSlice.SubSlice(state.output.bytes, 0_i64, state.output.used));
-        match ReadValue(text, state.root, state.table, state.output.limits) {
+        match ReadOwnOutput(text, state.root, state.table, state.output.limits) {
             Result::Error(error) => { state.output.failed = true; state.output.error = error; state.publicationStatus = Result<unit, SerializationError>::Error(error); },
             Result::Ok(_) => { state.publicationStatus = Result<unit, SerializationError>::Ok(()); },
         };

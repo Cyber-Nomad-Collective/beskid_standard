@@ -120,10 +120,10 @@ test process_binary_stdin_stdout_roundtrip_with_partial_transfers_preserves_orde
             if (count > 65536_i64) { count = 65536_i64; }
             match input.TryWrite(source, written, count) {
                 Result::Error(_) => Assert.Fail("stdin write to a live child"),
-                Result::Ok(sent) => {
-                    // -1 marks a pending write: TryWrite returned None.
-                    i64 bytes = Optional.UnwrapOr<i64>(sent, -1_i64);
-                    if (bytes > 0_i64) { written = written + bytes; progressed = true; }
+                Result::Ok(sent) => match sent {
+                    Option::Some(bytes) => { if (bytes > 0_i64) { written = written + bytes; progressed = true; } },
+                    // A pending write: the child is not ready for input yet.
+                    Option::None => { },
                 },
             };
         } else {
@@ -136,15 +136,20 @@ test process_binary_stdin_stdout_roundtrip_with_partial_transfers_preserves_orde
         match output.TryRead(buffer, 0_i64, 4096_i64) {
             Result::Error(_) => Assert.Fail("stdout read from a live child"),
             Result::Ok(read) => {
-                // -1 marks pending readiness (None); 0 is end of stream.
-                i64 bytes = Optional.UnwrapOr<i64>(read, -1_i64);
-                if (bytes == 0_i64) { eof = true; }
-                mut i64 copied = 0_i64;
-                while (copied < bytes) {
-                    Array.Append<u8>(received, buffer[copied]);
-                    copied = copied + 1_i64;
-                }
-                if (bytes > 0_i64) { reads = reads + 1_i64; progressed = true; }
+                match read {
+                    // 0 is end of stream.
+                    Option::Some(bytes) => {
+                        if (bytes == 0_i64) { eof = true; }
+                        mut i64 copied = 0_i64;
+                        while (copied < bytes) {
+                            Array.Append<u8>(received, buffer[copied]);
+                            copied = copied + 1_i64;
+                        }
+                        if (bytes > 0_i64) { reads = reads + 1_i64; progressed = true; }
+                    },
+                    // Pending readiness: no output is available yet.
+                    Option::None => { },
+                };
             },
         };
         if (!progressed && !eof) {

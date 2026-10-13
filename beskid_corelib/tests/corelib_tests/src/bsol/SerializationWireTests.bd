@@ -1,3 +1,6 @@
+//! `BsolSerializationWireTests`: the precise serialization.v1 BSOL representation (BSOL-06-08) and the bounded
+//! owned value policies it applies (SER-05). Each section keeps the tests of one former target unchanged.
+
 use Core.Optional;
 use Core.Bsol.Serialization;
 use Core.Bsol.Syntax;
@@ -6,22 +9,21 @@ use Core.Environment;
 use Core.Serialization.Contracts;
 use Core.Serialization.Errors;
 use Core.Serialization.Numeric;
-
 use Core.Collections.Array;
-
 use Core.Results;
-
 use Core.Serialization.DataValue;
-
 use Core.Serialization.Descriptors;
-
 use Core.Serialization.Limits;
-
 use Core.Serialization.Metadata;
-
 use Core.Serialization.Registry;
-
 use Testing.Assert;
+use Core.Bsol.Limits as BsolLimits;
+use Core.Bsol.Schema;
+use Core.Bsol.Typed;
+use Core.String;
+use Core.Serialization.Decimal;
+
+// ---- SerializationWireTests.bd (target `BsolSerializationWireTests`) ----
 
 string WireFixture(string name) {
     match Environment.Get("BESKID_BSOL_CORPUS") {
@@ -584,4 +586,345 @@ test wire_encoder_prepares_fallible_work_before_nonallocating_commit {
     Assert.True(Results.IsOk(encoder.Begin(Limits.DefaultLimits())), "reusable encoder starts a fresh transaction");
     Assert.True(Results.IsOk(encoder.WriteSigned(43_i64, 64_u8)), "fresh payload prepared");
     Assert.True(Results.IsOk(encoder.Commit()), "fresh transaction committed");
+}
+
+// ---- TypedBindingTests.bd (formerly target `BsolTypedBindingTests`) ----
+
+pub type Counter
+{
+    pub i64 count,
+}
+
+Syntax.Node Node(Syntax.NodeKind kind, string name, string raw, i64[] children)
+{
+    return Syntax.Node
+    {
+        kind: kind,
+
+        span: Syntax.Span
+        {
+            start: -1_i64,
+
+            end: -1_i64,
+        },
+
+        raw: raw,
+
+        text: raw,
+
+        name: name,
+
+        label: "",
+
+        hasLabel: false,
+
+        schemaless: false,
+
+        children: children,
+
+        attributes: Array.Empty<i64>(),
+    };
+}
+
+/// Explicit native binding fixture; the real Serialization Mod must generate
+/// equivalent typed field/constructor calls with exact source authority.
+pub type CounterBinding : Typed.BsolBinding<Counter> {
+    pub Result<Counter, Schema.Diagnostic[]> ReadDocument(Schema.ValidatedDocument checked, SerializationLimits limits) {
+        Syntax.Document document = checked.document;
+        mut i64 i = 0_i64;
+        while (i < Array.Len<Schema.FieldBinding>(checked.fields)) {
+            Schema.FieldBinding field = checked.fields[i];
+            Syntax.Node assignment = document.nodes[field.assignment];
+            if (assignment.name == "count" && Array.Len<i64>(assignment.children) == 1_i64) {
+                Syntax.Node number = document.nodes[assignment.children[0_i64]];
+                match Numeric.ParseSigned(number.raw, 64_i64) {
+                    Result::Ok(count) => { return Result::Ok(Counter { count: count }); },
+                    Result::Error(error) => { return Result::Error([BindingError(Errors.Code(error), number.span)]); },
+                };
+            }
+            i = i + 1_i64;
+        }
+        return Result::Error([BindingError("MissingTypedField", Syntax.Span { start: 0_i64, end: 0_i64 })]);
+    }
+    pub Result<Syntax.Document, Schema.Diagnostic[]> WriteDocument(Counter value, Schema.Profile profile, SerializationLimits limits) {
+        Syntax.Node number = Node(Syntax.NodeKind::Number, "", Decimal.Signed(value.count), Array.Empty<i64>());
+        Syntax.Node assignment = Node(Syntax.NodeKind::Assignment, "count", "", [0_i64]);
+        Syntax.Node block = Node(Syntax.NodeKind::Block, "config", "", [1_i64]);
+        return Result::Ok(Syntax.Document { source: "", nodes: [number, assignment, block], roots: [2_i64], trivia: Array.Empty<Syntax.Trivia>() });
+    }
+}
+
+Schema.Diagnostic BindingError(string code, Syntax.Span span)
+{
+    return Schema.Diagnostic
+    {
+        code: code,
+
+        stage: Schema.DiagnosticStage::Validation,
+
+        span: span,
+
+        field: "count",
+
+        rule: "config",
+
+        profile: "counter.v2",
+
+        hasRelated: false,
+
+        relatedSpan: Syntax.Span
+        {
+            start: -1_i64,
+
+            end: -1_i64,
+        },
+
+        message: code,
+    };
+}
+
+Schema.Profile Profile()
+{
+    return match Schema.ParseProfile("profile \"counter.v2\" { version = 2 rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extras = false field \"count\" { type = i64 required = true } } }", BsolLimits.DefaultLimits())
+    {
+        Result::Ok(profile) => profile,
+
+        Result::Error(_) => {
+            Assert.Fail("binding profile valid");
+            return Profile();
+        },
+    };
+}
+
+test bsol_explicit_typed_binding_reads_exact_integer_after_validation
+{
+    CounterBinding binding = CounterBinding { };
+
+    match Typed.ReadResolved<Counter, CounterBinding>("config { count = 9007199254740993 }", Profile(), binding, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("validated typed binding"),
+
+        Result::Ok(value) => Assert.Equal(value.count, 9007199254740993_i64, "typed value beyond float precision"),
+    };
+}
+
+test bsol_explicit_typed_binding_write_roundtrip_is_profile_checked
+{
+    CounterBinding binding = CounterBinding { };
+
+    match Typed.Write<Counter, CounterBinding>(Counter
+    {
+        count: 9007199254740993_i64,
+    }, Profile(), binding, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("bounded native typed writer"),
+
+        Result::Ok(text) => {
+            match Typed.ReadResolved<Counter, CounterBinding>(text, Profile(), binding, Limits.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("typed canonical reread"),
+
+                Result::Ok(value) => Assert.Equal(value.count, 9007199254740993_i64, "same typed config"),
+            };
+        },
+    };
+}
+
+test bsol_typed_binding_missing_duplicate_and_wrong_kind_reject
+{
+    CounterBinding binding = CounterBinding { };
+
+    Assert.True(Results.IsError(Typed.ReadResolved<Counter, CounterBinding>("config { }", Profile(), binding, Limits.DefaultLimits())), "required field rejects before construction");
+
+    Assert.True(Results.IsError(Typed.ReadResolved<Counter, CounterBinding>("config { count = 1 count = 2 }", Profile(), binding, Limits.DefaultLimits())), "duplicates reject before typed decode");
+
+    Assert.True(Results.IsError(Typed.ReadResolved<Counter, CounterBinding>("config { count = \"bad\" }", Profile(), binding, Limits.DefaultLimits())), "kind mismatch rejects");
+}
+
+// ---- Release case tests (SER-05 bounded atomic owned values, precision and Unicode) ----
+
+SerializationLimits WithLimits(i64 input, i64 output, i64 depth, i64 nodes, i64 scalar) {
+    mut SerializationLimits limits = Limits.DefaultLimits();
+    limits.maxInputBytes = input;
+    limits.maxOutputBytes = output;
+    limits.maxDepth = depth;
+    limits.maxNodes = nodes;
+    limits.maxScalarBytes = scalar;
+    return limits;
+}
+
+string ErrorCode(Result<string, SerializationError> result) {
+    return match result {
+        Result::Ok(_) => "",
+        Result::Error(error) => Errors.Code(error),
+    };
+}
+
+/// Smallest budget (1..64) for which `write` succeeds when only the selected limit varies, or 0.
+i64 RequiredWriteBudget(ShapeId shape, DataValue value, Registry.ShapeRegistry table, bool depth) {
+    mut i64 budget = 1_i64;
+    while (budget <= 64_i64) {
+        mut SerializationLimits limits = WithLimits(8388608_i64, 8388608_i64, 128_i64, budget, 1048576_i64);
+        if (depth) { limits = WithLimits(8388608_i64, 8388608_i64, budget, 100000_i64, 1048576_i64); }
+        if (Results.IsOk(Serialization.WriteValue(shape, value, table, limits))) { return budget; }
+        budget = budget + 1_i64;
+    }
+    return 0_i64;
+}
+
+test serialization_each_configured_limit_succeeds_and_plus_one_returns_limit_exceeded_without_partial_output {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId text = Register(table, "limit-string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
+    ShapeId list = Register(table, "limit-string-list", ShapeKind::List, 0_u8, [text]);
+    ShapeId nested = Register(table, "limit-string-list-list", ShapeKind::List, 0_u8, [list]);
+    DataValue items = DataValue::Sequence(SequenceKind::List, [DataValue::String("ab"), DataValue::String("cd"), DataValue::String("ef")]);
+    string canonical = match Serialization.WriteValue(list, items, table, Limits.DefaultLimits()) {
+        Result::Ok(value) => value,
+        Result::Error(_) => { Assert.Fail("boundary fixture writes under default limits"); return; },
+    };
+    i64 bytes = String.Len(canonical);
+    match Serialization.WriteValue(list, items, table, WithLimits(8388608_i64, bytes, 128_i64, 100000_i64, 1048576_i64)) {
+        Result::Error(_) => Assert.Fail("output exactly at the byte limit is admitted"),
+        Result::Ok(bounded) => Assert.Equal(bounded, canonical, "bounded output is the complete text"),
+    };
+    Assert.Equal(ErrorCode(Serialization.WriteValue(list, items, table, WithLimits(8388608_i64, bytes - 1_i64, 128_i64, 100000_i64, 1048576_i64))), "OutputLimit", "one output byte over the limit returns OutputLimit and no text");
+    Assert.True(Results.IsOk(Serialization.ReadValue(canonical, list, table, WithLimits(bytes, 8388608_i64, 128_i64, 100000_i64, 1048576_i64))), "input exactly at the byte limit is admitted");
+    Assert.True(Results.IsError(Serialization.ReadValue(canonical, list, table, WithLimits(bytes - 1_i64, 8388608_i64, 128_i64, 100000_i64, 1048576_i64))), "one input byte over the limit returns no value");
+    // The largest scalar is a 100-byte string, longer than every tag and the 64-byte shape identity.
+    mut string longText = "";
+    while (String.Len(longText) < 100_i64) { longText = longText + "x"; }
+    DataValue wide = DataValue::Sequence(SequenceKind::List, [DataValue::String(longText), DataValue::String("cd")]);
+    string wideText = match Serialization.WriteValue(list, wide, table, Limits.DefaultLimits()) {
+        Result::Ok(value) => value,
+        Result::Error(_) => { Assert.Fail("scalar fixture writes under default limits"); return; },
+    };
+    Assert.True(Results.IsOk(Serialization.WriteValue(list, wide, table, WithLimits(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 100_i64))), "a scalar exactly at the byte limit is written");
+    Assert.Equal(ErrorCode(Serialization.WriteValue(list, wide, table, WithLimits(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 99_i64))), "ScalarLimit", "one scalar byte over the limit returns ScalarLimit");
+    Assert.True(Results.IsOk(Serialization.ReadValue(wideText, list, table, WithLimits(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 100_i64))), "a decoded scalar exactly at the byte limit is read");
+    Assert.True(Results.IsError(Serialization.ReadValue(wideText, list, table, WithLimits(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 99_i64))), "one decoded scalar byte over the limit returns no value");
+    i64 nodes = RequiredWriteBudget(list, items, table, false);
+    Assert.True(nodes > 0_i64, "fixture fits a bounded node budget");
+    DataValue longer = DataValue::Sequence(SequenceKind::List, [DataValue::String("ab"), DataValue::String("cd"), DataValue::String("ef"), DataValue::String("gh")]);
+    i64 longerNodes = RequiredWriteBudget(list, longer, table, false);
+    Assert.True(longerNodes > nodes, "one more collection entry is charged to the node budget");
+    Assert.Equal(ErrorCode(Serialization.WriteValue(list, longer, table, WithLimits(8388608_i64, 8388608_i64, 128_i64, longerNodes - 1_i64, 1048576_i64))), "CollectionLimit", "one node over the limit returns CollectionLimit");
+    DataValue deeper = DataValue::Sequence(SequenceKind::List, [items]);
+    i64 depth = RequiredWriteBudget(list, items, table, true);
+    Assert.True(depth > 0_i64, "fixture fits a bounded depth budget");
+    i64 deeperDepth = RequiredWriteBudget(nested, deeper, table, true);
+    Assert.True(deeperDepth > depth, "one more nesting level is charged to the depth budget");
+    Assert.Equal(ErrorCode(Serialization.WriteValue(nested, deeper, table, WithLimits(8388608_i64, 8388608_i64, deeperDepth - 1_i64, 100000_i64, 1048576_i64))), "CollectionLimit", "one level over the depth limit returns CollectionLimit");
+}
+
+test serialization_cycle_rejects_and_acyclic_alias_copies_by_value {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId recursive = match Registry.SignatureId("alias-recursive-list", 8388608_i64) {
+        Result::Ok(id) => id,
+        Result::Error(_) => { Assert.Fail("recursive fixture identity"); return; },
+    };
+    Register(table, "alias-recursive-list", ShapeKind::List, 0_u8, [recursive]);
+    mut DataValue[] slots = [DataValue::Unit];
+    DataValue cycle = DataValue::Sequence(SequenceKind::List, slots);
+    Array.Set<DataValue>(slots, 0_i64, cycle);
+    Assert.Equal(ErrorCode(Serialization.WriteValue(recursive, cycle, table, Limits.DefaultLimits())), "CycleDetected", "a value reachable from itself rejects before output");
+    ShapeId text = Register(table, "alias-string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
+    ShapeId pair = Register(table, "alias-string-list", ShapeKind::List, 0_u8, [text]);
+    DataValue shared = DataValue::String("one allocation, two edges");
+    match Serialization.WriteValue(pair, DataValue::Sequence(SequenceKind::List, [shared, shared]), table, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("acyclic repeated alias is legal"),
+        Result::Ok(written) => {
+            i64 first = String.IndexOf(written, "one allocation, two edges");
+            Assert.True(first >= 0_i64, "aliased value is written");
+            string rest = String.SubSlice(written, first + 1_i64, String.Len(written) - first - 1_i64);
+            Assert.True(String.Contains(rest, "one allocation, two edges"), "the alias is written again by value, not as a reference");
+            match Serialization.ReadValue(written, pair, table, Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("by-value copies read back"),
+                Result::Ok(value) => match value {
+                    DataValue::Sequence(kind, values) => {
+                        Assert.Equal(Array.Len<DataValue>(values), 2_i64, "two independent entries");
+                        match values[1] {
+                            DataValue::String(second) => Assert.Equal(second, "one allocation, two edges", "second copy keeps the shared contents"),
+                            _ => Assert.Fail("second entry is a string"),
+                        };
+                    },
+                    _ => Assert.Fail("list reads back as a sequence"),
+                },
+            };
+        },
+    };
+}
+
+string RecordText(ShapeId record, string fields) {
+    return Envelope(record, "value \"record\" { shape = \"" + Metadata.FormatShapeId(record) + "\" fields = [" + fields + "] }");
+}
+
+string ReadCode(string text, ShapeId shape, Registry.ShapeRegistry table) {
+    return match Serialization.ReadValue(text, shape, table, Limits.DefaultLimits()) {
+        Result::Ok(_) => "",
+        Result::Error(error) => Errors.Code(error),
+    };
+}
+
+test serialization_record_missing_required_duplicate_and_unknown_fields_reject_and_optional_fields_may_be_absent {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId integer = Register(table, "policy-i64", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+    ShapeId text = Register(table, "policy-string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
+    ShapeId record = RegisterStructured(table, "policy-record", ShapeKind::Record, [
+        FieldDescriptor { name: "id", shape: integer, required: true, optional: false, defaultSignature: "" },
+        FieldDescriptor { name: "note", shape: text, required: false, optional: true, defaultSignature: "" },
+    ], Array.Empty<VariantDescriptor>());
+    string id = "field \"id\" { value = value \"i64\" { data = 7 } }";
+    string note = "field \"note\" { value = value \"string\" { data = \"n\" } }";
+    match Serialization.ReadValue(RecordText(record, id), record, table, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("absent optional field is admitted"),
+        Result::Ok(value) => match value {
+            DataValue::Record(shape, fields) => {
+                Assert.Equal(Array.Len<RecordField>(fields), 1_i64, "absent fields are not fabricated by the format");
+                Assert.Equal(fields[0].name, "id", "the present field is read");
+            },
+            _ => Assert.Fail("record reads back as a record"),
+        },
+    };
+    Assert.True(Results.IsOk(Serialization.ReadValue(RecordText(record, id + ", " + note), record, table, Limits.DefaultLimits())), "present optional field is read");
+    Assert.Equal(ReadCode(RecordText(record, note), record, table), "MissingField", "missing required field rejects");
+    Assert.Equal(ReadCode(RecordText(record, id + ", " + id), record, table), "DuplicateField", "duplicate field rejects");
+    Assert.Equal(ReadCode(RecordText(record, id + ", field \"extra\" { value = value \"i64\" { data = 1 } }"), record, table), "UnknownField", "unknown field rejects without an extras binding");
+    Assert.Equal(ErrorCode(Serialization.WriteValue(record, DataValue::Record(record, [RecordField { name: "note", value: DataValue::String("n") }]), table, Limits.DefaultLimits())), "MissingField", "writer rejects a missing required field");
+}
+
+test serialization_precision_unicode_scalars_and_invalid_surrogates_roundtrip_or_reject {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId signed = Register(table, "precision-i64", ShapeKind::Signed, 64_u8, Array.Empty<ShapeId>());
+    ShapeId unsigned = Register(table, "precision-u64", ShapeKind::Unsigned, 64_u8, Array.Empty<ShapeId>());
+    ShapeId text = Register(table, "precision-string", ShapeKind::String, 0_u8, Array.Empty<ShapeId>());
+    ShapeId scalar = Register(table, "precision-char", ShapeKind::Scalar, 0_u8, Array.Empty<ShapeId>());
+    match Roundtrip(signed, DataValue::Signed(-9007199254740993_i64, 64_u8), table) {
+        DataValue::Signed(value, width) => Assert.Equal(value, -9007199254740993_i64, "negative integer beyond 2^53 is exact"),
+        _ => Assert.Fail("signed reads back as signed"),
+    };
+    match Roundtrip(signed, DataValue::Signed(9007199254740993_i64, 64_u8), table) {
+        DataValue::Signed(value, width) => Assert.Equal(value, 9007199254740993_i64, "positive integer beyond 2^53 is exact"),
+        _ => Assert.Fail("signed reads back as signed"),
+    };
+    match Roundtrip(unsigned, DataValue::Unsigned(18446744073709551615_u64, 64_u8), table) {
+        DataValue::Unsigned(value, width) => Assert.Equal(value, 18446744073709551615_u64, "u64 maximum is exact"),
+        _ => Assert.Fail("unsigned reads back as unsigned"),
+    };
+    match Roundtrip(text, DataValue::String("a😀b"), table) {
+        DataValue::String(value) => {
+            Assert.Equal(value, "a😀b", "non-BMP scalar keeps its identity without normalization");
+            Assert.Equal(String.Len(value), 6_i64, "exact UTF-8 bytes");
+        },
+        _ => Assert.Fail("string reads back as string"),
+    };
+    match Roundtrip(scalar, DataValue::Scalar(char(66376_u32)), table) {
+        DataValue::Scalar(value) => Assert.Equal(u32(value), 66376_u32, "non-BMP char is one scalar"),
+        _ => Assert.Fail("char reads back as char"),
+    };
+    Assert.True(Results.IsOk(Serialization.ReadValue(Envelope(text, "value \"string\" { data = \"\\uD83D\\uDE00\" }"), text, table, Limits.DefaultLimits())), "escaped surrogate pair is one valid scalar");
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(text, "value \"string\" { data = \"\\uD800\" }"), text, table, Limits.DefaultLimits())), "lone high surrogate rejects");
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(text, "value \"string\" { data = \"\\uDC00\" }"), text, table, Limits.DefaultLimits())), "lone low surrogate rejects");
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(scalar, "value \"char\" { data = \"\\uDFFF\" }"), scalar, table, Limits.DefaultLimits())), "surrogate is not a char");
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(signed, "value \"i64\" { data = 9223372036854775808 }"), signed, table, Limits.DefaultLimits())), "i64 overflow rejects instead of rounding");
+    Assert.True(Results.IsError(Serialization.ReadValue(Envelope(unsigned, "value \"u64\" { data = 1.0 }"), unsigned, table, Limits.DefaultLimits())), "float spelling is not an exact integer");
 }

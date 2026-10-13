@@ -19,6 +19,14 @@ use Core.Bsol.ImportGraph;
 use Core.Bsol.Schema;
 use Core.Bsol.Typed;
 use Core.Serialization.Limits as SerializationPolicy;
+use Core.Bsol.Errors;
+use Core.Bsol.Serialization;
+use Core.Optional;
+use Core.Serialization.DataValue;
+use Core.Serialization.Descriptors;
+use Core.Serialization.FloatDecimal;
+use Core.Serialization.Metadata;
+use Core.Serialization.Registry;
 
 // ---- SyntaxTests.bd (formerly target `BsolSyntaxTests`) ----
 
@@ -737,4 +745,449 @@ test bsol_import_graph_preserves_supported_schema_version_in_owned_cache {
         Result::Error(_) => Assert.Fail("existing version one profile remains supported"),
         Result::Ok(graph) => Assert.Equal(graph.sources[graph.root].version, 1_i64, "version retained with canonical source identity and digest"),
     };
+}
+
+// ---- SchemaImportTests.bd (formerly target `BsolSchemaImportTests`) ----
+
+/// Owned root source with its verified content digest, as a host materializes it.
+Imports.MaterializedSource MaterializeRoot(string source, string identity)
+{
+    match Sha256.HashUtf8(source, 8388608_i64)
+    {
+        Result::Error(_) => {
+            Assert.Fail("fixture source hashes");
+            return Imports.MaterializedSource { source: source, canonicalIdentity: identity, sourceSha256: Array.Empty<u8>() };
+        },
+
+        Result::Ok(digest) => {
+            return Imports.MaterializedSource { source: source, canonicalIdentity: identity, sourceSha256: digest };
+        },
+    };
+}
+
+/// Deterministic host contract control; proves no production filesystem or lock authority.
+type FixtureResolver : Imports.Resolver
+{
+    bool missing,
+
+    bool corrupt,
+
+    pub Result<Imports.MaterializedSource, Imports.ImportFailure> Resolve(Imports.ImportRequest request)
+    {
+        if (this.missing)
+        {
+            return Result::Error(Imports.ImportFailure { code: "MissingCache", message: "fixture has no materialized cache entry" });
+        }
+        Imports.MaterializedSource materialized = MaterializeRoot("profile \"base.v2\" { version = 2 }", "file:schemas/base.bsol");
+        if (this.corrupt)
+        {
+            // The host claims the digest of other bytes: the library must reject it before parsing.
+            Imports.MaterializedSource other = MaterializeRoot("profile \"other.v2\" { version = 2 }", "file:schemas/base.bsol");
+            return Result::Ok(Imports.MaterializedSource { source: materialized.source, canonicalIdentity: materialized.canonicalIdentity, sourceSha256: other.sourceSha256 });
+        }
+        return Result::Ok(materialized);
+    }
+}
+
+unit RejectImport(bool missing, bool corrupt, string code)
+{
+    Imports.MaterializedSource root = MaterializeRoot("profile \"local.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"schemas/base.bsol\" alias = base } }", "file:local.bsol");
+    FixtureResolver resolver = FixtureResolver
+    {
+        missing: missing,
+
+        corrupt: corrupt,
+    };
+    match Schema.LoadProfile<FixtureResolver>(root, resolver, Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("invalid host materialization rejected"),
+
+        Result::Error(errors) => {
+            mut bool found = false;
+            mut i64 i = 0_i64;
+            while (i < Array.Len<Schema.Diagnostic>(errors))
+            {
+                Schema.Diagnostic error = errors[i];
+                if (error.code == code)
+                {
+                    found = true;
+                    Assert.True(error.span.end > error.span.start, "failure points to import declaration");
+                    Assert.Equal(error.profile, "local.v2", "import failure retains profile identity");
+                }
+                i = i + 1_i64;
+            }
+            Assert.True(found, "exact import materialization diagnostic");
+        },
+    };
+}
+
+/// @native-only
+test bsol_schema_import_missing_materialized_cache_is_source_spanned
+{
+    RejectImport(true, false, "MissingCache");
+}
+
+/// @native-only
+test bsol_schema_import_source_digest_mismatch_rejects
+{
+    RejectImport(false, true, "ImportDigestMismatch");
+}
+
+// ---- Release case tests (BSOL-06-02 syntax distinction, BSOL-06-09 lexical matrix, bounds and floats) ----
+
+string KindName(Syntax.NodeKind kind) {
+    return match kind {
+        Syntax.NodeKind::Block => "block",
+        Syntax.NodeKind::Assignment => "assignment",
+        Syntax.NodeKind::Identifier => "identifier",
+        Syntax.NodeKind::String => "string",
+        Syntax.NodeKind::Number => "number",
+        Syntax.NodeKind::Boolean => "boolean",
+        Syntax.NodeKind::Reference => "reference",
+        Syntax.NodeKind::List => "list",
+        Syntax.NodeKind::Map => "map",
+        Syntax.NodeKind::Attribute => "attribute",
+    };
+}
+
+/// The value a scalar node denotes: decoded text for strings, the token of identifiers and booleans,
+/// the exact spelling of numbers and the kind/label path of references. Containers carry none.
+string ScalarValue(Syntax.Node node) {
+    return match node.kind {
+        Syntax.NodeKind::String => "s:" + node.text,
+        Syntax.NodeKind::Identifier => "i:" + node.text,
+        Syntax.NodeKind::Number => "n:" + node.raw,
+        Syntax.NodeKind::Boolean => "b:" + node.text,
+        Syntax.NodeKind::Reference => "r:" + node.name + "/" + node.text,
+        _ => "",
+    };
+}
+
+/// Ordered structural identity of two subtrees: kind, name, label, schemaless marker, scalar value,
+/// attributes and children, compared position by position. Spans, trivia and spacing are ignored.
+bool SameSubtree(Syntax.Document left, i64 leftIndex, Syntax.Document right, i64 rightIndex) {
+    Syntax.Node a = left.nodes[leftIndex];
+    Syntax.Node b = right.nodes[rightIndex];
+    if (KindName(a.kind) != KindName(b.kind) || a.name != b.name || a.label != b.label || a.hasLabel != b.hasLabel || a.schemaless != b.schemaless) { return false; }
+    if (ScalarValue(a) != ScalarValue(b)) { return false; }
+    if (Array.Len<i64>(a.attributes) != Array.Len<i64>(b.attributes) || Array.Len<i64>(a.children) != Array.Len<i64>(b.children)) { return false; }
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(a.attributes)) {
+        if (!SameSubtree(left, a.attributes[index], right, b.attributes[index])) { return false; }
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<i64>(a.children)) {
+        if (!SameSubtree(left, a.children[index], right, b.children[index])) { return false; }
+        index = index + 1_i64;
+    }
+    return true;
+}
+
+bool SameDocument(Syntax.Document left, Syntax.Document right) {
+    if (Array.Len<i64>(left.roots) != Array.Len<i64>(right.roots)) { return false; }
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(left.roots)) {
+        if (!SameSubtree(left, left.roots[index], right, right.roots[index])) { return false; }
+        index = index + 1_i64;
+    }
+    return true;
+}
+
+/// Index of the assignment named `name` among the ordered children of `block`, or -1.
+i64 AssignmentIndex(Syntax.Document document, Syntax.Node block, string name) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(block.children)) {
+        Syntax.Node child = document.nodes[block.children[index]];
+        if (KindName(child.kind) == "assignment" && child.name == name) { return block.children[index]; }
+        index = index + 1_i64;
+    }
+    return -1_i64;
+}
+
+/// The single value node assigned to `name` in `block`.
+Syntax.Node AssignedValue(Syntax.Document document, Syntax.Node block, string name) {
+    i64 assignment = AssignmentIndex(document, block, name);
+    Assert.True(assignment >= 0_i64, "assignment " + name + " is present in declaration order");
+    Syntax.Node node = document.nodes[assignment];
+    Assert.Equal(Array.Len<i64>(node.children), 1_i64, "assignment " + name + " carries exactly one value");
+    return document.nodes[node.children[0]];
+}
+
+test bsol_parse_write_parse_preserves_kinds_labels_attributes_and_references_across_whitespace_and_comments {
+    string spaced = "# leading comment
+@Version(since = \"0.6\")
+config   \"primary\"   {
+  // a comment that names the field mode = slow
+  @Secret token = \"s3cr3t\"
+  mode = fast
+  quoted = \"fast\"
+  link = @service/backend
+  local = @primary
+  counts = [ -12 , 0 , 1.25e+2 , ]
+  empty = {}
+  options = { retries = 3, label = \"x\" }
+}
+
+service \"backend\" { enabled = true }
+";
+    string compact = "@Version(since = \"0.6\") config \"primary\" { @Secret token = \"s3cr3t\" mode = fast quoted = \"fast\" link = @service/backend local = @primary counts = [-12, 0, 1.25e+2] empty = {} options = { retries = 3, label = \"x\" } } service \"backend\" { enabled = true }";
+    match Parser.Parse(spaced, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("commented and spaced document parses"),
+        Result::Ok(first) => {
+            match Parser.Parse(compact, Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("compact spelling of the same document parses"),
+                Result::Ok(other) => Assert.True(SameDocument(first, other), "whitespace, comments and the trailing list comma do not change ordered syntax"),
+            };
+            Assert.Equal(Array.Len<i64>(first.roots), 2_i64, "two labeled root blocks in declaration order");
+            Syntax.Node primary = first.nodes[first.roots[0]];
+            Syntax.Node service = first.nodes[first.roots[1]];
+            Assert.Equal(primary.name, "config", "first block kind");
+            Assert.True(primary.hasLabel && primary.label == "primary", "first block label decoded");
+            Assert.Equal(service.name, "service", "second block kind");
+            Assert.True(service.hasLabel && service.label == "backend", "second block label decoded");
+            Assert.Equal(Array.Len<i64>(primary.attributes), 1_i64, "block attribute retained on the block");
+            Assert.Equal(KindName(first.nodes[primary.attributes[0]].kind), "attribute", "block attribute is an attribute node");
+            Syntax.Node token = first.nodes[AssignmentIndex(first, primary, "token")];
+            Assert.Equal(Array.Len<i64>(token.attributes), 1_i64, "assignment attribute retained on the assignment");
+            Syntax.Node mode = AssignedValue(first, primary, "mode");
+            Syntax.Node quoted = AssignedValue(first, primary, "quoted");
+            Assert.Equal(KindName(mode.kind), "identifier", "bare word stays an identifier");
+            Assert.Equal(KindName(quoted.kind), "string", "quoted word stays a string");
+            Assert.Equal(quoted.text, "fast", "string value decoded");
+            Assert.Equal(KindName(AssignedValue(first, primary, "link").kind), "reference", "kind/label reference stays a reference");
+            Assert.Equal(KindName(AssignedValue(first, primary, "local").kind), "reference", "label reference stays a reference");
+            Syntax.Node counts = AssignedValue(first, primary, "counts");
+            Assert.Equal(KindName(counts.kind), "list", "list value");
+            Assert.Equal(Array.Len<i64>(counts.children), 3_i64, "trailing comma adds no list item");
+            Assert.Equal(first.nodes[counts.children[2]].raw, "1.25e+2", "exponent number keeps its exact spelling");
+            Assert.Equal(KindName(AssignedValue(first, primary, "empty").kind), "map", "empty braces are an empty map");
+            Assert.Equal(KindName(AssignedValue(first, service, "enabled").kind), "boolean", "boolean value");
+            match Writer.Write(first, Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("canonical writer accepts the parsed document"),
+                Result::Ok(canonical) => {
+                    match Parser.Parse(canonical, Limits.DefaultLimits()) {
+                        Result::Error(_) => Assert.Fail("canonical output reparses"),
+                        Result::Ok(second) => {
+                            Assert.True(SameDocument(first, second), "parse, write, parse keeps kinds, labels, attributes, references and value distinctions");
+                            match Writer.Write(second, Limits.DefaultLimits()) {
+                                Result::Error(_) => Assert.Fail("reparsed document writes"),
+                                Result::Ok(again) => Assert.Equal(again, canonical, "canonical output is a fixed point"),
+                            };
+                        },
+                    };
+                },
+            };
+        },
+    };
+}
+
+/// The rejection is checked and points inside the input, after the opening of the block body.
+unit RejectLexical(string source, i64 bodyStart) {
+    match Parser.Parse(source, Limits.DefaultLimits()) {
+        Result::Ok(_) => Assert.Fail("invalid lexical input rejects: " + source),
+        Result::Error(error) => {
+            Assert.True(error.span.start >= bodyStart, "diagnostic points at the offending token, not the document start: " + source);
+            Assert.True(error.span.start <= error.span.end && error.span.end <= String.Len(source), "diagnostic byte span lies inside the input: " + source);
+        },
+    };
+}
+
+test bsol_lexical_matrix_rejects_bracket_attributes_invalid_escapes_leading_zero_and_nonfinite {
+    match Parser.Parse("@Secret config { @Note(text = \"a\") values = [-1, 0, 2.5e-3, -7E+2, 18446744073709551615] empty = {} wide = \"\\uD83D\\uDE00\" }", Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("corrected accepted lexical matrix parses"),
+        Result::Ok(document) => {
+            Syntax.Node root = document.nodes[document.roots[0]];
+            Assert.Equal(Array.Len<i64>(root.attributes), 1_i64, "@ attribute before a block");
+            Syntax.Node values = AssignedValue(document, root, "values");
+            Assert.Equal(Array.Len<i64>(values.children), 5_i64, "signed and exponent numbers are list items");
+            Assert.Equal(document.nodes[values.children[0]].raw, "-1", "negative integer spelling");
+            Assert.Equal(document.nodes[values.children[2]].raw, "2.5e-3", "finite negative exponent spelling");
+            Assert.Equal(document.nodes[values.children[3]].raw, "-7E+2", "signed uppercase exponent spelling");
+            Assert.Equal(document.nodes[values.children[4]].raw, "18446744073709551615", "exact integer digits beyond 2^53");
+            Assert.Equal(KindName(AssignedValue(document, root, "empty").kind), "map", "empty map value");
+            Syntax.Node wide = AssignedValue(document, root, "wide");
+            Assert.Equal(wide.text, "😀", "escaped surrogate pair decodes to one non-BMP scalar");
+            Assert.Equal(String.Len(wide.text), 4_i64, "one non-BMP scalar is four UTF-8 bytes");
+        },
+    };
+    RejectLexical("[Secret] config { }", 0_i64);
+    RejectLexical("config { [Secret] value = 1 }", 7_i64);
+    RejectLexical("config { value = \"\\uD800\" }", 7_i64);
+    RejectLexical("config { value = \"\\uDE00\" }", 7_i64);
+    RejectLexical("config { value = \"\\uD83Dx\" }", 7_i64);
+    RejectLexical("config { value = \"\\x41\" }", 7_i64);
+    RejectLexical("config { value = \"\\u12\" }", 7_i64);
+    RejectLexical("config { value = \"a" + Lexer.Scalar(1_i64) + "b\" }", 7_i64);
+    RejectLexical("config { value = 01 }", 7_i64);
+    RejectLexical("config { value = -01 }", 7_i64);
+    RejectLexical("config { value = 00.5 }", 7_i64);
+    RejectLexical("config { value = 1. }", 7_i64);
+    RejectLexical("config { value = .5 }", 7_i64);
+    RejectLexical("config { value = +1 }", 7_i64);
+    RejectLexical("config { value = 1e }", 7_i64);
+    RejectLexical("config { value = 1e9999 }", 7_i64);
+    RejectLexical("config { value = -1e9999 }", 7_i64);
+    RejectLexical("config { values = [1, 1e400] }", 7_i64);
+}
+
+Limits.BsolLimits Bounded(i64 input, i64 output, i64 depth, i64 nodes, i64 scalar) {
+    return Limits.BsolLimits {
+        maxInputBytes: input,
+        maxOutputBytes: output,
+        maxDepth: depth,
+        maxNodes: nodes,
+        maxScalarBytes: scalar,
+        maxImports: 256_i64,
+        maxImportDepth: 32_i64,
+        maxResolvedSchemaBytes: 8388608_i64,
+    };
+}
+
+bool LimitKind(Errors.BsolError error, string expected) {
+    string actual = match error.kind {
+        Errors.ErrorKind::InputLimit => "input",
+        Errors.ErrorKind::OutputLimit => "output",
+        Errors.ErrorKind::ScalarLimit => "scalar",
+        Errors.ErrorKind::DepthLimit => "depth",
+        Errors.ErrorKind::NodeLimit => "nodes",
+        _ => "other",
+    };
+    return actual == expected;
+}
+
+/// Smallest depth budget that admits `source`, or 0 when none up to 64 does.
+i64 RequiredDepth(string source) {
+    mut i64 depth = 1_i64;
+    while (depth <= 64_i64) {
+        if (Results.IsOk(Parser.Parse(source, Bounded(8388608_i64, 8388608_i64, depth, 100000_i64, 1048576_i64)))) { return depth; }
+        depth = depth + 1_i64;
+    }
+    return 0_i64;
+}
+
+/// Smallest aggregate node and entry budget that admits `source`, or 0 when none up to 4096 does.
+i64 RequiredNodes(string source) {
+    mut i64 nodes = 1_i64;
+    while (nodes <= 4096_i64) {
+        if (Results.IsOk(Parser.Parse(source, Bounded(8388608_i64, 8388608_i64, 128_i64, nodes, 1048576_i64)))) { return nodes; }
+        nodes = nodes + 1_i64;
+    }
+    return 0_i64;
+}
+
+test bsol_each_configured_limit_boundary_admits_and_plus_one_rejects_atomically {
+    string source = "# head
+root \"r\" { a = 1 inner { b = \"xy\" deeper { c = [1, 2] } } }";
+    i64 inputBytes = String.Len(source);
+    Assert.True(Results.IsOk(Parser.Parse(source, Bounded(inputBytes, 8388608_i64, 128_i64, 100000_i64, 1048576_i64))), "input exactly at the byte limit is admitted");
+    match Parser.Parse(source, Bounded(inputBytes - 1_i64, 8388608_i64, 128_i64, 100000_i64, 1048576_i64)) {
+        Result::Ok(_) => Assert.Fail("input one byte over the limit rejects"),
+        Result::Error(error) => Assert.True(LimitKind(error, "input"), "input overflow reports the input limit"),
+    };
+    i64 nodes = RequiredNodes(source);
+    Assert.True(nodes > 0_i64, "fixture fits a bounded aggregate budget");
+    Assert.Equal(RequiredNodes(source + " # tail"), nodes + 1_i64, "one more comment entry costs exactly one aggregate unit");
+    match Parser.Parse(source + " # tail", Bounded(8388608_i64, 8388608_i64, 128_i64, nodes, 1048576_i64)) {
+        Result::Ok(_) => Assert.Fail("one aggregate entry over the limit rejects"),
+        Result::Error(error) => Assert.True(LimitKind(error, "nodes"), "aggregate overflow reports the node limit"),
+    };
+    Assert.True(Results.IsOk(Parser.Parse("a { x = \"xyz\" }", Bounded(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 3_i64))), "scalar exactly at the byte limit is admitted");
+    match Parser.Parse("a { x = \"xyz\" }", Bounded(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 2_i64)) {
+        Result::Ok(_) => Assert.Fail("scalar one byte over the limit rejects"),
+        Result::Error(error) => Assert.True(LimitKind(error, "scalar"), "scalar overflow reports the scalar limit"),
+    };
+    i64 depth = RequiredDepth("a { b { c {} } }");
+    Assert.True(depth > 0_i64, "three nested blocks fit a bounded depth budget");
+    Assert.Equal(RequiredDepth("a { b { c { d {} } } }"), depth + 1_i64, "each nesting level costs exactly one depth unit");
+    match Parser.Parse("a { b { c { d {} } } }", Bounded(8388608_i64, 8388608_i64, depth, 100000_i64, 1048576_i64)) {
+        Result::Ok(_) => Assert.Fail("one level over the depth limit rejects"),
+        Result::Error(error) => Assert.True(LimitKind(error, "depth"), "depth overflow reports the depth limit"),
+    };
+    match Parser.Parse(source, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("output fixture parses"),
+        Result::Ok(document) => match Writer.Write(document, Limits.DefaultLimits()) {
+            Result::Error(_) => Assert.Fail("canonical output under default limits"),
+            Result::Ok(canonical) => {
+                i64 outputBytes = String.Len(canonical);
+                match Writer.Write(document, Bounded(8388608_i64, outputBytes, 128_i64, 100000_i64, 1048576_i64)) {
+                    Result::Error(_) => Assert.Fail("output exactly at the byte limit is admitted"),
+                    Result::Ok(bounded) => Assert.Equal(bounded, canonical, "bounded output is the complete canonical text"),
+                };
+                match Writer.Write(document, Bounded(8388608_i64, outputBytes - 1_i64, 128_i64, 100000_i64, 1048576_i64)) {
+                    Result::Ok(_) => Assert.Fail("output one byte over the limit rejects without partial text"),
+                    Result::Error(error) => Assert.True(LimitKind(error, "output"), "output overflow reports the output limit"),
+                };
+            },
+        },
+    };
+}
+
+ShapeId FloatShape(Registry.ShapeRegistry table, u8 width) {
+    string signature = "release-float-" + i64(width);
+    ShapeId id = match Registry.SignatureId(signature, 8388608_i64) {
+        Result::Ok(value) => value,
+        Result::Error(_) => { Assert.Fail("float fixture signature hashes"); return FloatShape(table, width); },
+    };
+    ShapeDescriptor descriptor = ShapeDescriptor {
+        id: id,
+        signature: signature,
+        packageIdentity: "fixture@1.0.0",
+        sourcePath: "Fixture.bd",
+        declarationPath: signature,
+        schemaVersion: "1",
+        kind: ShapeKind::Float,
+        width: width,
+        arguments: Array.Empty<ShapeId>(),
+        fields: Array.Empty<FieldDescriptor>(),
+        variants: Array.Empty<VariantDescriptor>(),
+        extras: Optional.Empty<ExtrasBinding>(),
+    };
+    Assert.True(Results.IsOk(Registry.Register(table, descriptor, 8388608_i64, 100000_i64)), "float descriptor registered");
+    return id;
+}
+
+/// Writes finite bits at their declared width, checks the emitted decimal is the shortest roundtrip text
+/// of FloatDecimal, reads it back and returns that decimal text.
+string WriteFloatExactly(Registry.ShapeRegistry table, ShapeId shape, u64 bits, u8 width) {
+    string expected = match FloatDecimal.Format(bits, width, SerializationPolicy.DefaultLimits()) {
+        Result::Ok(text) => text,
+        Result::Error(_) => { Assert.Fail("finite bits have a shortest decimal"); return ""; },
+    };
+    match Serialization.WriteValue(shape, DataValue::Float(bits, width), table, SerializationPolicy.DefaultLimits()) {
+        Result::Error(_) => { Assert.Fail("finite float writes at its declared width"); },
+        Result::Ok(text) => {
+            Assert.True(String.Contains(text, "data = " + expected + " "), "written decimal is the shortest roundtrip text");
+            match Serialization.ReadValue(text, shape, table, SerializationPolicy.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("written float reads back"),
+                Result::Ok(value) => match value {
+                    DataValue::Float(actual, actualWidth) => {
+                        Assert.Equal(actual, bits, "exact bits survive write and read");
+                        Assert.Equal(actualWidth, width, "declared width survives write and read");
+                    },
+                    _ => Assert.Fail("float reads back as a float"),
+                },
+            };
+        },
+    };
+    return expected;
+}
+
+test bsol_float_output_is_shortest_roundtrip_and_keeps_negative_zero_at_both_widths {
+    Registry.ShapeRegistry table = Registry.Create();
+    ShapeId narrow = FloatShape(table, 32_u8);
+    ShapeId wide = FloatShape(table, 64_u8);
+    string singleTenth = WriteFloatExactly(table, narrow, 0x3dcccccd_u64, 32_u8);
+    string doubleTenth = WriteFloatExactly(table, wide, 0x3fb999999999999a_u64, 64_u8);
+    Assert.Equal(singleTenth, doubleTenth, "f32 0.1 is written from its own width, not widened to f64 digits");
+    Assert.True(String.Len(singleTenth) <= 4_i64, "shortest text for one tenth needs at most four bytes");
+    string singleZero = WriteFloatExactly(table, narrow, 0x80000000_u64, 32_u8);
+    string doubleZero = WriteFloatExactly(table, wide, 0x8000000000000000_u64, 64_u8);
+    Assert.Equal<u8>(String.ByteAt(singleZero, 0_i64), 45_u8, "f32 negative zero keeps its sign");
+    Assert.Equal<u8>(String.ByteAt(doubleZero, 0_i64), 45_u8, "f64 negative zero keeps its sign");
+    WriteFloatExactly(table, narrow, 0x7f7fffff_u64, 32_u8);
+    WriteFloatExactly(table, wide, 0x0000000000000001_u64, 64_u8);
+    Assert.True(Results.IsError(Serialization.WriteValue(narrow, DataValue::Float(0x7fc00000_u64, 32_u8), table, SerializationPolicy.DefaultLimits())), "f32 NaN rejects");
+    Assert.True(Results.IsError(Serialization.WriteValue(wide, DataValue::Float(0x7ff0000000000000_u64, 64_u8), table, SerializationPolicy.DefaultLimits())), "f64 infinity rejects");
+    Assert.True(Results.IsError(Serialization.WriteValue(narrow, DataValue::Float(0x3fb999999999999a_u64, 32_u8), table, SerializationPolicy.DefaultLimits())), "f64 bits under an f32 descriptor reject instead of narrowing");
 }

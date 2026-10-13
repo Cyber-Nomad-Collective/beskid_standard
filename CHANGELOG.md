@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`
+  handle type, the `LinuxPthread`/`DarwinPthread` contracts and `ThreadError`.
+  `Spawn` passed `0` as the `pthread_t*` out-parameter and had no callers. Fibers
+  are the concurrency model; `Thread.Yield` remains.
+- Remove the seven string-in/string-out Glue Mod contracts (`TypeMapping`,
+  `SymbolEmission`, `LinkArgs`, `SignatureReader`, `SignatureWriter`,
+  `ToolchainProbe`, `StdioBridge`), the unused `[Glue]`, `[GlueImport]` and
+  `[GlueExport]` attributes and the `GlueBackendKind` enum from `corelib_glue`.
+  The package now holds only the provisional stdio bridge protocol.
+
 ### Fixed
 
 - Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent

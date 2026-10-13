@@ -686,7 +686,7 @@ callers.
 - Status (2026-10-06, relocation): fixed by compiler 0.5.3. The AOT linker maps a
   versioned soname to its base name (`canonical_link_library_name` in
   `beskid_aot/src/linker/common.rs`: `libc.so.6` -> `-lc`), which resolves to libSystem on
-  macOS. `Crypto.Entropy` keeps the `Core.Threading.Thread` pattern (Linux contract with
+  macOS. `Crypto.Entropy` keeps the paired-contract pattern (Linux contract with
   `libc.so.6`, Darwin contract with `libc`), and the shim is removed from
   `packages/web/interop/curl-interop.sh`. Not yet confirmed by a macOS 0.5.3 AOT build
   (no 0.5.3 macOS CLI was available during the relocation).

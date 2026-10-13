@@ -6,12 +6,12 @@ use SerializationMod.Syntax;
 use SerializationMod.Scalars;
 use SerializationMod.Collect;
 
-/// Structural call plans are not semantic witnesses. The host validates each
-/// contributed function and exact current nominal/default correspondence.
+/// One declared nominal field site and its typed read: `Reader.ReadField<F, R>`, whose body the
+/// compiler issues through the exact current field decoder correspondence of F. A structural
+/// call plan is not a semantic witness; the compiler validates each concrete application.
 pub type NominalBinding {
     pub SpannedType ty,
-    pub OptionalSpannedPath factory,
-    pub OptionalSpannedExpression decoder,
+    pub SpannedPath factory,
 }
 
 pub type FieldPolicy {
@@ -80,7 +80,7 @@ pub i64 ContainerIndex(ContainerSite[] containers, SpannedType ty) {
     return -1_i64;
 }
 
-/// Declared types that need a typed FieldDecoder binding, in traversal order.
+/// Declared nominal sites read through `Reader.ReadField`, in traversal order.
 /// Primitives, primitive and bytes arrays and container shells are generated directly.
 pub SpannedType[] BindingTypes(SpannedType ty, ContainerSite[] containers, bool bytes) {
     mut SpannedType[] result = [];
@@ -220,21 +220,8 @@ pub Result<ValueBody, SemanticError> Value(Syntax.Builder builder, SpannedType t
                 index = index + 1_i64;
             }
             if (selected < 0_i64) { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "nominal read requires its exact admitted typed factory" }); }
-            match plan.bindings[selected].decoder {
-                OptionalSpannedExpression::Some(decoder) => {
-                    match plan.bindings[selected].factory { OptionalSpannedPath::Some(_) => { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "field binding has two competing factory paths" }); }, _ => { }, };
-                    SpannedExpression call = Syntax.Call(builder, Syntax.Member(builder, decoder, "Read"), [Syntax.Local(builder, "reader"), Syntax.Local(builder, "limits")]);
-                    return Result::Ok(ValueBody { statements: [], value: Syntax.Propagate(builder, call) });
-                },
-                OptionalSpannedExpression::None => { },
-            };
-            match plan.bindings[selected].factory {
-                OptionalSpannedPath::Some(factory) => {
-                    SpannedExpression call = Syntax.Call(builder, Syntax.Name(builder, factory), [Syntax.Local(builder, "reader"), Syntax.Local(builder, "limits")]);
-                    return Result::Ok(ValueBody { statements: [], value: Syntax.Propagate(builder, call) });
-                },
-                OptionalSpannedPath::None => { return Result::Error(SemanticError { code: "SerializationReadBinding", message: "field binding has no typed factory" }); },
-            };
+            SpannedExpression call = Syntax.Call(builder, Syntax.Name(builder, plan.bindings[selected].factory), [Syntax.Local(builder, "reader"), Syntax.Local(builder, "limits")]);
+            return Result::Ok(ValueBody { statements: [], value: Syntax.Propagate(builder, call) });
         },
     };
 }

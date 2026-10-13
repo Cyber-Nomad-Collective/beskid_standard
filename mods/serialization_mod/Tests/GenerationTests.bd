@@ -27,7 +27,7 @@ Syntax.CanonicalPath[] FixturePaths() {
         Route("Core.String.Core.SortOrdinal", "SortOrdinal"),
         Route("Core.Serialization.Contracts.Serializable", "Serializable"), Route("Core.Serialization.Contracts.Encoder", "Encoder"),
         Route("Core.Serialization.Contracts.Decoder", "Decoder"), Route("Core.Serialization.Reader.Reader", "Reader"),
-        Route("Core.Serialization.Reader.FieldDecoder", "FieldDecoder"), Route("Core.Serialization.Limits.SerializationLimits", "Limits"),
+        Route("Core.Serialization.Reader.ReadField", "ReadField"), Route("Core.Serialization.Limits.SerializationLimits", "Limits"),
         Route("Core.Serialization.Errors.SerializationError", "Error"), Route("Core.Serialization.Errors.Diagnostic", "Diagnostic"),
         Route("Core.Serialization.Errors.NumericError", "NumericError"),
         Route("Core.Serialization.Descriptors.CompiledShape", "CompiledShape"), Route("Core.Numeric.FloatBits.ToBits32", "ToBits32"),
@@ -101,6 +101,71 @@ i64 TypeGenerics(SyntaxContributionItem item) {
 
 i64 TypeMembers(SyntaxContributionItem item) {
     match item { SyntaxContributionItem::TypeDefinition(definition) => { return Array.Len(definition.node.fields.items); }, _ => { return -1_i64; }, };
+}
+
+/// Nominal field sites a record decoder reads through `Reader.ReadField`.
+i64 ReadSites(SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers) {
+    match Generation.FieldReadSites(Generation.DecoderShape::Record(fields, policies), containers) {
+        Result::Ok(sites) => { return Array.Len(sites); },
+        Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); return -1_i64; },
+    };
+}
+
+/// Nominal payload sites an enum decoder reads through `Reader.ReadField`.
+i64 VariantReadSites(SpannedEnumVariant[] variants, Read.VariantPolicy[] policies) {
+    match Generation.FieldReadSites(Generation.DecoderShape::Enumeration(variants, policies), []) {
+        Result::Ok(sites) => { return Array.Len(sites); },
+        Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); return -1_i64; },
+    };
+}
+
+/// Parameter count of a generated function item, or -1.
+i64 FunctionParameters(SyntaxContributionItem item) {
+    match item { SyntaxContributionItem::FunctionDefinition(definition) => { return Array.Len(definition.node.parameters.items); }, _ => { return -1_i64; }, };
+}
+
+/// Final callee segment of a propagated call `callee(...)?`, or "".
+string PropagatedCallee(SpannedExpression expression) {
+    match expression.node {
+        Expression::Try(value) => {
+            match value.node.expr.node {
+                Expression::Call(call) => {
+                    match call.node.callee.node {
+                        Expression::Path(path) => {
+                            SpannedPathSegment[] segments = path.node.path.node.segments.items;
+                            return segments[Array.Len(segments) - 1_i64].node.name.node.name;
+                        },
+                        _ => { },
+                    };
+                },
+                _ => { },
+            };
+        },
+        _ => { },
+    };
+    return "";
+}
+
+/// Type argument count of the final callee segment of a propagated call, or -1.
+i64 PropagatedCalleeTypeArguments(SpannedExpression expression) {
+    match expression.node {
+        Expression::Try(value) => {
+            match value.node.expr.node {
+                Expression::Call(call) => {
+                    match call.node.callee.node {
+                        Expression::Path(path) => {
+                            SpannedPathSegment[] segments = path.node.path.node.segments.items;
+                            return Array.Len(segments[Array.Len(segments) - 1_i64].node.typeArgs.items);
+                        },
+                        _ => { },
+                    };
+                },
+                _ => { },
+            };
+        },
+        _ => { },
+    };
+    return -1_i64;
 }
 
 /// Final segment of the function a `let` statement calls, or "".
@@ -226,18 +291,23 @@ test serialization_generic_record_emits_encoder_then_decoder_group {
     SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
     SpannedField[] fields = [Syntax.DataField(builder, "value", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
     Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["GenericRecord"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [Plain("value"), Plain("count")]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "encoder impl + decoder type/read/impl/factory");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "encoder impl + decoder type/field decoder factory/impl");
     Assert.Equal<u32>(target.encoderIndex, 0_u32, "encoder is the first contribution");
     Assert.Equal<u32>(target.decoderIndex, 3_u32, "decoder impl is the fourth contribution");
+    Assert.Equal<i64>(Array.Len(target.decoderMembers), 2_i64, "adapter type and field decoder factory are the group members");
+    Assert.Equal<u32>(target.decoderMembers[0_i64], 1_u32, "adapter type member");
+    Assert.Equal<u32>(target.decoderMembers[1_i64], 2_u32, "field decoder factory member");
     Assert.True(IsImpl(target.items[0_i64]), "item 0 is the Serializable impl");
     Assert.True(IsType(target.items[1_i64]), "item 1 is the decoder adapter type");
-    Assert.True(IsFunction(target.items[2_i64]), "item 2 is the read helper");
+    Assert.True(IsFunction(target.items[2_i64]), "item 2 is the field decoder factory");
     Assert.True(IsImpl(target.items[3_i64]), "item 3 is the Decoder impl");
-    Assert.True(IsFunction(target.items[4_i64]), "item 4 is the factory");
+    Assert.Equal<i64>(FunctionParameters(target.items[2_i64]), 2_i64, "the factory reads from (reader, limits) like FieldDecoder.Read");
     Assert.Equal<i64>(ImplGenerics(target.items[0_i64]), 2_i64, "encoder impl generics are T plus the encoder");
     Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 2_i64, "Encoder bound plus T Serializable bound");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 3_i64, "T, reader and one field decoder binding for T");
-    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 2_i64, "reader plus one T field decoder");
+    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and the reader; no binding parameter");
+    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "the adapter holds only its reader");
+    Assert.Equal<i64>(ImplBounds(target.items[3_i64]), 1_i64, "the Decoder impl bounds only the reader; T is revalidated per application");
+    Assert.Equal<i64>(ReadSites(fields, [Plain("value"), Plain("count")], []), 1_i64, "the T field reads through the issued correspondence");
 }
 
 // SER-01: nested GenericRecord<i32> and GenericRecord<string> keep distinct decoder bindings.
@@ -247,11 +317,11 @@ test serialization_nested_generic_instantiations_get_distinct_field_decoders {
     SpannedType ofText = GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::String));
     SpannedField[] fields = [Syntax.DataField(builder, "count", ofInt), Syntax.DataField(builder, "label", ofText)];
     Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Outer"], []), [], fields, [Plain("count"), Plain("label")]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "non generic record contribution group");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "non generic record contribution group");
     Assert.Equal<i64>(ImplGenerics(target.items[0_i64]), 1_i64, "encoder impl only has the encoder parameter");
     Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "no receiver parameter gets an unused bound");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 3_i64, "reader plus two instantiation decoders");
-    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 3_i64, "reader plus two field decoder members");
+    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
+    Assert.Equal<i64>(ReadSites(fields, [Plain("count"), Plain("label")], []), 2_i64, "each instantiation is its own ReadField site");
 }
 
 // SER-02: scalar profile including every explicit word width.
@@ -325,10 +395,11 @@ test serialization_payload_enum_emits_encoder_and_decoder_group {
     match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Shape"], []), [], variants, Payloads(variants), []) {
         Result::Error(error) => { Assert.Fail(error.message); },
         Result::Ok(target) => {
-            Assert.Equal<i64>(Array.Len(target.items), 5_i64, "enum encoder impl plus four decoder items");
+            Assert.Equal<i64>(Array.Len(target.items), 4_i64, "enum encoder impl plus three decoder items");
             Assert.Equal<u32>(target.encoderIndex, 0_u32, "encoder first");
             Assert.Equal<u32>(target.decoderIndex, 3_u32, "decoder impl fourth");
-            Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "reader plus one nominal payload decoder");
+            Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
+            Assert.Equal<i64>(VariantReadSites(variants, Payloads(variants)), 1_i64, "one nominal payload reads through ReadField");
         },
     };
 }
@@ -347,7 +418,7 @@ test serialization_record_without_default_generates_complete_decoder_group {
     Syntax.Builder builder = NewBuilder();
     SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
     Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "present or absent, the contribution group is complete");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "present or absent, the contribution group is complete");
 }
 
 test serialization_skip_deserialize_without_typed_default_fails_before_generation {
@@ -367,8 +438,9 @@ test serialization_skip_both_directions_with_default_keeps_decoder_free_of_that_
     skipped.skipWrite = true;
     skipped.defaultFactory = OptionalSpannedPath::Some(Syntax.PathValue(builder, ["Defaults", "MakeCache"], []));
     Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Holder"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [skipped, Plain("count")]);
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and reader only; a field skipped in both directions needs no decoder binding");
-    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "only reader remains as a member");
+    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and reader only");
+    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "only reader is a member");
+    Assert.Equal<i64>(ReadSites(fields, [skipped, Plain("count")], []), 0_i64, "a field skipped in both directions has no read site");
 }
 
 SpannedStatement[] IfBody(SpannedStatement statement) {
@@ -444,7 +516,8 @@ test serialization_skip_deserialize_written_field_requires_decoder_binding_for_n
     SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
     SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], []))];
     Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Holder"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [SkippedRead(builder, "cache", true)]);
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 3_i64, "a consumed nominal value needs its typed decoder like any read");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "complete contribution group");
+    Assert.Equal<i64>(ReadSites(fields, [SkippedRead(builder, "cache", true)], []), 1_i64, "a consumed nominal value reads through ReadField like any read");
 }
 
 test serialization_skip_serialize_removes_parameter_bound_from_encoder {
@@ -455,7 +528,7 @@ test serialization_skip_serialize_removes_parameter_bound_from_encoder {
     skipped.skipWrite = true;
     Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Vault"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [skipped, Plain("count")]);
     Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "unwritten T needs no Serializable bound");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 3_i64, "decoder still reads T");
+    Assert.Equal<i64>(ReadSites(fields, [skipped, Plain("count")], []), 1_i64, "decoder still reads T");
 }
 
 test serialization_policy_count_mismatch_fails_closed {
@@ -610,9 +683,9 @@ test serialization_container_fields_bind_only_their_nominal_elements {
         Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::Bool)),
     ];
     Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Bag"], []), [], fields, [Plain("numbers"), Plain("items"), Plain("flag")], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "reader plus one binding for the Item element only");
-    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 2_i64, "reader plus the Item element decoder");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "complete contribution group");
+    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
+    Assert.Equal<i64>(ReadSites(fields, [Plain("numbers"), Plain("items"), Plain("flag")], sites), 1_i64, "only the Item element reads through ReadField");
 }
 
 test serialization_container_writes_list_optional_and_ordinal_map {
@@ -657,8 +730,8 @@ test serialization_record_with_map_field_generates_encoder {
     Read.ContainerSite[] sites = [Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I32)), Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
     SpannedField[] fields = [Syntax.DataField(builder, "maybe", option), Syntax.DataField(builder, "table", map)];
     Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Holder"], []), [], fields, [Plain("maybe"), Plain("table")], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "written map field completes the contribution group");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "option and map of primitives need no binding");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "written map field completes the contribution group");
+    Assert.Equal<i64>(ReadSites(fields, [Plain("maybe"), Plain("table")], sites), 0_i64, "option and map of primitives need no ReadField site");
     SpannedStatement[] body = EncoderBody(target);
     Assert.Equal<string>(OperationName(body[0_i64]), "BeginRecord", "no catchall: the record opens first");
     Assert.Equal<string>(OperationName(body[4_i64]), "BeginField", "the map field follows the optional field");
@@ -707,8 +780,9 @@ test serialization_payload_skipped_both_ways_uses_default_and_needs_no_binding {
     skipped.skipRead = true;
     skipped.skipWrite = true;
     skipped.defaultFactory = OptionalSpannedPath::Some(Syntax.PathValue(builder, ["Defaults", "MakeInner"], []));
+    Assert.Equal<i64>(VariantReadSites(variants, [Read.VariantPolicy { fields: [skipped] }]), 0_i64, "skipped payload has no read site");
     match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Shape"], []), [], variants, [Read.VariantPolicy { fields: [skipped] }], []) {
-        Result::Ok(target) => { Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "skipped payload needs no decoder binding"); },
+        Result::Ok(target) => { Assert.Equal<i64>(Array.Len(target.items), 4_i64, "complete contribution group"); },
         Result::Error(error) => { Assert.Fail(error.message); },
     };
     mut Read.FieldPolicy missing = Plain("inner");
@@ -750,8 +824,8 @@ test serialization_catchall_record_reads_unknown_fields_as_its_value_type {
     catchall.catchall = true;
     catchall.skipWrite = true;
     Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "reader plus one binding for catchall value V");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "complete contribution group");
+    Assert.Equal<i64>(ReadSites(fields, [Plain("count"), catchall], sites), 1_i64, "unknown fields read their catchall value V through ReadField");
 }
 
 test serialization_catchall_fails_closed_without_map_proof {
@@ -781,7 +855,7 @@ test serialization_catchall_flattens_after_declared_fields_in_ordinal_order {
     mut Read.FieldPolicy hidden = Plain("hidden");
     hidden.skipWrite = true;
     Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall, hidden], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "encoded catchall completes the contribution group");
+    Assert.Equal<i64>(Array.Len(target.items), 4_i64, "encoded catchall completes the contribution group");
     SpannedStatement[] body = EncoderBody(target);
     Assert.Equal<i64>(Array.Len(body), 10_i64, "keys, count, begin, declared field (3), index, catchall loop, end, return");
     Assert.Equal<string>(LetCallee(body[0_i64]), "SortOrdinal", "catchall keys are sorted before the record opens");
@@ -827,4 +901,25 @@ test serialization_ambiguous_canonical_path_plan_is_a_generation_error {
     Syntax.Builder builder = Syntax.CreateWithPaths(Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64), paths);
     SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
     Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "SerializationCanonicalPath", "ambiguous plan is reported");
+}
+
+// Typed field decoder factory correspondence: a nominal field reads through ReadField<F, R>.
+test serialization_nominal_field_reads_through_issued_field_decoder_correspondence {
+    Syntax.Builder builder = NewBuilder();
+    SpannedType point = Syntax.Named(builder, ["Point"], []);
+    SpannedType reader = Syntax.Named(builder, ["R"], []);
+    Read.NominalBinding binding = Read.NominalBinding { ty: point, factory: Syntax.CorePath(builder, ["Serialization", "Reader", "ReadField"], [point, reader]) };
+    match Read.Value(builder, point, 0_u8, false, Read.Plan([binding], [], Syntax.PathValue(builder, ["Result"], [])), 0_i64) {
+        Result::Ok(body) => {
+            Assert.Equal<i64>(Array.Len(body.statements), 0_i64, "a nominal read is a single call");
+            Assert.Equal<string>(PropagatedCallee(body.value), "ReadField", "the read calls the canonical ReadField");
+            Assert.Equal<i64>(PropagatedCalleeTypeArguments(body.value), 2_i64, "ReadField is applied to the exact field type and reader");
+        },
+        Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
+    };
+    Assert.True(Results.IsOk(Syntax.Status(builder)), "ReadField has a compiler-issued canonical path plan");
+    match Read.Value(builder, Syntax.Named(builder, ["Other"], []), 0_u8, false, Read.Plan([binding], [], Syntax.PathValue(builder, ["Result"], [])), 0_i64) {
+        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationReadBinding", "a site without its own binding rejects"); },
+        Result::Ok(_) => { Assert.Fail("another declared site must not borrow a binding"); },
+    };
 }

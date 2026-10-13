@@ -2,16 +2,16 @@ use Core.Results;
 use Core.Serialization.Contracts;
 use Core.Serialization.Errors;
 use Core.Serialization.Limits;
-use Core.Serialization.Reader;
+use Core.Serialization.Reader as ReaderApi;
 
 /// Construction is through Bind with exact applied bounds. The decoder retains
 /// the reader and field binding; no partially constructed T is publicly stored.
-type BoundDecoder<T, R, B> {
+pub type BoundDecoder<T, R, B> {
     R reader,
     B binding,
 }
 
-impl<T, R, B> BoundDecoder<T, R, B> : Decoder<T> where R: Reader, B: FieldDecoder<T, R> {
+impl<T, R, B> BoundDecoder<T, R, B> : Decoder<T> where R: ReaderApi.Reader, B: ReaderApi.FieldDecoder<T, R> {
     pub Result<T, SerializationError> ReadTyped(SerializationLimits limits) {
         this.reader.Begin(limits)?;
         T value = this.binding.Read(this.reader, limits)?;
@@ -20,6 +20,26 @@ impl<T, R, B> BoundDecoder<T, R, B> : Decoder<T> where R: Reader, B: FieldDecode
     }
 }
 
-pub BoundDecoder<T, R, B> Bind<T, R, B>(R reader, B binding) where R: Reader, B: FieldDecoder<T, R> {
+pub BoundDecoder<T, R, B> Bind<T, R, B>(R reader, B binding) where R: ReaderApi.Reader, B: ReaderApi.FieldDecoder<T, R> {
     return BoundDecoder<T, R, B> { reader: reader, binding: binding };
+}
+
+/// The typed field binding of T over R that the compiler issues through the
+/// field decoder correspondence (`Reader.ReadField`). It carries no state.
+pub type IssuedField<T, R> {}
+
+impl<T, R> IssuedField<T, R> : ReaderApi.FieldDecoder<T, R> where R: ReaderApi.Reader {
+    pub Result<T, SerializationError> Read(R reader, SerializationLimits limits) {
+        return ReaderApi.ReadField<T, R>(reader, limits);
+    }
+}
+
+pub IssuedField<T, R> FieldFor<T, R>() where R: ReaderApi.Reader {
+    return IssuedField<T, R> {};
+}
+
+/// The top-level Decoder<T> of a `[Serialize]` target (or any T with an issued
+/// field decoder correspondence) over one format reader.
+pub BoundDecoder<T, R, IssuedField<T, R>> DecoderFor<T, R>(R reader) where R: ReaderApi.Reader {
+    return Bind<T, R, IssuedField<T, R>>(reader, FieldFor<T, R>());
 }

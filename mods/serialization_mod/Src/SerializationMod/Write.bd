@@ -61,7 +61,7 @@ pub Result<SpannedStatement[], SemanticError> Value(Syntax.Builder builder, Span
                     Read.ContainerKind::Mapping => { return MapValue(builder, container.element, value, wordWidth, plan, depth); },
                 };
             }
-            return Result::Ok([OperationForNominal(builder, value)]);
+            return OperationForNominal(builder, ty, value, plan);
         },
         Type::Associated(_, _) => {
             return Result::Error(SemanticError { code: "SerializationOpaqueReference", message: "associated types have no serializable identity" });
@@ -155,9 +155,20 @@ Result<SpannedStatement[], SemanticError> MapValue(Syntax.Builder builder, Spann
     return Result::Ok(statements);
 }
 
-SpannedStatement OperationForNominal(Syntax.Builder builder, SpannedExpression value) {
-    SpannedExpression call = Syntax.Call(builder, Syntax.Member(builder, value, "WriteTyped"), [Syntax.Local(builder, "encoder"), Syntax.Local(builder, "limits")]);
-    return Syntax.Evaluate(builder, Syntax.Propagate(builder, call));
+/// A nominal field writes through `Contracts.WriteField<F, E>`, whose body the compiler issues
+/// through the exact current field codec correspondence of F. No receiver parameter gets a
+/// Serializable bound; each concrete application is revalidated by that correspondence.
+Result<SpannedStatement[], SemanticError> OperationForNominal(Syntax.Builder builder, SpannedType ty, SpannedExpression value, Read.TypePlan plan) {
+    match plan.encoder {
+        OptionalSpannedType::Some(encoder) => {
+            SpannedPath factory = Syntax.CorePath(builder, ["Serialization", "Contracts", "WriteField"], [ty, encoder]);
+            SpannedExpression call = Syntax.Call(builder, Syntax.Name(builder, factory), [value, Syntax.Local(builder, "encoder"), Syntax.Local(builder, "limits")]);
+            return Result::Ok([Syntax.Evaluate(builder, Syntax.Propagate(builder, call))]);
+        },
+        OptionalSpannedType::None => {
+            return Result::Error(SemanticError { code: "SerializationWriteBinding", message: "a nominal write requires the encoder of its write traversal" });
+        },
+    };
 }
 
 /// Writes List<T> in index order through its public Count/Get surface. Get is
@@ -219,12 +230,13 @@ Result<SpannedStatement[], SemanticError> Field(Syntax.Builder builder, SpannedT
     return Value(builder, ty, value, policy.wordWidth, plan, 0_i64);
 }
 
-/// Build the original record's method, with direct source-declared field access.
-/// Receiver/encoder/conformance identities are revalidated by BindTarget admission.
-pub Result<SpannedMethodDefinition, SemanticError> Record(Syntax.Builder builder, SpannedType receiver, SpannedType encoder, SpannedType limits, SpannedType result, SpannedPath shapeGetter, SpannedPath resultPath, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers) {
+/// The body of a record's field encoder factory over its `value` parameter, with direct
+/// source-declared field access. Receiver/encoder/conformance identities are revalidated by
+/// BindTarget admission.
+pub Result<SpannedStatement[], SemanticError> Record(Syntax.Builder builder, SpannedType encoder, SpannedPath shapeGetter, SpannedPath resultPath, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers) {
     SpannedExpression shape = Syntax.Call(builder, Syntax.Name(builder, shapeGetter), []);
     if (Array.Len(fields) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "field policy cardinality differs" }); }
-    Read.TypePlan plan = Read.Plan([], containers, resultPath);
+    Read.TypePlan plan = Read.EncoderPlan(containers, resultPath, encoder);
     mut i64 written = 0_i64;
     mut i64 catchall = -1_i64;
     mut string[] reserved = [];
@@ -252,7 +264,7 @@ pub Result<SpannedMethodDefinition, SemanticError> Record(Syntax.Builder builder
         mut bool mapping = false;
         if (site >= 0_i64) { match containers[site].kind { Read.ContainerKind::Mapping => { mapping = true; }, _ => { }, }; }
         if (!mapping) { return Result::Error(SemanticError { code: "SerializationCatchallType", message: "catchall field must be the canonical Foundation Map<string,V>" }); }
-        SpannedExpression extras = Syntax.Member(builder, Syntax.Local(builder, "self"), fields[catchall].node.name.node.name);
+        SpannedExpression extras = Syntax.Member(builder, Syntax.Local(builder, "value"), fields[catchall].node.name.node.name);
         KeyPlan keys = SortedKeys(builder, extras);
         statements = keys.statements;
         count = Syntax.Binary(builder, count, BinaryOp::Add, Syntax.Local(builder, keys.count));
@@ -268,7 +280,7 @@ pub Result<SpannedMethodDefinition, SemanticError> Record(Syntax.Builder builder
         Read.FieldPolicy policy = policies[index];
         if (!policy.skipWrite && !policy.catchall) {
             statements = Array.Append<SpannedStatement>(statements, Operation(builder, "BeginField", [Syntax.Text(builder, policy.wireName)]));
-            match Field(builder, field.ty, Syntax.Member(builder, Syntax.Local(builder, "self"), field.name.node.name), policy, plan) {
+            match Field(builder, field.ty, Syntax.Member(builder, Syntax.Local(builder, "value"), field.name.node.name), policy, plan) {
                 Result::Ok(body) => { statements = Concat(statements, body); },
                 Result::Error(error) => { return Result::Error(error); },
             };
@@ -279,15 +291,15 @@ pub Result<SpannedMethodDefinition, SemanticError> Record(Syntax.Builder builder
     statements = Concat(statements, flattened);
     statements = Array.Append<SpannedStatement>(statements, Operation(builder, "EndRecord", []));
     statements = Array.Append<SpannedStatement>(statements, Syntax.Return(builder, Syntax.ConstructVariant(builder, resultPath, "Ok", [Syntax.LiteralValue(builder, Literal::Unit)])));
-    return Result::Ok(Syntax.Method(builder, receiver, "WriteTyped", [Syntax.ParameterValue(builder, "encoder", encoder), Syntax.ParameterValue(builder, "limits", limits)], result, statements));
+    return Result::Ok(statements);
 }
 
-/// Each payload is destructured into a typed local and written in declaration
-/// order with its own field policy. No ordinal-only enum conversion or universal
-/// boxed payload is emitted.
-pub Result<SpannedMethodDefinition, SemanticError> Enumeration(Syntax.Builder builder, SpannedType receiver, SpannedPath receiverPath, SpannedType encoder, SpannedType limits, SpannedType result, SpannedPath shapeGetter, SpannedPath resultPath, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers) {
+/// The body of an enum's field encoder factory over its `value` parameter. Each payload is
+/// destructured into a typed local and written in declaration order with its own field policy.
+/// No ordinal-only enum conversion or universal boxed payload is emitted.
+pub Result<SpannedStatement[], SemanticError> Enumeration(Syntax.Builder builder, SpannedPath receiverPath, SpannedType encoder, SpannedPath shapeGetter, SpannedPath resultPath, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers) {
     if (Array.Len(variants) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant policy cardinality differs" }); }
-    Read.TypePlan plan = Read.Plan([], containers, resultPath);
+    Read.TypePlan plan = Read.EncoderPlan(containers, resultPath, encoder);
     mut SpannedMatchArm[] arms = [];
     mut i64 variantIndex = 0_i64;
     while (variantIndex < Array.Len(variants)) {
@@ -318,6 +330,6 @@ pub Result<SpannedMethodDefinition, SemanticError> Enumeration(Syntax.Builder bu
         arms = Array.Append<SpannedMatchArm>(arms, Syntax.Arm(builder, Syntax.VariantPattern(builder, receiverPath, variant.name.node.name, bindings), Syntax.BlockValue(builder, statements)));
         variantIndex = variantIndex + 1_i64;
     }
-    SpannedStatement dispatch = Syntax.Evaluate(builder, Syntax.MatchValue(builder, Syntax.Local(builder, "self"), arms));
-    return Result::Ok(Syntax.Method(builder, receiver, "WriteTyped", [Syntax.ParameterValue(builder, "encoder", encoder), Syntax.ParameterValue(builder, "limits", limits)], result, [dispatch]));
+    SpannedStatement dispatch = Syntax.Evaluate(builder, Syntax.MatchValue(builder, Syntax.Local(builder, "value"), arms));
+    return Result::Ok([dispatch]);
 }

@@ -206,29 +206,107 @@ test serialization_generated_nested_generic_record_decodes_at_top_level {
     ExpectPoint(point, -7_i32, 9_i32, "top-level Point");
 }
 
+/// One recorded call of a hand-built JSON test tape.
+TapeToken Call(string kind, string text, i64 signed, u8 width) {
+    mut TapeToken token = TapeCall(kind);
+    token.text = text;
+    token.signed = signed;
+    token.width = width;
+    return token;
+}
+
+// Abstract fields bound to a scalar or a canonical container are written and read through the
+// canonical writes and reads the field codec correspondence issues: a BSOL round trip, and
+// hand-built typed call tapes of the JSON test format that pin the exact read calls.
 test serialization_generated_scalar_and_container_applications_decode_through_one_correspondence {
     Boxed<i32> numbers = Boxed<i32> { item: -5_i32, history: List.New<i32>().Push(1_i32).Push(-2_i32) };
-    Boxed<i32> decodedNumbers = DecodeBsol<Boxed<i32>>(EncodeBsol<Boxed<i32>>(numbers), numbers, "Boxed<i32>");
-    Assert.Equal(decodedNumbers.item, -5_i32, "abstract field bound to i32 reads its exact width");
-    Assert.Equal(decodedNumbers.history.Count(), 2_i64, "List<T> bound to List<i32> keeps its length");
-    Assert.Equal(decodedNumbers.history.ToArray()[1], -2_i32, "List<i32> element");
+    Boxed<i32> roundNumbers = DecodeBsol<Boxed<i32>>(EncodeBsol<Boxed<i32>>(numbers), numbers, "Boxed<i32>");
+    Assert.Equal(roundNumbers.item, -5_i32, "abstract field bound to i32 round-trips at its exact width");
+    Assert.Equal(roundNumbers.history.Count(), 2_i64, "List<i32> round-trips its length");
+    Assert.Equal(roundNumbers.history.ToArray()[1], -2_i32, "List<i32> round-trips its elements");
+    Boxed<string> texts = Boxed<string> { item: "only", history: List.New<string>().Push("first") };
+    Boxed<string> roundTexts = DecodeBsol<Boxed<string>>(EncodeBsol<Boxed<string>>(texts), texts, "Boxed<string>");
+    Assert.Equal(roundTexts.item, "only", "abstract field bound to string round-trips");
+    Assert.Equal(roundTexts.history.ToArray()[0], "first", "List<string> round-trips its elements");
+    JsonTraceEncoder traced = NewJsonTrace();
+    Assert.True(Results.IsOk(Contracts.Encode<Boxed<i32>, JsonTraceEncoder>(numbers, traced, Limits.DefaultLimits())), "Boxed<i32> drives the JSON test format");
+    Assert.Equal(traced.text, "{\"item\":-5,\"history\":[1,-2]}", "the issued i32 and List writes make the declared calls");
+    string numbersShape = Metadata.FormatShapeId(Descriptors.CompiledShape<Boxed<i32>>().id);
+    TapeToken[] numbersTape = [
+        Call("record", numbersShape, 2_i64, 0_u8),
+        Call("field", "item", 0_i64, 0_u8), Call("signed", "", -5_i64, 32_u8),
+        Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 2_i64, 0_u8),
+        Call("signed", "", 1_i64, 32_u8), Call("signed", "", -2_i64, 32_u8),
+    ];
+    JsonTapeReader numbersReader = JsonTapeReader { tape: numbersTape, position: 0_i64 };
+    match Contracts.Decode<Boxed<i32>, Decoding.IssuedDecoder<Boxed<i32>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<i32>, JsonTapeReader>(numbersReader), Limits.DefaultLimits()) {
+        Result::Error(error) => Assert.Fail("Boxed<i32> decodes: " + Errors.Code(error)),
+        Result::Ok(decoded) => {
+            Assert.Equal(decoded.item, -5_i32, "abstract field bound to i32 reads its exact width");
+            Assert.Equal(decoded.history.Count(), 2_i64, "List<T> bound to List<i32> keeps its length");
+            Assert.Equal(decoded.history.ToArray()[1], -2_i32, "List<i32> element");
+        },
+    };
+    TapeToken[] wideTape = [
+        Call("record", numbersShape, 2_i64, 0_u8),
+        Call("field", "item", 0_i64, 0_u8), Call("signed", "", 5_i64, 64_u8),
+        Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 0_i64, 0_u8),
+    ];
+    JsonTapeReader wideReader = JsonTapeReader { tape: wideTape, position: 0_i64 };
+    Assert.True(Results.IsError(Contracts.Decode<Boxed<i32>, Decoding.IssuedDecoder<Boxed<i32>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<i32>, JsonTapeReader>(wideReader), Limits.DefaultLimits())), "the issued i32 read never accepts a 64-bit call");
+    string textsShape = Metadata.FormatShapeId(Descriptors.CompiledShape<Boxed<string>>().id);
+    TapeToken[] textsTape = [
+        Call("record", textsShape, 2_i64, 0_u8),
+        Call("field", "item", 0_i64, 0_u8), Call("string", "only", 0_i64, 0_u8),
+        Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 0_i64, 0_u8),
+    ];
+    JsonTapeReader textsReader = JsonTapeReader { tape: textsTape, position: 0_i64 };
+    match Contracts.Decode<Boxed<string>, Decoding.IssuedDecoder<Boxed<string>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<string>, JsonTapeReader>(textsReader), Limits.DefaultLimits()) {
+        Result::Error(error) => Assert.Fail("Boxed<string> decodes: " + Errors.Code(error)),
+        Result::Ok(decoded) => {
+            Assert.Equal(decoded.item, "only", "abstract field bound to string");
+            Assert.Equal(decoded.history.Count(), 0_i64, "empty List<string>");
+        },
+    };
     Boxed<Point> points = Boxed<Point> { item: Point { x: 3_i32, y: 4_i32 }, history: List.New<Point>().Push(Point { x: 5_i32, y: 6_i32 }) };
     Boxed<Point> decodedPoints = DecodeBsol<Boxed<Point>>(EncodeBsol<Boxed<Point>>(points), points, "Boxed<Point>");
     ExpectPoint(decodedPoints.item, 3_i32, 4_i32, "abstract field bound to Point");
     ExpectPoint(decodedPoints.history.ToArray()[0], 5_i32, 6_i32, "List<Point> element");
-    Boxed<string> texts = Boxed<string> { item: "only", history: List.New<string>() };
-    Boxed<string> decodedTexts = DecodeBsol<Boxed<string>>(EncodeBsol<Boxed<string>>(texts), texts, "Boxed<string>");
-    Assert.Equal(decodedTexts.item, "only", "abstract field bound to string");
-    Assert.Equal(decodedTexts.history.Count(), 0_i64, "empty List<string>");
 }
 
-test serialization_generated_variant_identity_survives_typed_decode {
+/// Whether `declared` occurs in `observed` in the same order (nested field names may interleave).
+bool InDeclaredOrder(string[] observed, string[] declared) {
+    mut i64 next = 0_i64;
+    mut i64 index = 0_i64;
+    while (index < Array.Len<string>(observed) && next < Array.Len<string>(declared)) {
+        if (observed[index] == declared[next]) { next = next + 1_i64; }
+        index = index + 1_i64;
+    }
+    return next == Array.Len<string>(declared);
+}
+
+test serialization_generated_variant_identity_and_field_order_survive_typed_decode {
     Signal[] values = [Signal::Idle, Signal::Level(-9007199254740993_i64), Signal::Named("", 0_u8), Signal::Named("probe", 255_u8)];
     mut i64 index = 0_i64;
     while (index < Array.Len<Signal>(values)) {
         ExpectSignal(DecodeBsol<Signal>(EncodeBsol<Signal>(values[index]), values[index], "Signal"), values[index], "Signal");
         index = index + 1_i64;
     }
+    // Declared field order reaches the format and the compiled descriptor, and the typed decode of
+    // that same call sequence reconstructs every field.
+    JsonTraceEncoder json = NewJsonTrace();
+    Assert.True(Results.IsOk(Contracts.Encode<FullShape, JsonTraceEncoder>(FullFixture(), json, Limits.DefaultLimits())), "FullShape drives the JSON test format");
+    string[] declared = ["flag", "tiny", "small", "medium", "large", "octet", "port", "unsignedWord", "huge", "narrow", "wide", "letter", "text", "payload", "nothing", "corners", "samples", "tags", "counts", "signal", "window", "span"];
+    Assert.Equal(json.fields[0], "flag", "the first written field is the first declared field");
+    Assert.True(InDeclaredOrder(json.fields, declared), "record output follows declaration order");
+    ShapeDescriptor full = Descriptors.CompiledShape<FullShape>();
+    Assert.Equal(Array.Len<FieldDescriptor>(full.fields), Array.Len<string>(declared), "every declared field is in the descriptor");
+    index = 0_i64;
+    while (index < Array.Len<string>(declared)) {
+        Assert.Equal(full.fields[index].name, declared[index], "descriptor field order is declaration order");
+        index = index + 1_i64;
+    }
+    ExpectFullShape(DecodeJson<FullShape>(json, FullFixture(), "FullShape"));
 }
 
 test serialization_generated_f32_and_f64_bits_survive_typed_decode {
@@ -267,10 +345,11 @@ pub type TapeToken {
     pub u64 unsigned,
     pub u8 width,
     pub bool flag,
+    pub u8[] bytes,
 }
 
 TapeToken TapeCall(string kind) {
-    return TapeToken { kind: kind, text: "", signed: 0_i64, unsigned: 0_u64, width: 0_u8, flag: false };
+    return TapeToken { kind: kind, text: "", signed: 0_i64, unsigned: 0_u64, width: 0_u8, flag: false, bytes: [] };
 }
 
 /// JSON test format. It owns its representation: records and maps are objects, sequences are arrays,
@@ -296,27 +375,27 @@ pub type JsonTraceEncoder : Contracts.Encoder {
     pub unit Abort() { this.text = ""; }
     pub Result<unit, SerializationError> WriteUnit() {
         this.text = this.text + "null,";
-        return Push(TapeCall("unit"));
+        return this.Push(TapeCall("unit"));
     }
     pub Result<unit, SerializationError> WriteBoolean(bool value) {
         if (value) { this.text = this.text + "true,"; } else { this.text = this.text + "false,"; }
         mut TapeToken token = TapeCall("bool");
         token.flag = value;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> WriteSigned(i64 value, u8 width) {
         this.text = this.text + Decimal.Signed(value) + ",";
         mut TapeToken token = TapeCall("signed");
         token.signed = value;
         token.width = width;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> WriteUnsigned(u64 value, u8 width) {
         this.text = this.text + Decimal.Unsigned(value) + ",";
         mut TapeToken token = TapeCall("unsigned");
         token.unsigned = value;
         token.width = width;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> WriteFloat(u64 bits, u8 width) {
         this.floatWidths = Array.Append<i64>(this.floatWidths, i64(width));
@@ -324,23 +403,25 @@ pub type JsonTraceEncoder : Contracts.Encoder {
         mut TapeToken token = TapeCall("float");
         token.unsigned = bits;
         token.width = width;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> WriteScalar(char value) {
         this.text = this.text + "\"" + Decimal.Unsigned(u64(u32(value))) + "\",";
         mut TapeToken token = TapeCall("scalar");
         token.unsigned = u64(u32(value));
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> WriteString(string value) {
         this.text = this.text + "\"" + value + "\",";
         mut TapeToken token = TapeCall("string");
         token.text = value;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> WriteBytes(u8[] value) {
         this.text = this.text + "\"bytes:" + Decimal.Signed(Array.Len<u8>(value)) + "\",";
-        return Result::Error(Errors.NumericError("JsonTestFormatHasNoBytes"));
+        mut TapeToken token = TapeCall("bytes");
+        token.bytes = value;
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> BeginRecord(Metadata.ShapeId shape, i64 fieldCount) {
         this.shapes = Array.Append<string>(this.shapes, Metadata.FormatShapeId(shape));
@@ -348,48 +429,48 @@ pub type JsonTraceEncoder : Contracts.Encoder {
         mut TapeToken token = TapeCall("record");
         token.text = Metadata.FormatShapeId(shape);
         token.signed = fieldCount;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> BeginField(string name) {
         this.fields = Array.Append<string>(this.fields, name);
         this.text = this.text + "\"" + name + "\":";
         mut TapeToken token = TapeCall("field");
         token.text = name;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> EndField() { return Result::Ok(()); }
-    pub Result<unit, SerializationError> EndRecord() { return Close("}"); }
+    pub Result<unit, SerializationError> EndRecord() { return this.Close("}"); }
     pub Result<unit, SerializationError> BeginSequence(i64 count) {
         this.text = this.text + "[";
         mut TapeToken token = TapeCall("sequence");
         token.signed = count;
-        return Push(token);
+        return this.Push(token);
     }
-    pub Result<unit, SerializationError> EndSequence() { return Close("]"); }
+    pub Result<unit, SerializationError> EndSequence() { return this.Close("]"); }
     pub Result<unit, SerializationError> BeginMap(i64 count) {
         this.text = this.text + "{";
         mut TapeToken token = TapeCall("map");
         token.signed = count;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> BeginMapEntry(string key) {
         this.text = this.text + "\"" + key + "\":";
         mut TapeToken token = TapeCall("entry");
         token.text = key;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> EndMapEntry() { return Result::Ok(()); }
-    pub Result<unit, SerializationError> EndMap() { return Close("}"); }
+    pub Result<unit, SerializationError> EndMap() { return this.Close("}"); }
     pub Result<unit, SerializationError> BeginVariant(Metadata.ShapeId shape, string name, i64 payloadCount) {
         this.shapes = Array.Append<string>(this.shapes, Metadata.FormatShapeId(shape));
         this.text = this.text + "{\"$variant\":\"" + name + "\",\"payload\":[";
         mut TapeToken token = TapeCall("variant");
         token.text = name;
         token.signed = payloadCount;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> EndVariant() {
-        Close("]");
+        this.Close("]");
         if (String.EndsWith(this.text, ",")) { this.text = String.SubSlice(this.text, 0_i64, String.Len(this.text) - 1_i64); }
         this.text = this.text + "},";
         return Result::Ok(());
@@ -398,7 +479,7 @@ pub type JsonTraceEncoder : Contracts.Encoder {
         if (!present) { this.text = this.text + "null,"; }
         mut TapeToken token = TapeCall("optional");
         token.flag = present;
-        return Push(token);
+        return this.Push(token);
     }
     pub Result<unit, SerializationError> EndOptional() { return Result::Ok(()); }
 
@@ -434,65 +515,68 @@ pub type JsonTapeReader : ReaderApi.Reader {
         return Result::Ok(());
     }
     pub Result<unit, SerializationError> ReadUnit() {
-        Next("unit")?;
+        this.Next("unit")?;
         return Result::Ok(());
     }
     pub Result<bool, SerializationError> ReadBoolean() {
-        TapeToken token = Next("bool")?;
+        TapeToken token = this.Next("bool")?;
         return Result::Ok(token.flag);
     }
     pub Result<i64, SerializationError> ReadSigned(u8 width) {
-        TapeToken token = Next("signed")?;
+        TapeToken token = this.Next("signed")?;
         if (token.width != width) { return Result::Error(Errors.NumericError("WidthMismatch")); }
         return Result::Ok(token.signed);
     }
     pub Result<u64, SerializationError> ReadUnsigned(u8 width) {
-        TapeToken token = Next("unsigned")?;
+        TapeToken token = this.Next("unsigned")?;
         if (token.width != width) { return Result::Error(Errors.NumericError("WidthMismatch")); }
         return Result::Ok(token.unsigned);
     }
     pub Result<u64, SerializationError> ReadFloat(u8 width) {
-        TapeToken token = Next("float")?;
+        TapeToken token = this.Next("float")?;
         if (token.width != width) { return Result::Error(Errors.NumericError("WidthMismatch")); }
         return Result::Ok(token.unsigned);
     }
     pub Result<char, SerializationError> ReadScalar() {
-        TapeToken token = Next("scalar")?;
+        TapeToken token = this.Next("scalar")?;
         return Result::Ok(char(u32(token.unsigned)));
     }
     pub Result<string, SerializationError> ReadString() {
-        TapeToken token = Next("string")?;
+        TapeToken token = this.Next("string")?;
         return Result::Ok(token.text);
     }
-    pub Result<u8[], SerializationError> ReadBytes() { return Result::Error(Errors.NumericError("JsonTestFormatHasNoBytes")); }
+    pub Result<u8[], SerializationError> ReadBytes() {
+        TapeToken token = this.Next("bytes")?;
+        return Result::Ok(token.bytes);
+    }
     pub Result<i64, SerializationError> BeginRecord(Metadata.ShapeId shape) {
-        TapeToken token = Next("record")?;
+        TapeToken token = this.Next("record")?;
         if (token.text != Metadata.FormatShapeId(shape)) { return Result::Error(Errors.NumericError("ShapeMismatch")); }
         return Result::Ok(token.signed);
     }
     pub Result<string, SerializationError> BeginField() {
-        TapeToken token = Next("field")?;
+        TapeToken token = this.Next("field")?;
         return Result::Ok(token.text);
     }
     pub Result<unit, SerializationError> EndField() { return Result::Ok(()); }
     pub Result<unit, SerializationError> EndRecord() { return Result::Ok(()); }
     pub Result<i64, SerializationError> BeginSequence() {
-        TapeToken token = Next("sequence")?;
+        TapeToken token = this.Next("sequence")?;
         return Result::Ok(token.signed);
     }
     pub Result<unit, SerializationError> EndSequence() { return Result::Ok(()); }
     pub Result<i64, SerializationError> BeginMap() {
-        TapeToken token = Next("map")?;
+        TapeToken token = this.Next("map")?;
         return Result::Ok(token.signed);
     }
     pub Result<string, SerializationError> BeginMapEntry() {
-        TapeToken token = Next("entry")?;
+        TapeToken token = this.Next("entry")?;
         return Result::Ok(token.text);
     }
     pub Result<unit, SerializationError> EndMapEntry() { return Result::Ok(()); }
     pub Result<unit, SerializationError> EndMap() { return Result::Ok(()); }
     pub Result<string, SerializationError> BeginVariant(Metadata.ShapeId shape) {
-        TapeToken token = Next("variant")?;
+        TapeToken token = this.Next("variant")?;
         return Result::Ok(token.text);
     }
     pub Result<i64, SerializationError> VariantCount() {
@@ -501,7 +585,7 @@ pub type JsonTapeReader : ReaderApi.Reader {
     }
     pub Result<unit, SerializationError> EndVariant() { return Result::Ok(()); }
     pub Result<bool, SerializationError> BeginOptional() {
-        TapeToken token = Next("optional")?;
+        TapeToken token = this.Next("optional")?;
         return Result::Ok(token.flag);
     }
     pub Result<unit, SerializationError> EndOptional() { return Result::Ok(()); }
@@ -518,7 +602,7 @@ pub type JsonTapeReader : ReaderApi.Reader {
 /// Top-level typed decode through the JSON test format, with the same issued Decoder<T> as BSOL.
 T DecodeJson<T>(JsonTraceEncoder encoded, T original, string what) {
     JsonTapeReader reader = JsonTapeReader { tape: encoded.tape, position: 0_i64 };
-    match Contracts.Decode<T, Decoding.BoundDecoder<T, JsonTapeReader, Decoding.IssuedField<T, JsonTapeReader>>>(Decoding.DecoderFor<T, JsonTapeReader>(reader), Limits.DefaultLimits()) {
+    match Contracts.Decode<T, Decoding.IssuedDecoder<T, JsonTapeReader>>(Decoding.DecoderFor<T, JsonTapeReader>(reader), Limits.DefaultLimits()) {
         Result::Error(error) => { Assert.Fail(what + " decodes from the JSON test format: " + Errors.Code(error)); },
         Result::Ok(value) => { return value; },
     };
@@ -587,5 +671,5 @@ test serialization_generated_json_reader_rejects_a_different_width {
     widened.width = 64_u8;
     tape[2] = widened;
     JsonTapeReader reader = JsonTapeReader { tape: tape, position: 0_i64 };
-    Assert.True(Results.IsError(Contracts.Decode<Point, Decoding.BoundDecoder<Point, JsonTapeReader, Decoding.IssuedField<Point, JsonTapeReader>>>(Decoding.DecoderFor<Point, JsonTapeReader>(reader), Limits.DefaultLimits())), "an i32 field never accepts a 64-bit integer call");
+    Assert.True(Results.IsError(Contracts.Decode<Point, Decoding.IssuedDecoder<Point, JsonTapeReader>>(Decoding.DecoderFor<Point, JsonTapeReader>(reader), Limits.DefaultLimits())), "an i32 field never accepts a 64-bit integer call");
 }

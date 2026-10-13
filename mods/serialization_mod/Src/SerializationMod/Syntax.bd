@@ -58,7 +58,7 @@ pub T[] Copy<T>(T[] values) {
     return result;
 }
 
-pub string FreshName(Builder builder) {
+string FreshDigits(Builder builder) {
     mut u32 value = Next(builder);
     mut u8[] reversed = [];
     while (value > 0_u32) {
@@ -71,7 +71,17 @@ pub string FreshName(Builder builder) {
         index = index - 1_i64;
         bytes = Array.Append<u8>(bytes, reversed[index]);
     }
-    return "__serialization" + String.FromUtf8CodeUnits(bytes);
+    return String.FromUtf8CodeUnits(bytes);
+}
+
+/// A fresh lowerCamelCase value name (local, binding, parameter) for generated code.
+pub string FreshName(Builder builder) {
+    return "serializationGenerated" + FreshDigits(builder);
+}
+
+/// A fresh PascalCase name for a generated type, generic parameter or callable.
+pub string FreshTypeName(Builder builder) {
+    return "SerializationGenerated" + FreshDigits(builder);
 }
 
 pub SpannedIdentifier IdentifierValue(Builder builder, string name) {
@@ -152,8 +162,44 @@ pub SpannedExpression Member(Builder builder, SpannedExpression target, string m
     return SpannedExpression { node: Expression::Member(value), span: builder.origin, id: Next(builder) };
 }
 
+/// The identifier chain `a.b.c` of a path or member access over plain names, or [] when the
+/// expression is anything else (a call result, an index, an applied generic).
+string[] NameChain(SpannedExpression expression) {
+    match expression.node {
+        Expression::Path(path) => {
+            mut string[] names = [];
+            mut i64 index = 0_i64;
+            while (index < Array.Len(path.node.path.node.segments.items)) {
+                PathSegment segment = path.node.path.node.segments.items[index].node;
+                if (Array.Len(segment.typeArgs.items) != 0_i64) { return []; }
+                names = Array.Append<string>(names, segment.name.node.name);
+                index = index + 1_i64;
+            }
+            return names;
+        },
+        Expression::Member(member) => {
+            mut string[] names = NameChain(member.node.target);
+            if (Array.Len(names) == 0_i64) { return []; }
+            names = Array.Append<string>(names, member.node.member.node.name);
+            return names;
+        },
+        _ => { return []; },
+    };
+}
+
+/// A method call on a named receiver (`reader.Begin(...)`, `this.reader.Finish()`) is spelled
+/// as one path callee, exactly as source parses it; a member access callee would be a call of a
+/// function-typed field value. Other callees are kept as given.
 pub SpannedExpression Call(Builder builder, SpannedExpression callee, SpannedExpression[] arguments) {
-    SpannedCallExpression value = SpannedCallExpression { node: CallExpression { callee: callee, args: SpannedExpressionList { items: arguments } }, span: builder.origin, id: Next(builder) };
+    mut SpannedExpression target = callee;
+    match callee.node {
+        Expression::Member(_) => {
+            string[] names = NameChain(callee);
+            if (Array.Len(names) > 0_i64) { target = Name(builder, PathValue(builder, names, [])); }
+        },
+        _ => { },
+    };
+    SpannedCallExpression value = SpannedCallExpression { node: CallExpression { callee: target, args: SpannedExpressionList { items: arguments } }, span: builder.origin, id: Next(builder) };
     return SpannedExpression { node: Expression::Call(value), span: builder.origin, id: Next(builder) };
 }
 
@@ -203,8 +249,21 @@ pub SpannedPattern Binding(Builder builder, string name) {
     return SpannedPattern { node: Pattern::Identifier(IdentifierValue(builder, name)), span: builder.origin, id: Next(builder) };
 }
 
+/// A pattern names its enum like source does, without applied arguments: the scrutinee's
+/// type supplies them, and exhaustiveness is judged against the bare declaration.
+SpannedPath Unapplied(Builder builder, SpannedPath ty) {
+    mut SpannedPathSegment[] segments = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(ty.node.segments.items)) {
+        PathSegment segment = PathSegment { name: ty.node.segments.items[index].node.name, typeArgs: SpannedTypeList { items: [] } };
+        segments = Array.Append<SpannedPathSegment>(segments, SpannedPathSegment { node: segment, span: builder.origin, id: Next(builder) });
+        index = index + 1_i64;
+    }
+    return SpannedPath { node: Path { segments: SpannedPathSegmentList { items: segments } }, span: builder.origin, id: Next(builder) };
+}
+
 pub SpannedPattern VariantPattern(Builder builder, SpannedPath ty, string variant, SpannedPattern[] items) {
-    EnumPattern value = EnumPattern { path: VariantPath(builder, ty, variant), items: SpannedPatternList { items: items } };
+    EnumPattern value = EnumPattern { path: VariantPath(builder, Unapplied(builder, ty), variant), items: SpannedPatternList { items: items } };
     return SpannedPattern { node: Pattern::Enum(SpannedEnumPattern { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
 }
 

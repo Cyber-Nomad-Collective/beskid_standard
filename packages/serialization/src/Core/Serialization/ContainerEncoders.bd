@@ -1,0 +1,76 @@
+use Core.Collections.Array;
+use Core.Collections.List;
+use Core.Collections.Map;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Serialization.Contracts;
+use Core.Serialization.Errors;
+use Core.Serialization.Limits;
+use Core.String.Core as StringCore;
+
+// Canonical container field writes. The field codec correspondence issues these exact functions
+// for an abstract field whose current application is an array or a canonical Foundation List,
+// string-key Map or Option. They make the same calls as the generated encoder for a declared
+// container field and write each element through `WriteField` for its own exact application.
+
+pub Result<unit, SerializationError> WriteArray<T, E>(T[] value, E encoder, SerializationLimits limits) where E: Encoder {
+    i64 count = Array.Len<T>(value);
+    encoder.BeginSequence(count)?;
+    mut i64 index = 0_i64;
+    while (index < count) {
+        Contracts.WriteField<T, E>(value[index], encoder, limits)?;
+        index = index + 1_i64;
+    }
+    encoder.EndSequence()?;
+    return Result::Ok(());
+}
+
+pub Result<unit, SerializationError> WriteList<T, E>(List<T> value, E encoder, SerializationLimits limits) where E: Encoder {
+    i64 count = value.Count();
+    encoder.BeginSequence(count)?;
+    mut i64 index = 0_i64;
+    while (index < count) {
+        match value.Get(index) {
+            Result::Ok(item) => { Contracts.WriteField<T, E>(item, encoder, limits)?; },
+            Result::Error(_) => { return Result::Error(Errors.NumericError("ListIndex")); },
+        };
+        index = index + 1_i64;
+    }
+    encoder.EndSequence()?;
+    return Result::Ok(());
+}
+
+/// Entries follow ordinal key order: Foundation Map entry order is an edit history.
+pub Result<unit, SerializationError> WriteMap<T, E>(Map<string, T> value, E encoder, SerializationLimits limits) where E: Encoder {
+    string[] keys = StringCore.SortOrdinal(value.Keys());
+    i64 count = Array.Len<string>(keys);
+    encoder.BeginMap(count)?;
+    mut i64 index = 0_i64;
+    while (index < count) {
+        string key = keys[index];
+        encoder.BeginMapEntry(key)?;
+        match value.Get(key) {
+            Result::Ok(item) => { Contracts.WriteField<T, E>(item, encoder, limits)?; },
+            Result::Error(_) => { return Result::Error(Errors.NumericError("MapKey")); },
+        };
+        encoder.EndMapEntry()?;
+        index = index + 1_i64;
+    }
+    encoder.EndMap()?;
+    return Result::Ok(());
+}
+
+pub Result<unit, SerializationError> WriteOptional<T, E>(Option<T> value, E encoder, SerializationLimits limits) where E: Encoder {
+    match value {
+        Option::Some(item) => {
+            encoder.BeginOptional(true)?;
+            Contracts.WriteField<T, E>(item, encoder, limits)?;
+            encoder.EndOptional()?;
+        },
+        Option::None => {
+            encoder.BeginOptional(false)?;
+            encoder.EndOptional()?;
+        },
+    };
+    return Result::Ok(());
+}

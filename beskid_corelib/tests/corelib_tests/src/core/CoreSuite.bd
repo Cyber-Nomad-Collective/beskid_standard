@@ -532,6 +532,104 @@ test string_trim_empty {
     Assert.Equal(String.Trim("   "), "", "Trim of all spaces is empty");
 }
 
+test string_trim_removes_newlines_tabs_and_carriage_returns {
+    string nl = String.Newline();
+    string cr = String.FromAscii(13);
+    string tab = String.Tab();
+    Assert.Equal(String.Trim(nl + tab + " hi" + cr + nl), "hi", "Trim removes LF, CR, tab and space at both ends");
+    Assert.Equal(String.Trim(nl + cr + nl), "", "Trim of only line breaks is empty");
+    Assert.Equal(String.Trim(" a" + nl + "b "), "a" + nl + "b", "Trim keeps interior line breaks");
+    Assert.Equal(String.Trim("x"), "x", "Trim of text without whitespace is unchanged");
+}
+
+// `==` and `!=` against a short literal compare in place; every chunk width and both operand
+// orders must agree with content equality. Operands are built at run time.
+test string_equals_literal_by_length_and_content {
+    string a = String.Concat("abcdefgh", "ijklmnopq");
+    Assert.True(a == "abcdefghijklmnopq", "equal 17-byte text");
+    Assert.True("abcdefghijklmnopq" == a, "literal on the left");
+    Assert.False(a == "abcdefghijklmnopX", "last byte differs");
+    Assert.False(a == "Xbcdefghijklmnopq", "first byte differs");
+    Assert.False(a == "abcdefghXjklmnopq", "byte in the second chunk differs");
+    Assert.False(a == "abcdefghijklmnop", "shorter literal");
+    Assert.True(a != "abcdefghijklmnopX", "!= on a difference");
+    Assert.False(a != "abcdefghijklmnopq", "!= on equal text");
+    Assert.True(String.SubSlice(a, 0, 0) == "", "empty equals the empty literal");
+    Assert.False(a == "", "non-empty differs from the empty literal");
+    Assert.True(String.SubSlice(a, 0, 1) == "a", "1 byte");
+    Assert.True(String.SubSlice(a, 0, 2) == "ab", "2 bytes");
+    Assert.True(String.SubSlice(a, 0, 3) == "abc", "3 bytes");
+    Assert.True(String.SubSlice(a, 0, 4) == "abcd", "4 bytes");
+    Assert.True(String.SubSlice(a, 0, 7) == "abcdefg", "7 bytes");
+    Assert.True(String.SubSlice(a, 0, 8) == "abcdefgh", "8 bytes");
+    Assert.True(String.SubSlice(a, 0, 9) == "abcdefghi", "9 bytes");
+    Assert.True(String.SubSlice(a, 0, 15) == "abcdefghijklmno", "15 bytes");
+    Assert.False(String.SubSlice(a, 0, 15) == "abcdefghijklmnX", "15 bytes, last differs");
+    Assert.True(String.SubSlice(a, 1, 16) == "bcdefghijklmnopq", "16 bytes at an unaligned start");
+    string repeated = String.Repeat("ab", 40);
+    Assert.True(repeated == "abababababababababababababababababababababababababababababababababababababababab", "80-byte literal");
+    Assert.False(repeated == "abababababababababababababababababababababababababababababababababababababababaX", "80-byte literal differs");
+}
+
+// `"${n}|Name"` formats `n`, then materializes the literal, then concatenates. The formatted
+// text must stay rooted across the literal's allocation: a collection there used to free it, and
+// the concatenation then read a dead object. A live array keeps the heap populated so the loop
+// runs through many collections.
+test string_interpolation_operands_survive_collection {
+    mut string[] live = Array.Empty<string>();
+    mut i64 k = 0;
+    while k < 20000 {
+        Array.Append<string>(live, "live ${k}");
+        k = k + 1;
+    }
+    mut i64 wrong = 0;
+    k = 0;
+    while k < 300000 {
+        mut i64 want = 7;
+        if k % 50 < 10 {
+            want = 6;
+        }
+        if String.Len("${k % 50}|Name") != want {
+            wrong = wrong + 1;
+        }
+        k = k + 1;
+    }
+    Assert.Equal(wrong, 0, "every interpolated string has its expected length");
+    Assert.Equal(Array.Len<string>(live), 20000, "live strings stay");
+}
+
+// The resolver spike measured 7.7 us per `==` against a literal and a `String.Join` that did
+// not finish 16k lines in 10 minutes. These bounds sit far above the fixed cost, so they catch
+// only regressions of that size, not machine load.
+test string_equality_and_join_stay_fast {
+    string a = String.Concat("Primary", "Expression");
+    mut i64 hits = 0;
+    Instant compareStart = Time.MonotonicNow();
+    mut i64 i = 0;
+    while i < 1000000 {
+        if a == "PrimaryExpression" {
+            hits = hits + 1;
+        }
+        i = i + 1;
+    }
+    i64 compareNanos = ElapsedNanos(compareStart);
+    Assert.Equal(hits, 1000000, "every comparison matched");
+    Assert.True(compareNanos < 2000000000, "1e6 string == literal take less than 2 s");
+    mut string[] lines = Array.Empty<string>();
+    i = 0;
+    while i < 20000 {
+        Array.Append<string>(lines, "line ${i}");
+        i = i + 1;
+    }
+    Instant joinStart = Time.MonotonicNow();
+    string joined = String.Join(lines, String.Newline());
+    i64 joinNanos = ElapsedNanos(joinStart);
+    string[] back = String.Lines(joined);
+    Assert.Equal(Array.Len<string>(back), 20000, "join round-trips through Lines");
+    Assert.Equal(Array.Get<string>(back, 19999), "line 19999", "last line");
+    Assert.True(joinNanos < 2000000000, "joining 20k lines takes less than 2 s");
+}
+
 test string_byte_at {
     Assert.Equal(String.ByteAt("ABC", 0), 65, "ByteAt(0) of \"ABC\" is 65");
 }
@@ -706,6 +804,14 @@ test string_join_round_trips_split {
     string[] parts = String.Split("a-b-c", "-");
     Assert.Equal(String.Join(parts, "+"), "a+b+c", "join with new separator");
     Assert.Equal(String.Join(Array.Empty<string>(), ","), "", "join of nothing is empty");
+}
+
+test string_join_edge_cases {
+    Assert.Equal(String.Join(String.Split("solo", ","), "+"), "solo", "one part is returned unchanged");
+    Assert.Equal(String.Join(String.Split(",", ","), ","), ",", "empty parts keep their separator");
+    Assert.Equal(String.Join(String.Split(",", ","), ""), "", "empty parts and separator join to empty");
+    Assert.Equal(String.Join(String.Split("a,b", ","), ""), "ab", "empty separator concatenates");
+    Assert.Equal(String.Join(String.Split("x:y:z", ":"), " :: "), "x :: y :: z", "multi-byte separator");
 }
 
 test string_replace {

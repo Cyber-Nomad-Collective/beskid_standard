@@ -20,6 +20,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the
+  result length: the result is sized once and every part is copied once. Joining
+  16,000 lines did not finish in 10 minutes and now takes about 4 ms.
+- `String.Trim` removes line feeds. It trims the same ASCII whitespace as
+  `TrimStart`, `TrimEnd` and `IsBlank`: space, tab, line feed and carriage
+  return.
+- `String.CompareOrdinal`, `Search.Compare` and `Search.Less` use the string
+  ordering operator (one runtime call) instead of a loop with a call per byte.
+  `HashTable` lookups index the table arrays directly, and `Hash.String` no
+  longer calls a function per byte for the exclusive or.
 - Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
   when two versions grow from one base. `Array.Append` grows storage in place
   with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place

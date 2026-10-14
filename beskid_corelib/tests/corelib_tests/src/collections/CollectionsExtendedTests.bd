@@ -14,6 +14,8 @@ use Core.Collections.Sort;
 use Core.Collections.StringMap;
 use Core.Optional.Option;
 use Core.Results;
+use Core.Time;
+use Core.Time.Instant;
 
 i64 I64OrDefault(Option<i64> value, i64 fallback) {
     return match value {
@@ -235,6 +237,39 @@ test string_map_grows_and_removes {
     Assert.Equal(I64OrDefault(map.Get("again49"), -1), 49, "reinserted lookup");
     Assert.Equal(Array.Len<string>(map.Keys()), 150, "keys view");
     Assert.Equal(Array.Len<i64>(map.Values()), 150, "values view");
+}
+
+// The resolver spike measured 4.7 us per `StringMap` lookup and 1.0 us per `I64Map` lookup.
+// The bounds sit far above the fixed cost, so they catch only regressions of that size.
+test hash_map_lookups_stay_fast {
+    mut string[] keys = Array.Empty<string>();
+    mut StringMap<i64> byName = StringMap.New<i64>();
+    mut I64Map<i64> byId = I64Map.New<i64>();
+    mut i64 i = 0;
+    while i < 1000 {
+        string key = "key${i}|Name";
+        Array.Append<string>(keys, key);
+        byName = byName.Insert(key, i);
+        byId = byId.Insert(i * 1048576 + 7, i);
+        i = i + 1;
+    }
+    mut i64 total = 0;
+    Instant nameStart = Time.MonotonicNow();
+    i = 0;
+    while i < 1000000 {
+        total = total + byName.GetOr(Array.Get<string>(keys, i % 1000), -1);
+        i = i + 1;
+    }
+    Instant nameEnd = Time.MonotonicNow();
+    i = 0;
+    while i < 1000000 {
+        total = total + byId.GetOr((i % 1000) * 1048576 + 7, -1);
+        i = i + 1;
+    }
+    Instant idEnd = Time.MonotonicNow();
+    Assert.Equal(total, 999000000, "every lookup hit");
+    Assert.True(nameEnd.nanos - nameStart.nanos < 3000000000, "1e6 StringMap lookups take less than 3 s");
+    Assert.True(idEnd.nanos - nameEnd.nanos < 3000000000, "1e6 I64Map lookups take less than 3 s");
 }
 
 test i64_map_basic {

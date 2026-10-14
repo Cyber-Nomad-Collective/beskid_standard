@@ -90,47 +90,74 @@ string StripCarriageReturn(string line) {
 }
 
 /// Concatenates `parts` with `separator` between consecutive elements.
+/// Runs in time linear in the result length: the result is sized once and each part is copied
+/// into it once.
 pub string Join(string[] parts, string separator) {
     i64 count = Array.Len<string>(parts);
-    mut string result = "";
+    if count == 0 {
+        return "";
+    }
+    if count == 1 {
+        return parts[0];
+    }
+    i64 separatorLength = Core.Len(separator);
+    mut i64 total = separatorLength * (count - 1);
     mut i64 i = 0;
     while i < count {
-        if i > 0 {
-            result = Concat(result, separator);
-        }
-        result = Concat(result, Array.Get<string>(parts, i));
+        total = total + Core.Len(parts[i]);
         i = i + 1;
     }
-    return result;
+    if total == 0 {
+        return "";
+    }
+    u8[] data = Array.Zeroed<u8>(total);
+    mut i64 at = CopyBytes(data, 0, parts[0]);
+    i = 1;
+    while i < count {
+        at = CopyBytes(data, at, separator);
+        at = CopyBytes(data, at, parts[i]);
+        i = i + 1;
+    }
+    return Utf8.FromUtf8CodeUnits(data);
+}
+
+/// Copies the bytes of `text` into `data` starting at `at`; returns the offset after them.
+i64 CopyBytes(u8[] data, i64 at, string text) {
+    i64 len = Core.Len(text);
+    mut i64 j = 0;
+    while j < len {
+        data[at + j] = text[j];
+        j = j + 1;
+    }
+    return at + len;
 }
 
 /// Replaces every non-overlapping occurrence of `old` with `replacement`, scanning left to right.
 /// An empty `old` returns `text` unchanged.
 pub string Replace(string text, string old, string replacement) {
-    i64 olen = Core.Len(old);
-    if olen == 0 {
+    if Core.Len(old) == 0 {
         return text;
     }
-    mut string result = "";
-    mut i64 start = 0;
-    mut i64 at = Core.IndexOfFrom(text, 0, old);
-    while at >= 0 {
-        result = Concat(Concat(result, Core.SubSlice(text, start, at - start)), replacement);
-        start = at + olen;
-        at = Core.IndexOfFrom(text, start, old);
-    }
-    return Concat(result, Core.SubSlice(text, start, Core.Len(text) - start));
+    return Join(Split(text, old), replacement);
 }
 
 /// Repeats `text` `count` times. A non-positive count yields the empty string.
 pub string Repeat(string text, i64 count) {
-    mut string result = "";
+    if count <= 0 {
+        return "";
+    }
+    i64 len = Core.Len(text);
+    if len == 0 {
+        return "";
+    }
+    u8[] data = Array.Zeroed<u8>(len * count);
+    mut i64 at = 0;
     mut i64 i = 0;
     while i < count {
-        result = Concat(result, text);
+        at = CopyBytes(data, at, text);
         i = i + 1;
     }
-    return result;
+    return Utf8.FromUtf8CodeUnits(data);
 }
 
 /// Left-pads `text` with `fill` until it is at least `width` bytes long.

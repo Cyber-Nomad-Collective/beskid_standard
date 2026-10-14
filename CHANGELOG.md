@@ -20,6 +20,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- CoreSuite covers concatenating and slicing a `Core.Args` string (storage
+  outside the managed heap) across collections.
 - `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the
   result length: the result is sized once and every part is copied once. Joining
   16,000 lines did not finish in 10 minutes and now takes about 4 ms.

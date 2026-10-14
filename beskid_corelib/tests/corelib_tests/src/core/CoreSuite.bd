@@ -465,6 +465,32 @@ test args_all_returns_array {
     Assert.Equal(len, Args.Count(), "All() length matches Count()");
 }
 
+// Argument strings live in storage the platform host maps once, outside the managed heap.
+// Concatenating or slicing one must still work, also while collections run between the
+// operations: rooting such an operand used to fail and turn `"arg:" + name` into a null string.
+test args_strings_concatenate_and_slice_across_collections {
+    string name = Args.ProgramName();
+    i64 nameLen = String.Len(name);
+    Assert.True(nameLen > 0, "the program name is not empty");
+    mut string[] live = Array.Empty<string>();
+    mut i64 wrong = 0;
+    mut i64 k = 0;
+    while k < 50000 {
+        string joined = "arg:" + name;
+        string head = String.SubSlice(name, 0, 1);
+        if String.Len(joined) != nameLen + 4 || String.Len(head) != 1 {
+            wrong = wrong + 1;
+        }
+        if k % 10 == 0 {
+            Array.Append<string>(live, joined);
+        }
+        k = k + 1;
+    }
+    Assert.Equal(wrong, 0, "every concatenation and slice of an argument has its expected length");
+    Assert.Equal(Array.Len<string>(live), 5000, "live strings stay");
+    Assert.True(Array.Get<string>(live, 4999) == "arg:" + name, "a kept concatenation keeps its text");
+}
+
 // ---- ErrorHandlingTests.bd (formerly target `CoreErrorHandlingTests`) ----
 
 // ErrorHandling module tests — ErrorInfo construction and emptiness predicate.

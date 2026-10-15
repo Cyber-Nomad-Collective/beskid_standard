@@ -69,8 +69,7 @@ pub unit ApplyPeerSettings(mut QEncoder e, i64 maxTableCapacity, i64 blockedStre
 
 /// Encoder stream bytes to send; the buffer is cleared.
 pub u8[] TakeOutput(mut QEncoder e) {
-    u8[] out = e.output;
-    e.output = Slice.New(0_i64);
+    u8[] out = exchange(e.output, Slice.New(0_i64));
     return out;
 }
 
@@ -185,15 +184,9 @@ pub u8[] EncodeSection(mut QEncoder e, i64 streamId, HeaderField[] fields) {
     out = QpackWire.WritePrefix(move out, required, sectionBase, QpackTable.MaxEntries(e.table));
     out = Mem.Join(out, lines, 0_i64, Slice.Len(lines));
     if required > 0_i64 {
-        mut i64[] ids = e.secStream;
-        mut i64[] reqs = e.secRequired;
-        mut i64[] mins = e.secMinRef;
-        Array.Append<i64>(ids, streamId);
-        Array.Append<i64>(reqs, required);
-        Array.Append<i64>(mins, minRef);
-        e.secStream = ids;
-        e.secRequired = reqs;
-        e.secMinRef = mins;
+        Array.Append<i64>(e.secStream, streamId);
+        Array.Append<i64>(e.secRequired, required);
+        Array.Append<i64>(e.secMinRef, minRef);
     }
     return out;
 }
@@ -217,9 +210,9 @@ unit RemoveSection(mut QEncoder e, i64 at) {
         }
         i = i + 1_i64;
     }
-    e.secStream = ids;
-    e.secRequired = reqs;
-    e.secMinRef = mins;
+    e.secStream = move ids;
+    e.secRequired = move reqs;
+    e.secMinRef = move mins;
     return;
 }
 
@@ -272,6 +265,6 @@ pub i64 OnDecoderStream(mut QEncoder e, u8[] data) {
     if count - pos > 16_i64 { return Fail(e); }
     u8[] rest = Mem.Zeroed(count - pos);
     if count > pos { Mem.Copy(rest, 0_i64, buf, pos, count - pos); }
-    e.pending = rest;
+    e.pending = move rest;
     return 0_i64;
 }

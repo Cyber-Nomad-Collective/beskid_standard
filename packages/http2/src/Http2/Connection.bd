@@ -64,7 +64,7 @@ unit GrowIn(Connection conn, i64 need) {
     if Slice.Len(conn.inBuf) >= need { return; }
     u8[] grown = Mem.Zeroed(FullBuffer());
     Mem.Copy(grown, 0_i64, conn.inBuf, 0_i64, Frame.HeaderLength());
-    conn.inBuf = grown;
+    conn.inBuf = move grown;
     return;
 }
 unit GrowOut(Connection conn, i64 need) {
@@ -447,8 +447,8 @@ Result<bool,Http2Error> FlushStream(Connection conn, Stream transport, StreamSta
 }
 
 // Queues `body` as the outgoing body of `s`; FlushData sends it with END_STREAM.
-pub unit QueueBody(StreamState s, u8[] body) {
-    s.outBody = body;
+pub unit QueueBody(StreamState s, move u8[] body) {
+    s.outBody = move body;
     s.outOffset = 0_i64;
     s.outPending = true;
     return;
@@ -612,7 +612,7 @@ pub Result<unit,Http2Error> Step(Connection conn, Stream transport, Instant star
 
 // ---- frame processing ----
 
-pub Result<unit,Http2Error> Process(Connection conn, Stream transport, Frame frame) {
+pub Result<unit,Http2Error> Process(Connection conn, Stream transport, move Frame frame) {
     if conn.continuationStream != 0_i64 {
         bool continuation = match frame { Frame::Continuation(_, _, _) => true, _ => false, };
         if !continuation { return Result::Error(Fail(conn, transport, FrameErrors.ProtocolError())); }
@@ -639,7 +639,7 @@ Result<unit,Http2Error> ReplenishConnection(Connection conn, Stream transport) {
     return WriteFrame(conn, transport, Frame.WindowUpdateFrame(0_i64, increment));
 }
 
-Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool endStream, i64 flowLength, u8[] data) {
+Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool endStream, i64 flowLength, move u8[] data) {
     conn.recvWindow = conn.recvWindow - flowLength;
     if conn.recvWindow < 0_i64 { return Result::Error(Fail(conn, transport, FrameErrors.FlowControlError())); }
     i64 index = IndexOf(conn, id);
@@ -665,7 +665,7 @@ Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool e
         ResetStream(conn, transport, s, FrameErrors.Cancel());
         return ReplenishConnection(conn, transport);
     }
-    s.body = Place(s.body, s.received, data, s.contentLength);
+    s.body = Place(s.body, s.received, move data, s.contentLength);
     s.received = s.received + count;
     Result<unit,Http2Error> conWindow = ReplenishConnection(conn, transport);
     match conWindow {
@@ -686,22 +686,23 @@ Result<unit,Http2Error> OnData(Connection conn, Stream transport, i64 id, bool e
 // `expected` when a content-length is known). Byte-wise Array.Append on an
 // array held in a struct field reallocates every call in 0.5.2, which
 // exhausted the heap in the curl interop run.
-u8[] Place(u8[] buf, i64 used, u8[] data, i64 expected) {
+u8[] Place(move u8[] buf, i64 used, move u8[] data, i64 expected) {
     i64 count = Slice.Len(data);
     if count == 0_i64 { return buf; }
     // The first DATA payload is a fresh copy owned by this stream: adopt it as the body
     // instead of allocating and copying again (most bodies arrive in one frame).
     if used == 0_i64 && Slice.Len(buf) == 0_i64 { return data; }
     i64 need = used + count;
-    mut u8[] target = buf;
-    if need > Slice.Len(buf) {
-        mut i64 size = Slice.Len(buf) * 2_i64;
-        if size < 4096_i64 { size = 4096_i64; }
-        if expected >= need && expected > size { size = expected; }
-        if size < need { size = need; }
-        target = Mem.Zeroed(size);
-        if used > 0_i64 { Mem.Copy(target, 0_i64, buf, 0_i64, used); }
+    if need <= Slice.Len(buf) {
+        Mem.Copy(buf, used, data, 0_i64, count);
+        return buf;
     }
+    mut i64 size = Slice.Len(buf) * 2_i64;
+    if size < 4096_i64 { size = 4096_i64; }
+    if expected >= need && expected > size { size = expected; }
+    if size < need { size = need; }
+    u8[] target = Mem.Zeroed(size);
+    if used > 0_i64 { Mem.Copy(target, 0_i64, buf, 0_i64, used); }
     Mem.Copy(target, used, data, 0_i64, count);
     return target;
 }
@@ -723,8 +724,8 @@ Result<unit,Http2Error> RemoteEnd(Connection conn, Stream transport, StreamState
     return Result::Ok(());
 }
 
-Result<unit,Http2Error> OnHeaders(Connection conn, Stream transport, i64 id, bool endStream, bool endHeaders, u8[] fragment) {
-    conn.block = fragment;
+Result<unit,Http2Error> OnHeaders(Connection conn, Stream transport, i64 id, bool endStream, bool endHeaders, move u8[] fragment) {
+    conn.block = move fragment;
     if !endHeaders {
         conn.continuationStream = id;
         conn.continuationEndStream = endStream;

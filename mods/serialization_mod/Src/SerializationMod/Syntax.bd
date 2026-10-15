@@ -58,6 +58,30 @@ pub T[] Copy<T>(T[] values) {
     return result;
 }
 
+/// The names of declared type parameters as identifiers spanned like the parameters.
+pub SpannedIdentifier[] TypeParameterNames(SpannedTypeParameter[] parameters) {
+    mut SpannedIdentifier[] names = Array.Empty<SpannedIdentifier>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<SpannedTypeParameter>(parameters)) {
+        SpannedTypeParameter parameter = parameters[index];
+        names = Array.Append<SpannedIdentifier>(names, SpannedIdentifier { node: Identifier { name: parameter.node.name }, span: parameter.span, id: parameter.id });
+        index = index + 1_i64;
+    }
+    return names;
+}
+
+/// Generated type parameters carry no attributes.
+pub SpannedTypeParameterList TypeParameters(Builder builder, SpannedIdentifier[] names) {
+    mut SpannedTypeParameter[] parameters = Array.Empty<SpannedTypeParameter>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<SpannedIdentifier>(names)) {
+        TypeParameter parameter = TypeParameter { attributes: SpannedAttributeList { items: [] }, name: names[index].node.name };
+        parameters = Array.Append<SpannedTypeParameter>(parameters, SpannedTypeParameter { node: parameter, span: names[index].span, id: Next(builder) });
+        index = index + 1_i64;
+    }
+    return SpannedTypeParameterList { items: parameters };
+}
+
 string FreshDigits(Builder builder) {
     mut u32 value = Next(builder);
     mut u8[] reversed = [];
@@ -112,7 +136,7 @@ pub SpannedAttributeParameter AttributeParameterValue(Builder builder, string na
 }
 
 pub SpannedAttributeDeclaration AttributeDeclarationValue(Builder builder, string name, SpannedAttributeTarget[] targets, SpannedAttributeParameter[] parameters) {
-    AttributeDeclaration value = AttributeDeclaration { visibility: Public(builder), name: IdentifierValue(builder, name), targets: SpannedAttributeTargetList { items: targets }, parameters: SpannedAttributeParameterList { items: parameters } };
+    AttributeDeclaration value = AttributeDeclaration { attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), name: IdentifierValue(builder, name), targets: SpannedAttributeTargetList { items: targets }, parameters: SpannedAttributeParameterList { items: parameters } };
     return SpannedAttributeDeclaration { node: value, span: builder.origin, id: Next(builder) };
 }
 
@@ -158,7 +182,7 @@ pub SpannedExpression Local(Builder builder, string name) {
 }
 
 pub SpannedExpression Member(Builder builder, SpannedExpression target, string member) {
-    SpannedMemberExpression value = SpannedMemberExpression { node: MemberExpression { target: target, member: IdentifierValue(builder, member) }, span: builder.origin, id: Next(builder) };
+    SpannedMemberExpression value = SpannedMemberExpression { node: MemberExpression { target: target, member: IdentifierValue(builder, member), typeArgs: SpannedTypeList { items: [] } }, span: builder.origin, id: Next(builder) };
     return SpannedExpression { node: Expression::Member(value), span: builder.origin, id: Next(builder) };
 }
 
@@ -258,7 +282,7 @@ pub SpannedExpression ConstructRecord(Builder builder, SpannedPath ty, SpannedSt
 }
 
 pub SpannedStatement Let(Builder builder, string name, SpannedType ty, bool mutable, SpannedExpression value) {
-    LetStatement declaration = LetStatement { mutable: mutable, name: IdentifierValue(builder, name), typeAnnotation: OptionalSpannedType::Some(ty), value: value };
+    LetStatement declaration = LetStatement { attributes: SpannedAttributeList { items: [] }, mutable: mutable, name: IdentifierValue(builder, name), typeAnnotation: OptionalSpannedType::Some(ty), value: value };
     return SpannedStatement { node: Statement::Let(SpannedLetStatement { node: declaration, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
 }
 
@@ -296,13 +320,15 @@ pub SpannedBlock Body(Builder builder, SpannedStatement[] statements) {
 }
 
 pub SpannedParameter ParameterValue(Builder builder, string name, SpannedType ty) {
-    return SpannedParameter { node: Parameter { _bulk: false, mutable: false, name: IdentifierValue(builder, name), ty: ty }, span: builder.origin, id: Next(builder) };
+    return SpannedParameter { node: Parameter { attributes: SpannedAttributeList { items: [] }, _bulk: false, mutable: false, name: IdentifierValue(builder, name), ty: ty }, span: builder.origin, id: Next(builder) };
 }
 
 pub SpannedMethodDefinition Method(Builder builder, SpannedType receiver, string name, SpannedParameter[] parameters, SpannedType result, SpannedStatement[] statements) {
     MethodDefinition method = MethodDefinition {
         attributes: SpannedAttributeList { items: [] },
         visibility: Public(builder), receiverType: receiver, name: IdentifierValue(builder, name),
+        generics: SpannedTypeParameterList { items: [] }, whereBounds: WhereBoundList { items: [] },
+        receiver: OptionalSpannedReceiverParameter::None,
         parameters: SpannedParameterList { items: parameters }, parameterDocs: OptionalLeadingDocCommentList { items: [] },
         returnType: OptionalSpannedType::Some(result), body: Body(builder, statements),
     };
@@ -318,7 +344,7 @@ pub WhereBound Bound(Builder builder, string parameter, SpannedPath contractPath
 }
 
 pub SpannedImplBlock GenericImplementation(Builder builder, SpannedIdentifier[] generics, WhereBound[] bounds, SpannedType receiver, SpannedPath contractPath, SpannedMethodDefinition[] methods) {
-    ImplBlock value = NativeFactories.ImplBlockValue(SpannedIdentifierList { items: generics }, WhereBoundList { items: bounds }, receiver, SpannedPathList { items: [contractPath] }, SpannedMethodDefinitionList { items: methods }, OptionalLeadingDocCommentList { items: [] }, SpannedAssociatedTypeBindingList { items: [] });
+    ImplBlock value = NativeFactories.ImplBlockValue(SpannedAttributeList { items: [] }, TypeParameters(builder, generics), WhereBoundList { items: bounds }, receiver, SpannedPathList { items: [contractPath] }, SpannedMethodDefinitionList { items: methods }, OptionalLeadingDocCommentList { items: [] }, SpannedAssociatedTypeBindingList { items: [] });
     return NativeFactories.SpannedImplBlockValue(value, builder.origin, Next(builder));
 }
 
@@ -335,7 +361,7 @@ pub SpannedExpression ArrayValue(Builder builder, SpannedExpression[] values) {
 pub SpannedFunctionDefinition Function(Builder builder, string name, SpannedIdentifier[] generics, WhereBound[] bounds, SpannedParameter[] parameters, SpannedType result, SpannedStatement[] statements) {
     FunctionDefinition value = FunctionDefinition {
         attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), name: IdentifierValue(builder, name),
-        generics: SpannedIdentifierList { items: generics }, whereBounds: WhereBoundList { items: bounds },
+        generics: TypeParameters(builder, generics), whereBounds: WhereBoundList { items: bounds },
         parameters: SpannedParameterList { items: parameters }, parameterDocs: OptionalLeadingDocCommentList { items: [] },
         returnType: OptionalSpannedType::Some(result), body: Body(builder, statements),
     };
@@ -385,7 +411,7 @@ pub SpannedField DataField(Builder builder, string name, SpannedType ty) {
 
 pub SpannedTypeDefinition RecordType(Builder builder, string name, SpannedIdentifier[] generics, SpannedField[] fields) {
     TypeDefinition value = TypeDefinition { attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), name: IdentifierValue(builder, name),
-        generics: SpannedIdentifierList { items: generics }, conformances: SpannedPathList { items: [] }, fields: SpannedFieldList { items: fields },
+        generics: TypeParameters(builder, generics), conformances: SpannedPathList { items: [] }, fields: SpannedFieldList { items: fields },
         fieldDocs: OptionalLeadingDocCommentList { items: [] }, methods: SpannedMethodDefinitionList { items: [] }, methodDocs: OptionalLeadingDocCommentList { items: [] },
         associatedTypeBindings: SpannedAssociatedTypeBindingList { items: [] } };
     return SpannedTypeDefinition { node: value, span: builder.origin, id: Next(builder) };

@@ -16,6 +16,7 @@ These pages are **not** platform-spec nodes: cross-cutting policy fields (`specL
 - [Collections](./Collections/README.md): [Array](./Collections/Array.md), [List](./Collections/List.md), [Map](./Collections/Map.md), [Set](./Collections/Set.md), [Queue](./Collections/Queue.md), [Stack](./Collections/Stack.md)
 - [Query](./Query/README.md): [Operators](./Query/Operators.md), [Execution](./Query/Execution.md)
 - [Core](./Core/README.md) OS runtime: [Syscall](./Core/Syscall.md), [Input](./Core/Input.md), [Output](./Core/Output.md), [Error](./Core/Error.md), [FS](./Core/FS.md), [Path](./Core/Path.md), [Time](./Core/Time.md), [Environment](./Core/Environment.md), [Process](./Core/Process.md)
+- [Core](./Core/README.md) parallelism: [Parallel](./Core/Parallel.md) (isolate scopes, ports, pipelines, parallel sequences, cost table)
 - [Testing](./Testing/README.md): [Contracts](./Testing/Contracts.md), [Assert](./Testing/Assert.md)
 
 ## Naming direction

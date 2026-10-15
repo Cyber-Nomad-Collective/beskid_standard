@@ -36,6 +36,12 @@ ProcessError StatusError(i64 status) {
     if status == -11_i64 { return ProcessError::Closed; }
     return ProcessError::IOError("child process operation failed");
 }
+/// A spawn status below -65536 carries the OS error code (the Windows system error code or the
+/// POSIX errno) as `-65536 - status`; the IOError message names it.
+ProcessError SpawnOsError(i64 status) {
+    i64 code = -65536_i64 - status;
+    return ProcessError::IOError("child process spawn failed: OS error ${code}");
+}
 TransferFailure TransferCause(i64 status) {
     if status == -3_i64 { return TransferFailure::Cancelled; }
     if status == -4_i64 { return TransferFailure::TimedOut; }
@@ -163,6 +169,7 @@ pub Result<ChildProcess, ProcessError> SpawnUntil(ProcessStartInfo info, Deadlin
         if __child_close(token) != 0_i32 { return Result::Error(ProcessError::CleanupFailed); }
         if started == -7_i32 { return Result::Error(ProcessError::NotFound(info.executable)); }
         if started == -8_i32 { return Result::Error(ProcessError::PermissionDenied(info.executable)); }
+        if started < -65536_i32 { return Result::Error(SpawnOsError(i64(started))); }
         return Result::Error(StatusError(i64(started)));
     }
     return Result::Ok(ChildProcess { token: token });

@@ -43,7 +43,8 @@ string ErrorName(ProcessError error) {
         ProcessError::NotFound(executable) => "NotFound",
         ProcessError::PermissionDenied(executable) => "PermissionDenied",
         ProcessError::ExitCode(code, stderr) => "ExitCode",
-        ProcessError::IOError(message) => "IOError",
+        // The message carries the OS error code of a failed spawn, so a failing case names it.
+        ProcessError::IOError(message) => "IOError(" + message + ")",
         ProcessError::InvalidInput => "InvalidInput",
         ProcessError::Cancelled => "Cancelled",
         ProcessError::TimedOut => "TimedOut",
@@ -270,4 +271,22 @@ test process_failed_spawn_setup_leaves_no_child_and_later_spawns_succeed {
         };
         round = round + 1_i64;
     }
+}
+
+test process_spawn_failure_with_an_os_error_is_typed_and_names_the_code {
+    // A missing working directory fails child creation itself: POSIX chdir reports ENOENT, the typed
+    // NotFound; CreateProcessW reports ERROR_DIRECTORY, an IOError that must name the OS error code.
+    string missing = Fixture() + ".missing-directory";
+    match Process.Spawn(ProcessStartInfo { executable: Fixture(), arguments: ["exit", "0"], environment: EnvironmentPolicy::Inherit, cwd: missing }) {
+        Result::Ok(child) => { child.Close(); Assert.Fail("a missing working directory cannot start a child"); },
+        Result::Error(error) => match error {
+            ProcessError::NotFound(executable) => { },
+            ProcessError::IOError(message) => Assert.True(String.StartsWith(message, "child process spawn failed: OS error "), "the spawn IOError names the OS error code, not " + message),
+            _ => Assert.Fail("a missing working directory is NotFound or an OS-coded IOError, not " + ErrorName(error)),
+        },
+    };
+    match Process.Run(Fixture(), ["exit", "0"]) {
+        Result::Error(error) => Assert.Fail("spawning works after an OS-level spawn failure: " + ErrorName(error)),
+        Result::Ok(output) => Assert.Equal(output.exitCode, 0_i64, "later child exits successfully"),
+    };
 }

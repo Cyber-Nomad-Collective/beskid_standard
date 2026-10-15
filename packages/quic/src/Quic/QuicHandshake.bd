@@ -236,7 +236,8 @@ pub u8[] PeerTransportParameters(CryptoHandshake h) {
 
 HandshakeEvent LbTake(LoopbackHandshake hs) {
     i64 i = hs.st[1];
-    HandshakeEvent ev = hs.events[i];
+    // The drained slot keeps a payload-free placeholder.
+    HandshakeEvent ev = exchange(hs.events[i], HandshakeEvent::Connected);
     hs.st[1] = i + 1_i64;
     return ev;
 }
@@ -344,8 +345,8 @@ i64 Handle(LoopbackHandshake hs, i64 level, i64 kind, u8[] body) {
         if String.Len(chosen) == 0_i64 { return AlertNoApplicationProtocol(); }
         if tl == 0_i64 { return AlertMissingExtension(); }
         hs.selected[0] = chosen;
-        hs.peerRandom = clientRandom;
         DeriveMaster(hs, clientRandom, hs.random);
+        hs.peerRandom = move clientRandom;
         u8[] sh = Mem.Zeroed(300_i64);
         Writer w = QuicWire.NewWriter(sh, 0_i64, 300_i64);
         QuicWire.PutAll(w, hs.random);
@@ -369,8 +370,8 @@ i64 Handle(LoopbackHandshake hs, i64 level, i64 kind, u8[] body) {
         if !QuicWire.Ok(r) { return AlertDecodeError(); }
         if !Supports(hs.alpn, chosen) { return AlertNoApplicationProtocol(); }
         hs.selected[0] = chosen;
-        hs.peerRandom = serverRandom;
         DeriveMaster(hs, hs.random, serverRandom);
+        hs.peerRandom = move serverRandom;
         Push(hs, HandshakeEvent::ReadSecret(2_i64, Secret(hs, "s hs")));
         Push(hs, HandshakeEvent::WriteSecret(2_i64, Secret(hs, "c hs")));
         hs.st[0] = StWaitServerFinished();

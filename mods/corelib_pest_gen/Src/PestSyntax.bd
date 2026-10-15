@@ -1,0 +1,194 @@
+/// Typed syntax builder for the Pest combinator Generator.
+/// Every node is constructed as canonical SDK syntax; no source text is emitted or parsed.
+/// Contribution-local IDs are structural labels: the host re-spans and owns accepted trees.
+use Beskid.Syntax.Nodes;
+use Beskid.Syntax.NativeFactories;
+use Core.Collections.Array;
+use Core.String;
+
+pub type Builder {
+    pub NodeSpan origin,
+    u32 nextId,
+}
+
+pub Builder Create(NodeSpan origin) {
+    return Builder { origin: origin, nextId: 1_u32 };
+}
+
+u32 Next(Builder builder) {
+    u32 result = builder.nextId;
+    builder.nextId = result + 1_u32;
+    return result;
+}
+
+pub SpannedIdentifier IdentifierValue(Builder builder, string name) {
+    return SpannedIdentifier { node: Identifier { name: name }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedVisibility Public(Builder builder) {
+    return SpannedVisibility { node: Visibility::Public, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedType Primitive(Builder builder, PrimitiveType primitive) {
+    SpannedPrimitiveType value = SpannedPrimitiveType { node: primitive, span: builder.origin, id: Next(builder) };
+    return SpannedType { node: Type::Primitive(value), span: builder.origin, id: Next(builder) };
+}
+
+/// Only the terminal segment receives applied generic arguments.
+pub SpannedPath PathValue(Builder builder, string[] names, SpannedType[] arguments) {
+    mut SpannedPathSegment[] segments = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(names)) {
+        mut SpannedType[] applied = [];
+        if (index + 1_i64 == Array.Len(names)) { applied = arguments; }
+        PathSegment segment = PathSegment { name: IdentifierValue(builder, names[index]), typeArgs: SpannedTypeList { items: applied } };
+        segments = Array.Append<SpannedPathSegment>(segments, SpannedPathSegment { node: segment, span: builder.origin, id: Next(builder) });
+        index = index + 1_i64;
+    }
+    return SpannedPath { node: Path { segments: SpannedPathSegmentList { items: segments } }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedType Named(Builder builder, string[] names, SpannedType[] arguments) {
+    return SpannedType { node: Type::Complex(PathValue(builder, names, arguments)), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Name(Builder builder, SpannedPath path) {
+    SpannedPathExpression value = SpannedPathExpression { node: PathExpression { path: path }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Path(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Local(Builder builder, string name) {
+    return Name(builder, PathValue(builder, [name], []));
+}
+
+pub SpannedExpression Call(Builder builder, SpannedExpression callee, SpannedExpression[] arguments) {
+    SpannedCallExpression value = SpannedCallExpression { node: CallExpression { callee: callee, args: SpannedExpressionList { items: arguments } }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Call(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression LiteralValue(Builder builder, Literal literal) {
+    SpannedLiteral value = SpannedLiteral { node: literal, span: builder.origin, id: Next(builder) };
+    SpannedLiteralExpression expression = SpannedLiteralExpression { node: LiteralExpression { literal: value }, span: builder.origin, id: Next(builder) };
+    return SpannedExpression { node: Expression::Literal(expression), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Integer(Builder builder, string spelling) {
+    return LiteralValue(builder, Literal::Integer(spelling));
+}
+
+pub SpannedExpression Boolean(Builder builder, bool value) {
+    return LiteralValue(builder, Literal::Bool(value));
+}
+
+/// Literal.String retains source spelling. Escape only the language's actual
+/// quote/backslash/interpolation forms; other bytes remain literal UTF-8.
+pub SpannedExpression Text(Builder builder, string text) {
+    mut string raw = "\"";
+    mut i64 position = 0_i64;
+    mut i64 run = 0_i64;
+    while (position < String.Len(text)) {
+        u8 byte = String.ByteAt(text, position);
+        mut bool escaped = byte == 34_u8 || byte == 92_u8;
+        if (byte == 36_u8 && position + 1_i64 < String.Len(text)) {
+            escaped = String.ByteAt(text, position + 1_i64) == 123_u8;
+        }
+        if (escaped) {
+            raw = raw + String.SubSlice(text, run, position - run) + "\\" + String.SubSlice(text, position, 1_i64);
+            run = position + 1_i64;
+        }
+        position = position + 1_i64;
+    }
+    raw = raw + String.SubSlice(text, run, String.Len(text) - run) + "\"";
+    return LiteralValue(builder, Literal::String(raw));
+}
+
+pub SpannedExpression ConstructVariant(Builder builder, SpannedPath ty, string variant, SpannedExpression[] arguments) {
+    SpannedEnumPath path = SpannedEnumPath { node: EnumPath { typePath: ty, variant: IdentifierValue(builder, variant) }, span: builder.origin, id: Next(builder) };
+    EnumConstructorExpression value = EnumConstructorExpression { path: path, hasEmptyParens: true, args: SpannedExpressionList { items: arguments } };
+    return SpannedExpression { node: Expression::EnumConstructor(SpannedEnumConstructorExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Binary(Builder builder, SpannedExpression left, BinaryOp operation, SpannedExpression right) {
+    BinaryExpression value = BinaryExpression { left: left, op: SpannedBinaryOp { node: operation, span: builder.origin, id: Next(builder) }, right: right };
+    return SpannedExpression { node: Expression::Binary(SpannedBinaryExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedExpression Not(Builder builder, SpannedExpression operand) {
+    UnaryExpression value = UnaryExpression { op: SpannedUnaryOp { node: UnaryOp::Not, span: builder.origin, id: Next(builder) }, expr: operand };
+    return SpannedExpression { node: Expression::Unary(SpannedUnaryExpression { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Let(Builder builder, string name, SpannedType ty, bool mutable, SpannedExpression value) {
+    LetStatement declaration = LetStatement { mutable: mutable, name: IdentifierValue(builder, name), typeAnnotation: OptionalSpannedType::Some(ty), value: value };
+    return SpannedStatement { node: Statement::Let(SpannedLetStatement { node: declaration, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Evaluate(Builder builder, SpannedExpression expression) {
+    SpannedExpressionStatement value = SpannedExpressionStatement { node: ExpressionStatement { expression: expression }, span: builder.origin, id: Next(builder) };
+    return SpannedStatement { node: Statement::Expression(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Assign(Builder builder, string target, SpannedExpression value) {
+    AssignExpression expression = AssignExpression { target: Local(builder, target), op: SpannedAssignOp { node: AssignOp::Assign, span: builder.origin, id: Next(builder) }, value: value };
+    return Evaluate(builder, SpannedExpression { node: Expression::Assign(SpannedAssignExpression { node: expression, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) });
+}
+
+pub SpannedStatement Return(Builder builder, SpannedExpression expression) {
+    SpannedReturnStatement value = SpannedReturnStatement { node: ReturnStatement { value: OptionalSpannedExpression::Some(expression) }, span: builder.origin, id: Next(builder) };
+    return SpannedStatement { node: Statement::Return(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement Break(Builder builder) {
+    SpannedBreakStatement value = NativeFactories.SpannedBreakStatementValue(NativeFactories.BreakStatementValue(), builder.origin, Next(builder));
+    return SpannedStatement { node: Statement::Break(value), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedBlock Body(Builder builder, SpannedStatement[] statements) {
+    return SpannedBlock { node: Block { statements: SpannedStatementList { items: statements } }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement While(Builder builder, SpannedExpression condition, SpannedStatement[] statements) {
+    WhileStatement value = WhileStatement { condition: condition, body: Body(builder, statements) };
+    return SpannedStatement { node: Statement::While(SpannedWhileStatement { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement If(Builder builder, SpannedExpression condition, SpannedStatement[] statements) {
+    IfStatement value = IfStatement { condition: condition, thenBlock: Body(builder, statements), elseBranch: OptionalSpannedElseBranch::None };
+    return SpannedStatement { node: Statement::If(SpannedIfStatement { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedStatement IfElse(Builder builder, SpannedExpression condition, SpannedStatement[] statements, SpannedStatement[] otherwise) {
+    SpannedElseBranch branch = SpannedElseBranch { node: ElseBranch::Block(Body(builder, otherwise)), span: builder.origin, id: Next(builder) };
+    IfStatement value = IfStatement { condition: condition, thenBlock: Body(builder, statements), elseBranch: OptionalSpannedElseBranch::Some(branch) };
+    return SpannedStatement { node: Statement::If(SpannedIfStatement { node: value, span: builder.origin, id: Next(builder) }), span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedParameter ParameterValue(Builder builder, string name, SpannedType ty) {
+    return SpannedParameter { node: Parameter { _bulk: false, mutable: false, name: IdentifierValue(builder, name), ty: ty }, span: builder.origin, id: Next(builder) };
+}
+
+pub SpannedFunctionDefinition Function(Builder builder, string name, SpannedParameter[] parameters, SpannedType result, SpannedStatement[] statements) {
+    FunctionDefinition value = FunctionDefinition {
+        attributes: SpannedAttributeList { items: [] }, visibility: Public(builder), name: IdentifierValue(builder, name),
+        generics: SpannedIdentifierList { items: [] }, whereBounds: WhereBoundList { items: [] },
+        parameters: SpannedParameterList { items: parameters }, parameterDocs: OptionalLeadingDocCommentList { items: [] },
+        returnType: OptionalSpannedType::Some(result), body: Body(builder, statements),
+    };
+    return SpannedFunctionDefinition { node: value, span: builder.origin, id: Next(builder) };
+}
+
+/// Arrays are owner storage; concatenation copies both operands into a new list.
+pub SpannedStatement[] Concat(SpannedStatement[] first, SpannedStatement[] second) {
+    mut SpannedStatement[] result = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(first)) {
+        result = Array.Append<SpannedStatement>(result, first[index]);
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len(second)) {
+        result = Array.Append<SpannedStatement>(result, second[index]);
+        index = index + 1_i64;
+    }
+    return result;
+}

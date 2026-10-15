@@ -54,11 +54,11 @@ Result<Response,H3Error> Await(H3Conn start, i64 id, i64 deadline) {
         if H3Quic.Expired(deadline) {
             H3Quic.Reset(conn.link, id, H3Errors.RequestCancelled());
             H3Quic.StopSending(conn.link, id, H3Errors.RequestCancelled());
-            return Result::Error(H3Error::Timeout());
+            return Result::Error(H3Error::Timeout);
         }
         H3Quic.Nap();
     }
-    return Result::Error(H3Error::Timeout());
+    return Result::Error(H3Error::Timeout);
 }
 
 /// Starts `request` on a new request stream and returns the stream id.
@@ -66,7 +66,7 @@ Result<Response,H3Error> Await(H3Conn start, i64 id, i64 deadline) {
 pub Result<i64,H3Error> Start(mut H3Conn conn, Request request) {
     i64 failed = H3Connection.ErrorCode(conn);
     if failed >= 0_i64 { return Result::Error(ConnectionFailure(conn, failed)); }
-    if H3Connection.GoawayReceived(conn) >= 0_i64 { return Result::Error(H3Error::GoingAway()); }
+    if H3Connection.GoawayReceived(conn) >= 0_i64 { return Result::Error(H3Error::GoingAway); }
     H3Config config = conn.config;
     Result<HeaderField[],H3Error> mapped = H3Mapping.RequestFields(request, config.scheme);
     return match mapped {
@@ -77,9 +77,9 @@ pub Result<i64,H3Error> Start(mut H3Conn conn, Request request) {
 
 Result<i64,H3Error> StartFields(mut H3Conn conn, HeaderField[] fields, u8[] body) {
     i64 id = H3Quic.OpenBidi(conn.link);
-    if id < 0_i64 { return Result::Error(H3Error::Transport()); }
+    if id < 0_i64 { return Result::Error(H3Error::Transport); }
     H3Req added = H3Connection.AddRequest(conn, id, true);
-    if !H3Connection.WriteMessage(conn, id, fields, body, Array.Empty<HeaderField>()) { return Result::Error(H3Error::Transport()); }
+    if !H3Connection.WriteMessage(conn, id, fields, body, Array.Empty<HeaderField>()) { return Result::Error(H3Error::Transport); }
     return Result::Ok(id);
 }
 
@@ -98,7 +98,7 @@ Response NoResponse() { return Response { status: 0_i64, reason: "", headers: Ar
 // A connection-level failure: Transport when QUIC itself ended the
 // connection, otherwise the HTTP/3 application error code.
 H3Error ConnectionFailure(H3Conn conn, i64 code) {
-    if H3Quic.TransportFailed(conn.link) { return H3Error::Transport(); }
+    if H3Quic.TransportFailed(conn.link) { return H3Error::Transport; }
     return H3Error::Connection(code);
 }
 
@@ -107,17 +107,17 @@ pub H3Outcome Poll(mut H3Conn conn, i64 id) {
     i64 code = H3Connection.Pump(conn);
     if code != 0_i64 { return Outcome(Failed(), ConnectionFailure(conn, code)); }
     i64 at = H3Connection.FindRequest(conn, id);
-    if at < 0_i64 { return Outcome(Failed(), H3Error::InvalidMessage()); }
+    if at < 0_i64 { return Outcome(Failed(), H3Error::InvalidMessage); }
     H3Req req = Array.Get<H3Req>(conn.requests, at);
     if req.st[0] == 4_i64 {
-        if req.st[1] == H3Errors.RequestRejected() { return Outcome(Failed(), H3Error::GoingAway()); }
+        if req.st[1] == H3Errors.RequestRejected() { return Outcome(Failed(), H3Error::GoingAway); }
         return Outcome(Failed(), H3Error::Stream(req.st[1]));
     }
-    if req.st[0] < 3_i64 { return Outcome(Pending(), H3Error::Timeout()); }
+    if req.st[0] < 3_i64 { return Outcome(Pending(), H3Error::Timeout); }
     req.st[5] = 1_i64;
     Result<Response,H3Error> mapped = H3Mapping.ResponseFromFields(req.headers, req.body);
     return match mapped {
-        Result::Ok(response) => H3Outcome { state: Ready(), response: response, error: H3Error::Timeout() },
+        Result::Ok(response) => H3Outcome { state: Ready(), response: response, error: H3Error::Timeout },
         Result::Error(error) => Outcome(Failed(), error),
     };
 }

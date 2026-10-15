@@ -1,4 +1,4 @@
-This directory is the canonical home for **corelib** human-facing documentation: module contracts, boundaries, and API notes. It ships inside **`beskid pckg pack`** artifacts under the `docs/` prefix (alongside generated `.beskid/docs/` API listings when the CLI runs doc generation during pack).
+This directory is the canonical home for **corelib** human-facing documentation: module contracts, boundaries, and API notes. It ships inside **`beskid package pack`** artifacts under the `docs/` prefix (alongside generated `.beskid/docs/` API listings when the CLI runs doc generation during pack).
 
 The public docs site under `site/website/src/content/docs/corelib/` holds short pointers to these files so the Beskid sources remain the editorial source of truth.
 

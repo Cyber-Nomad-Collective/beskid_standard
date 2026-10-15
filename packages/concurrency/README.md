@@ -1,5 +1,5 @@
 # corelib_concurrency
 
-Cooperative concurrency primitives for the Beskid standard library (`Fiber`, channels). OS-thread helpers live in `Core.Threading` (foundation); deprecated `System.Threading` shims remain here for one release.
+Cooperative concurrency primitives for the Beskid standard library (`Fiber`, channels). Fibers are the Beskid concurrency model; corelib exposes no raw OS-thread spawn. `Core.Threading.Thread.Yield` (foundation) is the only OS-thread operation.
 
-Depends on `corelib_foundation`. OS-thread helpers live in this package; the aggregate `corelib` prelude re-exports the supported surface.
+Depends on `corelib_foundation`. The aggregate `corelib` prelude re-exports the supported surface.

@@ -30,7 +30,7 @@ pub i64 ScalarSlots() { return 4_i64; }
 i64 Slot(i64 index) { return ModArith.WSlot(8_i64, index); }
 i64 SlotB() { return Slot(0_i64); }
 i64 SlotPowAcc() { return Slot(13_i64); }
-i64 Scratch(i64 index) { return Slot(9_i64 + index); }
+i64 ScratchSlot(i64 index) { return Slot(9_i64 + index); }
 i64 RegisterCount() { return 36_i64; }
 
 /// Limb offset of point register `index` (X, then Y at +8, then Z at +16).
@@ -171,10 +171,10 @@ pub type Affine { pub u32[] x, pub u32[] y, }
 pub Result<Affine, PkError> ToAffine(Curve c, i64 r) {
     u32[] w = c.w;
     i64 n = 8_i64;
-    if IsIdentityBit(w, r) == 1_u32 { return Result::Error(PkError::InvalidPoint()); }
-    i64 inv = Scratch(0_i64);
-    i64 x = Scratch(1_i64);
-    i64 y = Scratch(2_i64);
+    if IsIdentityBit(w, r) == 1_u32 { return Result::Error(PkError::InvalidPoint); }
+    i64 inv = ScratchSlot(0_i64);
+    i64 x = ScratchSlot(1_i64);
+    i64 y = ScratchSlot(2_i64);
     ModArith.WPowPublic(w, n, inv, r + 16_i64, SlotPowAcc(), InverseExponent(FieldPrime()));
     ModArith.WMul(w, n, x, r, inv);
     ModArith.WMul(w, n, y, r + 8_i64, inv);
@@ -201,14 +201,14 @@ pub Result<u8[], PkError> Encode(Curve c, i64 r) {
 /// Decodes an uncompressed SEC 1 point into register `r` and checks it: 65 bytes, prefix
 /// 0x04, both coordinates below p, and y^2 = x^3 - 3x + b. The identity has no encoding.
 pub Result<unit, PkError> Decode(Curve c, i64 r, u8[] encoded) {
-    if Slice.Len(encoded) != 65_i64 { return Result::Error(PkError::InvalidPoint()); }
-    if encoded[0] != u8(4) { return Result::Error(PkError::InvalidPoint()); }
+    if Slice.Len(encoded) != 65_i64 { return Result::Error(PkError::InvalidPoint); }
+    if encoded[0] != u8(4) { return Result::Error(PkError::InvalidPoint); }
     Result<u32[], PkError> xr = BigNat.FromBytesFixed(Scratch.Sub(encoded, 1_i64, 32_i64), 8_i64);
     Result<u32[], PkError> yr = BigNat.FromBytesFixed(Scratch.Sub(encoded, 33_i64, 32_i64), 8_i64);
     return match xr {
-        Result::Error(_) => Result::Error(PkError::InvalidPoint()),
+        Result::Error(_) => Result::Error(PkError::InvalidPoint),
         Result::Ok(x) => match yr {
-            Result::Error(_) => Result::Error(PkError::InvalidPoint()),
+            Result::Error(_) => Result::Error(PkError::InvalidPoint),
             Result::Ok(y) => FromAffine(c, r, x, y),
         },
     };
@@ -216,7 +216,7 @@ pub Result<unit, PkError> Decode(Curve c, i64 r, u8[] encoded) {
 
 Result<unit, PkError> FromAffine(Curve c, i64 r, u32[] x, u32[] y) {
     u32[] p = FieldPrime();
-    if ModArith.LessBit(x, p) == 0_u32 || ModArith.LessBit(y, p) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
+    if ModArith.LessBit(x, p) == 0_u32 || ModArith.LessBit(y, p) == 0_u32 { return Result::Error(PkError::InvalidPoint); }
     u32[] w = c.w;
     i64 n = 8_i64;
     ModArith.WLoad(w, n, r, x);
@@ -225,9 +225,9 @@ Result<unit, PkError> FromAffine(Curve c, i64 r, u32[] x, u32[] y) {
     ModArith.WToMont(w, n, r + 8_i64, r + 8_i64);
     ModArith.WToMont(w, n, r + 16_i64, ModArith.WOne(n));
     // y^2 = x^3 - 3x + b in Montgomery form.
-    i64 lhs = Scratch(0_i64);
-    i64 rhs = Scratch(1_i64);
-    i64 three = Scratch(2_i64);
+    i64 lhs = ScratchSlot(0_i64);
+    i64 rhs = ScratchSlot(1_i64);
+    i64 three = ScratchSlot(2_i64);
     ModArith.WMul(w, n, lhs, r + 8_i64, r + 8_i64);
     ModArith.WMul(w, n, rhs, r, r);
     ModArith.WMul(w, n, rhs, rhs, r);
@@ -235,18 +235,18 @@ Result<unit, PkError> FromAffine(Curve c, i64 r, u32[] x, u32[] y) {
     ModArith.WAdd(w, n, three, three, r);
     ModArith.WSub(w, n, rhs, rhs, three);
     ModArith.WAdd(w, n, rhs, rhs, SlotB());
-    if ModArith.WEqualBit(w, n, lhs, rhs) == 0_u32 { return Result::Error(PkError::InvalidPoint()); }
+    if ModArith.WEqualBit(w, n, lhs, rhs) == 0_u32 { return Result::Error(PkError::InvalidPoint); }
     return Result::Ok(());
 }
 
 /// A private scalar as eight plain limbs; fails unless it is 32 bytes in [1, n-1].
 pub Result<u32[], PkError> DecodeScalar(u8[] bytes) {
-    if Slice.Len(bytes) != 32_i64 { return Result::Error(PkError::InvalidLength()); }
+    if Slice.Len(bytes) != 32_i64 { return Result::Error(PkError::InvalidLength); }
     Result<u32[], PkError> decoded = BigNat.FromBytesFixed(bytes, 8_i64);
     return match decoded {
-        Result::Error(_) => Result::Error(PkError::InvalidScalar()),
+        Result::Error(_) => Result::Error(PkError::InvalidScalar),
         Result::Ok(k) => {
-            if (ModArith.IsZeroBit(k) | (1_u32 - ModArith.LessBit(k, Order()))) == 1_u32 { return Result::Error(PkError::InvalidScalar()); }
+            if (ModArith.IsZeroBit(k) | (1_u32 - ModArith.LessBit(k, Order()))) == 1_u32 { return Result::Error(PkError::InvalidScalar); }
             return Result::Ok(k);
         },
     };
@@ -297,7 +297,7 @@ pub Result<u8[], PkError> SharedSecret(u8[] privateKey, u8[] peerPublicKey) {
                         ScalarMult(c, RegB(), d, RegA());
                         Result<Affine, PkError> affine = ToAffine(c, RegB());
                         return match affine {
-                            Result::Error(_) => Result::Error(PkError::ZeroSharedSecret()),
+                            Result::Error(_) => Result::Error(PkError::ZeroSharedSecret),
                             Result::Ok(a) => {
                                 u8[] out = BigNat.ZeroBytes(32_i64);
                                 BigNat.WriteBytes(a.x, out, 0_i64, 32_i64);

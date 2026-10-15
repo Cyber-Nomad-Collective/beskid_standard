@@ -1,0 +1,160 @@
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.Serialization.Descriptors;
+use Core.Serialization.Errors;
+use Core.Serialization.Metadata;
+use Core.Serialization.Numeric;
+use Core.String;
+
+// Format-neutral compiler recipe; it is not an external wire format. No field
+// in this recipe grants typed access or an ExtrasBinding. Only the current
+// private emitted getter calls these ordinary source constructors.
+type Reader {
+    string source,
+    i64 position,
+    i64 nodes,
+    bool failed,
+}
+
+string Token(mut Reader reader) {
+    if (reader.failed) { return ""; }
+    i64 start = reader.position;
+    while (reader.position < String.Len(reader.source) && String.ByteAt(reader.source, reader.position) >= 48_u8 && String.ByteAt(reader.source, reader.position) <= 57_u8) {
+        if (reader.position - start > 19_i64) { reader.failed = true; return ""; }
+        reader.position = reader.position + 1_i64;
+    }
+    if (reader.position == start || reader.position >= String.Len(reader.source) || String.ByteAt(reader.source, reader.position) != 58_u8) { reader.failed = true; return ""; }
+    mut i64 size = 0_i64;
+    match Numeric.ParseSigned(String.SubSlice(reader.source, start, reader.position - start), 64_i64) {
+        Result::Error(_) => { reader.failed = true; return ""; },
+        Result::Ok(value) => { size = value; },
+    };
+    reader.position = reader.position + 1_i64;
+    if (size < 0_i64 || size > 1048576_i64 || size > String.Len(reader.source) - reader.position) { reader.failed = true; return ""; }
+    string value = String.SubSlice(reader.source, reader.position, size);
+    reader.position = reader.position + size;
+    return value;
+}
+
+i64 Number(mut Reader reader, i64 maximum) {
+    string text = Token(reader);
+    match Numeric.ParseSigned(text, 64_i64) {
+        Result::Error(_) => { reader.failed = true; return 0_i64; },
+        Result::Ok(value) => {
+            if (value < 0_i64 || value > maximum) { reader.failed = true; return 0_i64; }
+            return value;
+        },
+    };
+}
+
+Metadata.ShapeId Id(mut Reader reader) {
+    string text = Token(reader);
+    match Metadata.ParseShapeId(text) {
+        Result::Ok(value) => { return value; },
+        Result::Error(_) => { reader.failed = true; return IdFallback(); },
+    };
+}
+
+Metadata.ShapeId IdFallback() {
+    match Metadata.ParseShapeId("0000000000000000000000000000000000000000000000000000000000000000") {
+        Result::Ok(value) => { return value; },
+        Result::Error(_) => { return IdFallback(); },
+    };
+}
+
+FieldDescriptor[] Fields(mut Reader reader) {
+    i64 count = Number(reader, 65536_i64);
+    if (reader.failed || count > 100000_i64 - reader.nodes) { reader.failed = true; return Array.Empty<FieldDescriptor>(); }
+    reader.nodes = reader.nodes + count;
+    mut FieldDescriptor[] fields = Array.Empty<FieldDescriptor>();
+    mut i64 index = 0_i64;
+    while (index < count && !reader.failed) {
+        string name = Token(reader);
+        Metadata.ShapeId shape = Id(reader);
+        i64 required = Number(reader, 1_i64);
+        i64 optional = Number(reader, 1_i64);
+        string defaultSignature = Token(reader);
+        Array.Append<FieldDescriptor>(fields, FieldDescriptor { name: name, shape: shape, required: required == 1_i64, optional: optional == 1_i64, defaultSignature: defaultSignature });
+        index = index + 1_i64;
+    }
+    return fields;
+}
+
+ShapeKind Kind(mut Reader reader) {
+    string name = Token(reader);
+    if (name == "unit") { return ShapeKind::Unit; }
+    if (name == "bool") { return ShapeKind::Boolean; }
+    if (name == "signed") { return ShapeKind::Signed; }
+    if (name == "unsigned") { return ShapeKind::Unsigned; }
+    if (name == "float") { return ShapeKind::Float; }
+    if (name == "scalar") { return ShapeKind::Scalar; }
+    if (name == "string") { return ShapeKind::String; }
+    if (name == "bytes") { return ShapeKind::Bytes; }
+    if (name == "array") { return ShapeKind::Array; }
+    if (name == "list") { return ShapeKind::List; }
+    if (name == "record") { return ShapeKind::Record; }
+    if (name == "map") { return ShapeKind::Map; }
+    if (name == "variant") { return ShapeKind::Variant; }
+    if (name == "optional") { return ShapeKind::Optional; }
+    reader.failed = true;
+    return ShapeKind::Unit;
+}
+
+// The private exact factory returns a fresh managed graph. Token decoding can
+// only construct None extras; the compiled getter separately attaches retained
+// immutable bindings, never a serialized token or descriptive permission.
+Result<ShapeDescriptor[], SerializationError> ConstructCompiledDescriptors(string recipe) {
+    if (String.Len(recipe) > 8388608_i64) { return Result::Error(Errors.NumericError("CompiledMetadataLimit")); }
+    mut Reader reader = Reader { source: recipe, position: 0_i64, nodes: 0_i64, failed: false };
+    if (Token(reader) != "beskid.descriptor/1") { return Result::Error(Errors.NumericError("InvalidCompiledMetadata")); }
+    i64 count = Number(reader, 1024_i64);
+    if (reader.failed || count == 0_i64) { return Result::Error(Errors.NumericError("InvalidCompiledMetadata")); }
+    reader.nodes = count;
+    mut ShapeDescriptor[] result = Array.Empty<ShapeDescriptor>();
+    mut i64 index = 0_i64;
+    while (index < count && !reader.failed) {
+        Metadata.ShapeId identity = Id(reader);
+        string signature = Token(reader);
+        string packageIdentity = Token(reader);
+        string sourcePath = Token(reader);
+        string declarationPath = Token(reader);
+        string schemaVersion = Token(reader);
+        ShapeKind kind = Kind(reader);
+        u8 width = u8(Number(reader, 64_i64));
+        i64 argumentCount = Number(reader, 1024_i64);
+        if (argumentCount > 100000_i64 - reader.nodes) { reader.failed = true; }
+        reader.nodes = reader.nodes + argumentCount;
+        mut Metadata.ShapeId[] arguments = Array.Empty<Metadata.ShapeId>();
+        mut i64 item = 0_i64;
+        while (item < argumentCount && !reader.failed) { Array.Append<Metadata.ShapeId>(arguments, Id(reader)); item = item + 1_i64; }
+        FieldDescriptor[] fields = Fields(reader);
+        i64 variantCount = Number(reader, 65536_i64);
+        if (variantCount > 100000_i64 - reader.nodes) { reader.failed = true; }
+        reader.nodes = reader.nodes + variantCount;
+        mut VariantDescriptor[] variants = Array.Empty<VariantDescriptor>();
+        item = 0_i64;
+        while (item < variantCount && !reader.failed) {
+            string name = Token(reader);
+            u32 ordinal = u32(Number(reader, 65535_i64));
+            FieldDescriptor[] payload = Fields(reader);
+            Array.Append<VariantDescriptor>(variants, VariantDescriptor { name: name, ordinal: ordinal, fields: payload });
+            item = item + 1_i64;
+        }
+        if (!reader.failed) {
+            Array.Append<ShapeDescriptor>(result, ShapeDescriptor { id: identity, signature: signature, packageIdentity: packageIdentity, sourcePath: sourcePath, declarationPath: declarationPath, schemaVersion: schemaVersion, kind: kind, width: width, arguments: arguments, fields: fields, variants: variants, extras: Option.Empty<ExtrasBinding>() });
+        }
+        index = index + 1_i64;
+    }
+    if (reader.failed || reader.position != String.Len(recipe)) { return Result::Error(Errors.NumericError("InvalidCompiledMetadata")); }
+    return Result::Ok(result);
+}
+
+// Only the compiler's current retained contribution emits a call with a
+// length-bounded immutable recipe. External text never reaches this getter.
+ShapeDescriptor[] ConstructCompiledGraph(string recipe) {
+    match ConstructCompiledDescriptors(recipe) {
+        Result::Ok(descriptors) => { return descriptors; },
+        Result::Error(_) => { __panic_str("Invalid compiler-issued serialization descriptor recipe"); },
+    };
+}

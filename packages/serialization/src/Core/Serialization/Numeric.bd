@@ -1,0 +1,59 @@
+use Core.Results;
+use Core.String;
+use Core.Serialization.Errors;
+
+bool WireWidth(i64 width) {
+    return width == 8_i64 || width == 16_i64 || width == 32_i64 || width == 64_i64;
+}
+
+Result<u64, SerializationError> ParseMagnitude(string text, i64 start, u64 maximum) {
+    i64 length = String.Len(text);
+    if (start >= length) { return Result::Error(Errors.NumericError("InvalidInteger")); }
+    // Scalar length limits belong to the decoding policy. Leading zeroes do
+    // not enlarge the magnitude; check every digit before multiply/add instead.
+    mut u64 value = 0_u64;
+    mut i64 index = start;
+    while (index < length) {
+        u8 byte = String.ByteAt(text, index);
+        if (byte < 48_u8 || byte > 57_u8) { return Result::Error(Errors.NumericError("InvalidInteger")); }
+        u64 digit = u64(byte - 48_u8);
+        if (value > maximum / 10_u64 || (value == maximum / 10_u64 && digit > maximum % 10_u64)) {
+            return Result::Error(Errors.NumericError("IntegerOutOfRange"));
+        }
+        value = value * 10_u64 + digit;
+        index = index + 1_i64;
+    }
+    return Result::Ok(value);
+}
+
+pub Result<u64, SerializationError> ParseUnsigned(string text, i64 width) {
+    if (!WireWidth(width)) { return Result::Error(Errors.NumericError("UnsupportedWireWidth")); }
+    mut u64 maximum = 18446744073709551615_u64;
+    if (width == 8_i64) { maximum = 255_u64; }
+    if (width == 16_i64) { maximum = 65535_u64; }
+    if (width == 32_i64) { maximum = 4294967295_u64; }
+    return ParseMagnitude(text, 0_i64, maximum);
+}
+
+pub Result<i64, SerializationError> ParseSigned(string text, i64 width) {
+    if (!WireWidth(width)) { return Result::Error(Errors.NumericError("UnsupportedWireWidth")); }
+    if (String.Len(text) == 0_i64) { return Result::Error(Errors.NumericError("InvalidInteger")); }
+    bool negative = String.ByteAt(text, 0_i64) == 45_u8;
+    mut i64 start = 0_i64;
+    if (negative) { start = 1_i64; }
+    mut u64 maximum = 9223372036854775807_u64;
+    if (width == 8_i64) { maximum = 127_u64; }
+    if (width == 16_i64) { maximum = 32767_u64; }
+    if (width == 32_i64) { maximum = 2147483647_u64; }
+    if (negative) { maximum = maximum + 1_u64; }
+    return match ParseMagnitude(text, start, maximum) {
+        Result::Error(error) => Result::Error(error),
+        Result::Ok(magnitude) => {
+            if (negative) {
+                if (magnitude == 9223372036854775808_u64) { return Result::Ok(-9223372036854775807_i64 - 1_i64); }
+                return Result::Ok(-i64(magnitude));
+            }
+            return Result::Ok(i64(magnitude));
+        },
+    };
+}

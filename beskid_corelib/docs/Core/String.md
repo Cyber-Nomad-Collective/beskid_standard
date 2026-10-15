@@ -1,39 +1,65 @@
-`Core.String` wraps the runtime string length builtin and provides small helpers for common checks.
+# Core.String
 
-## API
+`Core.String` is the string hub. Strings are UTF-8; every length, offset, and count in this module is a **byte** (code unit) count, and comparison is ordinal (byte-wise). Import it with `use Core.String;` and call `String.Name(...)`.
+
+The hub forwards to four implementation modules: `Core.String.Core` (runtime-backed primitives), `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`.
+
+## Inspecting
 
 | Function | Behavior |
 |----------|----------|
-| `Len(string text) -> i64` | Returns `__str_len(text)` (UTF-8 code unit count in the current runtime representation). |
-| `IsEmpty(string text) -> bool` | `Len(text) == 0`. |
-| `Contains(string text, string needle) -> bool` | Returns `true` for an empty `needle`. If `Len(needle) > Len(text)` or the strings are exactly equal, returns `true` / `true` as appropriate. **Substrings are not fully implemented yet**—the current body does not scan general substrings, so do not rely on `Contains` for production substring search until the implementation is completed. |
+| `Len(text) -> i64` | UTF-8 byte length. `Len("café")` is 5. |
+| `IsEmpty(text) -> bool` | `Len(text) == 0`. |
+| `IsBlank(text) -> bool` | Empty or only ASCII space, tab, CR, LF. |
+| `ByteAt(text, index) -> u8` | Byte at `index`; out of range traps. |
+| `SubSlice(text, start, count) -> string` | `count` bytes from `start`. |
 
-## Policy
+## Searching and comparing
 
-- Prefer explicit length or equality checks when `Contains` semantics are not yet required.
-- `Testing.Assertions.AssertContains` calls `Core.String.Contains`; see [Testing.Assertions](../Testing/Assertions.md) for test expectations.
+| Function | Behavior |
+|----------|----------|
+| `Contains(text, needle)` | Substring test; the empty needle matches. |
+| `IndexOf(text, needle)` / `IndexOfFrom(text, start, needle)` | First offset or `-1`; the empty needle matches at `start`. |
+| `LastIndexOf(text, needle)` | Last offset or `-1`; the empty needle matches at `Len(text)`. |
+| `StartsWith(text, prefix)` / `EndsWith(text, suffix)` | Affix tests. |
+| `Count(text, needle)` | Non-overlapping occurrences; the empty needle counts 0. |
+| `Compare(a, b) -> i64` | `-1`, `0`, or `1` in ordinal order; a proper prefix sorts first. |
+| `Less(a, b) -> bool` | `Compare(a, b) < 0`. Use it instead of `<`, which strings do not support. |
 
-## Usage examples
+## Transforming
+
+| Function | Behavior |
+|----------|----------|
+| `Split(text, separator) -> string[]` | Keeps empty fields: `n` separators give `n + 1` parts. An empty separator returns `[text]`. |
+| `Lines(text) -> string[]` | Splits on LF, strips one trailing CR per line, ignores a final newline. |
+| `Join(parts, separator)` | Inverse of `Split`. |
+| `Replace(text, old, replacement)` | All non-overlapping matches, left to right; an empty `old` is a no-op. |
+| `Repeat(text, count)` | Non-positive `count` gives `""`. |
+| `PadLeft` / `PadRight(text, width, fill)` | Pads to at least `width` bytes; never truncates. |
+| `ToUpperAscii` / `ToLowerAscii` | Maps ASCII letters only; other bytes are unchanged. |
+| `Trim` / `TrimStart` / `TrimEnd` | `Trim` strips space, tab, CR; `TrimStart`/`TrimEnd` also strip LF. |
+| `RemovePrefix` / `RemoveSuffix` | Removes one affix when present. |
+| `Concat(a, b)` | `a + b`, safe for two empty operands (see Gotchas). |
+| `FromAscii(code)`, `Newline()`, `Tab()` | One-byte strings; string literals have no `\n` or `\t` escapes. |
+
+## Building
+
+`Core.String.Builder` accumulates UTF-8 bytes and materializes once:
 
 ```beskid
-// Len check — bail early on short input
-let username := "ab";
-if String.Len(username) < 3 {
-  return Error("username too short");
-};
-// > Error("username too short")
+use Core.String.Builder;
+
+mut StringBuilder b = Builder.New();
+b = b.Append("count=");
+b = b.AppendI64(42);
+b = b.AppendLine(";");
+string text = b.ToString(); // "count=42;\n"
 ```
 
-```beskid
-// IsEmpty guard — skip work when nothing to process
-let input := "";
-if String.IsEmpty(input) {
-  return "(empty)";
-};
-// > "(empty)"
-```
+Builders are linear values: keep using the returned builder and do not append to an older copy.
 
 ## Gotchas
 
-- **`Contains` is not fully implemented.** It handles empty needle, needle longer than text, and exact equality, but does not scan for general substrings yet. Do not rely on it for production substring search until the implementation is completed.
-- **`Len` returns UTF-8 code units, not characters.** A single Unicode character may span multiple bytes (code units), so `Len("café")` may return 5 (4 ASCII + 1 two-byte é), not 4.
+- **Empty-plus-empty concatenation.** In the 0.5.2 runtime, `a + b` where both operands are empty produces an invalid string. Library code routes through `String.Concat`; do the same when both sides can be empty.
+- **No `\n` escapes.** Literals support only `\"`, `\\`, and `\${`. Use `String.Newline()`, `String.Tab()`, or `String.FromAscii(code)`.
+- **Bytes, not characters.** Offsets can land inside a multi-byte sequence if you compute them yourself; offsets returned by the search functions always start a match.

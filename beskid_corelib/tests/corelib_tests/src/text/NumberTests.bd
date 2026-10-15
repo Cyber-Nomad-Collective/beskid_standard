@@ -1,0 +1,143 @@
+/// Core.Text.Number parsing, formatting, and checked conversion tests.
+
+use Testing.Assert;
+use Core.Results;
+use Core.Text.Number;
+use Core.Text.NumberError;
+
+i64 I64Or(Result<i64, NumberError> parsed, i64 fallback) {
+    return match parsed {
+        Result::Ok(value) => value,
+        Result::Error(_) => fallback,
+    };
+}
+
+f64 F64Or(Result<f64, NumberError> parsed, f64 fallback) {
+    return match parsed {
+        Result::Ok(value) => value,
+        Result::Error(_) => fallback,
+    };
+}
+
+i64 CodeOf(NumberError error) {
+    return match error {
+        NumberError::Empty => 1_i64,
+        NumberError::InvalidCharacter(offset) => 100_i64 + offset,
+        NumberError::Overflow => 2_i64,
+        NumberError::NotFinite => 3_i64,
+    };
+}
+
+i64 ErrorCodeI64(Result<i64, NumberError> parsed) {
+    return match parsed {
+        Result::Ok(_) => 0_i64,
+        Result::Error(error) => CodeOf(error),
+    };
+}
+
+i64 ErrorCodeF64(Result<f64, NumberError> parsed) {
+    return match parsed {
+        Result::Ok(_) => 0_i64,
+        Result::Error(error) => CodeOf(error),
+    };
+}
+
+bool Near(f64 actual, f64 expected) {
+    f64 diff = actual - expected;
+    return diff < 0.000000001 && diff > -0.000000001;
+}
+
+test number_parse_i64_basic {
+    Assert.Equal(I64Or(Number.ParseI64("42"), 0), 42, "plain digits");
+    Assert.Equal(I64Or(Number.ParseI64("-17"), 0), -17, "negative");
+    Assert.Equal(I64Or(Number.ParseI64("+5"), 0), 5, "explicit plus");
+}
+
+test number_parse_i64_full_range {
+    Assert.Equal(I64Or(Number.ParseI64("9223372036854775807"), 0), Number.MaxI64(), "max i64");
+    Assert.Equal(I64Or(Number.ParseI64("-9223372036854775808"), 0), Number.MinI64(), "min i64");
+    Assert.Equal(ErrorCodeI64(Number.ParseI64("9223372036854775808")), 2, "max + 1 overflows");
+    Assert.Equal(ErrorCodeI64(Number.ParseI64("-9223372036854775809")), 2, "min - 1 overflows");
+}
+
+test number_parse_i64_errors {
+    Assert.Equal(ErrorCodeI64(Number.ParseI64("")), 1, "empty");
+    Assert.Equal(ErrorCodeI64(Number.ParseI64("-")), 1, "sign only");
+    Assert.Equal(ErrorCodeI64(Number.ParseI64("12a")), 102, "bad digit offset");
+    Assert.Equal(ErrorCodeI64(Number.ParseI64(" 1")), 100, "leading space rejected");
+}
+
+test number_parse_hex {
+    Assert.Equal(I64Or(Number.ParseHex("ff"), 0), 255, "lowercase");
+    Assert.Equal(I64Or(Number.ParseHex("0x7FFF"), 0), 32767, "prefixed uppercase");
+    Assert.Equal(I64Or(Number.ParseHex("7fffffffffffffff"), 0), Number.MaxI64(), "max");
+    Assert.Equal(ErrorCodeI64(Number.ParseHex("10000000000000000")), 2, "overflow");
+    Assert.Equal(ErrorCodeI64(Number.ParseHex("0x")), 1, "prefix only");
+    Assert.Equal(ErrorCodeI64(Number.ParseHex("fg")), 101, "bad hex digit");
+}
+
+test number_format_hex {
+    Assert.Equal(Number.FormatHex(255), "ff", "small");
+    Assert.Equal(Number.FormatHex(0), "0", "zero");
+    Assert.Equal(Number.FormatHex(-1), "ffffffffffffffff", "two's complement");
+}
+
+test number_parse_f64 {
+    Assert.True(Near(F64Or(Number.ParseF64("1.25"), 0.0), 1.25), "fraction");
+    Assert.True(Near(F64Or(Number.ParseF64("-0.5"), 0.0), -0.5), "negative fraction");
+    Assert.True(Near(F64Or(Number.ParseF64(".5"), 0.0), 0.5), "leading point");
+    Assert.True(Near(F64Or(Number.ParseF64("3."), 0.0), 3.0), "trailing point");
+    Assert.True(Near(F64Or(Number.ParseF64("2.5e3"), 0.0), 2500.0), "exponent");
+    Assert.True(Near(F64Or(Number.ParseF64("125E-2"), 0.0), 1.25), "negative exponent");
+}
+
+test number_parse_f64_errors {
+    Assert.Equal(ErrorCodeF64(Number.ParseF64("")), 1, "empty");
+    Assert.Equal(ErrorCodeF64(Number.ParseF64(".")), 1, "point only");
+    Assert.Equal(ErrorCodeF64(Number.ParseF64("1e")), 102, "dangling exponent");
+    Assert.Equal(ErrorCodeF64(Number.ParseF64("1.2.3")), 103, "second point");
+    Assert.Equal(ErrorCodeF64(Number.ParseF64("nan")), 100, "NaN rejected");
+}
+
+test number_truncate_and_round {
+    Assert.Equal(I64Or(Number.TruncateToI64(7.9), 0), 7, "truncate positive");
+    Assert.Equal(I64Or(Number.TruncateToI64(-7.9), 0), -7, "truncate negative");
+    Assert.Equal(I64Or(Number.TruncateToI64(4503599627370497.0), 0), 4503599627370497, "2^52 + 1 exact");
+    Assert.Equal(I64Or(Number.RoundToI64(2.5), 0), 3, "round half away from zero");
+    Assert.Equal(I64Or(Number.RoundToI64(-2.5), 0), -3, "round negative half");
+    Assert.Equal(ErrorCodeI64(Number.TruncateToI64(9223372036854775807.0)), 2, "2^63 overflows");
+    Assert.Equal(I64Or(Number.TruncateToI64(-9223372036854775807.0), 0), Number.MinI64(), "-2^63 fits");
+}
+
+test number_truncate_not_finite {
+    f64 zero = 0.0;
+    Assert.Equal(ErrorCodeI64(Number.TruncateToI64(1.0 / zero)), 3, "infinity");
+    Assert.Equal(ErrorCodeI64(Number.TruncateToI64(zero / zero)), 3, "NaN");
+    Assert.False(Number.IsFinite(zero / zero), "NaN is not finite");
+    Assert.True(Number.IsFinite(1.5), "finite");
+}
+
+test number_format_fixed {
+    Assert.Equal(Number.FormatFixed(3.14159, 2), "3.14", "two places");
+    Assert.Equal(Number.FormatFixed(2.5, 0), "3", "zero places rounds");
+    Assert.Equal(Number.FormatFixed(0.05, 3), "0.050", "padded fraction");
+    Assert.Equal(Number.FormatFixed(-1.005, 1), "-1.0", "negative");
+    Assert.Equal(Number.FormatFixed(9.999, 2), "10.00", "carry into whole part");
+    Assert.Equal(Number.FormatFixed(-0.0001, 2), "0.00", "negative zero prints unsigned");
+}
+
+test number_format_general {
+    Assert.Equal(Number.FormatGeneral(2.0), "2", "integral");
+    Assert.Equal(Number.FormatGeneral(-0.5), "-0.5", "fraction");
+    Assert.Equal(Number.FormatGeneral(0.0), "0", "zero");
+    Assert.Equal(Number.FormatGeneral(123456.789), "123456.789", "mixed");
+    Assert.Equal(Number.FormatGeneral(1000000000000000.0), "1e+15", "large switches to exponent");
+    Assert.Equal(Number.FormatGeneral(0.000001), "1e-6", "small switches to exponent");
+    Assert.Equal(Number.FormatGeneral(0.00001), "0.00001", "1e-5 stays decimal");
+}
+
+test number_pow10 {
+    Assert.True(Near(Number.Pow10(3), 1000.0), "positive");
+    Assert.True(Near(Number.Pow10(-2), 0.01), "negative");
+    Assert.True(Near(Number.Pow10(0), 1.0), "zero");
+}

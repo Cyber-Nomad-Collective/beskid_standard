@@ -1,0 +1,333 @@
+/// Core.Time.Calendar — constant-time proleptic Gregorian calendar arithmetic, weekdays, and
+/// RFC 3339 / ISO 8601 date-time parsing and formatting.
+/// @tier(supported)
+/// Day numbers count days since 1970-01-01 (negative before it). Conversions use Howard
+/// Hinnant's civil-date algorithms and are exact for every representable year. All results are
+/// UTC; parsing applies a numeric `±HH:MM` offset and rejects leap seconds.
+use Core.Results;
+use Core.String.Core;
+use Core.String.Transform;
+use Core.Time.Date;
+use Core.Time.DateTime;
+use Core.Time.Instant;
+use Core.Time.TimeError;
+use Core.Time.TimeOfDay;
+
+/// Floor division for possibly negative numerators.
+i64 FloorDiv(i64 value, i64 divisor) {
+    i64 q = value / divisor;
+    if value % divisor != 0 && (value < 0) != (divisor < 0) {
+        return q - 1;
+    }
+    return q;
+}
+
+/// Floor modulo, always in `0..divisor` for a positive divisor.
+i64 FloorMod(i64 value, i64 divisor) {
+    return value - FloorDiv(value, divisor) * divisor;
+}
+
+/// Returns true for a Gregorian leap year.
+pub bool IsLeapYear(i64 year) {
+    return FloorMod(year, 4) == 0 && (FloorMod(year, 100) != 0 || FloorMod(year, 400) == 0);
+}
+
+/// Days in `month` (1-12) of `year`; `0` for an invalid month.
+pub i64 DaysInMonth(i64 year, i64 month) {
+    if month < 1 || month > 12 {
+        return 0;
+    }
+    if month == 2 {
+        if IsLeapYear(year) {
+            return 29;
+        }
+        return 28;
+    }
+    if month == 4 || month == 6 || month == 9 || month == 11 {
+        return 30;
+    }
+    return 31;
+}
+
+/// Returns true when `year-month-day` names a real calendar day.
+pub bool IsValidDate(i64 year, i64 month, i64 day) {
+    return month >= 1 && month <= 12 && day >= 1 && day <= DaysInMonth(year, month);
+}
+
+/// Day number (days since 1970-01-01) of a civil date.
+pub i64 DaysFromCivil(i64 year, i64 month, i64 day) {
+    mut i64 y = year;
+    if month <= 2 {
+        y = y - 1;
+    }
+    i64 era = FloorDiv(y, 400);
+    i64 yoe = y - era * 400;
+    mut i64 shifted = month - 3;
+    if month <= 2 {
+        shifted = month + 9;
+    }
+    i64 doy = (153 * shifted + 2) / 5 + day - 1;
+    i64 doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    return era * 146097 + doe - 719468;
+}
+
+/// Civil date of day number `days`.
+pub Date CivilFromDays(i64 days) {
+    i64 z = days + 719468;
+    i64 era = FloorDiv(z, 146097);
+    i64 doe = z - era * 146097;
+    i64 yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    i64 doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    i64 mp = (5 * doy + 2) / 153;
+    i64 day = doy - (153 * mp + 2) / 5 + 1;
+    mut i64 month = mp + 3;
+    if mp >= 10 {
+        month = mp - 9;
+    }
+    mut i64 year = yoe + era * 400;
+    if month <= 2 {
+        year = year + 1;
+    }
+    return Date { year: year, month: month, day: day };
+}
+
+/// Day number of `date`.
+pub i64 ToDays(Date date) {
+    return DaysFromCivil(date.year, date.month, date.day);
+}
+
+/// ISO weekday of `date`: 1 = Monday through 7 = Sunday.
+pub i64 IsoWeekday(Date date) {
+    // 1970-01-01 was a Thursday (ISO 4).
+    return FloorMod(ToDays(date) + 3, 7) + 1;
+}
+
+/// Ordinal day within the year, 1 for January 1st.
+pub i64 DayOfYear(Date date) {
+    return ToDays(date) - DaysFromCivil(date.year, 1, 1) + 1;
+}
+
+/// `date` moved by `delta` days (negative moves backwards).
+pub Date AddDays(Date date, i64 delta) {
+    return CivilFromDays(ToDays(date) + delta);
+}
+
+/// `date` moved by `delta` months. The day clamps to the target month's length, so
+/// January 31st plus one month is February 28th or 29th.
+pub Date AddMonths(Date date, i64 delta) {
+    i64 index = date.year * 12 + (date.month - 1) + delta;
+    i64 year = FloorDiv(index, 12);
+    i64 month = FloorMod(index, 12) + 1;
+    mut i64 day = date.day;
+    i64 limit = DaysInMonth(year, month);
+    if day > limit {
+        day = limit;
+    }
+    return Date { year: year, month: month, day: day };
+}
+
+/// `date` moved by `delta` years; February 29th clamps to the 28th in common years.
+pub Date AddYears(Date date, i64 delta) {
+    return AddMonths(date, delta * 12);
+}
+
+/// Whole days from `earlier` to `later` (negative when `later` is before `earlier`).
+pub i64 DaysBetween(Date earlier, Date later) {
+    return ToDays(later) - ToDays(earlier);
+}
+
+/// `-1`, `0`, or `1` as `a` is before, equal to, or after `b`.
+pub i64 CompareDates(Date a, Date b) {
+    i64 diff = ToDays(a) - ToDays(b);
+    if diff < 0 {
+        return -1;
+    }
+    if diff > 0 {
+        return 1;
+    }
+    return 0;
+}
+
+i64 NanosPerSecond() {
+    return 1000000000_i64;
+}
+
+i64 NanosPerDay() {
+    return 86400000000000_i64;
+}
+
+/// UTC civil date and time of `instant` (nanoseconds since the Unix epoch).
+pub DateTime ToDateTime(Instant instant) {
+    i64 days = FloorDiv(instant.nanos, NanosPerDay());
+    i64 dayNanos = instant.nanos - days * NanosPerDay();
+    i64 seconds = dayNanos / NanosPerSecond();
+    TimeOfDay time = TimeOfDay {
+        hour: seconds / 3600,
+        minute: (seconds % 3600) / 60,
+        second: seconds % 60,
+        nanosecond: dayNanos % NanosPerSecond(),
+    };
+    return DateTime { date: CivilFromDays(days), time: time };
+}
+
+/// Instant of a UTC civil date and time.
+pub Instant FromDateTime(DateTime value) {
+    TimeOfDay time = value.time;
+    i64 seconds = time.hour * 3600 + time.minute * 60 + time.second;
+    i64 nanos = ToDays(value.date) * NanosPerDay() + seconds * NanosPerSecond() + time.nanosecond;
+    return Instant { nanos: nanos };
+}
+
+string Pad(i64 value, i64 width) {
+    return Transform.PadLeft("${value}", width, "0");
+}
+
+/// Formats `date` as `YYYY-MM-DD`. Years outside `0..=9999` print with a sign and at least four
+/// digits, as ISO 8601 expanded years.
+pub string FormatDate(Date date) {
+    mut string year = Pad(date.year, 4);
+    if date.year < 0 {
+        year = "-" + Pad(0 - date.year, 4);
+    }
+    if date.year > 9999 {
+        year = "+" + year;
+    }
+    return year + "-" + Pad(date.month, 2) + "-" + Pad(date.day, 2);
+}
+
+/// Formats `instant` as RFC 3339 UTC, such as `2026-10-06T12:30:00Z`. A nonzero sub-second part
+/// prints as milliseconds (`.250`) when exact, otherwise as nanoseconds (`.000000001`).
+pub string FormatInstant(Instant instant) {
+    DateTime value = ToDateTime(instant);
+    TimeOfDay time = value.time;
+    mut string text = FormatDate(value.date) + "T" + Pad(time.hour, 2) + ":" + Pad(time.minute, 2) + ":" + Pad(time.second, 2);
+    i64 nanos = time.nanosecond;
+    if nanos != 0 {
+        if nanos % 1000000 == 0 {
+            text = text + "." + Pad(nanos / 1000000, 3);
+        } else {
+            text = text + "." + Pad(nanos, 9);
+        }
+    }
+    return text + "Z";
+}
+
+Result<i64, TimeError> Digits(string input, i64 start, i64 count) {
+    if start + count > Core.Len(input) {
+        return Result<i64, TimeError>::Error(TimeError::InvalidFormat(input));
+    }
+    mut i64 value = 0;
+    mut i64 i = 0;
+    while i < count {
+        u8 b = Core.ByteAt(input, start + i);
+        if b < 48 || b > 57 {
+            return Result<i64, TimeError>::Error(TimeError::InvalidFormat(input));
+        }
+        value = value * 10 + (i64(b) - 48);
+        i = i + 1;
+    }
+    return Result<i64, TimeError>::Ok(value);
+}
+
+bool ByteIs(string input, i64 index, u8 expected) {
+    return index < Core.Len(input) && Core.ByteAt(input, index) == expected;
+}
+
+/// Parses an RFC 3339 date-time such as `2026-10-06T12:30:00Z`, `2026-10-06t12:30:00.5+02:00`,
+/// or `2026-10-06 12:30:00-05:30`, returning the UTC instant. Fractions may have 1-9 digits.
+/// A date alone (`2026-10-06`) means midnight UTC. Fields out of range report `OutOfRange`
+/// with the field name; structural problems report `InvalidFormat`.
+pub Result<Instant, TimeError> ParseInstant(string input) {
+    i64 len = Core.Len(input);
+    i64 year = Digits(input, 0, 4)?;
+    if !ByteIs(input, 4, 45) || !ByteIs(input, 7, 45) {
+        return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+    }
+    i64 month = Digits(input, 5, 2)?;
+    i64 day = Digits(input, 8, 2)?;
+    if month < 1 || month > 12 {
+        return Result<Instant, TimeError>::Error(TimeError::OutOfRange("month"));
+    }
+    if day < 1 || day > DaysInMonth(year, month) {
+        return Result<Instant, TimeError>::Error(TimeError::OutOfRange("day"));
+    }
+    i64 dayNanos = DaysFromCivil(year, month, day) * NanosPerDay();
+    if len == 10 {
+        return Result<Instant, TimeError>::Ok(Instant { nanos: dayNanos });
+    }
+    if !(ByteIs(input, 10, 84) || ByteIs(input, 10, 116) || ByteIs(input, 10, 32)) {
+        return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+    }
+    i64 hour = Digits(input, 11, 2)?;
+    if !ByteIs(input, 13, 58) || !ByteIs(input, 16, 58) {
+        return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+    }
+    i64 minute = Digits(input, 14, 2)?;
+    i64 second = Digits(input, 17, 2)?;
+    if hour > 23 {
+        return Result<Instant, TimeError>::Error(TimeError::OutOfRange("hour"));
+    }
+    if minute > 59 {
+        return Result<Instant, TimeError>::Error(TimeError::OutOfRange("minute"));
+    }
+    if second > 59 {
+        return Result<Instant, TimeError>::Error(TimeError::OutOfRange("second"));
+    }
+    mut i64 i = 19;
+    mut i64 fraction = 0;
+    if ByteIs(input, i, 46) {
+        i = i + 1;
+        mut i64 digits = 0;
+        while i < len && Core.ByteAt(input, i) >= 48 && Core.ByteAt(input, i) <= 57 {
+            if digits < 9 {
+                fraction = fraction * 10 + (i64(Core.ByteAt(input, i)) - 48);
+            }
+            digits = digits + 1;
+            i = i + 1;
+        }
+        if digits == 0 || digits > 9 {
+            return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+        }
+        while digits < 9 {
+            fraction = fraction * 10;
+            digits = digits + 1;
+        }
+    }
+    mut i64 offsetSeconds = 0;
+    if ByteIs(input, i, 90) || ByteIs(input, i, 122) {
+        i = i + 1;
+    } else {
+        if !(ByteIs(input, i, 43) || ByteIs(input, i, 45)) {
+            return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+        }
+        bool behind = ByteIs(input, i, 45);
+        i64 offsetHour = Digits(input, i + 1, 2)?;
+        if !ByteIs(input, i + 3, 58) {
+            return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+        }
+        i64 offsetMinute = Digits(input, i + 4, 2)?;
+        if offsetHour > 23 || offsetMinute > 59 {
+            return Result<Instant, TimeError>::Error(TimeError::OutOfRange("offset"));
+        }
+        offsetSeconds = offsetHour * 3600 + offsetMinute * 60;
+        if behind {
+            offsetSeconds = 0 - offsetSeconds;
+        }
+        i = i + 6;
+    }
+    if i != len {
+        return Result<Instant, TimeError>::Error(TimeError::InvalidFormat(input));
+    }
+    i64 localSeconds = hour * 3600 + minute * 60 + second;
+    i64 nanos = dayNanos + (localSeconds - offsetSeconds) * NanosPerSecond() + fraction;
+    return Result<Instant, TimeError>::Ok(Instant { nanos: nanos });
+}
+
+/// Parses a `YYYY-MM-DD` date with the same validation as `ParseInstant`.
+pub Result<Date, TimeError> ParseDate(string input) {
+    if Core.Len(input) != 10 {
+        return Result<Date, TimeError>::Error(TimeError::InvalidFormat(input));
+    }
+    Instant instant = ParseInstant(input)?;
+    return Result<Date, TimeError>::Ok(CivilFromDays(FloorDiv(instant.nanos, NanosPerDay())));
+}

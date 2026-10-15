@@ -1,0 +1,581 @@
+//! `SerializationSuite`: the serialization tests of corelib_tests, merged into one target so the matrix lowers
+//! the serialization closure once. Each section keeps the tests of one former target unchanged.
+
+use Core.Serialization.Limits;
+use Core.Serialization.Numeric;
+use Core.Results;
+use Testing.Assert;
+use Core.Serialization.DataValue;
+use Core.Serialization.Metadata;
+use Core.Collections.Array;
+use Core.Optional;
+use Core.Serialization.Descriptors;
+use Core.Serialization.Registry;
+use Core.Serialization.Decimal;
+use Core.Numeric.FloatBits;
+use Core.Serialization.FloatDecimal;
+use Core.String;
+
+// ---- PolicyTests.bd (formerly target `SerializationPolicyTests`) ----
+
+test serialization_default_limits_match_public_contract {
+    SerializationLimits limits = Limits.DefaultLimits();
+    Assert.Equal(limits.maxInputBytes, 8388608_i64, "input byte bound");
+    Assert.Equal(limits.maxOutputBytes, 8388608_i64, "output byte bound");
+    Assert.Equal(limits.maxDepth, 128_i64, "nesting bound");
+    Assert.Equal(limits.maxNodes, 100000_i64, "aggregate node and entry bound");
+    Assert.Equal(limits.maxScalarBytes, 1048576_i64, "scalar byte bound");
+}
+
+test serialization_unsigned_decimal_retains_all_u64_bits {
+    match Numeric.ParseUnsigned("18446744073709551615", 64_i64) {
+        Result::Ok(value) => Assert.Equal(value, 18446744073709551615_u64, "exact maximum without float conversion"),
+        Result::Error(_) => Assert.Fail("u64 maximum admitted"),
+    };
+    match Numeric.ParseUnsigned("9007199254740993", 64_i64) {
+        Result::Ok(value) => Assert.Equal(value, 9007199254740993_u64, "integer above 2^53 remains exact"),
+        Result::Error(_) => Assert.Fail("exact integer admitted"),
+    };
+}
+
+test serialization_unsigned_width_and_overflow_reject {
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("256", 8_i64)), "u8 overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("18446744073709551616", 64_i64)), "u64 overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("-1", 64_i64)), "negative unsigned rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("1", 7_i64)), "unsupported wire width rejects");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("1.0", 64_i64)), "decimal float is not an integer");
+}
+
+test serialization_signed_minimum_and_width_are_exact {
+    match Numeric.ParseSigned("-9223372036854775808", 64_i64) {
+        Result::Ok(value) => Assert.Equal(value, -9223372036854775807_i64 - 1_i64, "signed minimum admitted without positive overflow"),
+        Result::Error(_) => Assert.Fail("i64 minimum admitted"),
+    };
+    Assert.True(Results.IsError(Numeric.ParseSigned("-129", 8_i64)), "i8 negative overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseSigned("128", 8_i64)), "i8 positive overflow rejects");
+    Assert.True(Results.IsError(Numeric.ParseSigned("9223372036854775808", 64_i64)), "i64 overflow rejects");
+}
+
+test serialization_leading_zeroes_preserve_exact_integer_value {
+    match Numeric.ParseUnsigned("000000000000000000000000000000000000000000000000001", 8_i64) {
+        Result::Ok(value) => Assert.Equal(value, 1_u64, "leading zeroes do not change range"),
+        Result::Error(_) => Assert.Fail("bounded exact decimal with leading zeroes admitted"),
+    };
+    match Numeric.ParseSigned("-000000000000000000000000000000000000000000000000128", 8_i64) {
+        Result::Ok(value) => Assert.Equal(value, -128_i64, "negative minimum with leading zeroes"),
+        Result::Error(_) => Assert.Fail("leading zeroes do not overflow signed magnitude"),
+    };
+}
+
+// ---- DataValueTests.bd (formerly target `SerializationDataValueTests`) ----
+
+test serialization_value_retains_signed_width_and_unsigned_range {
+    DataValue signedValue = DataValue::Signed(-128_i64, 8_u8);
+    match signedValue {
+        DataValue::Signed(value, width) => {
+            Assert.Equal(value, -128_i64, "signed payload");
+            Assert.Equal(width, 8_u8, "declared wire width");
+        },
+        _ => Assert.Fail("signed value remains distinguished"),
+    };
+    DataValue unsignedValue = DataValue::Unsigned(18446744073709551615_u64, 64_u8);
+    match unsignedValue {
+        DataValue::Unsigned(value, width) => {
+            Assert.Equal(value, 18446744073709551615_u64, "full exact integer range");
+            Assert.Equal(width, 64_u8, "unsigned wire width");
+        },
+        _ => Assert.Fail("unsigned value remains distinguished"),
+    };
+}
+
+test serialization_value_retains_float_width_and_negative_zero_bits {
+    DataValue floatOne = DataValue::Float(2147483648_u64, 32_u8);
+    DataValue floatTwo = DataValue::Float(9223372036854775808_u64, 64_u8);
+    match floatOne {
+        DataValue::Float(bits, width) => {
+            Assert.Equal(bits, 2147483648_u64, "f32 negative zero bits");
+            Assert.Equal(width, 32_u8, "f32 is not promoted");
+        },
+        _ => Assert.Fail("float retains its own representation"),
+    };
+    match floatTwo {
+        DataValue::Float(bits, width) => {
+            Assert.Equal(bits, 9223372036854775808_u64, "f64 negative zero bits");
+            Assert.Equal(width, 64_u8, "f64 width");
+        },
+        _ => Assert.Fail("float does not become an integer"),
+    };
+}
+
+test serialization_value_distinguishes_bytes_strings_and_unicode_scalars {
+    DataValue bytes = DataValue::Bytes([0_u8, 255_u8]);
+    match bytes {
+        DataValue::Bytes(value) => {
+            Assert.Equal(Array.Len<u8>(value), 2_i64, "explicit bytes length");
+            Assert.Equal(value[1], 255_u8, "byte is not text decoding");
+        },
+        _ => Assert.Fail("bytes retain explicit format representation"),
+    };
+    DataValue text = DataValue::String("🙂");
+    match text {
+        DataValue::String(value) => Assert.Equal(value, "🙂", "text preserves Unicode without normalization"),
+        _ => Assert.Fail("string is distinguished from bytes"),
+    };
+    DataValue scalar = DataValue::Scalar('🙂');
+    match scalar {
+        DataValue::Scalar(value) => Assert.Equal(value, '🙂', "one non-BMP scalar remains char"),
+        _ => Assert.Fail("Unicode scalar is distinguished from string"),
+    };
+}
+
+test serialization_value_distinguishes_unit_optional_and_sequence {
+    DataValue unitValue = DataValue::Unit();
+    match unitValue { DataValue::Unit() => Assert.True(true, "unit has no fabricated payload"), _ => Assert.Fail("unit identity") };
+    DataValue none = DataValue::Optional(false, []);
+    DataValue some = DataValue::Optional(true, [unitValue]);
+    match none {
+        DataValue::Optional(present, payload) => {
+            Assert.False(present, "None presence");
+            Assert.Equal(Array.Len<DataValue>(payload), 0_i64, "None carries no value");
+        },
+        _ => Assert.Fail("None is not unit"),
+    };
+    match some {
+        DataValue::Optional(present, payload) => {
+            Assert.True(present, "Some presence");
+            Assert.Equal(Array.Len<DataValue>(payload), 1_i64, "Some unit carries a value");
+        },
+        _ => Assert.Fail("Some unit is not None"),
+    };
+    DataValue sequence = DataValue::Sequence(SequenceKind::Array, [some, none]);
+    match sequence {
+        DataValue::Sequence(kind, payload) => {
+            Assert.Equal(Array.Len<DataValue>(payload), 2_i64, "ordered sequence length");
+            Assert.True(kind == SequenceKind::Array, "array/list distinction retained");
+        },
+        _ => Assert.Fail("sequence retains ordered values"),
+    };
+}
+
+test serialization_shape_id_preserves_complete_digest_and_rejects_noncanonical_text {
+    string digest = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    match Metadata.ParseShapeId(digest) {
+        Result::Ok(shape) => Assert.Equal(Metadata.FormatShapeId(shape), digest, "all 256 identity bits retained"),
+        Result::Error(_) => Assert.Fail("canonical complete digest admitted"),
+    };
+    Assert.True(Results.IsError(Metadata.ParseShapeId("1")), "short numeric IDs cannot replace stable digests");
+    Assert.True(Results.IsError(Metadata.ParseShapeId("000102030405060708090A0b0c0d0e0f101112131415161718191a1b1c1d1e1f")), "wire identity is lowercase hex");
+    Assert.True(Results.IsError(Metadata.ParseShapeId("g00102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f")), "nonhex identity rejects");
+}
+
+test serialization_nested_record_payload_survives_forced_gc {
+    string digest = "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f";
+    match Metadata.ParseShapeId(digest) {
+        Result::Error(_) => Assert.Fail("complete shape identity admitted"),
+        Result::Ok(shape) => {
+            DataValue record = DataValue::Record(shape, [
+                RecordField { name: "text", value: DataValue::String("rooted " + "payload") },
+                RecordField { name: "bytes", value: DataValue::Sequence(SequenceKind::List, [DataValue::Bytes([0_u8, 255_u8])]) },
+            ]);
+            Assert.CollectGarbage();
+            Assert.CollectGarbage();
+            match record {
+                DataValue::Record(identity, fields) => {
+                    Assert.Equal(Metadata.FormatShapeId(identity), digest, "shape metadata stays rooted");
+                    Assert.Equal(Array.Len<RecordField>(fields), 2_i64, "ordered record fields survive");
+                    Assert.Equal(fields[0].name, "text", "declared field order");
+                    match fields[0].value {
+                        DataValue::String(text) => Assert.Equal(text, "rooted payload", "managed enum payload survives collection"),
+                        _ => Assert.Fail("record string identity retained"),
+                    };
+                    match fields[1].value {
+                        DataValue::Sequence(kind, items) => {
+                            Assert.True(kind == SequenceKind::List, "list kind survives");
+                            match items[0] {
+                                DataValue::Bytes(bytes) => Assert.Equal(bytes[1], 255_u8, "nested byte buffer survives collection"),
+                                _ => Assert.Fail("nested bytes identity retained"),
+                            };
+                        },
+                        _ => Assert.Fail("nested sequence identity retained"),
+                    };
+                },
+                _ => Assert.Fail("record value survives collection"),
+            };
+        },
+    };
+}
+
+// ---- RegistryTests.bd (formerly target `SerializationRegistryTests`) ----
+
+ShapeDescriptor Descriptor()
+{
+    Metadata.ShapeId id = match Registry.SignatureId("abc", 8388608_i64)
+    {
+        Result::Ok(value) => value,
+
+        Result::Error(_) => {
+            Assert.Fail("SHA256 canonical signature");
+            return Descriptor();
+        },
+    };
+    return ShapeDescriptor
+    {
+        id: id,
+
+        signature: "abc",
+
+        packageIdentity: "package@1.0.0",
+
+        sourcePath: "Main.bd",
+
+        declarationPath: "Item",
+
+        schemaVersion: "1",
+
+        kind: ShapeKind::Record,
+
+        width: 0_u8,
+
+        arguments: Array.Empty<Metadata.ShapeId>(),
+
+        fields: Array.Empty<FieldDescriptor>(),
+
+        variants: Array.Empty<VariantDescriptor>(),
+
+        extras: Optional.Empty<ExtrasBinding>(),
+    };
+}
+
+test serialization_signature_sha256_exact
+{
+    ShapeDescriptor descriptor = Descriptor();
+
+    Assert.Equal(Metadata.FormatShapeId(descriptor.id), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "actual SHA256 identity");
+}
+
+test serialization_registration_conflict_is_atomic_and_owned
+{
+    ShapeRegistry shapeTable = Registry.Create();
+
+    mut ShapeDescriptor descriptor = Descriptor();
+
+    Assert.True(Results.IsOk(Registry.Register(shapeTable, descriptor, 8388608_i64, 100000_i64)), "initial registration");
+
+    mut ShapeDescriptor conflicting = Descriptor();
+
+    conflicting.schemaVersion = "incompatible";
+
+    Assert.True(Results.IsError(Registry.Register(shapeTable, conflicting, 8388608_i64, 100000_i64)), "incompatible descriptor rejects");
+
+    descriptor.sourcePath = "mutated";
+
+    match Registry.Lookup(shapeTable, descriptor.id)
+    {
+        Result::Error(_) => Assert.Fail("first registration preserved"),
+
+        Result::Ok(value) => Assert.Equal(value.sourcePath, "Main.bd", "registered descriptor copied independently"),
+    };
+}
+
+test serialization_signature_limit_returns_checked_error
+{
+    Assert.True(Results.IsError(Registry.SignatureId("abc", 2_i64)), "signature bytes bounded before hash allocation");
+}
+
+Metadata.ShapeId Identity(string signature) {
+    match Registry.SignatureId(signature, 8388608_i64) {
+        Result::Ok(value) => { return value; },
+        Result::Error(_) => { Assert.Fail("fixture identity"); return Identity(signature); },
+    };
+}
+
+test serialization_graph_missing_edge_keeps_existing_table {
+    ShapeRegistry table = Registry.Create();
+    ShapeDescriptor prior = Descriptor();
+    Assert.True(Results.IsOk(Registry.Register(table, prior, 1048576_i64, 16_i64)), "prior registration");
+    mut ShapeDescriptor root = Descriptor();
+    root.signature = "root-with-missing-child"; root.id = Identity(root.signature);
+    Array.Append<FieldDescriptor>(root.fields, FieldDescriptor { name: "child", shape: Identity("missing"), required: true, optional: false, defaultSignature: "" });
+    Assert.True(Results.IsError(Registry.RegisterGraph(table, [root], 1048576_i64, 8388608_i64, 16_i64)), "missing edge rejects complete closure");
+    Assert.True(Results.IsError(Registry.Lookup(table, root.id)), "failed root was never published");
+    match Registry.Lookup(table, prior.id) {
+        Result::Error(_) => { Assert.Fail("prior graph survives"); },
+        Result::Ok(value) => { Assert.Equal(value.sourcePath, "Main.bd", "prior metadata retained"); },
+    };
+}
+
+test serialization_graph_admits_complete_recursive_closure {
+    ShapeRegistry table = Registry.Create();
+    mut ShapeDescriptor root = Descriptor();
+    root.signature = "recursive-record"; root.id = Identity(root.signature);
+    Array.Append<FieldDescriptor>(root.fields, FieldDescriptor { name: "next", shape: root.id, required: false, optional: true, defaultSignature: "" });
+    Assert.True(Results.IsOk(Registry.RegisterGraph(table, [root], 1048576_i64, 8388608_i64, 16_i64)), "schema back-reference is resolved within full closure");
+    Assert.True(Results.IsOk(Registry.RegisterGraph(table, [root], 1048576_i64, 8388608_i64, 16_i64)), "identical complete closure can be registered repeatedly");
+}
+
+test serialization_graph_signature_budget_failure_does_not_publish {
+    ShapeRegistry table = Registry.Create();
+    ShapeDescriptor root = Descriptor();
+    Assert.True(Results.IsError(Registry.RegisterGraph(table, [root], 1048576_i64, 2_i64, 16_i64)), "aggregate signatures bounded");
+    Assert.True(Results.IsError(Registry.Lookup(table, root.id)), "budget failure leaves empty table");
+}
+
+// ---- DecimalTests.bd (formerly target `SerializationDecimalTests`) ----
+
+test serialization_decimal_unsigned_maximum_and_exact_large_integer
+{
+    Assert.Equal(Decimal.Unsigned(18446744073709551615_u64), "18446744073709551615", "u64 maximum decimal exact");
+
+    Assert.Equal(Decimal.Unsigned(9007199254740993_u64), "9007199254740993", "no float conversion");
+
+    Assert.Equal(Decimal.Unsigned(0_u64), "0", "canonical zero");
+}
+
+test serialization_decimal_signed_minimum_roundtrip
+{
+    i64 minimum = -9223372036854775807_i64 - 1_i64;
+
+    string text = Decimal.Signed(minimum);
+
+    Assert.Equal(text, "-9223372036854775808", "minimum avoids signed negation overflow");
+
+    match Numeric.ParseSigned(text, 64_i64)
+    {
+        Result::Error(_) => Assert.Fail("exact signed roundtrip"),
+
+        Result::Ok(value) => Assert.Equal(value, minimum, "same signed minimum"),
+    };
+}
+
+test serialization_decimal_wire_width_range_rejects_before_output
+{
+    Assert.True(Results.IsError(Decimal.FormatSigned(128_i64, 8_u8)), "signed width range");
+
+    Assert.True(Results.IsError(Decimal.FormatUnsigned(256_u64, 8_u8)), "unsigned width range");
+
+    Assert.True(Results.IsError(Decimal.FormatUnsigned(1_u64, 7_u8)), "unsupported explicit width");
+}
+
+// ---- FloatDecimalTests.bd (formerly target `SerializationFloatDecimalTests`) ----
+
+unit Roundtrip(u64 bits, u8 width)
+{
+    match FloatDecimal.Format(bits, width, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("finite bits format natively"),
+
+        Result::Ok(text) => {
+            match FloatDecimal.Parse(text, width, Limits.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("formatted decimal parses"),
+
+                Result::Ok(actual) => Assert.Equal(actual, bits, "exact bit roundtrip at declared width"),
+            };
+        },
+    };
+}
+
+test serialization_float_f64_normal_subnormal_boundary_roundtrips
+{
+    u64[] values = [0_u64, 0x8000000000000000_u64, 1_u64, 0x000fffffffffffff_u64, 0x0010000000000000_u64, 0x3ff0000000000000_u64, 0x3ff0000000000001_u64, 0x3fb999999999999a_u64, 0x7fefffffffffffff_u64, 0x8010000000000000_u64];
+
+    mut i64 index = 0_i64;
+
+    while (index < Array.Len<u64>(values))
+    {
+        Roundtrip(values[index], 64_u8);
+        index = index + 1_i64;
+    }
+}
+
+test serialization_float_f32_direct_width_roundtrips
+{
+    u64[] values = [0_u64, 0x80000000_u64, 1_u64, 0x007fffff_u64, 0x00800000_u64, 0x3f800000_u64, 0x3f800001_u64, 0x3dcccccd_u64, 0x7f7fffff_u64];
+
+    mut i64 index = 0_i64;
+
+    while (index < Array.Len<u64>(values))
+    {
+        Roundtrip(values[index], 32_u8);
+        index = index + 1_i64;
+    }
+}
+
+test serialization_float_decimal_direct_f32_avoids_double_rounding
+{
+    match FloatDecimal.Parse("1.0000000596046448", 32_u8, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("finite decimal admitted"),
+
+        Result::Ok(bits) => Assert.Equal(bits, 0x3f800001_u64, "direct round above f32 midpoint"),
+    };
+
+    match FloatDecimal.Parse("1.000000059604644775390625", 32_u8, Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("exact halfway admitted"),
+
+        Result::Ok(bits) => Assert.Equal(bits, 0x3f800000_u64, "halfway rounds to even"),
+    };
+}
+
+test serialization_float_nonfinite_invalid_width_and_input_limits_reject
+{
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7ff0000000000000_u64, 64_u8, Limits.DefaultLimits())), "infinity rejects");
+
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7ff8000000000001_u64, 64_u8, Limits.DefaultLimits())), "NaN rejects, no normalization");
+
+    Assert.True(Results.IsError(FloatDecimal.Format(0x100000000_u64, 32_u8, Limits.DefaultLimits())), "bits exceed declared f32 storage");
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("1e309", 64_u8, Limits.DefaultLimits())), "overflow rejects");
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("NaN", 64_u8, Limits.DefaultLimits())), "special spelling rejects");
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("1.0x", 64_u8, Limits.DefaultLimits())), "trailing garbage rejects");
+
+    mut SerializationLimits limits = Limits.DefaultLimits();
+
+    limits.maxScalarBytes = 2_i64;
+
+    Assert.True(Results.IsError(FloatDecimal.Parse("1.0", 64_u8, limits)), "scalar byte limit checked first");
+}
+
+test serialization_float_shortest_search_checks_asymmetric_rounding_interval {
+    // 2^-1017: the nearest 16-digit decimal is outside the narrower lower
+    // rounding boundary, while the adjacent upper candidate roundtrips.
+    match FloatDecimal.Format(27021597764222976_u64, 64_u8, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("finite power-of-two conversion"),
+        Result::Ok(text) => Assert.Equal(text, "7120236347223045e-322", "16 significant digits rather than unnecessary 17"),
+    };
+}
+
+test string_interpolation_of_f64_round_trips_through_float_decimal_parse
+{
+    // String interpolation formats an f64 as its shortest round-trip decimal text; reading that
+    // text back yields the same bits.
+    u64[] values = [1_u64, 0x000fffffffffffff_u64, 0x0010000000000000_u64, 0x3ff0000000000001_u64, 0x3fb999999999999a_u64, 0x3fd3333333333334_u64, 0x400921fb54442d18_u64, 0xc00921fb54442d18_u64, 0x4340000000000000_u64, 0x4480000000000000_u64, 0x7fefffffffffffff_u64, 0x8010000000000000_u64, 27021597764222976_u64];
+
+    mut i64 index = 0_i64;
+
+    while (index < Array.Len<u64>(values))
+    {
+        f64 value = FloatBits.FromBits64(values[index]);
+        string text = "${value}";
+        match FloatDecimal.Parse(text, 64_u8, Limits.DefaultLimits())
+        {
+            Result::Error(_) => Assert.Fail("interpolated f64 text parses"),
+
+            Result::Ok(actual) => Assert.Equal(actual, values[index], "interpolated f64 text reads back as the same bits"),
+        };
+        index = index + 1_i64;
+    }
+}
+
+// ---- NumericBoundaryTests.bd (formerly target `SerializationNumericBoundaryTests`) ----
+
+// SER-05 / SER-06 numeric boundaries (Task 4): exact integer widths, no float coercion.
+
+unit AcceptSigned(string text, i64 width, i64 expected) {
+    match Numeric.ParseSigned(text, width) {
+        Result::Ok(value) => Assert.Equal<i64>(value, expected, "signed boundary admitted exactly"),
+        Result::Error(_) => Assert.Fail("signed boundary must be admitted"),
+    };
+}
+
+unit AcceptUnsigned(string text, i64 width, u64 expected) {
+    match Numeric.ParseUnsigned(text, width) {
+        Result::Ok(value) => Assert.Equal<u64>(value, expected, "unsigned boundary admitted exactly"),
+        Result::Error(_) => Assert.Fail("unsigned boundary must be admitted"),
+    };
+}
+
+test serialization_signed_limits_for_every_wire_width {
+    AcceptSigned("-128", 8_i64, -128_i64);
+    AcceptSigned("127", 8_i64, 127_i64);
+    AcceptSigned("-32768", 16_i64, -32768_i64);
+    AcceptSigned("32767", 16_i64, 32767_i64);
+    AcceptSigned("-2147483648", 32_i64, -2147483648_i64);
+    AcceptSigned("2147483647", 32_i64, 2147483647_i64);
+    AcceptSigned("9223372036854775807", 64_i64, 9223372036854775807_i64);
+    Assert.True(Results.IsError(Numeric.ParseSigned("-32769", 16_i64)), "i16 minimum minus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("32768", 16_i64)), "i16 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("-2147483649", 32_i64)), "i32 minimum minus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("2147483648", 32_i64)), "i32 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseSigned("-9223372036854775809", 64_i64)), "i64 minimum minus one");
+}
+
+test serialization_unsigned_limits_for_every_wire_width {
+    AcceptUnsigned("0", 8_i64, 0_u64);
+    AcceptUnsigned("255", 8_i64, 255_u64);
+    AcceptUnsigned("65535", 16_i64, 65535_u64);
+    AcceptUnsigned("4294967295", 32_i64, 4294967295_u64);
+    AcceptUnsigned("18446744073709551615", 64_i64, 18446744073709551615_u64);
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("65536", 16_i64)), "u16 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("4294967296", 32_i64)), "u32 maximum plus one");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("256", 8_i64)), "u8 maximum plus one");
+}
+
+test serialization_integers_above_two_pow_53_are_exact_in_both_signs {
+    AcceptSigned("9007199254740993", 64_i64, 9007199254740993_i64);
+    AcceptSigned("-9007199254740993", 64_i64, -9007199254740993_i64);
+    AcceptUnsigned("9007199254740993", 64_i64, 9007199254740993_u64);
+    AcceptUnsigned("18446744073709551614", 64_i64, 18446744073709551614_u64);
+    // Neighbouring odd and even values above 2^53 must stay distinct.
+    AcceptUnsigned("9007199254740995", 64_i64, 9007199254740995_u64);
+    Assert.Equal<string>(Decimal.Signed(-9007199254740993_i64), "-9007199254740993", "formatting does not pass through f64");
+}
+
+test serialization_integer_text_rejects_non_canonical_forms {
+    Assert.True(Results.IsError(Numeric.ParseSigned("", 32_i64)), "empty text");
+    Assert.True(Results.IsError(Numeric.ParseSigned("-", 32_i64)), "sign without digits");
+    Assert.True(Results.IsError(Numeric.ParseSigned("+1", 32_i64)), "explicit plus sign");
+    Assert.True(Results.IsError(Numeric.ParseSigned(" 1", 32_i64)), "leading space");
+    Assert.True(Results.IsError(Numeric.ParseSigned("1e3", 32_i64)), "exponent is not an integer");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("", 32_i64)), "empty unsigned");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("-0", 64_i64)), "unsigned has no negative zero spelling");
+    Assert.True(Results.IsError(Numeric.ParseUnsigned("1_u8", 8_i64)), "literal suffix is not wire text");
+}
+
+test serialization_signed_negative_zero_integer_is_plain_zero {
+    AcceptSigned("-0", 32_i64, 0_i64);
+}
+
+unit RoundtripText(string text, u8 width, u64 expectedBits) {
+    match FloatDecimal.Parse(text, width, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("finite decimal text parses"),
+        Result::Ok(bits) => {
+            Assert.Equal<u64>(bits, expectedBits, "exact bit pattern at declared width");
+            match FloatDecimal.Format(bits, width, Limits.DefaultLimits()) {
+                Result::Error(_) => Assert.Fail("finite bits format"),
+                Result::Ok(formatted) => {
+                    match FloatDecimal.Parse(formatted, width, Limits.DefaultLimits()) {
+                        Result::Error(_) => Assert.Fail("formatted text parses"),
+                        Result::Ok(again) => Assert.Equal<u64>(again, expectedBits, "format then parse is lossless"),
+                    };
+                },
+            };
+        },
+    };
+}
+
+test serialization_float_negative_zero_keeps_sign_bit_at_both_widths {
+    RoundtripText("-0.0", 64_u8, 9223372036854775808_u64);
+    RoundtripText("-0.0", 32_u8, 2147483648_u64);
+    RoundtripText("0.0", 64_u8, 0_u64);
+    match FloatDecimal.Format(9223372036854775808_u64, 64_u8, Limits.DefaultLimits()) {
+        Result::Error(_) => Assert.Fail("negative zero formats"),
+        Result::Ok(text) => Assert.Equal<u8>(String.ByteAt(text, 0_i64), 45_u8, "negative zero text starts with a minus sign"),
+    };
+}
+
+test serialization_float_rejects_every_nonfinite_encoding_and_spelling {
+    // f32 infinities and NaNs, plus the f64 negative infinity.
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7f800000_u64, 32_u8, Limits.DefaultLimits())), "f32 +infinity");
+    Assert.True(Results.IsError(FloatDecimal.Format(0xff800000_u64, 32_u8, Limits.DefaultLimits())), "f32 -infinity");
+    Assert.True(Results.IsError(FloatDecimal.Format(0x7fc00000_u64, 32_u8, Limits.DefaultLimits())), "f32 quiet NaN");
+    Assert.True(Results.IsError(FloatDecimal.Format(0xfff0000000000000_u64, 64_u8, Limits.DefaultLimits())), "f64 -infinity");
+    Assert.True(Results.IsError(FloatDecimal.Parse("Infinity", 64_u8, Limits.DefaultLimits())), "Infinity spelling");
+    Assert.True(Results.IsError(FloatDecimal.Parse("-inf", 64_u8, Limits.DefaultLimits())), "-inf spelling");
+    Assert.True(Results.IsError(FloatDecimal.Parse("nan", 32_u8, Limits.DefaultLimits())), "nan spelling");
+    Assert.True(Results.IsError(FloatDecimal.Parse("-1e309", 64_u8, Limits.DefaultLimits())), "f64 negative overflow");
+    Assert.True(Results.IsError(FloatDecimal.Parse("1e39", 32_u8, Limits.DefaultLimits())), "f32 overflow");
+}

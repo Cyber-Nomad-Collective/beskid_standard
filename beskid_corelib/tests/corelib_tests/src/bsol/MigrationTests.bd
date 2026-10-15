@@ -1,0 +1,226 @@
+use Core.Bsol.Limits;
+
+use Core.Bsol.Migration;
+
+use Core.Bsol.Parser;
+
+use Core.Bsol.Schema;
+
+use Core.Bsol.Syntax;
+
+use Core.Environment;
+
+use Core.FS;
+
+use Core.Results;
+
+use Core.Collections.Array;
+
+use Testing.Assert;
+
+test bsol_migration_stage_is_fresh_and_requires_declared_definition {
+    Schema.Profile owner = Profile("profile");
+    i64 originalCount = Array.Len<i64>(owner.migrationNodes);
+    Assert.True(originalCount > 0_i64, "fixture has declared migration");
+    match Schema.MigrationStage(owner, owner.migrationNodes[0_i64]) {
+        Result::Error(_) => Assert.Fail("declared migration stage"),
+        Result::Ok(selected) => {
+            mut Schema.Profile stage = selected;
+            stage.migrationNodes = Array.Empty<i64>();
+            Assert.Equal(Array.Len<i64>(owner.migrationNodes), originalCount, "stage mutation cannot replace original migration definitions");
+        },
+    };
+    Assert.True(Results.IsError(Schema.MigrationStage(owner, -1_i64)), "foreign definition index rejected");
+}
+
+string ReadMigration(string name)
+{
+    return match Environment.Get("BESKID_BSOL_CORPUS")
+    {
+        Result::Error(_) => {
+            Assert.Fail("shared corpus configured");
+            return "";
+        },
+
+        Result::Ok(root) => match FS.ReadAllText(root + "/cases/schema-migration/" + name + ".bsol")
+        {
+            Result::Error(_) => {
+                Assert.Fail("shared migration fixture readable");
+                return "";
+            },
+
+            Result::Ok(text) => text,
+        },
+    };
+}
+
+Schema.Profile Profile(string name)
+{
+    return match Schema.ParseProfile(ReadMigration(name), Limits.DefaultLimits())
+    {
+        Result::Ok(profile) => profile,
+
+        Result::Error(_) => {
+            Assert.Fail("migration profile parses");
+            return Profile(name);
+        },
+    };
+}
+
+Syntax.Document Document(string name)
+{
+    return match Parser.Parse(ReadMigration(name), Limits.DefaultLimits())
+    {
+        Result::Ok(document) => document,
+
+        Result::Error(_) => {
+            Assert.Fail("migration input parses");
+            return Document(name);
+        },
+    };
+}
+
+unit HasError(Schema.Diagnostic[] errors, string code, bool related)
+{
+    mut bool found = false;
+    mut i64 index = 0_i64;
+    while (index < Array.Len<Schema.Diagnostic>(errors))
+    {
+        Schema.Diagnostic error = errors[index];
+        if (error.code == code)
+        {
+            found = true;
+            if (related)
+            {
+                Assert.True(error.hasRelated, "both source definitions retained");
+                Assert.True(error.relatedSpan.end > error.relatedSpan.start, "related byte span");
+            }
+        }
+        index = index + 1_i64;
+    }
+    Assert.True(found, "exact checked migration diagnostic");
+}
+
+unit RejectPlan(string profile, string document, string code, bool related)
+{
+    match Migration.PlanMigration(Document(document), Profile(profile), Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("invalid route rejects"),
+
+        Result::Error(errors) => HasError(errors, code, related),
+    };
+}
+
+test bsol_migration_selected_typed_nodes_preserve_other_strings_and_original
+{
+    Syntax.Document original = Document("selected");
+
+    match Migration.PlanMigration(original, Profile("profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("one structural route"),
+
+        Result::Ok(plan) => {
+            match Migration.ApplyMigration(plan, Limits.DefaultLimits())
+            {
+                Result::Error(_) => Assert.Fail("rewrite validates target atomically"),
+
+                Result::Ok(checked) => {
+                    mut bool name = false;
+                    mut bool version = false;
+                    mut bool other = false;
+                    mut i64 index = 0_i64;
+                    while (index < Array.Len<Syntax.Node>(checked.document.nodes))
+                    {
+                        Syntax.Node node = checked.document.nodes[index];
+                        if (node.kind == Syntax.NodeKind::Assignment && Array.Len<i64>(node.children) == 1_i64)
+                        {
+                            Syntax.Node value = checked.document.nodes[node.children[0_i64]];
+                            if (node.name == "name")
+                            {
+                                name = value.kind == Syntax.NodeKind::String && value.text == "new";
+                            }
+                            if (node.name == "version")
+                            {
+                                version = value.kind == Syntax.NodeKind::Number && value.raw == "2";
+                            }
+                            if (node.name == "text")
+                            {
+                                other = value.text == "old_name = old";
+                            }
+                        }
+                        index = index + 1_i64;
+                    }
+                    Assert.True(name && version && other, "selected rename/add/replace retain typed scalar and unselected text");
+                    Assert.Equal(original.source, ReadMigration("selected"), "input source remains unchanged");
+                    match Migration.PlanMigration(checked.document, Profile("profile"), Limits.DefaultLimits())
+                    {
+                        Result::Ok(_) => Assert.Fail("completed migration is not repeated"),
+
+                        Result::Error(errors) => HasError(errors, "AlreadyAtTarget", false),
+                    };
+                },
+            };
+        },
+    };
+}
+
+test bsol_migration_ambiguous_routes_report_both_definitions
+{
+    RejectPlan("ambiguous-profile", "selected", "AmbiguousMigrationRoute", true);
+}
+
+test bsol_migration_self_cycle_rejects
+{
+    RejectPlan("cycle-profile", "selected", "MigrationCycle", false);
+}
+
+test bsol_migration_no_route_and_already_target_are_distinct
+{
+    RejectPlan("profile", "no-route", "NoMigrationRoute", false);
+
+    RejectPlan("profile", "already", "AlreadyAtTarget", false);
+}
+
+test bsol_migration_destination_collision_preserves_original
+{
+    Syntax.Document original = Document("collision");
+
+    match Migration.PlanMigration(original, Profile("profile"), Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("collision is an application error"),
+
+        Result::Ok(plan) => match Migration.ApplyMigration(plan, Limits.DefaultLimits())
+        {
+            Result::Ok(_) => Assert.Fail("destination collision rejects"),
+
+            Result::Error(errors) => HasError(errors, "MigrationDestinationCollision", true),
+        },
+    };
+
+    Assert.Equal(original.source, ReadMigration("collision"), "failed transaction never mutates source");
+}
+
+/// Two privately owned stages share one route/work policy and expose only final validation.
+test bsol_migration_chain_reaches_target_without_mutating_input
+{
+    Syntax.Document original = Document("selected");
+
+    match Migration.MigrateChain(original, "config.v1", "config.v3", [Profile("profile"), Profile("chain-target")], Limits.DefaultLimits())
+    {
+        Result::Error(_) => Assert.Fail("unique two-stage route succeeds"),
+
+        Result::Ok(checked) => Assert.Equal(checked.profile, "config.v3", "final target is sole published profile"),
+    };
+
+    Assert.Equal(original.source, ReadMigration("selected"), "intermediate rewrites remain private");
+}
+
+test bsol_migration_chain_cycles_are_checked_before_application
+{
+    match Migration.MigrateChain(Document("selected"), "config.v1", "config.v3", [Profile("profile"), Profile("chain-target"), Profile("chain-cycle")], Limits.DefaultLimits())
+    {
+        Result::Ok(_) => Assert.Fail("reachable multi-profile cycle rejects"),
+
+        Result::Error(errors) => HasError(errors, "MigrationCycle", true),
+    };
+}

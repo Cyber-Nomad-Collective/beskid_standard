@@ -5,7 +5,6 @@ use Core.String;
 use Crypto.ConstantTime;
 use Crypto.Hmac;
 use Tls.Alert;
-use Tls.Emit;
 use Tls.KeySchedule;
 use Tls.Messages;
 use Tls.PeerKeys;
@@ -85,20 +84,20 @@ pub type HandshakeEngine {
     HashState transcript,
     KeyShare share,
     PeerKey peerKey,
-    Blob[] b,
+    TlsConfig.Blob[] b,
     // [0] negotiated ALPN, [1] received server name.
     string[] names,
-    Blob[] peerChain,
+    TlsConfig.Blob[] peerChain,
 }
 
 // ---------------------------------------------------------------- construction
 
 u8[] None() { return Slice.New(0_i64); }
 
-Blob[] EmptyBlobs(i64 count) {
-    mut Blob[] list = Array.Empty<Blob>();
+TlsConfig.Blob[] EmptyBlobs(i64 count) {
+    mut TlsConfig.Blob[] list = Array.Empty<TlsConfig.Blob>();
     mut i64 i = 0_i64;
-    while i < count { Array.Append<Blob>(list, Blob { data: None() }); i = i + 1_i64; }
+    while i < count { Array.Append<TlsConfig.Blob>(list, TlsConfig.Blob { data: None() }); i = i + 1_i64; }
     return list;
 }
 
@@ -108,7 +107,7 @@ PeerKey NoKey() { return PeerKey { kind: 0_i64, point: None(), modulus: None(), 
 HandshakeEngine Make(bool isClient, TlsClientConfig cc, TlsServerConfig sc, i64 state) {
     mut TlsEvent[] events = Array.Empty<TlsEvent>();
     mut u8[] inbuf = Array.Empty<u8>();
-    mut Blob[] chain = Array.Empty<Blob>();
+    mut TlsConfig.Blob[] chain = Array.Empty<TlsConfig.Blob>();
     i64[] st = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
     st[0] = state;
     return HandshakeEngine {
@@ -141,7 +140,7 @@ Result<unit, TlsError> CheckAlpn(string[] names) {
     return Result::Ok(());
 }
 
-TlsServerConfig DummyServer() { return TlsConfig.Server(Array.Empty<Blob>(), None()); }
+TlsServerConfig DummyServer() { return TlsConfig.Server(Array.Empty<TlsConfig.Blob>(), None()); }
 TlsClientConfig DummyClient() { return TlsConfig.Client("", CertificateVerification::DangerousAcceptAnyCertificate); }
 
 /// A client engine. Validates the configuration; call `Start` to produce the ClientHello.
@@ -157,7 +156,7 @@ pub Result<HandshakeEngine, TlsError> NewClient(TlsClientConfig config) {
 
 /// A server engine waiting for a ClientHello.
 pub Result<HandshakeEngine, TlsError> NewServer(TlsServerConfig config) {
-    if Array.Len<Blob>(config.certificateChain) == 0_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigMissingCertificate())); }
+    if Array.Len<TlsConfig.Blob>(config.certificateChain) == 0_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigMissingCertificate())); }
     if Slice.Len(config.privateKey) != 32_i64 { return Result::Error(TlsError::InvalidConfig(TlsErrors.ConfigInvalidPrivateKey())); }
     CheckSuitesGroups(config.cipherSuites, config.groups)?;
     CheckAlpn(config.alpn)?;
@@ -182,10 +181,10 @@ pub Result<HandshakeEngine, TlsError> NewClientAfterHello(TlsClientConfig config
 
 // ---------------------------------------------------------------- small helpers
 
-unit SetB(HandshakeEngine e, i64 index, u8[] data) { e.b[index] = Blob { data: data }; return; }
+unit SetB(HandshakeEngine e, i64 index, u8[] data) { e.b[index] = TlsConfig.Blob { data: data }; return; }
 
 u8[] GetB(HandshakeEngine e, i64 index) {
-    Blob x = e.b[index];
+    TlsConfig.Blob x = e.b[index];
     return x.data;
 }
 
@@ -292,7 +291,7 @@ pub bool UsedHelloRetry(HandshakeEngine e) { return e.st[SRetries()] > 0_i64; }
 pub u8[] PeerTransportParameters(HandshakeEngine e) { return GetB(e, BPeerTransport()); }
 
 /// Client side: the server's certificate chain (DER, end-entity first).
-pub Blob[] PeerCertificates(HandshakeEngine e) { return e.peerChain; }
+pub TlsConfig.Blob[] PeerCertificates(HandshakeEngine e) { return e.peerChain; }
 
 /// The encryption level at which the engine expects the next handshake bytes.
 pub i64 ReadLevel(HandshakeEngine e) { return e.st[SLevel()]; }
@@ -579,11 +578,11 @@ Result<unit, TlsError> ClientOnCertificate(HandshakeEngine e, Framed m) {
     if Slice.Len(cert.context) != 0_i64 { return Result::Error(F(Alert.IllegalParameter())); }
     i64 n = Array.Len<CertificateEntry>(cert.entries);
     if n == 0_i64 { return Result::Error(F(Alert.DecodeError())); }
-    mut Blob[] chain = Array.Empty<Blob>();
+    mut TlsConfig.Blob[] chain = Array.Empty<TlsConfig.Blob>();
     mut i64 i = 0_i64;
     while i < n {
         CertificateEntry entry = cert.entries[i];
-        Array.Append<Blob>(chain, Blob { data: entry.data });
+        Array.Append<TlsConfig.Blob>(chain, TlsConfig.Blob { data: entry.data });
         i = i + 1_i64;
     }
     e.peerChain = chain;
@@ -790,10 +789,10 @@ Result<unit, TlsError> ServerSendFlight(HandshakeEngine e, Messages.ClientHello 
     AddT(e, eeBytes);
     // Certificate.
     mut CertificateEntry[] entries = Array.Empty<CertificateEntry>();
-    i64 nc = Array.Len<Blob>(s.certificateChain);
+    i64 nc = Array.Len<TlsConfig.Blob>(s.certificateChain);
     mut i64 i = 0_i64;
     while i < nc {
-        Blob cert = s.certificateChain[i];
+        TlsConfig.Blob cert = s.certificateChain[i];
         mut Extension[] none = Array.Empty<Extension>();
         Array.Append<CertificateEntry>(entries, CertificateEntry { data: cert.data, extensions: none });
         i = i + 1_i64;

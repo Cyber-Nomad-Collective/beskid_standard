@@ -1,0 +1,170 @@
+/// Core.Path.Lexical — purely textual path operations with POSIX `/` separators.
+/// @tier(supported)
+/// Nothing here touches the filesystem: `..` is resolved against the preceding text, so results
+/// can differ from the real filesystem when symbolic links are involved. Use `ToForwardSlashes`
+/// first for Windows-style input.
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.String.Core;
+use Core.String.Transform;
+
+/// Returns true when `path` starts with `/`.
+pub bool IsRooted(string path) {
+    return Core.Len(path) > 0 && Core.ByteAt(path, 0) == 47;
+}
+
+/// Replaces every `\` with `/`.
+pub string ToForwardSlashes(string path) {
+    return Transform.Replace(path, "\\", "/");
+}
+
+/// Splits `path` into its non-empty components, dropping empty and `.` segments.
+/// `/a//b/./c` gives `a`, `b`, `c`; `..` segments are kept as written.
+pub string[] Segments(string path) {
+    string[] raw = Transform.Split(path, "/");
+    mut string[] parts = Array.Empty<string>();
+    mut i64 i = 0;
+    while i < Array.Len<string>(raw) {
+        string part = Array.Get<string>(raw, i);
+        if Core.Len(part) > 0 && part != "." {
+            parts = Array.Append<string>(parts, part);
+        }
+        i = i + 1;
+    }
+    return parts;
+}
+
+/// Lexically normalizes `path`: collapses repeated separators, removes `.` segments, and resolves
+/// `..` against the preceding segment. A rooted path never climbs above `/`; a relative path
+/// keeps unresolved leading `..` segments. The empty relative result is `.`.
+pub string Normalize(string path) {
+    bool rooted = IsRooted(path);
+    string[] parts = Segments(path);
+    mut string[] kept = Array.Empty<string>();
+    mut i64 count = 0;
+    mut i64 i = 0;
+    while i < Array.Len<string>(parts) {
+        string part = Array.Get<string>(parts, i);
+        if part == ".." {
+            if count > 0 && Array.Get<string>(kept, count - 1) != ".." {
+                kept = Array.RemoveLast<string>(kept);
+                count = count - 1;
+            } else {
+                if !rooted {
+                    kept = Array.Append<string>(kept, part);
+                    count = count + 1;
+                }
+            }
+        } else {
+            kept = Array.Append<string>(kept, part);
+            count = count + 1;
+        }
+        i = i + 1;
+    }
+    string body = Transform.Join(kept, "/");
+    if rooted {
+        return Transform.Concat("/", body);
+    }
+    if count == 0 {
+        return ".";
+    }
+    return body;
+}
+
+/// Joins `parts` with `/` and normalizes the result. A rooted part discards everything before it,
+/// so `JoinAll(["a", "/b", "c"])` is `/b/c`.
+pub string JoinAll(string[] parts) {
+    mut string joined = "";
+    mut i64 i = 0;
+    while i < Array.Len<string>(parts) {
+        string part = Array.Get<string>(parts, i);
+        if IsRooted(part) {
+            joined = part;
+        } else {
+            if Core.Len(part) > 0 {
+                if Core.Len(joined) > 0 {
+                    joined = joined + "/" + part;
+                } else {
+                    joined = part;
+                }
+            }
+        }
+        i = i + 1;
+    }
+    return Normalize(joined);
+}
+
+/// Returns the relative path that leads from directory `from` to `to`, after normalizing both.
+/// Returns `None` when exactly one of them is rooted, or when `from` keeps leading `..` segments
+/// that cannot be inverted lexically.
+pub Option<string> Relative(string from, string to) {
+    if IsRooted(from) != IsRooted(to) {
+        return Option::None;
+    }
+    string[] source = Segments(Normalize(from));
+    string[] target = Segments(Normalize(to));
+    i64 sourceCount = Array.Len<string>(source);
+    i64 targetCount = Array.Len<string>(target);
+    mut i64 common = 0;
+    while common < sourceCount && common < targetCount && Array.Get<string>(source, common) == Array.Get<string>(target, common) {
+        common = common + 1;
+    }
+    mut string[] steps = Array.Empty<string>();
+    mut i64 i = common;
+    while i < sourceCount {
+        if Array.Get<string>(source, i) == ".." {
+            return Option::None;
+        }
+        steps = Array.Append<string>(steps, "..");
+        i = i + 1;
+    }
+    i = common;
+    while i < targetCount {
+        steps = Array.Append<string>(steps, Array.Get<string>(target, i));
+        i = i + 1;
+    }
+    if Array.Len<string>(steps) == 0 {
+        return Option::Some(".");
+    }
+    return Option::Some(Transform.Join(steps, "/"));
+}
+
+/// Returns the final component without its last extension: `dir/archive.tar.gz` gives
+/// `archive.tar`, `.profile` (a leading dot only) is returned whole.
+pub string Stem(string path) {
+    string[] parts = Segments(path);
+    i64 count = Array.Len<string>(parts);
+    if count == 0 {
+        return "";
+    }
+    string name = Array.Get<string>(parts, count - 1);
+    mut i64 dot = Core.Len(name) - 1;
+    while dot > 0 && Core.ByteAt(name, dot) != 46 {
+        dot = dot - 1;
+    }
+    if dot <= 0 {
+        return name;
+    }
+    return Core.SubSlice(name, 0, dot);
+}
+
+/// Returns the parent of a normalized `path`: `/a/b` gives `/a`, `/a` gives `/`, `a` gives `.`,
+/// and `/` stays `/`.
+pub string Parent(string path) {
+    string normal = Normalize(path);
+    if normal == "/" || normal == "." {
+        return normal;
+    }
+    string[] parts = Segments(normal);
+    i64 count = Array.Len<string>(parts);
+    if Array.Get<string>(parts, count - 1) == ".." {
+        return Transform.Concat(normal, "/..");
+    }
+    if count == 1 {
+        if IsRooted(normal) {
+            return "/";
+        }
+        return ".";
+    }
+    return Normalize(Transform.Concat(normal, "/.."));
+}

@@ -1,0 +1,735 @@
+/// Exact native IEEE754/decimal conversion. No host parser/formatter calls.
+/// Long-mantissa retention follows the exact midpoint comparison bounds in
+/// fast_float binary_format (769 double / 114 float digits), with a nonzero
+/// sticky digit appended instead of rounding a retained run of nines.
+use Core.Collections.Array;
+
+use Core.Results;
+
+use Core.Serialization.Decimal;
+
+use Core.Serialization.Errors;
+
+use Core.Serialization.Limits;
+
+use Core.String;
+
+type Big
+{
+    u32[] words,
+}
+
+type Ratio
+{
+    Big numerator,
+
+    Big denominator,
+}
+
+type Binary
+{
+    u64 mantissa,
+
+    i64 exponent,
+}
+
+type Layout
+{
+    i64 fractionBits,
+
+    i64 bias,
+
+    i64 minExponent,
+
+    i64 digits,
+
+    i64 minOrder,
+
+    i64 maxOrder,
+
+    u64 sign,
+
+    u64 maximum,
+
+    u64 fractionMask,
+
+    u64 exponentMask,
+}
+
+Big Make(u64 value)
+{
+    mut u32[] words = Array.Empty<u32>();
+    Array.Append<u32>(words, u32(value & 4294967295_u64));
+    if (value > 4294967295_u64)
+    {
+        Array.Append<u32>(words, u32(value >> 32_u64));
+    }
+    return Big
+    {
+        words: words,
+    };
+}
+
+Big Copy(Big source)
+{
+    mut Big result = Make(0_u64);
+    Array.Set<u32>(result.words, 0_i64, source.words[0_i64]);
+    mut i64 i = 1_i64;
+    while (i < Array.Len<u32>(source.words))
+    {
+        Array.Append<u32>(result.words, source.words[i]);
+        i = i + 1_i64;
+    }
+    return result;
+}
+
+unit MultiplySmall(Big value, u32 factor)
+{
+    mut u64 carry = 0_u64;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<u32>(value.words))
+    {
+        u64 product = u64(value.words[i]) * u64(factor) + carry;
+        Array.Set<u32>(value.words, i, u32(product & 4294967295_u64));
+        carry = product >> 32_u64;
+        i = i + 1_i64;
+    }
+    if (carry != 0_u64)
+    {
+        Array.Append<u32>(value.words, u32(carry));
+    }
+}
+
+unit AddSmall(Big value, u32 addend)
+{
+    mut u64 carry = u64(addend);
+    mut i64 i = 0_i64;
+    while (carry != 0_u64 && i < Array.Len<u32>(value.words))
+    {
+        u64 sum = u64(value.words[i]) + carry;
+        Array.Set<u32>(value.words, i, u32(sum & 4294967295_u64));
+        carry = sum >> 32_u64;
+        i = i + 1_i64;
+    }
+    if (carry != 0_u64)
+    {
+        Array.Append<u32>(value.words, u32(carry));
+    }
+}
+
+unit Add(Big value, Big other)
+{
+    mut u64 carry = 0_u64;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<u32>(other.words) || carry != 0_u64)
+    {
+        if (i >= Array.Len<u32>(value.words))
+        {
+            Array.Append<u32>(value.words, 0_u32);
+        }
+
+        mut u64 digit = 0_u64;
+        if (i < Array.Len<u32>(other.words))
+        {
+            digit = u64(other.words[i]);
+        }
+
+        u64 sum = u64(value.words[i]) + digit + carry;
+        Array.Set<u32>(value.words, i, u32(sum & 4294967295_u64));
+        carry = sum >> 32_u64;
+        i = i + 1_i64;
+    }
+}
+
+Big Shift(Big value, i64 count)
+{
+    mut Big result = Make(0_u64);
+    if (count == 0_i64)
+    {
+        return Copy(value);
+    }
+
+    i64 whole = count / 32_i64;
+    i64 bits = count % 32_i64;
+    mut i64 i = 1_i64;
+    while (i < whole)
+    {
+        Array.Append<u32>(result.words, 0_u32);
+        i = i + 1_i64;
+    }
+
+    mut u64 carry = 0_u64;
+    i = 0_i64;
+    while (i < Array.Len<u32>(value.words))
+    {
+        u64 combined = (u64(value.words[i]) << u64(bits)) | carry;
+        if (whole == 0_i64 && i == 0_i64)
+        {
+            Array.Set<u32>(result.words, 0_i64, u32(combined & 4294967295_u64));
+        }
+        else
+        {
+            Array.Append<u32>(result.words, u32(combined & 4294967295_u64));
+        }
+        carry = combined >> 32_u64;
+        i = i + 1_i64;
+    }
+    if (carry != 0_u64)
+    {
+        Array.Append<u32>(result.words, u32(carry));
+    }
+    return result;
+}
+
+Big Product(Big value, u64 factor)
+{
+    mut Big low = Copy(value);
+    MultiplySmall(low, u32(factor & 4294967295_u64));
+    if (factor > 4294967295_u64)
+    {
+        mut Big high = Copy(value);
+        MultiplySmall(high, u32(factor >> 32_u64));
+        Add(low, Shift(high, 32_i64));
+    }
+    return low;
+}
+
+i64 Used(Big value)
+{
+    mut i64 size = Array.Len<u32>(value.words);
+    while (size > 1_i64 && value.words[size - 1_i64] == 0_u32)
+    {
+        size = size - 1_i64;
+    }
+    return size;
+}
+
+i64 Compare(Big left, Big right)
+{
+    i64 a = Used(left);
+    i64 b = Used(right);
+    if (a < b)
+    {
+        return -1_i64;
+    }
+    if (a > b)
+    {
+        return 1_i64;
+    }
+
+    mut i64 i = a;
+    while (i > 0_i64)
+    {
+        i = i - 1_i64;
+        if (left.words[i] < right.words[i])
+        {
+            return -1_i64;
+        }
+        if (left.words[i] > right.words[i])
+        {
+            return 1_i64;
+        }
+    }
+    return 0_i64;
+}
+
+unit PowerTen(Big value, i64 exponent)
+{
+    mut i64 i = 0_i64;
+    while (i < exponent)
+    {
+        MultiplySmall(value, 10_u32);
+        i = i + 1_i64;
+    }
+}
+
+Ratio DecimalRatio(Big digits, i64 exponent)
+{
+    mut Big numerator = Copy(digits);
+    mut Big denominator = Make(1_u64);
+    if (exponent >= 0_i64)
+    {
+        PowerTen(numerator, exponent);
+    }
+    else
+    {
+        PowerTen(denominator, -exponent);
+    }
+    return Ratio
+    {
+        numerator: numerator,
+
+        denominator: denominator,
+    };
+}
+
+Layout FloatLayout(u8 width)
+{
+    if (width == 32_u8)
+    {
+        return Layout
+        {
+            fractionBits: 23_i64,
+
+            bias: 127_i64,
+
+            minExponent: -149_i64,
+
+            digits: 114_i64,
+
+            minOrder: -46_i64,
+
+            maxOrder: 38_i64,
+
+            sign: 2147483648_u64,
+
+            maximum: 2139095039_u64,
+
+            fractionMask: 8388607_u64,
+
+            exponentMask: 255_u64,
+        };
+    }
+    return Layout
+    {
+        fractionBits: 52_i64,
+
+        bias: 1023_i64,
+
+        minExponent: -1074_i64,
+
+        digits: 769_i64,
+
+        minOrder: -325_i64,
+
+        maxOrder: 308_i64,
+
+        sign: 9223372036854775808_u64,
+
+        maximum: 9218868437227405311_u64,
+
+        fractionMask: 4503599627370495_u64,
+
+        exponentMask: 2047_u64,
+    };
+}
+
+Binary BinaryValue(u64 bits, Layout layout)
+{
+    u64 exponent = (bits >> u64(layout.fractionBits)) & layout.exponentMask;
+    u64 mantissa = bits & layout.fractionMask;
+    if (exponent == 0_u64)
+    {
+        return Binary
+        {
+            mantissa: mantissa,
+
+            exponent: layout.minExponent,
+        };
+    }
+    return Binary
+    {
+        mantissa: mantissa | (1_u64 << u64(layout.fractionBits)),
+
+        exponent: i64(exponent) - layout.bias - layout.fractionBits,
+    };
+}
+
+i64 CompareBinary(Ratio decimal, Binary binary)
+{
+    mut Big left = Copy(decimal.numerator);
+    mut Big right = Product(decimal.denominator, binary.mantissa);
+    if (binary.exponent >= 0_i64)
+    {
+        right = Shift(right, binary.exponent);
+    }
+    else
+    {
+        left = Shift(left, -binary.exponent);
+    }
+    return Compare(left, right);
+}
+
+u64 Rounded(Ratio decimal, Layout layout)
+{
+    mut u64 low = 0_u64;
+    mut u64 high = layout.maximum;
+    while (low < high)
+    {
+        u64 middle = low + (high - low + 1_u64) / 2_u64;
+        if (CompareBinary(decimal, BinaryValue(middle, layout)) >= 0_i64)
+        {
+            low = middle;
+        }
+        else
+        {
+            high = middle - 1_u64;
+        }
+    }
+
+    Binary a = BinaryValue(low, layout);
+    Binary b = BinaryValue(low + 1_u64, layout);
+    mut i64 exponent = a.exponent;
+    if (b.exponent < exponent)
+    {
+        exponent = b.exponent;
+    }
+
+    u64 sum = (a.mantissa << u64(a.exponent - exponent)) + (b.mantissa << u64(b.exponent - exponent));
+    i64 midpoint = CompareBinary(decimal, Binary
+    {
+        mantissa: sum,
+
+        exponent: exponent - 1_i64,
+    });
+    if (midpoint > 0_i64 || (midpoint == 0_i64 && (low & 1_u64) != 0_u64))
+    {
+        return low + 1_u64;
+    }
+    return low;
+}
+
+bool Valid(SerializationLimits limits)
+{
+    return limits.maxInputBytes >= 0_i64 && limits.maxOutputBytes >= 0_i64 && limits.maxScalarBytes >= 0_i64 && limits.maxNodes >= 1_i64 && limits.maxDepth >= 1_i64;
+}
+
+bool Digit(u8 byte)
+{
+    return byte >= 48_u8 && byte <= 57_u8;
+}
+
+pub Result<u64, SerializationError> Parse(string text, u8 width, SerializationLimits limits)
+{
+    i64 length = String.Len(text);
+    if (!Valid(limits))
+    {
+        return Result::Error(Errors.NumericError("InvalidLimits"));
+    }
+    if (width != 32_u8 && width != 64_u8)
+    {
+        return Result::Error(Errors.NumericError("UnsupportedWireWidth"));
+    }
+    if (length > limits.maxInputBytes || length > limits.maxScalarBytes || length > 2305843009213693951_i64)
+    {
+        return Result::Error(Errors.NumericError("LimitExceeded"));
+    }
+    if (length == 0_i64)
+    {
+        return Result::Error(Errors.NumericError("InvalidFloat"));
+    }
+
+    Layout layout = FloatLayout(width);
+    mut i64 position = 0_i64;
+    mut bool negative = false;
+    u8 first = String.ByteAt(text, 0_i64);
+    if (first == 45_u8 || first == 43_u8)
+    {
+        negative = first == 45_u8;
+        position = 1_i64;
+    }
+    if (position >= length || !Digit(String.ByteAt(text, position)))
+    {
+        return Result::Error(Errors.NumericError("InvalidFloat"));
+    }
+
+    mut Big digits = Make(0_u64);
+    mut i64 kept = 0_i64;
+    mut i64 significant = 0_i64;
+    mut i64 fraction = 0_i64;
+    mut bool dotted = false;
+    mut bool nonzero = false;
+    mut bool sticky = false;
+    while (position < length)
+    {
+        u8 byte = String.ByteAt(text, position);
+        if (byte == 46_u8 && !dotted)
+        {
+            dotted = true;
+            position = position + 1_i64;
+            if (position >= length || !Digit(String.ByteAt(text, position)))
+            {
+                return Result::Error(Errors.NumericError("InvalidFloat"));
+            }
+        }
+        else if (Digit(byte))
+        {
+            if (dotted)
+            {
+                fraction = fraction + 1_i64;
+            }
+            if (byte != 48_u8)
+            {
+                nonzero = true;
+            }
+            if (nonzero)
+            {
+                significant = significant + 1_i64;
+                if (kept < layout.digits)
+                {
+                    MultiplySmall(digits, 10_u32);
+                    AddSmall(digits, u32(byte - 48_u8));
+                    kept = kept + 1_i64;
+                }
+                else if (byte != 48_u8)
+                {
+                    sticky = true;
+                }
+            }
+            position = position + 1_i64;
+        }
+        else
+        {
+            break;
+        }
+    }
+
+    mut i64 exponent = 0_i64;
+    mut bool exponentNegative = false;
+    if (position < length && (String.ByteAt(text, position) == 101_u8 || String.ByteAt(text, position) == 69_u8))
+    {
+        position = position + 1_i64;
+        if (position < length && (String.ByteAt(text, position) == 45_u8 || String.ByteAt(text, position) == 43_u8))
+        {
+            exponentNegative = String.ByteAt(text, position) == 45_u8;
+            position = position + 1_i64;
+        }
+        if (position >= length || !Digit(String.ByteAt(text, position)))
+        {
+            return Result::Error(Errors.NumericError("InvalidFloat"));
+        }
+
+        i64 maximum = length + 4096_i64;
+        while (position < length && Digit(String.ByteAt(text, position)))
+        {
+            i64 digit = i64(String.ByteAt(text, position) - 48_u8);
+            if (exponent > (maximum - digit) / 10_i64)
+            {
+                exponent = maximum;
+            }
+            else
+            {
+                exponent = exponent * 10_i64 + digit;
+            }
+            position = position + 1_i64;
+        }
+    }
+    if (position != length)
+    {
+        return Result::Error(Errors.NumericError("InvalidFloat"));
+    }
+
+    mut u64 sign = 0_u64;
+    if (negative)
+    {
+        sign = layout.sign;
+    }
+    if (!nonzero)
+    {
+        return Result::Ok(sign);
+    }
+    if (exponentNegative)
+    {
+        exponent = -exponent;
+    }
+
+    i64 order = exponent - fraction + significant - 1_i64;
+    if (order > layout.maxOrder)
+    {
+        return Result::Error(Errors.NumericError("FloatOutOfRange"));
+    }
+    if (order < layout.minOrder)
+    {
+        return Result::Ok(sign);
+    }
+    if (sticky)
+    {
+        MultiplySmall(digits, 10_u32);
+        AddSmall(digits, 1_u32);
+        kept = kept + 1_i64;
+    }
+
+    Ratio decimal = DecimalRatio(digits, order - kept + 1_i64);
+    u64 bits = Rounded(decimal, layout);
+    if (bits > layout.maximum)
+    {
+        return Result::Error(Errors.NumericError("FloatOutOfRange"));
+    }
+    return Result::Ok(bits | sign);
+}
+
+Ratio BinaryRatio(Binary binary)
+{
+    mut Big numerator = Make(binary.mantissa);
+    mut Big denominator = Make(1_u64);
+    if (binary.exponent >= 0_i64)
+    {
+        numerator = Shift(numerator, binary.exponent);
+    }
+    else
+    {
+        denominator = Shift(denominator, -binary.exponent);
+    }
+    return Ratio
+    {
+        numerator: numerator,
+
+        denominator: denominator,
+    };
+}
+
+i64 ComparePower(Ratio value, i64 power)
+{
+    mut Big left = Copy(value.numerator);
+    mut Big right = Copy(value.denominator);
+    if (power >= 0_i64)
+    {
+        PowerTen(right, power);
+    }
+    else
+    {
+        PowerTen(left, -power);
+    }
+    return Compare(left, right);
+}
+
+u64 NearestInteger(Ratio value, u64 maximum)
+{
+    mut u64 low = 0_u64;
+    mut u64 high = maximum;
+    while (low < high)
+    {
+        u64 middle = low + (high - low + 1_u64) / 2_u64;
+        if (Compare(value.numerator, Product(value.denominator, middle)) >= 0_i64)
+        {
+            low = middle;
+        }
+        else
+        {
+            high = middle - 1_u64;
+        }
+    }
+
+    i64 half = Compare(Product(value.numerator, 2_u64), Product(value.denominator, low * 2_u64 + 1_u64));
+    if (half > 0_i64 || (half == 0_i64 && (low & 1_u64) != 0_u64))
+    {
+        return low + 1_u64;
+    }
+    return low;
+}
+
+pub Result<string, SerializationError> Format(u64 bits, u8 width, SerializationLimits limits)
+{
+    if (!Valid(limits))
+    {
+        return Result::Error(Errors.NumericError("InvalidLimits"));
+    }
+    if (width != 32_u8 && width != 64_u8)
+    {
+        return Result::Error(Errors.NumericError("UnsupportedWireWidth"));
+    }
+
+    Layout layout = FloatLayout(width);
+    if (width == 32_u8 && bits > 4294967295_u64)
+    {
+        return Result::Error(Errors.NumericError("FloatOutOfRange"));
+    }
+
+    bool negative = (bits & layout.sign) != 0_u64;
+    u64 magnitude = bits & (layout.sign - 1_u64);
+    if (magnitude > layout.maximum)
+    {
+        return Result::Error(Errors.NumericError("NonFiniteFloat"));
+    }
+
+    mut string sign = "";
+    if (negative)
+    {
+        sign = "-";
+    }
+    if (magnitude == 0_u64)
+    {
+        string zero = sign + "0.0";
+        if (String.Len(zero) > limits.maxOutputBytes || String.Len(zero) > limits.maxScalarBytes)
+        {
+            return Result::Error(Errors.NumericError("LimitExceeded"));
+        }
+        return Result::Ok(zero);
+    }
+
+    Ratio value = BinaryRatio(BinaryValue(magnitude, layout));
+    mut i64 low = -325_i64;
+    mut i64 high = 309_i64;
+    while (low < high)
+    {
+        i64 middle = low + (high - low + 1_i64) / 2_i64;
+        if (ComparePower(value, middle) >= 0_i64)
+        {
+            low = middle;
+        }
+        else
+        {
+            high = middle - 1_i64;
+        }
+    }
+
+    i64 order = low;
+    mut i64 count = 1_i64;
+    mut u64 maximum = 10_u64;
+    mut i64 maxDigits = 17_i64;
+    if (width == 32_u8)
+    {
+        maxDigits = 9_i64;
+    }
+    while (count <= maxDigits)
+    {
+        mut i64 exponent = order - count + 1_i64;
+        mut Ratio scaled = Ratio
+        {
+            numerator: Copy(value.numerator),
+
+            denominator: Copy(value.denominator),
+        };
+        if (exponent >= 0_i64)
+        {
+            PowerTen(scaled.denominator, exponent);
+        }
+        else
+        {
+            PowerTen(scaled.numerator, -exponent);
+        }
+
+        u64 nearest = NearestInteger(scaled, maximum);
+        // IEEE rounding intervals are asymmetric at powers of two. The closest
+        // decimal can miss the narrow side while its adjacent neighbor lies in
+        // the wider side; all three candidates are checked at this precision.
+        mut i64 candidate = 0_i64;
+        while (candidate < 3_i64)
+        {
+            mut u64 decimal = nearest;
+            if (candidate == 1_i64) { if (nearest > 0_u64) { decimal = nearest - 1_u64; } }
+            if (candidate == 2_i64) { decimal = nearest + 1_u64; }
+            mut i64 candidateExponent = exponent;
+            if (decimal != 0_u64)
+            {
+                while (decimal % 10_u64 == 0_u64) { decimal = decimal / 10_u64; candidateExponent = candidateExponent + 1_i64; }
+                string text = sign + Decimal.Unsigned(decimal) + "e" + Decimal.Signed(candidateExponent);
+                match Parse(text, width, Limits.DefaultLimits())
+                {
+                    Result::Error(_) => { },
+                    Result::Ok(actual) => {
+                        if (actual == bits)
+                        {
+                            if (String.Len(text) > limits.maxOutputBytes || String.Len(text) > limits.maxScalarBytes) { return Result::Error(Errors.NumericError("LimitExceeded")); }
+                            return Result::Ok(text);
+                        }
+                    },
+                };
+            }
+            candidate = candidate + 1_i64;
+        }
+        maximum = maximum * 10_u64;
+        count = count + 1_i64;
+    }
+    return Result::Error(Errors.NumericError("FloatConversionFailed"));
+}

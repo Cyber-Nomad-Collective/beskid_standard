@@ -1,0 +1,329 @@
+use Core.Collections.Array;
+use Core.Optional.Option;
+
+use Core.Hash.Sha256;
+
+use Core.Results;
+
+use Core.Serialization.Descriptors;
+
+use Core.Serialization.Errors;
+
+use Core.Serialization.Metadata;
+
+use Core.String;
+
+pub type ShapeRegistry
+{
+    ShapeDescriptor[] descriptors,
+}
+
+pub ShapeRegistry Create()
+{
+    return ShapeRegistry
+    {
+        descriptors: Array.Empty<ShapeDescriptor>(),
+    };
+}
+
+FieldDescriptor[] CopyFields(FieldDescriptor[] source)
+{
+    mut FieldDescriptor[] result = Array.Empty<FieldDescriptor>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<FieldDescriptor>(source))
+    {
+        FieldDescriptor field = source[i];
+        Array.Append<FieldDescriptor>(result, FieldDescriptor
+        {
+            name: field.name,
+
+            shape: field.shape,
+
+            required: field.required,
+
+            optional: field.optional,
+
+            defaultSignature: field.defaultSignature,
+        });
+        i = i + 1_i64;
+    }
+    return result;
+}
+
+ShapeDescriptor Copy(ShapeDescriptor source)
+{
+    mut Metadata.ShapeId[] arguments = Array.Empty<Metadata.ShapeId>();
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Metadata.ShapeId>(source.arguments))
+    {
+        Array.Append<Metadata.ShapeId>(arguments, source.arguments[i]);
+        i = i + 1_i64;
+    }
+
+    mut VariantDescriptor[] variants = Array.Empty<VariantDescriptor>();
+    i = 0_i64;
+    while (i < Array.Len<VariantDescriptor>(source.variants))
+    {
+        VariantDescriptor variant = source.variants[i];
+        Array.Append<VariantDescriptor>(variants, VariantDescriptor
+        {
+            name: variant.name,
+
+            ordinal: variant.ordinal,
+
+            fields: CopyFields(variant.fields),
+        });
+        i = i + 1_i64;
+    }
+    return ShapeDescriptor
+    {
+        id: source.id,
+
+        signature: source.signature,
+
+        packageIdentity: source.packageIdentity,
+
+        sourcePath: source.sourcePath,
+
+        declarationPath: source.declarationPath,
+
+        schemaVersion: source.schemaVersion,
+
+        kind: source.kind,
+
+        width: source.width,
+
+        arguments: arguments,
+
+        fields: CopyFields(source.fields),
+
+        variants: variants,
+
+        extras: source.extras,
+    };
+}
+
+bool SameFields(FieldDescriptor[] left, FieldDescriptor[] right)
+{
+    if (Array.Len<FieldDescriptor>(left) != Array.Len<FieldDescriptor>(right))
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<FieldDescriptor>(left))
+    {
+        FieldDescriptor a = left[i];
+        FieldDescriptor b = right[i];
+        if (a.name != b.name || Metadata.FormatShapeId(a.shape) != Metadata.FormatShapeId(b.shape) || a.required != b.required || a.optional != b.optional || a.defaultSignature != b.defaultSignature)
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+bool Same(ShapeDescriptor a, ShapeDescriptor b)
+{
+    if (a.signature != b.signature || a.packageIdentity != b.packageIdentity || a.sourcePath != b.sourcePath || a.declarationPath != b.declarationPath || a.schemaVersion != b.schemaVersion || a.kind != b.kind || a.width != b.width || !Descriptors.SameExtras(a.extras, b.extras) || !SameFields(a.fields, b.fields))
+    {
+        return false;
+    }
+    if (Array.Len<Metadata.ShapeId>(a.arguments) != Array.Len<Metadata.ShapeId>(b.arguments) || Array.Len<VariantDescriptor>(a.variants) != Array.Len<VariantDescriptor>(b.variants))
+    {
+        return false;
+    }
+
+    mut i64 i = 0_i64;
+    while (i < Array.Len<Metadata.ShapeId>(a.arguments))
+    {
+        if (Metadata.FormatShapeId(a.arguments[i]) != Metadata.FormatShapeId(b.arguments[i]))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    i = 0_i64;
+    while (i < Array.Len<VariantDescriptor>(a.variants))
+    {
+        VariantDescriptor x = a.variants[i];
+        VariantDescriptor y = b.variants[i];
+        if (x.name != y.name || x.ordinal != y.ordinal || !SameFields(x.fields, y.fields))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+pub Result<Metadata.ShapeId, SerializationError> SignatureId(string signature, i64 maxBytes)
+{
+    return match Sha256.HashUtf8(signature, maxBytes)
+    {
+        Result::Error(_) => Result::Error(Errors.NumericError("SignatureLimitExceeded")),
+
+        Result::Ok(bytes) => {
+            string alphabet = "0123456789abcdef";
+            mut u8[] hex = Array.Empty<u8>();
+            mut i64 i = 0_i64;
+            while (i < 32_i64)
+            {
+                u8 value = bytes[i];
+                Array.Append<u8>(hex, String.ByteAt(alphabet, i64(value >> 4_u8)));
+                Array.Append<u8>(hex, String.ByteAt(alphabet, i64(value & 15_u8)));
+                i = i + 1_i64;
+            }
+            return Metadata.ParseShapeId(String.FromUtf8CodeUnits(hex));
+        },
+    };
+}
+
+pub Result<unit, SerializationError> Register(ShapeRegistry shapeTable, ShapeDescriptor descriptor, i64 maxSignatureBytes, i64 maxShapes)
+{
+    if (maxShapes < 1_i64 || maxSignatureBytes < 0_i64)
+    {
+        return Result::Error(Errors.NumericError("InvalidLimits"));
+    }
+    match SignatureId(descriptor.signature, maxSignatureBytes)
+    {
+        Result::Error(error) => {
+            return Result::Error(error);
+        },
+
+        Result::Ok(id) => {
+            if (Metadata.FormatShapeId(id) != Metadata.FormatShapeId(descriptor.id))
+            {
+                return Result::Error(Errors.NumericError("ShapeIdMismatch"));
+            }
+        },
+    };
+    mut i64 i = 0_i64;
+    while (i < Array.Len<ShapeDescriptor>(shapeTable.descriptors))
+    {
+        ShapeDescriptor prior = shapeTable.descriptors[i];
+        if (Metadata.FormatShapeId(prior.id) == Metadata.FormatShapeId(descriptor.id))
+        {
+            if (!Same(prior, descriptor))
+            {
+                return Result::Error(Errors.NumericError("ShapeRegistrationConflict"));
+            }
+            return Result::Ok(());
+        }
+        i = i + 1_i64;
+    }
+    if (i >= maxShapes)
+    {
+        return Result::Error(Errors.NumericError("ShapeRegistrationLimit"));
+    }
+    Array.Append<ShapeDescriptor>(shapeTable.descriptors, Copy(descriptor));
+    return Result::Ok(());
+}
+
+pub Result<ShapeDescriptor, SerializationError> Lookup(ShapeRegistry shapeTable, Metadata.ShapeId id)
+{
+    mut i64 i = 0_i64;
+    while (i < Array.Len<ShapeDescriptor>(shapeTable.descriptors))
+    {
+        ShapeDescriptor descriptor = shapeTable.descriptors[i];
+        if (Metadata.FormatShapeId(descriptor.id) == Metadata.FormatShapeId(id))
+        {
+            return Result::Ok(Copy(descriptor));
+        }
+        i = i + 1_i64;
+    }
+    return Result::Error(Errors.NumericError("UnknownShape"));
+}
+
+/// Returns the value shape only for a sealed binding belonging to this exact
+/// registered target and canonical string-map application.
+pub Result<Metadata.ShapeId, SerializationError> ExtraValue(ShapeRegistry table, ShapeDescriptor descriptor) {
+    match descriptor.extras {
+        Option::None => { return Result::Error(Errors.NumericError("UnknownField")); },
+        Option::Some(binding) => {
+            if (Metadata.FormatShapeId(Descriptors.ExtrasTarget(binding)) != Metadata.FormatShapeId(descriptor.id)) {
+                return Result::Error(Errors.NumericError("ExtrasTargetMismatch"));
+            }
+            match Lookup(table, Descriptors.ExtrasMap(binding)) {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(map) => {
+                    if (map.kind != ShapeKind::Map || Array.Len<Metadata.ShapeId>(map.arguments) != 1_i64 || Metadata.FormatShapeId(map.arguments[0_i64]) != Metadata.FormatShapeId(Descriptors.ExtrasValue(binding))) {
+                        return Result::Error(Errors.NumericError("ExtrasMapMismatch"));
+                    }
+                },
+            };
+            match Lookup(table, Descriptors.ExtrasValue(binding)) {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(_) => { return Result::Ok(Descriptors.ExtrasValue(binding)); },
+            };
+        },
+    };
+}
+
+Result<unit, SerializationError> CheckFields(ShapeRegistry table, FieldDescriptor[] fields) {
+    mut i64 index = 0_i64;
+    while (index < Array.Len<FieldDescriptor>(fields)) {
+        match Lookup(table, fields[index].shape) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(_) => { },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(());
+}
+
+/// Admission stages a complete copied table, checks all edges and sealed
+/// bindings, then publishes one managed reference. Failure leaves the old table.
+pub Result<unit, SerializationError> RegisterGraph(ShapeRegistry table, ShapeDescriptor[] graph, i64 maxSignatureBytes, i64 maxTotalSignatureBytes, i64 maxShapes) {
+    if (maxTotalSignatureBytes < 0_i64 || maxSignatureBytes < 0_i64 || maxShapes < 1_i64 || Array.Len<ShapeDescriptor>(graph) > maxShapes) {
+        return Result::Error(Errors.NumericError("InvalidLimits"));
+    }
+    ShapeRegistry staged = Create();
+    mut i64 total = 0_i64;
+    mut i64 index = 0_i64;
+    while (index < Array.Len<ShapeDescriptor>(table.descriptors)) {
+        ShapeDescriptor descriptor = table.descriptors[index];
+        if (String.Len(descriptor.signature) > maxTotalSignatureBytes - total) { return Result::Error(Errors.NumericError("ShapeSignatureLimit")); }
+        total = total + String.Len(descriptor.signature);
+        match Register(staged, descriptor, maxSignatureBytes, maxShapes) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<ShapeDescriptor>(graph)) {
+        ShapeDescriptor descriptor = graph[index];
+        if (String.Len(descriptor.signature) > maxTotalSignatureBytes - total) { return Result::Error(Errors.NumericError("ShapeSignatureLimit")); }
+        total = total + String.Len(descriptor.signature);
+        match Register(staged, descriptor, maxSignatureBytes, maxShapes) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<ShapeDescriptor>(staged.descriptors)) {
+        ShapeDescriptor descriptor = staged.descriptors[index];
+        mut i64 child = 0_i64;
+        while (child < Array.Len<Metadata.ShapeId>(descriptor.arguments)) {
+            match Lookup(staged, descriptor.arguments[child]) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
+            child = child + 1_i64;
+        }
+        match CheckFields(staged, descriptor.fields) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
+        child = 0_i64;
+        while (child < Array.Len<VariantDescriptor>(descriptor.variants)) {
+            match CheckFields(staged, descriptor.variants[child].fields) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
+            child = child + 1_i64;
+        }
+        match descriptor.extras {
+            Option::None => { },
+            Option::Some(_) => {
+                if (descriptor.kind != ShapeKind::Record) { return Result::Error(Errors.NumericError("ExtrasTargetMismatch")); }
+                match ExtraValue(staged, descriptor) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
+            },
+        };
+        index = index + 1_i64;
+    }
+    table.descriptors = staged.descriptors;
+    return Result::Ok(());
+}
+
+pub Result<unit, SerializationError> RegisterCompiled<T>(ShapeRegistry table, i64 maxSignatureBytes, i64 maxTotalSignatureBytes, i64 maxShapes) {
+    return RegisterGraph(table, Descriptors.CompiledDescriptors<T>(), maxSignatureBytes, maxTotalSignatureBytes, maxShapes);
+}

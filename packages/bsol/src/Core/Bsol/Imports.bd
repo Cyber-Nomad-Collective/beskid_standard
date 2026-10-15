@@ -1,0 +1,244 @@
+use Core.Results;
+use Core.String;
+use Core.Collections.Array;
+use Core.Hash.Sha256;
+use Core.Bsol.Syntax;
+
+/// Requests are resolved by the explicitly supplied offline host. This module
+/// performs no filesystem access, lock lookup, process invocation or network I/O.
+pub enum ImportRequest {
+    File(string path),
+    Git(string url, string revision, string path),
+    Registry(string package, string version, string path),
+    Pckg(string package, string version, string path),
+}
+
+pub type ImportFailure {
+    pub string code,
+    pub string message,
+}
+
+/// The host must resolve symlinks within its controlled roots and verify locks
+/// and cached artifacts before returning owned source. The library independently
+/// checks the returned content digest before parsing or caching it.
+pub type MaterializedSource {
+    pub string source,
+    pub string canonicalIdentity,
+    pub u8[] sourceSha256,
+}
+
+pub contract Resolver {
+    Result<MaterializedSource, ImportFailure> Resolve(ImportRequest request);
+}
+
+pub type ImportDeclaration {
+    pub string profile,
+    pub string alias,
+    pub bool hasAlias,
+    pub ImportRequest request,
+    pub Syntax.Span span,
+}
+
+/// Decode the owned syntax arena without trusting caller-supplied indices.
+/// Duplicate/unknown properties reject before any host is invoked.
+pub Result<ImportDeclaration, ImportFailure> ParseDeclaration(Syntax.Document document, i64 nodeIndex) {
+    i64 count = Array.Len<Syntax.Node>(document.nodes);
+    if (nodeIndex < 0_i64 || nodeIndex >= count) { return Result::Error(Failure("InvalidImportDeclaration", "import node is outside the document")); }
+    Syntax.Node block = document.nodes[nodeIndex];
+    if (block.kind != Syntax.NodeKind::Block || block.name != "import_schema" || !block.hasLabel || String.Len(block.label) == 0_i64 || block.schemaless || Array.Len<i64>(block.attributes) != 0_i64) {
+        return Result::Error(Failure("InvalidImportDeclaration", "expected a labelled import_schema block without attributes"));
+    }
+    if (Array.Len<i64>(block.children) > 7_i64) { return Result::Error(Failure("InvalidImportDeclaration", "import declaration exceeds its property set")); }
+    mut string from = "";
+    mut string path = "";
+    mut string url = "";
+    mut string revision = "";
+    mut string package = "";
+    mut string version = "";
+    mut string alias = "";
+    mut string[] seen = Array.Empty<string>();
+    mut i64 index = 0_i64;
+    while (index < Array.Len<i64>(block.children)) {
+        i64 childIndex = block.children[index];
+        if (childIndex < 0_i64 || childIndex >= count) { return Result::Error(Failure("InvalidImportDeclaration", "import child is outside the document")); }
+        Syntax.Node child = document.nodes[childIndex];
+        if (child.kind != Syntax.NodeKind::Assignment || Array.Len<i64>(child.children) != 1_i64 || Array.Len<i64>(child.attributes) != 0_i64) { return Result::Error(Failure("InvalidImportProperty", "import properties must be scalar assignments")); }
+        mut i64 previous = 0_i64;
+        while (previous < Array.Len<string>(seen)) {
+            if (seen[previous] == child.name) { return Result::Error(Failure("DuplicateImportProperty", "import property is repeated")); }
+            previous = previous + 1_i64;
+        }
+        Array.Append<string>(seen, child.name);
+        i64 valueIndex = child.children[0_i64];
+        if (valueIndex < 0_i64 || valueIndex >= count) { return Result::Error(Failure("InvalidImportProperty", "import value is outside the document")); }
+        Syntax.Node value = document.nodes[valueIndex];
+        if (value.kind != Syntax.NodeKind::String && value.kind != Syntax.NodeKind::Identifier && value.kind != Syntax.NodeKind::Reference) { return Result::Error(Failure("InvalidImportProperty", "import property requires textual value")); }
+        if (child.name == "from") { from = value.text; }
+        else if (child.name == "path") { path = value.text; }
+        else if (child.name == "url") { url = value.text; }
+        else if (child.name == "rev") { revision = value.text; }
+        else if (child.name == "package") { package = value.text; }
+        else if (child.name == "version") { version = value.text; }
+        else if (child.name == "alias") { alias = value.text; }
+        else { return Result::Error(Failure("UnknownImportProperty", "unknown import property")); }
+        index = index + 1_i64;
+    }
+    index = 0_i64;
+    while (index < Array.Len<string>(seen)) {
+        string property = seen[index];
+        bool common = property == "from" || property == "alias";
+        bool allowed = common || (from == "file" && property == "path") ||
+            (from == "git" && (property == "path" || property == "url" || property == "rev")) ||
+            (from == "registry" && (property == "path" || property == "package" || property == "version"));
+        if (!allowed) { return Result::Error(Failure("InvalidImportProperty", "property does not belong to this import source")); }
+        if (property == "alias" && String.Len(alias) == 0_i64) { return Result::Error(Failure("InvalidImportAlias", "explicit import alias cannot be empty")); }
+        index = index + 1_i64;
+    }
+    mut ImportRequest request = ImportRequest::File(path);
+    if (from == "file") { request = ImportRequest::File(path); }
+    else if (from == "git") { request = ImportRequest::Git(url, revision, path); }
+    else if (from == "registry") { request = ImportRequest::Registry(package, version, path); }
+    else {
+        match ParsePckgShorthand(from) {
+            Result::Error(error) => { return Result::Error(error); },
+            Result::Ok(shorthand) => { request = shorthand; },
+        };
+    }
+    match ValidateRequest(request) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => {
+            return Result::Ok(ImportDeclaration { profile: block.label, alias: alias, hasAlias: String.Len(alias) != 0_i64, request: request, span: block.span });
+        },
+    };
+}
+
+ImportFailure Failure(string code, string message) {
+    return ImportFailure { code: code, message: message };
+}
+
+/// Accept portable, root-relative paths only. The host additionally checks the
+/// real path; lexical validation cannot prove symlink containment.
+pub bool RelativePath(string path) {
+    i64 length = String.Len(path);
+    if (length == 0_i64) { return false; }
+    mut i64 segmentStart = 0_i64;
+    mut i64 index = 0_i64;
+    while (index <= length) {
+        if (index == length || String.ByteAt(path, index) == 47_u8) {
+            i64 count = index - segmentStart;
+            if (count == 0_i64) { return false; }
+            if (count == 1_i64 && String.ByteAt(path, segmentStart) == 46_u8) { return false; }
+            if (count == 2_i64 && String.ByteAt(path, segmentStart) == 46_u8 && String.ByteAt(path, segmentStart + 1_i64) == 46_u8) { return false; }
+            segmentStart = index + 1_i64;
+        } else {
+            u8 byte = String.ByteAt(path, index);
+            if (byte == 0_u8 || byte == 92_u8 || byte == 58_u8 || byte < 32_u8 || byte == 127_u8) { return false; }
+        }
+        index = index + 1_i64;
+    }
+    return true;
+}
+
+/// A Git request must identify an immutable full object, never a moving ref.
+pub bool ImmutableRevision(string revision) {
+    i64 length = String.Len(revision);
+    if (length != 40_i64 && length != 64_i64) { return false; }
+    mut i64 index = 0_i64;
+    while (index < length) {
+        u8 byte = String.ByteAt(revision, index);
+        if (!((byte >= 48_u8 && byte <= 57_u8) || (byte >= 97_u8 && byte <= 102_u8))) { return false; }
+        index = index + 1_i64;
+    }
+    return true;
+}
+
+Result<unit, ImportFailure> ValidatePath(string path) {
+    if (!RelativePath(path)) { return Result::Error(Failure("InvalidImportPath", "import path must remain relative to the controlled root")); }
+    return Result<unit, ImportFailure>::Ok(());
+}
+
+/// Share the standalone resolver's @pckg/package/version/path grammar. Preserve
+/// the remaining path verbatim so the same containment validation applies.
+pub Result<ImportRequest, ImportFailure> ParsePckgShorthand(string reference) {
+    i64 length = String.Len(reference);
+    if (length < 7_i64 || String.SubSlice(reference, 0_i64, 6_i64) != "@pckg/") {
+        return Result::Error(Failure("InvalidPackageShorthand", "expected @pckg/package/version/path"));
+    }
+    mut i64 packageEnd = 6_i64;
+    while (packageEnd < length && String.ByteAt(reference, packageEnd) != 47_u8) { packageEnd = packageEnd + 1_i64; }
+    if (packageEnd == 6_i64 || packageEnd == length) {
+        return Result::Error(Failure("InvalidPackageShorthand", "package shorthand requires a package and version"));
+    }
+    i64 versionStart = packageEnd + 1_i64;
+    mut i64 versionEnd = versionStart;
+    while (versionEnd < length && String.ByteAt(reference, versionEnd) != 47_u8) { versionEnd = versionEnd + 1_i64; }
+    if (versionEnd == versionStart || versionEnd >= length - 1_i64) {
+        return Result::Error(Failure("InvalidPackageShorthand", "package shorthand requires an exact version and profile path"));
+    }
+    string path = String.SubSlice(reference, versionEnd + 1_i64, length - versionEnd - 1_i64);
+    if (!RelativePath(path)) { return Result::Error(Failure("InvalidImportPath", "package profile path escapes the controlled root")); }
+    return Result::Ok(ImportRequest::Pckg(
+        String.SubSlice(reference, 6_i64, packageEnd - 6_i64),
+        String.SubSlice(reference, versionStart, versionEnd - versionStart),
+        path
+    ));
+}
+
+/// Validate before invoking the host. Git immutability and path safety are
+/// enforced here; exact registry lock/version verification remains the host's
+/// responsibility because only it possesses the materialized lock authority.
+pub Result<unit, ImportFailure> ValidateRequest(ImportRequest request) {
+    match request {
+        ImportRequest::File(path) => { return ValidatePath(path); },
+        ImportRequest::Git(url, revision, path) => {
+            if (String.Len(url) == 0_i64) { return Result::Error(Failure("MissingGitUrl", "Git import requires a canonical URL")); }
+            if (!ImmutableRevision(revision)) { return Result::Error(Failure("MutableGitRevision", "Git import requires a full immutable object identity")); }
+            return ValidatePath(path);
+        },
+        ImportRequest::Registry(package, version, path) => {
+            if (String.Len(package) == 0_i64 || String.Len(version) == 0_i64) { return Result::Error(Failure("MissingRegistryLock", "registry import requires package identity and exact locked version")); }
+            return ValidatePath(path);
+        },
+        ImportRequest::Pckg(package, version, path) => {
+            if (String.Len(package) == 0_i64 || String.Len(version) == 0_i64) { return Result::Error(Failure("MissingRegistryLock", "package shorthand requires package identity and exact locked version")); }
+            return ValidatePath(path);
+        },
+    };
+}
+
+/// The sole host invocation path: invalid requests never reach the adapter,
+/// and materialized bytes cannot enter the parser before digest verification.
+pub Result<MaterializedSource, ImportFailure> ResolveVerified<R>(ImportRequest request, R resolver, i64 maxBytes) where R: Resolver {
+    if (maxBytes < 0_i64) { return Result::Error(Failure("LimitExceeded", "invalid resolved source budget")); }
+    match ValidateRequest(request) {
+        Result::Error(error) => { return Result::Error(error); },
+        Result::Ok(_) => {
+            match resolver.Resolve(request) {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(materialized) => { return VerifyMaterialized(materialized, maxBytes); },
+            };
+        },
+    };
+}
+
+pub Result<MaterializedSource, ImportFailure> VerifyMaterialized(MaterializedSource materialized, i64 maxBytes) {
+    if (String.Len(materialized.canonicalIdentity) == 0_i64) {
+        return Result::Error(Failure("MissingImportIdentity", "host returned no canonical materialization identity"));
+    }
+    if (Array.Len<u8>(materialized.sourceSha256) != 32_i64) {
+        return Result::Error(Failure("ImportDigestMismatch", "materialized digest must contain all 256 bits"));
+    }
+    match Sha256.HashUtf8(materialized.source, maxBytes) {
+        Result::Error(_) => { return Result::Error(Failure("LimitExceeded", "materialized source exceeds the resolved schema budget")); },
+        Result::Ok(digest) => {
+            mut i64 index = 0_i64;
+            while (index < 32_i64) {
+                if (digest[index] != materialized.sourceSha256[index]) {
+                    return Result::Error(Failure("ImportDigestMismatch", "materialized source does not match its locked content digest"));
+                }
+                index = index + 1_i64;
+            }
+            return Result::Ok(materialized);
+        },
+    };
+}

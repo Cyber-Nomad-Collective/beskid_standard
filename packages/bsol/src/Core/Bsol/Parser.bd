@@ -1,0 +1,553 @@
+use Core.Bsol.Syntax;
+
+use Core.Bsol.Lexer;
+
+use Core.Bsol.Limits;
+
+use Core.Bsol.Errors;
+
+use Core.Collections.Array;
+
+use Core.Results;
+
+use Core.String;
+
+bool Enter(mut Lexer.State state, i64 depth)
+{
+    if (depth > state.limits.maxDepth)
+    {
+        Lexer.Fail(state, Errors.ErrorKind::DepthLimit, "BSOL nesting limit");
+        return false;
+    }
+    return !state.failed;
+}
+
+unit Child(mut Syntax.Node node, i64 child)
+{
+    if (child >= 0_i64)
+    {
+        Array.Append<i64>(node.children, child);
+    }
+}
+
+i64 Attribute(mut Lexer.State state, i64 depth)
+{
+    Lexer.Skip(state);
+    i64 start = state.pos;
+    Lexer.Require(state, 64_u8);
+    mut Syntax.Node node = Lexer.EmptyNode(Syntax.NodeKind::Attribute, start);
+    node.name = Lexer.Ident(state);
+    i64 index = Lexer.Add(state, node);
+    if (Lexer.Take(state, 40_u8))
+    {
+        Child(node, Assignment(state, depth + 1_i64, true));
+        while (Lexer.Take(state, 44_u8) && !state.failed)
+        {
+            Child(node, Assignment(state, depth + 1_i64, true));
+        }
+        Lexer.Require(state, 41_u8);
+    }
+    Lexer.Finish(state, index, node);
+    return index;
+}
+
+i64[] Attributes(mut Lexer.State state, i64 depth)
+{
+    mut i64[] attributes = [];
+    Lexer.Skip(state);
+    while (Lexer.At(state, 64_u8) && !state.failed)
+    {
+        i64 attr = Attribute(state, depth);
+        if (attr >= 0_i64)
+        {
+            Array.Append<i64>(attributes, attr);
+        }
+        Lexer.Skip(state);
+    }
+    return attributes;
+}
+
+unit Body(mut Lexer.State state, mut Syntax.Node node, i64 depth)
+{
+    Lexer.Require(state, 123_u8);
+    Lexer.Skip(state);
+    while (!Lexer.At(state, 125_u8) && !state.failed)
+    {
+        if (state.pos >= String.Len(state.source))
+        {
+            Lexer.Fail(state, Errors.ErrorKind::UnexpectedEnd, "unterminated block");
+        }
+        else
+        {
+            Child(node, Statement(state, depth + 1_i64, false));
+        }
+        Lexer.Skip(state);
+    }
+    Lexer.Require(state, 125_u8);
+}
+
+i64 Statement(mut Lexer.State state, i64 depth, bool blockOnly)
+{
+    if (!Enter(state, depth))
+    {
+        return -1_i64;
+    }
+    Lexer.Skip(state);
+    i64 start = state.pos;
+    i64[] attributes = Attributes(state, depth);
+    string name = Lexer.Ident(state);
+    Lexer.Skip(state);
+    if (!blockOnly && Lexer.At(state, 61_u8))
+    {
+        mut Syntax.Node node = Lexer.EmptyNode(Syntax.NodeKind::Assignment, start);
+        node.name = name;
+        node.attributes = attributes;
+        i64 index = Lexer.Add(state, node);
+        Lexer.Require(state, 61_u8);
+        Child(node, Value(state, depth + 1_i64));
+        Lexer.Finish(state, index, node);
+        return index;
+    }
+
+    mut Syntax.Node block = Lexer.EmptyNode(Syntax.NodeKind::Block, start);
+    block.name = name;
+    block.attributes = attributes;
+    if (Lexer.At(state, 34_u8))
+    {
+        block.hasLabel = true;
+        block.label = Lexer.Quoted(state);
+    }
+    if (Lexer.Take(state, 64_u8))
+    {
+        string suffix = Lexer.Ident(state);
+        if (suffix != "schemaless")
+        {
+            Lexer.Fail(state, Errors.ErrorKind::UnexpectedToken, "expected schemaless marker");
+        }
+        block.schemaless = true;
+    }
+
+    i64 index = Lexer.Add(state, block);
+    Body(state, block, depth);
+    Lexer.Finish(state, index, block);
+    return index;
+}
+
+i64 Assignment(mut Lexer.State state, i64 depth, bool mapEntry)
+{
+    if (!Enter(state, depth))
+    {
+        return -1_i64;
+    }
+    Lexer.Skip(state);
+    i64 start = state.pos;
+    mut Syntax.Node node = Lexer.EmptyNode(Syntax.NodeKind::Assignment, start);
+    node.name = Lexer.Ident(state);
+    i64 index = Lexer.Add(state, node);
+    Lexer.Require(state, 61_u8);
+    Child(node, Value(state, depth + 1_i64));
+    Lexer.Finish(state, index, node);
+    return index;
+}
+
+unit Unique(mut Lexer.State state, Syntax.Node map, i64 entry)
+{
+    if (entry < 0_i64 || state.failed)
+    {
+        return;
+    }
+
+    string name = state.nodes[entry].name;
+    mut i64 i = 0_i64;
+    while (i < Array.Len<i64>(map.children))
+    {
+        if (state.nodes[map.children[i]].name == name)
+        {
+            Lexer.Fail(state, Errors.ErrorKind::DuplicateKey, "duplicate map key");
+        }
+        i = i + 1_i64;
+    }
+}
+
+/// Preserve raw numbers exactly; only decimal/exponent forms require finite f64 range.
+unit Number(mut Lexer.State state, mut Syntax.Node node)
+{
+    i64 start = state.pos;
+    if (Lexer.At(state, 45_u8))
+    {
+        state.pos = state.pos + 1_i64;
+    }
+    if (!Lexer.Digit(Lexer.Peek(state)))
+    {
+        Lexer.Fail(state, Errors.ErrorKind::InvalidNumber, "expected digit");
+        return;
+    }
+    if (Lexer.At(state, 48_u8))
+    {
+        state.pos = state.pos + 1_i64;
+    }
+    else
+    {
+        while (Lexer.Digit(Lexer.Peek(state)) && state.pos < String.Len(state.source))
+        {
+            state.pos = state.pos + 1_i64;
+        }
+    }
+
+    mut bool decimal = false;
+    if (Lexer.At(state, 46_u8))
+    {
+        decimal = true;
+        state.pos = state.pos + 1_i64;
+        if (!Lexer.Digit(Lexer.Peek(state)))
+        {
+            Lexer.Fail(state, Errors.ErrorKind::InvalidNumber, "missing fractional digit");
+        }
+        while (Lexer.Digit(Lexer.Peek(state)) && state.pos < String.Len(state.source))
+        {
+            state.pos = state.pos + 1_i64;
+        }
+    }
+
+    i64 mantissaEnd = state.pos;
+    mut i64 exponent = 0_i64;
+    mut bool negativeExponent = false;
+    if (Lexer.At(state, 101_u8) || Lexer.At(state, 69_u8))
+    {
+        decimal = true;
+        state.pos = state.pos + 1_i64;
+        if (Lexer.At(state, 45_u8) || Lexer.At(state, 43_u8))
+        {
+            negativeExponent = Lexer.At(state, 45_u8);
+            state.pos = state.pos + 1_i64;
+        }
+        if (!Lexer.Digit(Lexer.Peek(state)))
+        {
+            Lexer.Fail(state, Errors.ErrorKind::InvalidNumber, "missing exponent digit");
+        }
+        while (Lexer.Digit(Lexer.Peek(state)) && state.pos < String.Len(state.source))
+        {
+            if (exponent < 100000000_i64)
+            {
+                exponent = exponent * 10_i64 + i64(Lexer.Peek(state) - 48_u8);
+            }
+            state.pos = state.pos + 1_i64;
+        }
+    }
+    if (Lexer.IdByte(Lexer.Peek(state)) || Lexer.At(state, 46_u8))
+    {
+        Lexer.Fail(state, Errors.ErrorKind::InvalidNumber, "invalid numeric suffix");
+    }
+    if (state.pos - start > state.limits.maxScalarBytes)
+    {
+        Lexer.Fail(state, Errors.ErrorKind::ScalarLimit, "number byte limit");
+        return;
+    }
+    node.raw = String.SubSlice(state.source, start, state.pos - start);
+    node.text = node.raw;
+    if (decimal && !state.failed)
+    {
+        mut f64 significand = 0.0;
+        mut i64 significantDigits = 0_i64;
+        mut i64 kept = 0_i64;
+        mut i64 fractionDigits = 0_i64;
+        mut bool fractional = false;
+        mut bool nonzero = false;
+        mut i64 i = start;
+        while (i < mantissaEnd)
+        {
+            u8 b = String.ByteAt(state.source, i);
+            if (b == 46_u8)
+            {
+                fractional = true;
+            }
+            else if (Lexer.Digit(b))
+            {
+                if (fractional)
+                {
+                    fractionDigits = fractionDigits + 1_i64;
+                }
+                if (b != 48_u8)
+                {
+                    nonzero = true;
+                }
+                if (nonzero)
+                {
+                    significantDigits = significantDigits + 1_i64;
+                    if (kept < 19_i64)
+                    {
+                        significand = significand * 10.0 + f64(b - 48_u8);
+                        kept = kept + 1_i64;
+                    }
+                }
+            }
+            i = i + 1_i64;
+        }
+        if (negativeExponent)
+        {
+            exponent = -exponent;
+        }
+        exponent = exponent - fractionDigits + significantDigits - kept;
+        if (nonzero && exponent > 400_i64)
+        {
+            Lexer.Fail(state, Errors.ErrorKind::InvalidNumber, "nonfinite decimal");
+        }
+        else if (nonzero && exponent >= -400_i64)
+        {
+            while (exponent > 0_i64)
+            {
+                significand = significand * 10.0;
+                exponent = exponent - 1_i64;
+            }
+            while (exponent < 0_i64)
+            {
+                significand = significand / 10.0;
+                exponent = exponent + 1_i64;
+            }
+            if (!(significand - significand == 0.0))
+            {
+                Lexer.Fail(state, Errors.ErrorKind::InvalidNumber, "nonfinite decimal");
+            }
+        }
+    }
+}
+
+unit TypeToken(mut Lexer.State state, mut Syntax.Node node)
+{
+    mut i64 brackets = 0_i64;
+    mut i64 parentheses = 0_i64;
+    mut bool scanning = true;
+    while (scanning && state.pos < String.Len(state.source) && !state.failed)
+    {
+        u8 b = Lexer.Peek(state);
+        if (b == 91_u8)
+        {
+            brackets = brackets + 1_i64;
+        }
+        else if (b == 40_u8)
+        {
+            parentheses = parentheses + 1_i64;
+        }
+        else if (b == 93_u8)
+        {
+            if (brackets == 0_i64)
+            {
+                scanning = false;
+            }
+            else
+            {
+                brackets = brackets - 1_i64;
+            }
+        }
+        else if (b == 41_u8)
+        {
+            if (parentheses == 0_i64)
+            {
+                scanning = false;
+            }
+            else
+            {
+                parentheses = parentheses - 1_i64;
+            }
+        }
+        else if (b == 46_u8)
+        {
+            if (parentheses < 1_i64 || state.pos < 1_i64 || state.pos + 1_i64 >= String.Len(state.source) || !Lexer.IdByte(String.ByteAt(state.source, state.pos - 1_i64)) || !Lexer.Alpha(String.ByteAt(state.source, state.pos + 1_i64))) {
+                Lexer.Fail(state, Errors.ErrorKind::UnexpectedToken, "expected qualified type segment");
+                scanning = false;
+            }
+        }
+        else if (!Lexer.IdByte(b) && b != 124_u8 && b != 44_u8 && b != 32_u8 && b != 9_u8)
+        {
+            scanning = false;
+        }
+        else if (brackets == 0_i64 && parentheses == 0_i64)
+        {
+            scanning = false;
+        }
+        if (scanning)
+        {
+            state.pos = state.pos + 1_i64;
+            if (brackets + parentheses > state.limits.maxDepth)
+            {
+                Lexer.Fail(state, Errors.ErrorKind::DepthLimit, "type expression nesting limit");
+            }
+        }
+    }
+    if (brackets != 0_i64 || parentheses != 0_i64)
+    {
+        Lexer.Fail(state, Errors.ErrorKind::UnexpectedEnd, "unterminated type expression");
+    }
+    if (state.pos - node.span.start > state.limits.maxScalarBytes)
+    {
+        Lexer.Fail(state, Errors.ErrorKind::ScalarLimit, "type token byte limit");
+        return;
+    }
+    node.text = String.SubSlice(state.source, node.span.start, state.pos - node.span.start);
+}
+
+i64 Value(mut Lexer.State state, i64 depth)
+{
+    if (!Enter(state, depth))
+    {
+        return -1_i64;
+    }
+    Lexer.Skip(state);
+    i64 start = state.pos;
+    mut Syntax.Node node = Lexer.EmptyNode(Syntax.NodeKind::Identifier, start);
+    i64 index = Lexer.Add(state, node);
+    if (index < 0_i64)
+    {
+        return index;
+    }
+    if (Lexer.At(state, 34_u8))
+    {
+        node.kind = Syntax.NodeKind::String;
+        node.text = Lexer.Quoted(state);
+    }
+    else if (Lexer.Take(state, 123_u8))
+    {
+        node.kind = Syntax.NodeKind::Map;
+        Lexer.Skip(state);
+        if (!Lexer.At(state, 125_u8))
+        {
+            i64 entry = Assignment(state, depth + 1_i64, true);
+            Unique(state, node, entry);
+            Child(node, entry);
+            while (Lexer.Take(state, 44_u8) && !state.failed)
+            {
+                Lexer.Skip(state);
+                if (!Lexer.At(state, 125_u8))
+                {
+                    i64 next = Assignment(state, depth + 1_i64, true);
+                    Unique(state, node, next);
+                    Child(node, next);
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+        Lexer.Require(state, 125_u8);
+    }
+    else if (Lexer.Take(state, 91_u8))
+    {
+        node.kind = Syntax.NodeKind::List;
+        Lexer.Skip(state);
+        if (!Lexer.At(state, 93_u8))
+        {
+            Child(node, Value(state, depth + 1_i64));
+            while (Lexer.Take(state, 44_u8) && !state.failed)
+            {
+                Lexer.Skip(state);
+                if (!Lexer.At(state, 93_u8))
+                {
+                    Child(node, Value(state, depth + 1_i64));
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }
+        Lexer.Require(state, 93_u8);
+    }
+    else if (Lexer.Take(state, 64_u8))
+    {
+        node.kind = Syntax.NodeKind::Reference;
+        mut string first = Lexer.Ident(state);
+        mut bool qualified = false;
+        while (Lexer.At(state, 46_u8) && !state.failed) {
+            qualified = true;
+            state.pos = state.pos + 1_i64;
+            if (!Lexer.Alpha(Lexer.Peek(state))) {
+                Lexer.Fail(state, Errors.ErrorKind::UnexpectedToken, "expected qualifier segment");
+            } else {
+                string segment = Lexer.Ident(state);
+                if (String.Len(first) + 1_i64 > state.limits.maxScalarBytes || String.Len(segment) > state.limits.maxScalarBytes - String.Len(first) - 1_i64) {
+                    Lexer.Fail(state, Errors.ErrorKind::ScalarLimit, "reference qualifier byte limit");
+                } else { first = first + "." + segment; }
+            }
+        }
+        node.text = first;
+        if (Lexer.Take(state, 47_u8))
+        {
+            node.name = first;
+            node.text = Lexer.Ident(state);
+        }
+        else if (qualified) {
+            Lexer.Fail(state, Errors.ErrorKind::UnexpectedToken, "qualified reference requires a label path");
+        }
+    }
+    else if (Lexer.At(state, 45_u8) || Lexer.Digit(Lexer.Peek(state)))
+    {
+        node.kind = Syntax.NodeKind::Number;
+        Number(state, node);
+    }
+    else
+    {
+        string token = Lexer.Ident(state);
+        node.text = token;
+        Lexer.Skip(state);
+        if (Lexer.At(state, 34_u8) || Lexer.At(state, 123_u8))
+        {
+            node.kind = Syntax.NodeKind::Block;
+            node.name = token;
+            if (Lexer.At(state, 34_u8))
+            {
+                node.hasLabel = true;
+                node.label = Lexer.Quoted(state);
+            }
+            Body(state, node, depth);
+        }
+        else if (Lexer.At(state, 91_u8) || Lexer.At(state, 40_u8))
+        {
+            TypeToken(state, node);
+        }
+        else if (token == "true" || token == "false")
+        {
+            node.kind = Syntax.NodeKind::Boolean;
+        }
+    }
+    Lexer.Finish(state, index, node);
+    return index;
+}
+
+pub Result<Syntax.Document, Errors.BsolError> Parse(string source, Limits.BsolLimits limits)
+{
+    mut Lexer.State state = Lexer.Start(source, limits);
+    mut i64[] roots = [];
+    if (limits.maxInputBytes < 0_i64 || String.Len(source) > limits.maxInputBytes)
+    {
+        Lexer.Fail(state, Errors.ErrorKind::InputLimit, "input byte limit");
+    }
+    if (!Limits.Valid(limits))
+    {
+        Lexer.Fail(state, Errors.ErrorKind::InvalidSyntax, "invalid parser limits");
+    }
+    Lexer.Skip(state);
+    while (state.pos < String.Len(source) && !state.failed)
+    {
+        i64 root = Statement(state, 1_i64, true);
+        if (root >= 0_i64)
+        {
+            Array.Append<i64>(roots, root);
+        }
+        Lexer.Skip(state);
+    }
+    if (state.failed)
+    {
+        return Result::Error(state.error);
+    }
+    return Result::Ok(Syntax.Document
+    {
+        source: source,
+
+        nodes: state.nodes,
+
+        roots: roots,
+
+        trivia: state.trivia,
+    });
+}

@@ -1,8 +1,8 @@
 /// Platform terminal probes (Linux / macOS / Windows).
 use Console.Capabilities;
-use Console.Capabilities.ColorModel;
 use Console.ConsoleMessage;
 use Concurrency.Channel;
+use Core.Results;
 use Core.String;
 use Platform.Linux;
 use Platform.MacOS;
@@ -46,27 +46,27 @@ pub bool ForcePlainText() {
 
 pub ColorModel ProbeColorModel() {
     if ForcePlainText() {
-        return ColorModel::Basic16();
+        return ColorModel::Basic16;
     }
     if EnvFlagSet("COLORTERM") {
-        return ColorModel::TrueColor();
+        return ColorModel::TrueColor;
     }
     if EnvEquals("TERM", "xterm-256color") {
-        return ColorModel::Indexed256();
+        return ColorModel::Indexed256;
     }
     if EnvEquals("TERM", "xterm-color") {
-        return ColorModel::Basic16();
+        return ColorModel::Basic16;
     }
     if EnvFlagSet("TERM") {
-        return ColorModel::Indexed256();
+        return ColorModel::Indexed256;
     }
-    return ColorModel::Indexed256();
+    return ColorModel::Indexed256;
 }
 
 /// Best-effort parse of `COLUMNS` / `LINES` when numeric ioctl paths are unavailable.
 pub Console.ConsoleSize EnvFallbackSize() {
-    i32 columns = 80;
-    i32 rows = 24;
+    mut i32 columns = 80;
+    mut i32 rows = 24;
     string cols = __env_get("COLUMNS");
     if !Core.String.IsEmpty(cols) {
         columns = ParseEnvColumns(cols, columns);
@@ -90,7 +90,7 @@ pub i32 ParsePositiveInt(string value, i32 defaultValue) {
         if b < 48 || b > 57 {
             return defaultValue;
         }
-        acc = acc * 10 + (b - 48);
+        acc = acc * 10 + (i64(b) - 48);
         i = i + 1;
     }
     if acc < 1 || acc > 2147483647 {
@@ -132,7 +132,7 @@ pub unit PollResize(Channel<ConsoleMessage> messages, mut Console.ConsoleSize la
     Console.ConsoleSize now = QuerySize();
     if now.columns != lastSize.columns || now.rows != lastSize.rows {
         lastSize = now;
-        match messages.Send(ConsoleMessage::Resize(now)) {
+        match Channel.Send(messages, ConsoleMessage::Resize(now)) {
             Result::Ok(_) => {},
             Result::Error(_) => {},
         };
@@ -145,7 +145,7 @@ pub unit PollResizeHub(mut Console.OnResize hub) {
     Console.ConsoleSize now = QuerySize();
     if now.columns != hub.lastSize.columns || now.rows != hub.lastSize.rows {
         hub.lastSize = now;
-        hub.OnResize(now);
+        hub.Raise(now);
     }
     return;
 }

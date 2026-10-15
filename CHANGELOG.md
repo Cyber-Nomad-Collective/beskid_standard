@@ -6,14 +6,90 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Removed
+
+- Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`
+  handle type, the `LinuxPthread`/`DarwinPthread` contracts and `ThreadError`.
+  `Spawn` passed `0` as the `pthread_t*` out-parameter and had no callers. Fibers
+  are the concurrency model; `Thread.Yield` remains.
+- Remove the seven string-in/string-out Glue Mod contracts (`TypeMapping`,
+  `SymbolEmission`, `LinkArgs`, `SignatureReader`, `SignatureWriter`,
+  `ToolchainProbe`, `StdioBridge`), the unused `[Glue]`, `[GlueImport]` and
+  `[GlueExport]` attributes and the `GlueBackendKind` enum from `corelib_glue`.
+  The package now holds only the provisional stdio bridge protocol.
+
 ### Fixed
 
+- CoreSuite covers concatenating and slicing a `Core.Args` string (storage
+  outside the managed heap) across collections.
+- `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the
+  result length: the result is sized once and every part is copied once. Joining
+  16,000 lines did not finish in 10 minutes and now takes about 4 ms.
+- `String.Trim` removes line feeds. It trims the same ASCII whitespace as
+  `TrimStart`, `TrimEnd` and `IsBlank`: space, tab, line feed and carriage
+  return.
+- `String.CompareOrdinal`, `Search.Compare` and `Search.Less` use the string
+  ordering operator (one runtime call) instead of a loop with a call per byte.
+  `HashTable` lookups index the table arrays directly, and `Hash.String` no
+  longer calls a function per byte for the exclusive or.
 - Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
   when two versions grow from one base. `Array.Append` grows storage in place
   with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
   only when the version owns the storage tip and copies the prefix otherwise.
 
 ### Added
+
+- Add explicit offline BSOL import resolver requests and materialized-source
+  digest verification with portable root-relative path and immutable Git checks.
+
+- Add resolved BSOL profile composition with alias-aware rule/type rebasing,
+  owned imported default and condition arenas, and source-closure reownership
+  during validation and migration.
+
+- Preserve imported rule origins during qualified reference resolution and
+  parse dot-separated import qualifiers in reference and type syntax.
+
+- Add explicit resolver-backed typed BSOL reads and reconstruct profile source
+  ownership before invoking typed writer bindings.
+
+- Add Core.Numeric.FloatBits exact bit projections for f32 and f64 values.
+
+- Provide typed compiler SDK factories for compilation, workspace members,
+  registrations, package catalogs and contract requests for native adapter preparation.
+
+### Added
+
+- Add typed format-independent serialization DataValue representations and
+  canonical 256-bit ShapeId parsing and formatting.
+
+- Add the format-independent serialization package foundation with documented
+  resource limits and exact checked signed/unsigned decimal parsing. Cover
+  integer-width overflow, the full u64 range, and precision beyond 2^53.
+- Add `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`
+  through the `Core.String` hub: ordinal `Compare`/`Less`, affix and
+  occurrence search, `Split`/`Lines`/`Join`, `Replace`, `Repeat`, padding,
+  ASCII case mapping, trimming, `Concat`, and a linear UTF-8 `StringBuilder`.
+- Add `Core.Text.Number` with full-range `ParseI64`, `ParseHex`, `ParseF64`,
+  typed `NumberError`, `FormatFixed`, `FormatGeneral`, `FormatHex`, and pure
+  `TruncateToI64`/`RoundToI64` conversion.
+- Add `Core.Collections.Sort` (stable merge sort, keyed sorting of any element
+  type, binary search), `Hash`, a caller-hashed open-addressing `HashTable`,
+  hashed `StringMap` and `I64Map`, an `i64`-priority `PriorityQueue`, and
+  typed `CollectionError`.
+- Extend `List` (`TryGet`, `First`, `Last`, `IndexOf`, `Contains`, `Set`,
+  `Insert`, `RemoveAt`, `Remove`, `Reverse`, `Slice`, `Concat`, `ToArray`,
+  `Clear`, `FromArray`), `Map` (`TryGet`, `GetOr`, `Keys`, `Values`,
+  `Entries`, `Clear`), and `Set` (`Union`, `Intersect`, `Difference`,
+  `IsSubsetOf`, `ToArray`, `FromArray`).
+- Add `Core.Json`: RFC 8259 parsing with typed `JsonError` offsets, escape and
+  surrogate-pair decoding, a nesting limit, compact and indented output, and
+  value construction and access helpers.
+- Add `Core.Path.Lexical` normalization, joining, relative paths, stems, and
+  parents; `Core.Time.Calendar` constant-time date arithmetic, ISO weekdays,
+  and RFC 3339 parsing and formatting; and `Testing.Expect` expectations that
+  report expected and actual values.
+- Document the 0.5.2 compiler and runtime limits that shape these APIs, and
+  how to test a modified Corelib with a released binary.
 
 - Add the networking protocol packages to the corelib aggregate:
   `corelib_uri`, `corelib_codec`, `corelib_connect`, `corelib_crypto`,
@@ -52,6 +128,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Correct the `Core.String` reference: `Contains` scans substrings, and the
+  page now covers the full search, transform, and builder surface.
 - Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.
 - Box every Channel payload through one descriptor-backed generic value shape.
   Document sender/queue/receiver ownership at commit, cancellation and close;
@@ -84,6 +162,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Channel and Mutex wrappers with the canonical Optional/Results modules.
 
 ### Fixed
+
+- Parse exact decimal magnitudes with leading zeroes without treating total
+  text length as numeric overflow; preserve checked per-digit wire-width ranges.
 
 - Fix QUIC loopback datagram loss (WEB7): the `QuicEndpoint` receiver fiber now
   waits without a deadline, because a timed-out runtime receive can drop a datagram

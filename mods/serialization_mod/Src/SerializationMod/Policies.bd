@@ -1,0 +1,212 @@
+use Beskid.Compiler.Semantic;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Results;
+use Core.String;
+use SerializationMod.Syntax;
+use SerializationMod.Read;
+use SerializationMod.Eligibility;
+
+SemanticError Invalid(string message) { return SemanticError { code: "SerializationFieldPolicy", message: message }; }
+
+/// Decode only the actual language string literal forms. Raw spelling is not a
+/// runtime string and interpolation must never select a policy or source path.
+Result<string, SemanticError> Text(SpannedExpression expression) {
+    match expression.node {
+        Expression::Literal(value) => {
+            match value.node.literal.node {
+                Literal::String(raw) => {
+                    i64 length = String.Len(raw);
+                    if (length < 2_i64 || String.ByteAt(raw, 0_i64) != 34_u8 || String.ByteAt(raw, length - 1_i64) != 34_u8) { return Result::Error(Invalid("policy requires a quoted string literal")); }
+                    mut string decoded = "";
+                    mut i64 position = 1_i64;
+                    mut i64 run = position;
+                    while (position < length - 1_i64) {
+                        u8 byte = String.ByteAt(raw, position);
+                        if (byte == 36_u8 && position + 1_i64 < length - 1_i64 && String.ByteAt(raw, position + 1_i64) == 123_u8) { return Result::Error(Invalid("policy string cannot interpolate")); }
+                        if (byte == 92_u8) {
+                            decoded = decoded + String.SubSlice(raw, run, position - run);
+                            position = position + 1_i64;
+                            if (position >= length - 1_i64) { return Result::Error(Invalid("truncated policy escape")); }
+                            u8 escaped = String.ByteAt(raw, position);
+                            if (escaped == 34_u8 || escaped == 92_u8) {
+                                decoded = decoded + String.SubSlice(raw, position, 1_i64);
+                            } else {
+                                if (escaped != 36_u8 || position + 1_i64 >= length - 1_i64 || String.ByteAt(raw, position + 1_i64) != 123_u8) { return Result::Error(Invalid("unsupported policy escape")); }
+                                decoded = decoded + String.SubSlice(raw, position, 2_i64);
+                                position = position + 1_i64;
+                            }
+                            run = position + 1_i64;
+                        }
+                        position = position + 1_i64;
+                    }
+                    return Result::Ok(decoded + String.SubSlice(raw, run, length - 1_i64 - run));
+                },
+                _ => { },
+            };
+        },
+        _ => { },
+    };
+    return Result::Error(Invalid("policy requires a literal string"));
+}
+
+Result<bool, SemanticError> Boolean(SpannedExpression expression) {
+    match expression.node { Expression::Literal(value) => { match value.node.literal.node { Literal::Bool(boolean) => { return Result::Ok(boolean); }, _ => { }, }; }, _ => { }, };
+    return Result::Error(Invalid("policy requires a boolean literal"));
+}
+
+bool IdentifierStart(u8 byte) { return byte == 95_u8 || (byte >= 65_u8 && byte <= 90_u8) || (byte >= 97_u8 && byte <= 122_u8); }
+bool IdentifierPart(u8 byte) { return IdentifierStart(byte) || (byte >= 48_u8 && byte <= 57_u8); }
+
+/// This creates descriptive syntax only. Actual factory arity, return type,
+/// substitutions and source ownership must pass the private contribution issuer.
+Result<SpannedPath, SemanticError> Factory(Syntax.Builder builder, string text) {
+    mut string[] names = [];
+    mut i64 position = 0_i64;
+    mut i64 start = 0_i64;
+    while (position <= String.Len(text)) {
+        if (position == String.Len(text) || String.ByteAt(text, position) == 46_u8) {
+            if (position == start) { return Result::Error(Invalid("default factory path has an empty segment")); }
+            names = Array.Append<string>(names, String.SubSlice(text, start, position - start));
+            start = position + 1_i64;
+        } else {
+            u8 byte = String.ByteAt(text, position);
+            if ((position == start && !IdentifierStart(byte)) || !IdentifierPart(byte)) { return Result::Error(Invalid("default factory must be a qualified identifier path")); }
+        }
+        position = position + 1_i64;
+    }
+    return Result::Ok(Syntax.PathValue(builder, names, []));
+}
+
+Result<u8, SemanticError> Width(SpannedExpression expression) {
+    match expression.node {
+        Expression::Literal(value) => {
+            match value.node.literal.node {
+                Literal::Integer(raw) => {
+                    mut i64 index = 0_i64;
+                    mut i64 number = 0_i64;
+                    while (index < String.Len(raw) && String.ByteAt(raw, index) >= 48_u8 && String.ByteAt(raw, index) <= 57_u8) {
+                        number = number * 10_i64 + i64(String.ByteAt(raw, index) - 48_u8);
+                        if (number > 64_i64) { return Result::Error(Invalid("word width must be 8, 16, 32 or 64")); }
+                        index = index + 1_i64;
+                    }
+                    if (index == 0_i64) { return Result::Error(Invalid("word width requires an unsigned decimal literal")); }
+                    string suffix = String.SubSlice(raw, index, String.Len(raw) - index);
+                    if (suffix != "" && suffix != "_u8" && suffix != "_i64") { return Result::Error(Invalid("word width literal has an unsupported suffix")); }
+                    if (number == 8_i64 || number == 16_i64 || number == 32_i64 || number == 64_i64) { return Result::Ok(u8(number)); }
+                },
+                _ => { },
+            };
+        },
+        _ => { },
+    };
+    return Result::Error(Invalid("word width must be 8, 16, 32 or 64"));
+}
+
+pub Result<Read.FieldPolicy, SemanticError> Field(Syntax.Builder builder, SpannedField field) {
+    mut Read.FieldPolicy policy = Read.FieldPolicy { wireName: field.node.name.node.name, skipRead: false, skipWrite: false, wordWidth: 0_u8, bytes: false, defaultFactory: OptionalSpannedPath::None, catchall: false };
+    mut bool named = false;
+    mut i64 index = 0_i64;
+    mut bool selected = false;
+    while (index < Array.Len(field.node.attributes.items)) {
+        Attribute fieldAttribute = field.node.attributes.items[index].node;
+        if (fieldAttribute.name.node.name == "SerializeField") {
+            if (selected) { return Result::Error(Invalid("duplicate SerializeField policy")); }
+            selected = true;
+            mut string[] seen = [];
+            mut i64 argument = 0_i64;
+            while (argument < Array.Len(fieldAttribute.arguments.items)) {
+                AttributeArgument value = fieldAttribute.arguments.items[argument].node;
+                string name = value.name.node.name;
+                mut i64 previous = 0_i64;
+                while (previous < Array.Len(seen)) { if (seen[previous] == name) { return Result::Error(Invalid("duplicate SerializeField argument")); } previous = previous + 1_i64; }
+                seen = Array.Append<string>(seen, name);
+                if (name == "Name") {
+                    match Text(value.value) { Result::Ok(text) => { if (String.Len(text) == 0_i64) { return Result::Error(Invalid("serialized field name cannot be empty")); } policy.wireName = text; named = true; }, Result::Error(error) => { return Result::Error(error); }, };
+                } else { if (name == "SkipSerialize" || name == "SkipDeserialize" || name == "Bytes" || name == "Catchall") {
+                    match Boolean(value.value) {
+                        Result::Ok(boolean) => {
+                            if (name == "SkipSerialize") { policy.skipWrite = boolean; }
+                            else if (name == "SkipDeserialize") { policy.skipRead = boolean; }
+                            else if (name == "Bytes") { policy.bytes = boolean; }
+                            else { policy.catchall = boolean; }
+                        },
+                        Result::Error(error) => { return Result::Error(error); },
+                    };
+                } else { if (name == "WordWidth") {
+                    match Width(value.value) { Result::Ok(width) => { policy.wordWidth = width; }, Result::Error(error) => { return Result::Error(error); }, };
+                } else { if (name == "Default") {
+                    match Text(value.value) { Result::Ok(text) => { match Factory(builder, text) { Result::Ok(path) => { policy.defaultFactory = OptionalSpannedPath::Some(path); }, Result::Error(error) => { return Result::Error(error); }, }; }, Result::Error(error) => { return Result::Error(error); }, };
+                } else { return Result::Error(Invalid("unknown SerializeField argument")); } } } }
+                argument = argument + 1_i64;
+            }
+        }
+        index = index + 1_i64;
+    }
+    if (policy.catchall) {
+        // The catchall is not itself a wire field: it captures unknown fields.
+        mut bool factory = false;
+        match policy.defaultFactory { OptionalSpannedPath::Some(_) => { factory = true; }, _ => { }, };
+        if (named || policy.bytes || policy.wordWidth != 0_u8 || factory || policy.skipRead) {
+            return Result::Error(SemanticError { code: "SerializationCatchall", message: "a catchall field admits only SkipSerialize; it has no wire name, width, bytes, default or skipped read" });
+        }
+    }
+    if (policy.skipRead) { match policy.defaultFactory { OptionalSpannedPath::None => { return Result::Error(Invalid("skipped deserialization field requires an exact typed default factory")); }, _ => { }, }; }
+    return Result::Ok(policy);
+}
+
+Eligibility.Rejection At(SemanticError error, SpannedField field) {
+    return Eligibility.RejectionValue(error, field.span);
+}
+
+/// Record policies: wire names are unique per direction and at most one field
+/// is the catchall. Failures carry the offending field's source span.
+pub Result<Read.FieldPolicy[], Eligibility.Rejection> Fields(Syntax.Builder builder, SpannedField[] fields) {
+    mut Read.FieldPolicy[] policies = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        match Field(builder, fields[index]) {
+            Result::Error(error) => { return Result::Error(At(error, fields[index])); },
+            Result::Ok(policy) => {
+                mut i64 previous = 0_i64;
+                while (previous < Array.Len(policies)) {
+                    if (policy.catchall && policies[previous].catchall) { return Result::Error(At(SemanticError { code: "SerializationCatchall", message: "a record admits at most one catchall field" }, fields[index])); }
+                    if (!policy.catchall && !policies[previous].catchall && policies[previous].wireName == policy.wireName && ((!policies[previous].skipRead && !policy.skipRead) || (!policies[previous].skipWrite && !policy.skipWrite))) { return Result::Error(At(Invalid("conflicting serialized field names"), fields[index])); }
+                    previous = previous + 1_i64;
+                }
+                policies = Array.Append<Read.FieldPolicy>(policies, policy);
+            },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(policies);
+}
+
+/// Payload policies. Payloads are positional, so a field is either on the wire
+/// in both directions or skipped in both directions and built by its default
+/// factory; a default never applies to a present positional payload.
+pub Result<Read.FieldPolicy[], Eligibility.Rejection> Variant(Syntax.Builder builder, SpannedField[] fields) {
+    mut Read.FieldPolicy[] policies = [];
+    mut i64 index = 0_i64;
+    while (index < Array.Len(fields)) {
+        match Field(builder, fields[index]) {
+            Result::Error(error) => { return Result::Error(At(error, fields[index])); },
+            Result::Ok(policy) => {
+                if (policy.catchall) { return Result::Error(At(SemanticError { code: "SerializationCatchall", message: "only a record field can be a catchall" }, fields[index])); }
+                if (policy.skipRead != policy.skipWrite) { return Result::Error(At(Invalid("a positional payload field must be skipped in both directions or in neither"), fields[index])); }
+                match policy.defaultFactory {
+                    OptionalSpannedPath::Some(_) => { if (!policy.skipRead) { return Result::Error(At(Invalid("a present positional payload field cannot have a missing-value default"), fields[index])); } },
+                    _ => { },
+                };
+                mut i64 previous = 0_i64;
+                while (previous < Array.Len(policies)) {
+                    if (!policy.skipRead && !policies[previous].skipRead && policies[previous].wireName == policy.wireName) { return Result::Error(At(Invalid("conflicting serialized payload field names"), fields[index])); }
+                    previous = previous + 1_i64;
+                }
+                policies = Array.Append<Read.FieldPolicy>(policies, policy);
+            },
+        };
+        index = index + 1_i64;
+    }
+    return Result::Ok(policies);
+}

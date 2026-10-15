@@ -11,8 +11,8 @@ use Crypto.Errors;
 /// Every failure wipes the partial output and returns EntropyUnavailable; there is
 /// no fallback to a non-cryptographic generator.
 ///
-/// The contracts follow `Core.Threading.Thread`: a Linux contract named by the glibc
-/// soname and a Darwin contract named `libc`, tried in that order. Compiler 0.5.3 links
+/// The contracts use a Linux contract named by the glibc soname and a Darwin contract
+/// named `libc`, tried in that order. Compiler 0.5.3 links
 /// a versioned soname by its base name (`libc.so.6` -> `-lc`), so an AOT link reaches
 /// libc on Linux and libSystem on macOS without a link shim (COMPILER-GAPS WEB4).
 /// The C names are dictated by libc, so these contracts trigger naming warning W1633.
@@ -76,12 +76,12 @@ pub Result<unit, CryptoError> Fill(u8[] buffer) {
     i64 total = Slice.Len(buffer);
     if total == 0_i64 { return Result::Ok(()); }
     i64 scratch = LinuxLibc.malloc(MaxChunk());
-    if scratch == 0_i64 { ConstantTime.Wipe(buffer); return Result::Error(CryptoError::EntropyUnavailable()); }
+    if scratch == 0_i64 { ConstantTime.Wipe(buffer); return Result::Error(CryptoError::EntropyUnavailable); }
     i64 mode = LinuxLibc.malloc(2_i64);
     if mode == 0_i64 {
         LinuxLibc.free(scratch);
         ConstantTime.Wipe(buffer);
-        return Result::Error(CryptoError::EntropyUnavailable());
+        return Result::Error(CryptoError::EntropyUnavailable);
     }
     LinuxLibc.memset(mode, 114_i32, 1_i64);
     LinuxLibc.memset(mode + 1_i64, 0_i32, 1_i64);
@@ -91,14 +91,14 @@ pub Result<unit, CryptoError> Fill(u8[] buffer) {
     LinuxLibc.free(mode);
     if !ok || (total >= 16_i64 && ConstantTime.Equal(buffer, Slice.New(total))) {
         ConstantTime.Wipe(buffer);
-        return Result::Error(CryptoError::EntropyUnavailable());
+        return Result::Error(CryptoError::EntropyUnavailable);
     }
     return Result::Ok(());
 }
 
 /// Returns `count` fresh random bytes from the OS CSPRNG.
 pub Result<u8[], CryptoError> Bytes(i64 count) {
-    if count < 0_i64 { return Result::Error(CryptoError::InvalidLength()); }
+    if count < 0_i64 { return Result::Error(CryptoError::InvalidLength); }
     u8[] out = Slice.New(count);
     return match Fill(out) {
         Result::Ok(_) => Result::Ok(out),

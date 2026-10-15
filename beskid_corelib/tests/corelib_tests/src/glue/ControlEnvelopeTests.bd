@@ -1,0 +1,49 @@
+use Core.Glue.Envelope;
+use Core.Glue.BinaryCodec;
+use Core.Serialization.DataValue;
+use Core.Collections.Array;
+use Core.Results;
+use Testing.Assert;
+
+u8[] ControlZeroBinding(){
+    mut u8[] bytes=Array.Empty<u8>();mut i64 index=0_i64;
+    while index<32_i64{Array.Append(bytes,0_u8);index=index+1_i64;}
+    return bytes;
+}
+
+/// @native-only
+test glue_shutdown_has_empty_payload_and_exact_canonical_wire_offsets {
+    Envelope shutdown=Envelope{kind:5_u8,generation:9_u64,request:0_u64,library:"manual",binding:ControlZeroBinding(),shapes:Array.Empty<u8>(),payload:Array.Empty<u8>()};
+    match Envelope.Encode(shutdown){
+        Result::Error(_)=>Assert.Fail("canonical empty control must encode"),
+        Result::Ok(frame)=>{
+            Assert.Equal(Array.Len(frame),74_i64,"prefix plus fixed body and library bytes");
+            Assert.Equal(frame[0],70_u8,"exact little-endian body length");
+            Assert.Equal(frame[4],1_u8,"protocol version one");
+            Assert.Equal(frame[6],5_u8,"shutdown kind");
+            Assert.Equal(frame[8],9_u8,"issued generation");
+            Assert.Equal(frame[16],0_u8,"control request zero");
+            Assert.Equal(frame[70],0_u8,"payload length zero");
+            match Envelope.Decode(frame){
+                Result::Error(_)=>Assert.Fail("canonical control must decode"),
+                Result::Ok(value)=>Assert.Equal(Array.Len(value.payload),0_i64,"empty payload retained"),
+            };
+        },
+    };
+}
+
+/// @native-only
+test glue_cancel_and_shutdown_reject_binary_unit_as_control_payload {
+    u8[] unitBytes=match BinaryCodec.Encode(DataValue::Unit()){
+        Result::Ok(bytes)=>bytes,
+        Result::Error(_)=>{Assert.Fail("ordinary unit encoding exists");return;},
+    };
+    Assert.Equal(Array.Len(unitBytes),1_i64,"unit is a value tag, not empty control");
+    u8[] binding=ControlZeroBinding();binding[0]=1_u8;
+    Envelope cancel=Envelope{kind:4_u8,generation:9_u64,request:1_u64,library:"manual",binding:binding,shapes:Array.Empty<u8>(),payload:unitBytes};
+    match Envelope.Encode(cancel){Result::Ok(_)=>Assert.Fail("unit cancel payload must reject"),Result::Error(_)=>{},};
+    cancel.payload=Array.Empty<u8>();
+    match Envelope.Encode(cancel){Result::Error(_)=>Assert.Fail("empty cancel payload must encode"),Result::Ok(bytes)=>{Assert.Equal(bytes[6],4_u8,"cancel kind");Assert.Equal(bytes[16],1_u8,"original request retained");Assert.Equal(bytes[34],1_u8,"original binding retained");Assert.Equal(bytes[70],0_u8,"cancel payload length zero");},};
+    Envelope shutdown=Envelope{kind:5_u8,generation:9_u64,request:0_u64,library:"manual",binding:ControlZeroBinding(),shapes:Array.Empty<u8>(),payload:unitBytes};
+    match Envelope.Encode(shutdown){Result::Ok(_)=>Assert.Fail("unit shutdown payload must reject"),Result::Error(_)=>{},};
+}

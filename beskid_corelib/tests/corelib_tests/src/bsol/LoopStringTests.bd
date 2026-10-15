@@ -1,0 +1,313 @@
+/// Compiler regression: branch-carried managed string updates must reach loop exits.
+use Core.Output;
+
+use Core.Bsol.Lexer;
+
+use Core.Bsol.Limits;
+
+use Core.String;
+
+use Testing.Assert;
+
+string StraightLine()
+{
+    mut string text = "";
+    text = text + "A";
+    return text;
+}
+
+string SingleWhile()
+{
+    mut string text = "";
+    mut i64 index = 0_i64;
+    while (index < 1_i64)
+    {
+        text = text + "A";
+        index = index + 1_i64;
+    }
+    return text;
+}
+
+string BranchWhile()
+{
+    mut string text = "";
+    mut i64 index = 0_i64;
+    while (index < 2_i64)
+    {
+        if (index == 1_i64)
+        {
+            return text;
+        }
+        if (index < 0_i64)
+        {
+            return "invalid";
+        }
+        else if (index == 0_i64)
+        {
+            text = text + "A";
+        }
+        else
+        {
+            text = text + "B";
+        }
+        index = index + 1_i64;
+    }
+    return text;
+}
+
+test bsol_compiler_straightline_managed_string_update
+{
+    string actual = StraightLine();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA straightline text: " + actual);
+
+    Output.WriteLine("SSA straightline length: " + length);
+
+    Assert.Equal(actual, "A", "straightline managed update reaches return");
+}
+
+test bsol_compiler_single_while_managed_string_update
+{
+    string actual = SingleWhile();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA singlewhile text: " + actual);
+
+    Output.WriteLine("SSA singlewhile length: " + length);
+
+    Assert.Equal(actual, "A", "loop-carried managed update reaches exit");
+}
+
+test bsol_compiler_branch_while_managed_string_update
+{
+    string actual = BranchWhile();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA branchwhile text: " + actual);
+
+    Output.WriteLine("SSA branchwhile length: " + length);
+
+    Assert.Equal(actual, "A", "branch-carried managed update reaches next iteration return");
+}
+
+string HelperAfterConcat()
+{
+    mut Lexer.State state = Lexer.Start("x", Limits.DefaultLimits());
+    mut string text = "";
+    text = text + Lexer.Scalar(65_i64);
+    u8 next = Lexer.Peek(state);
+    if (next != 120_u8)
+    {
+        return "wrong helper result";
+    }
+    return text;
+}
+
+string AllocatingHelperAfterConcat()
+{
+    mut string text = "";
+    text = text + Lexer.Scalar(65_i64);
+    string another = Lexer.Scalar(66_i64);
+    if (String.Len(another) != 1_i64)
+    {
+        return "wrong allocation result";
+    }
+    return text;
+}
+
+string LoopStateHelperAfterConcat()
+{
+    mut Lexer.State state = Lexer.Start("x\"", Limits.DefaultLimits());
+    mut string text = "";
+    while (state.pos < String.Len(state.source) && !state.failed)
+    {
+        u8 next = Lexer.Peek(state);
+        if (next == 34_u8)
+        {
+            return text;
+        }
+        if (next < 32_u8)
+        {
+            state.failed = true;
+        }
+        else if (next == 120_u8)
+        {
+            text = text + Lexer.Scalar(65_i64);
+            state.pos = state.pos + 1_i64;
+            u8 after = Lexer.Peek(state);
+            if (after != 34_u8)
+            {
+                return "wrong state position";
+            }
+        }
+        else
+        {
+            state.pos = state.pos + 1_i64;
+        }
+    }
+    return text;
+}
+
+test bsol_compiler_managed_concat_survives_ordinary_state_helper
+{
+    string actual = HelperAfterConcat();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA ordinaryhelper text: " + actual);
+
+    Output.WriteLine("SSA ordinaryhelper length: " + length);
+
+    Assert.Equal(actual, "A", "updated managed local survives ordinary helper call");
+}
+
+test bsol_compiler_managed_concat_survives_allocating_helper
+{
+    string actual = AllocatingHelperAfterConcat();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA allocatinghelper text: " + actual);
+
+    Output.WriteLine("SSA allocatinghelper length: " + length);
+
+    Assert.Equal(actual, "A", "updated managed local survives allocating helper call");
+}
+
+test bsol_compiler_managed_concat_survives_loop_state_helpers
+{
+    string actual = LoopStateHelperAfterConcat();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA loopstatehelper text: " + actual);
+
+    Output.WriteLine("SSA loopstatehelper length: " + length);
+
+    Assert.Equal(actual, "A", "updated managed local survives loop state helper calls");
+}
+
+test bsol_compiler_nonempty_concat_empty_right_literal
+{
+    string left = Lexer.Scalar(65_i64);
+
+    string actual = left + "";
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA emptyright literal text: " + actual);
+
+    Output.WriteLine("SSA emptyright literal length: " + length);
+
+    Assert.Equal(actual, "A", "empty right operand preserves nonempty left string");
+}
+
+test bsol_compiler_nonempty_concat_empty_right_dynamic_slice
+{
+    string left = Lexer.Scalar(65_i64);
+
+    string right = String.SubSlice("X", 1_i64, 0_i64);
+
+    i64 rightLength = String.Len(right);
+
+    string actual = left + right;
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA emptyright dynamic slice length: " + rightLength);
+
+    Output.WriteLine("SSA emptyright dynamic result text: " + actual);
+
+    Output.WriteLine("SSA emptyright dynamic result length: " + length);
+
+    Assert.Equal(actual, "A", "empty dynamic right slice preserves nonempty left string");
+}
+
+string PriorEmptyConcatThenAllocatingConcat()
+{
+    mut string text = "";
+    text = text + String.SubSlice("X", 1_i64, 0_i64);
+    string scalar = Lexer.Scalar(65_i64);
+    text = text + scalar;
+    return text;
+}
+
+string NestedBranchPriorEmptyConcatThenAllocatingConcat()
+{
+    mut Lexer.State state = Lexer.Start("x", Limits.DefaultLimits());
+    mut string text = "";
+    while (state.pos < String.Len(state.source) && !state.failed)
+    {
+        u8 b = Lexer.Peek(state);
+        if (b < 32_u8)
+        {
+            return "unexpected control";
+        }
+        else if (b == 120_u8)
+        {
+            text = text + String.SubSlice(state.source, state.pos, 0_i64);
+            state.pos = state.pos + 1_i64;
+            u8 escaped = 110_u8;
+            if (escaped == 34_u8 || escaped == 92_u8)
+            {
+                text = text + Lexer.Scalar(i64(escaped));
+            }
+            else if (escaped == 110_u8)
+            {
+                text = text + Lexer.Scalar(65_i64);
+            }
+            else
+            {
+                return "unexpected dispatch";
+            }
+        }
+        else
+        {
+            return "unexpected byte";
+        }
+    }
+    return text;
+}
+
+test bsol_compiler_prior_empty_concat_then_allocating_concat
+{
+    string actual = PriorEmptyConcatThenAllocatingConcat();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA priorempty concat length: " + length);
+
+    Assert.Equal(actual, "A", "prior empty concat remains a valid left operand after allocating scalar");
+}
+
+test bsol_compiler_nested_branch_prior_empty_concat_then_allocating_concat
+{
+    string actual = NestedBranchPriorEmptyConcatThenAllocatingConcat();
+
+    i64 length = String.Len(actual);
+
+    Output.WriteLine("SSA nested priorempty concat length: " + length);
+
+    Assert.Equal(actual, "A", "prior empty concat remains valid across nested escape branch and scalar call");
+}
+
+test bsol_compiler_dynamic_empty_left_concat_nonempty_literal
+{
+    string left = String.SubSlice("X", 1_i64, 0_i64);
+
+    string actual = left + "A";
+
+    i64 leftLength = String.Len(left);
+
+    i64 actualLength = String.Len(actual);
+
+    Output.WriteLine("SSA dynamicempty left length: " + leftLength);
+
+    Output.WriteLine("SSA dynamicempty left literal result length: " + actualLength);
+
+    Assert.Equal(actual, "A", "dynamic empty left operand preserves nonempty literal right string");
+}

@@ -12,7 +12,7 @@ use Crypto.Entropy;
 use Uri.Chars;
 use Uri.Parse;
 use Uri.Scheme;
-use Uri.Types;
+use Uri.Types as UriTypes;
 use Connect;
 use Connect.Policy;
 use Core.Optional.Option;
@@ -177,7 +177,7 @@ WsError HeadError(CodecError error) {
         CodecError::Truncated => WsError::HandshakeFailed(WsHandshake.ReasonTruncated()),
         CodecError::InvalidLine => WsError::HandshakeFailed(WsHandshake.ReasonBadHeader()),
         CodecError::Io(cause) => WsTransport.FromIo(cause),
-        _ => WsError::Io(),
+        _ => WsError::Io,
     };
 }
 
@@ -207,11 +207,11 @@ pub Result<WsHead, WsError> ReadHead(BufferedReader reader, WsTransport transpor
             Result::Ok(h) => { Array.Append<WsHeader>(headers, h); },
         };
     }
-    return Result::Error(WsError::Io());
+    return Result::Error(WsError::Io);
 }
 
 /// Resource name of a ws URI: path ("/" when empty) and query (section 3).
-pub string ResourceName(UriRef u) {
+pub string ResourceName(UriTypes.UriRef u) {
     mut string path = u.path;
     if String.Len(path) == 0_i64 { path = "/"; }
     if u.hasQuery { return path + "?" + u.query; }
@@ -225,28 +225,28 @@ pub Result<WsConnection, WsError> Open(string url, WsOptions options) {
     // `Types.Empty()` placeholders would resolve against Network.Types (both are
     // imported as `Types`), so each step continues in a helper instead.
     return match Parse.Parse(url) {
-        Result::Error(_) => Result::Error(WsError::InvalidUrl()),
+        Result::Error(_) => Result::Error(WsError::InvalidUrl),
         Result::Ok(u) => OpenUri(u, options),
     };
 }
 
-Result<WsConnection, WsError> OpenUri(UriRef u, WsOptions options) {
+Result<WsConnection, WsError> OpenUri(UriTypes.UriRef u, WsOptions options) {
     string scheme = Chars.LowerAscii(u.scheme);
-    if scheme != "ws" && scheme != "wss" { return Result::Error(WsError::UnsupportedScheme()); }
-    if u.hasFragment { return Result::Error(WsError::InvalidUrl()); }
+    if scheme != "ws" && scheme != "wss" { return Result::Error(WsError::UnsupportedScheme); }
+    if u.hasFragment { return Result::Error(WsError::InvalidUrl); }
     string resource = ResourceName(u);
     bool secure = scheme == "wss";
     return match Scheme.AuthorityOf(u) {
-        Result::Error(_) => Result::Error(WsError::InvalidUrl()),
+        Result::Error(_) => Result::Error(WsError::InvalidUrl),
         Result::Ok(authority) => OpenAuthority(authority, secure, resource, options),
     };
 }
 
-Result<WsConnection, WsError> OpenAuthority(Authority authority, bool secure, string resource, WsOptions options) {
+Result<WsConnection, WsError> OpenAuthority(UriTypes.Authority authority, bool secure, string resource, WsOptions options) {
     string hostName = authority.hostName;
     string hostHeader = Scheme.HostHeader(authority);
     return match Network.Types.PortNumber(authority.port) {
-        Result::Error(_) => Result::Error(WsError::InvalidUrl()),
+        Result::Error(_) => Result::Error(WsError::InvalidUrl),
         Result::Ok(port) => OpenTcp(hostName, port, secure, hostHeader, resource, options),
     };
 }
@@ -254,7 +254,7 @@ Result<WsConnection, WsError> OpenAuthority(Authority authority, bool secure, st
 Result<WsConnection, WsError> OpenTcp(string hostName, Port port, bool secure, string hostHeader, string resource, WsOptions options) {
     ConnectPolicy policy = Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(options.handshakeTimeoutMillis));
     return match Connect.ConnectHost(hostName, port, policy) {
-        Result::Error(_) => Result::Error(WsError::ConnectFailed()),
+        Result::Error(_) => Result::Error(WsError::ConnectFailed),
         Result::Ok(stream) => OpenStream(stream, hostName, secure, hostHeader, resource, options),
     };
 }
@@ -449,7 +449,7 @@ Result<WsFrameIn, WsError> ReadFrame(WsConnection self) {
     };
     i64 length = header.payloadLength;
     i64 limit = self.st[6];
-    if length > limit { return Result::Error(WsError::MessageTooBig()); }
+    if length > limit { return Result::Error(WsError::MessageTooBig); }
     Result<unit, CodecError> skipped = WsTransport.Skip(reader, transport, headerLength);
     match skipped {
         Result::Error(error) => { return Result::Error(WsTransport.FromCodec(error)); },
@@ -476,7 +476,7 @@ Result<unit, WsError> WriteFrame(WsConnection self, bool fin, i64 opcode, u8[] p
     mut u8[] key = Slice.New(0_i64);
     if !self.isServer {
         match Entropy.Bytes(4_i64) {
-            Result::Error(_) => { return Result::Error(WsError::EntropyUnavailable()); },
+            Result::Error(_) => { return Result::Error(WsError::EntropyUnavailable); },
             Result::Ok(bytes) => { key = bytes; },
         };
     }
@@ -539,8 +539,8 @@ WsError Fail(WsConnection self, WsError error) {
 // ---- sending ----
 
 pub Result<unit, WsError> SendFrameOn(WsConnection self, bool fin, i64 opcode, u8[] payload) {
-    if self.st[0] != StateOpen() { return Result::Error(WsError::Closed()); }
-    if opcode == WsFrame.OpClose() { return Result::Error(WsError::InvalidArgument()); }
+    if self.st[0] != StateOpen() { return Result::Error(WsError::Closed); }
+    if opcode == WsFrame.OpClose() { return Result::Error(WsError::InvalidArgument); }
     Result<unit, WsError> written = WriteFrame(self, fin, opcode, payload);
     return match written {
         Result::Ok(_) => Result::Ok(()),
@@ -558,7 +558,7 @@ pub Result<unit, WsError> SendBinaryOn(WsConnection self, u8[] data) {
 
 /// Sends a ping (payload at most 125 bytes). The pong is consumed by Receive and counted.
 pub Result<unit, WsError> PingOn(WsConnection self, u8[] payload) {
-    if Slice.Len(payload) > WsFrame.MaxControlPayload() { return Result::Error(WsError::InvalidArgument()); }
+    if Slice.Len(payload) > WsFrame.MaxControlPayload() { return Result::Error(WsError::InvalidArgument); }
     return SendFrameOn(self, true, WsFrame.OpPing(), payload);
 }
 
@@ -569,7 +569,7 @@ pub Result<unit, WsError> PingOn(WsConnection self, u8[] payload) {
 /// sent one), the transport is closed, and WsMessage::Close is returned. A protocol
 /// violation sends close 1002/1007/1009, closes the transport and returns the error.
 pub Result<WsMessage, WsError> ReceiveOn(WsConnection self) {
-    if self.st[0] == StateClosed() { return Result::Error(WsError::Closed()); }
+    if self.st[0] == StateClosed() { return Result::Error(WsError::Closed); }
     WsTransport.SetDeadlines(self.transport, self.st[8], 0_i64);
     while true {
         Result<WsFrameIn, WsError> got = ReadFrame(self);
@@ -604,7 +604,7 @@ pub Result<WsMessage, WsError> ReceiveOn(WsConnection self) {
             },
         };
     }
-    return Result::Error(WsError::Closed());
+    return Result::Error(WsError::Closed);
 }
 
 // Adds one data frame to the message being reassembled. Returns the message opcode
@@ -621,9 +621,9 @@ Result<i64, WsError> Accumulate(WsConnection self, bool fin, i64 opcode, u8[] pa
     }
     i64 messageOpcode = self.st[1];
     i64 total = self.st[2] + length;
-    if total > self.st[6] { return Result::Error(WsError::MessageTooBig()); }
+    if total > self.st[6] { return Result::Error(WsError::MessageTooBig); }
     if messageOpcode == WsFrame.OpText() && !WsUtf8.Feed(self.utf8, payload, 0_i64, length) {
-        return Result::Error(WsError::InvalidUtf8());
+        return Result::Error(WsError::InvalidUtf8);
     }
     if self.st[2] == 0_i64 {
         self.partial = payload;
@@ -635,7 +635,7 @@ Result<i64, WsError> Accumulate(WsConnection self, bool fin, i64 opcode, u8[] pa
     }
     self.st[2] = total;
     if !fin { return Result::Ok(0_i64); }
-    if messageOpcode == WsFrame.OpText() && !WsUtf8.Complete(self.utf8) { return Result::Error(WsError::InvalidUtf8()); }
+    if messageOpcode == WsFrame.OpText() && !WsUtf8.Complete(self.utf8) { return Result::Error(WsError::InvalidUtf8); }
     self.st[1] = 0_i64;
     return Result::Ok(messageOpcode);
 }

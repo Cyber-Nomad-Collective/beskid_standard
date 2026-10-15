@@ -4,7 +4,7 @@ Standard library sources for the Beskid toolchain. Registry package identity: **
 
 ## Documentation
 
-Module contracts, runtime boundaries, and design notes live under **[`docs/`](./docs/README.md)**. These Markdown files are included in **`beskid pckg pack`** artifacts at `docs/**/*.md`. When you run pack on this project, the CLI also emits API listings under **`.beskid/docs/`** (`api.json`, `index.md`) for the registry documentation viewer.
+Module contracts, runtime boundaries, and design notes live under **[`docs/`](./docs/README.md)**. These Markdown files are included in **`beskid package pack`** artifacts at `docs/**/*.md`. When you run pack on this project, the CLI also emits API listings under **`.beskid/docs/`** (`api.json`, `index.md`) for the registry documentation viewer.
 
 ## Layout
 

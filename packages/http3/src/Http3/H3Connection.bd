@@ -102,7 +102,7 @@ pub H3Conn Open(QuicLink link, bool isServer, H3Config config) {
     conn.st[1] = encoderStream;
     conn.st[2] = decoderStream;
     mut u8[] first = H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeControl());
-    first = H3Frame.AppendFrame(first, H3Frame.TypeSettings(), H3Settings.Encode(LocalSettings(config)));
+    first = H3Frame.AppendFrame(move first, H3Frame.TypeSettings(), H3Settings.Encode(LocalSettings(config)));
     bool sent = H3Quic.Write(link, control, first, false);
     bool sentEncoder = H3Quic.Write(link, encoderStream, H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeEncoder()), false);
     bool sentDecoder = H3Quic.Write(link, decoderStream, H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeDecoder()), false);
@@ -173,10 +173,10 @@ pub unit FailStream(H3Conn conn, H3Req req, i64 code) {
 
 /// Encodes a field section and writes it as a HEADERS frame (QPACK
 /// encoder stream data is flushed first).
-pub u8[] HeadersFrame(mut H3Conn conn, i64 streamId, HeaderField[] fields, mut u8[] out) {
+pub u8[] HeadersFrame(mut H3Conn conn, i64 streamId, HeaderField[] fields, move u8[] out) {
     u8[] section = QpackEncoder.EncodeSection(conn.encoder, streamId, fields);
     FlushQpack(conn);
-    return H3Frame.AppendFrame(out, H3Frame.TypeHeaders(), section);
+    return H3Frame.AppendFrame(move out, H3Frame.TypeHeaders(), section);
 }
 
 /// Largest DATA frame payload written. Kept at 4 KiB so neither side ever
@@ -195,7 +195,7 @@ pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] 
         mut i64 chunk = total - at;
         if chunk > DataChunk() { chunk = DataChunk(); }
         mut u8[] frame = H3Frame.AppendVarint(Slice.New(0_i64), H3Frame.TypeData());
-        frame = H3Frame.AppendVarint(frame, chunk);
+        frame = H3Frame.AppendVarint(move frame, chunk);
         i64 head = Slice.Len(frame);
         u8[] data = Mem.Zeroed(head + chunk);
         Mem.Copy(data, 0_i64, frame, 0_i64, head);
@@ -204,7 +204,7 @@ pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] 
         at = at + chunk;
     }
     mut u8[] tail = Slice.New(0_i64);
-    if Array.Len<HeaderField>(trailers) > 0_i64 { tail = HeadersFrame(conn, streamId, trailers, tail); }
+    if Array.Len<HeaderField>(trailers) > 0_i64 { tail = HeadersFrame(conn, streamId, trailers, move tail); }
     return H3Quic.Write(conn.link, streamId, tail, true);
 }
 

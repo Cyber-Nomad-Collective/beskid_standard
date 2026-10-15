@@ -73,7 +73,7 @@ test isolate_handles_compare_by_id {
 
 test task_body_reports_its_isolate {
     Isolate parent = Isolate.Current();
-    Result<bool, ParallelError> result = Parallel.Scope<bool>((Scope s) => {
+    Result<bool, ParallelError> result = Parallel.Scope<bool>((Core.Parallel.Scopes.Scope s) => {
         Task<bool> t = s.Spawn(() => Isolate.Current().Equals(parent));
         return match t.Join() {
             Result::Ok(same) => Result::Ok(same),
@@ -86,7 +86,7 @@ test task_body_reports_its_isolate {
 // ---- 0.6.3: fork-join ----
 
 test scope_joins_every_task_before_returning {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> left = s.Spawn(() => 20_i64);
         Task<i64> right = s.Spawn(() => 22_i64);
         i64 a = OrZero(left.Join());
@@ -97,7 +97,7 @@ test scope_joins_every_task_before_returning {
 }
 
 test early_error_return_still_joins {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> waiting = s.Spawn(() => AwaitCancel(5000_i64));
         return Result::Error(ParallelError::Cancelled);
     });
@@ -119,7 +119,7 @@ pub type Knobs {
 }
 
 Result<i64, ParallelError> Measure(Config config, Knobs knobs) {
-    return Parallel.Scope<i64>((Scope s) => {
+    return Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> t = s.Spawn(() => config.width + knobs.depth);
         return match t.Join() {
             Result::Ok(v) => Result::Ok(v),
@@ -134,7 +134,7 @@ test shared_and_copied_captures_reach_the_task {
 }
 
 test spawn_try_error_fails_the_task {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> t = s.SpawnTry<i64>(() => Result::Error("no input"));
         match t.Join() {
             Result::Error(TaskError::Failed(failure)) => {
@@ -152,7 +152,7 @@ test spawn_try_error_fails_the_task {
 }
 
 test second_join_is_refused {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> t = s.Spawn(() => 7_i64);
         i64 first = OrZero(t.Join());
         match t.Join() {
@@ -165,7 +165,7 @@ test second_join_is_refused {
 }
 
 test join_after_the_scope_returned_is_refused {
-    Result<Task<i64>, ParallelError> escaped = Parallel.Scope<Task<i64>>((Scope s) => {
+    Result<Task<i64>, ParallelError> escaped = Parallel.Scope<Task<i64>>((Core.Parallel.Scopes.Scope s) => {
         return Result::Ok(s.Spawn(() => 1_i64));
     });
     match escaped {
@@ -182,7 +182,7 @@ test join_after_the_scope_returned_is_refused {
 test failures_are_reported_in_spawn_order {
     mut i64 run = 0_i64;
     while run < 10_i64 {
-        Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
             Task<i64> slow = s.SpawnTry<i64>(() => {
                 Spin(30_i64);
                 return Result::Error("slow");
@@ -216,7 +216,7 @@ test failures_are_reported_in_spawn_order {
 }
 
 test failure_cancels_siblings {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> waiting = s.Spawn(() => AwaitCancel(5000_i64));
         Task<i64> failing = s.SpawnTry<i64>(() => Result::Error("down"));
         return Result::Ok(OrZero(waiting.Join()));
@@ -234,7 +234,7 @@ test failure_cancels_siblings {
 }
 
 test tolerated_failure_is_a_value {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<Result<i64, string>> t = s.Spawn<Result<i64, string>>(() => Result::Error("skip"));
         match t.Join() {
             Result::Ok(Result::Error(reason)) => Assert.Equal<string>(reason, "skip", "the tolerated error is the value"),
@@ -246,7 +246,7 @@ test tolerated_failure_is_a_value {
 }
 
 test scope_cancel_cancels_every_task {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> a = s.Spawn(() => AwaitCancel(5000_i64));
         Task<i64> b = s.Spawn(() => AwaitCancel(5000_i64));
         s.Cancel();
@@ -261,7 +261,7 @@ test scope_cancel_cancels_every_task {
 // ---- 0.6.3: nesting and serial elision ----
 
 i64 InnerPair() {
-    Result<i64, ParallelError> inner = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> inner = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> a = s.Spawn(() => 1_i64);
         Task<i64> b = s.Spawn(() => 1_i64);
         return Result::Ok(OrZero(a.Join()) + OrZero(b.Join()));
@@ -270,7 +270,7 @@ i64 InnerPair() {
 }
 
 test nested_scopes_complete {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> left = s.Spawn(() => InnerPair());
         Task<i64> right = s.Spawn(() => InnerPair());
         return Result::Ok(OrZero(left.Join()) + OrZero(right.Join()));
@@ -280,7 +280,7 @@ test nested_scopes_complete {
 
 test serial_scope_runs_every_body_on_the_caller {
     Isolate main = Isolate.Main();
-    Result<i64, ParallelError> result = Parallel.ScopeWith<i64>(ScopeOptions { workers: 0_i64, serial: true }, (Scope s) => {
+    Result<i64, ParallelError> result = Parallel.ScopeWith<i64>(ScopeOptions { workers: 0_i64, serial: true }, (Core.Parallel.Scopes.Scope s) => {
         Task<bool> placement = s.Spawn(() => Isolate.Current().Equals(main));
         Task<i64> left = s.Spawn(() => 20_i64);
         Task<i64> right = s.Spawn(() => 22_i64);
@@ -304,7 +304,7 @@ ReadOnlyArray<string> LoadWords() {
 
 test frozen_array_is_shared_with_a_task {
     ReadOnlyArray<string> words = LoadWords();
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> t = s.Spawn(() => words.Count());
         return match t.Join() {
             Result::Ok(n) => Result::Ok(n),
@@ -319,7 +319,7 @@ test frozen_array_is_shared_with_a_task {
 // ---- 0.6.4: ports ----
 
 test bounded_producer_and_consumer {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<i64> values = s.PortWith<i64>(4_i64);
         Task<unit> producer = s.Spawn(() => {
             mut i64 i = 0_i64;
@@ -344,7 +344,7 @@ test bounded_producer_and_consumer {
 }
 
 test try_receive_on_an_empty_open_port_would_block {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<i64> empty = s.Port<i64>();
         match empty.TryReceive() {
             TryResult::WouldBlock => Assert.True(true, "an empty open port would block"),
@@ -356,7 +356,7 @@ test try_receive_on_an_empty_open_port_would_block {
 }
 
 test closed_port_drains_then_reports_closed {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<i64> p = s.Port<i64>();
         p.Send(5_i64);
         p.Close();
@@ -379,7 +379,7 @@ test closed_port_drains_then_reports_closed {
 }
 
 test port_handle_crosses_a_port {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<Port<i64>> replyTo = s.Port<Port<i64>>();
         Task<unit> server = s.Spawn(() => {
             match replyTo.Receive() {
@@ -412,7 +412,7 @@ unit SumInbox(Port<i64> inbox, Port<i64> done) {
 }
 
 test two_workers_share_one_inbox {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<i64> inbox = s.Port<i64>();
         Port<i64> done = s.Port<i64>();
         Isolate first = s.Isolate(() => SumInbox(inbox, done));
@@ -431,11 +431,11 @@ test two_workers_share_one_inbox {
 }
 
 test worker_panic_fails_the_scope {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<i64> inbox = s.Port<i64>();
         Isolate worker = s.Isolate(() => {
             match inbox.Receive() {
-                Result::Ok(_) => { __panic_str("worker down"); },
+                Result::Ok(_) => { Assert.Fail("worker down"); },
                 Result::Error(_) => { },
             };
             return;
@@ -452,7 +452,7 @@ test worker_panic_fails_the_scope {
     });
     match result {
         Result::Error(ParallelError::Failed(failures)) => match failures.First() {
-            Option::Some(failure) => Assert.Equal<string>(failure.message, "worker down", "the worker's panic message"),
+            Option::Some(failure) => Assert.Contains(failure.message, "worker down", "the worker's panic message"),
             Option::None => Assert.True(false, "one failure present"),
         },
         _ => Assert.True(false, "a long-lived isolate's panic fails the scope"),
@@ -462,7 +462,7 @@ test worker_panic_fails_the_scope {
 // ---- 0.6.4: pipelines ----
 
 test three_stage_pipeline_keeps_input_order {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<string> lines = s.PortWith<string>(2000_i64);
         Result<i64, ParallelError> consumed = s
             .Source((Port<i64> out) => {
@@ -503,7 +503,7 @@ test three_stage_pipeline_keeps_input_order {
 }
 
 test stage_failure_cancels_the_pipeline {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         return s
             .Source((Port<i64> out) => {
                 mut i64 i = 1_i64;
@@ -517,7 +517,7 @@ test stage_failure_cancels_the_pipeline {
             })
             .Stage(2_i64, (n) => {
                 if n == 500_i64 {
-                    __panic_str("bad record");
+                    Assert.Fail("bad record");
                 }
                 return n;
             })
@@ -631,7 +631,7 @@ test user_combiner_with_both_markers {
 }
 
 test for_each_applies_the_body_to_every_element {
-    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Port<i64> seen = s.PortWith<i64>(200_i64);
         Numbers(100_i64).Parallel().ForEach((x) => {
             seen.Send(x);

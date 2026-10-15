@@ -18,6 +18,7 @@ use Core.Optional.Option;
 use Concurrency;
 use Core.Parallel.Scopes;
 use Core.Parallel.Combiners;
+use Core.Parallel;
 
 // ---- Source ----
 
@@ -28,6 +29,11 @@ use Core.Parallel.Combiners;
 [ScopeBorrowed]
 type SeqSource<T> {
     [ImmutableStorage] T[] items,
+
+    // The element at `index`. A method keeps the storage read out of the lambdas that run on workers.
+    pub Option<T> At(i64 index) {
+        return Option::Some(Array.Get<T>(this.items, index));
+    }
 }
 
 /// A sequence over the elements of `values`, without copying them.
@@ -43,7 +49,7 @@ pub ParallelSeq<T> OfArray<T>(T[] values) where T: Core.Parallel.Transferable {
 ParallelSeq<T> FromSource<T>(SeqSource<T> source, i64 count) where T: Core.Parallel.Transferable {
     return ParallelSeq<T> {
         count: count,
-        element: (i64 index) => Option::Some(Array.Get<T>(source.items, index)),
+        element: (i64 index) => source.At(index),
         chunkMax: 0_i64,
         chunkMin: 0_i64,
     };
@@ -302,10 +308,11 @@ Result<R, ParallelError> JoinInOrder<R>(Task<R>[] tasks, (R, R) => R merge) wher
     while k < Array.Len<Task<R>>(tasks) {
         match Array.Get<Task<R>>(tasks, k).Join() {
             Result::Ok(part) => {
-                acc = match acc {
+                Option<R> next = match acc {
                     Option::Some(left) => Option::Some(merge(left, part)),
                     Option::None => Option::Some(part),
                 };
+                acc = next;
             },
             Result::Error(_) => { return Result::Error(ParallelError::Cancelled); },
         };

@@ -1,0 +1,658 @@
+//! `ParallelSuite`: Core.Parallel fork-join scopes (0.6.3), ports and pipelines (0.6.4) and
+//! data-parallel sequences (0.6.5). Every test passes under any `BESKID_ISOLATES_MAX`, including
+//! 1 (serial elision): bodies that wait for cancellation also stop at a deadline, so an elided
+//! body cannot hang its scope.
+
+use Testing.Assert;
+use Core.Results;
+use Core.Optional.Option;
+use Core.Collections.Array;
+use Core.Collections.List;
+use Concurrency;
+use Concurrency.TryResult;
+use Core.Parallel;
+use Core.Parallel.Scopes;
+use Core.Parallel.Isolate;
+use Core.Parallel.Port;
+use Core.Parallel.ReadOnlyArray;
+use Core.Parallel.Combiners;
+use Core.Parallel.ParallelSeq;
+
+// ---- Helpers ----
+
+List<i64> Numbers(i64 count) {
+    mut List<i64> values = List.New<i64>();
+    mut i64 i = 0_i64;
+    while i < count {
+        values = values.Push(i);
+        i = i + 1_i64;
+    }
+    return values;
+}
+
+// Busy-waits `ms` milliseconds on the monotonic clock.
+unit Spin(i64 ms) {
+    i64 until = Concurrency.NowMillis() + ms;
+    while Concurrency.NowMillis() < until { }
+    return;
+}
+
+// Loops until the task is cancelled or `ms` milliseconds pass; returns 1 when cancelled.
+i64 AwaitCancel(i64 ms) {
+    i64 until = Concurrency.NowMillis() + ms;
+    while Concurrency.NowMillis() < until {
+        if Parallel.IsCancelled() {
+            return 1_i64;
+        }
+        Concurrency.Yield();
+    }
+    return 0_i64;
+}
+
+i64 OrZero(Result<i64, TaskError> joined) {
+    return match joined {
+        Result::Ok(value) => value,
+        Result::Error(_) => 0_i64,
+    };
+}
+
+i64 ScopeValue(Result<i64, ParallelError> result) {
+    return match result {
+        Result::Ok(value) => value,
+        Result::Error(_) => -1_i64,
+    };
+}
+
+// ---- 0.6.3: isolate handle ----
+
+test isolate_handles_compare_by_id {
+    Isolate here = Isolate.Current();
+    Assert.True(here.Equals(Isolate.Current()), "the current isolate equals itself");
+    Assert.True(Isolate.Main().Equals(Isolate.Current()), "a test body runs on the main isolate");
+}
+
+test task_body_reports_its_isolate {
+    Isolate parent = Isolate.Current();
+    Result<bool, ParallelError> result = Parallel.Scope<bool>((Scope s) => {
+        Task<bool> t = s.Spawn(() => Isolate.Current().Equals(parent));
+        return match t.Join() {
+            Result::Ok(same) => Result::Ok(same),
+            Result::Error(_) => Result::Error(ParallelError::Cancelled),
+        };
+    });
+    Assert.True(Results.IsOk(result), "a body that only reads its isolate completes");
+}
+
+// ---- 0.6.3: fork-join ----
+
+test scope_joins_every_task_before_returning {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> left = s.Spawn(() => 20_i64);
+        Task<i64> right = s.Spawn(() => 22_i64);
+        i64 a = OrZero(left.Join());
+        i64 b = OrZero(right.Join());
+        return Result::Ok(a + b);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 42_i64, "two tasks sum to 42");
+}
+
+test early_error_return_still_joins {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> waiting = s.Spawn(() => AwaitCancel(5000_i64));
+        return Result::Error(ParallelError::Cancelled);
+    });
+    match result {
+        Result::Error(ParallelError::Cancelled) => Assert.True(true, "the scope reports the body's cancellation"),
+        _ => Assert.True(false, "an early Cancelled return is the scope result"),
+    };
+}
+
+[Immutable]
+pub type Config {
+    pub string path,
+    pub i64 width,
+}
+
+[Copyable]
+pub type Knobs {
+    pub i64 depth,
+}
+
+Result<i64, ParallelError> Measure(Config config, Knobs knobs) {
+    return Parallel.Scope<i64>((Scope s) => {
+        Task<i64> t = s.Spawn(() => config.width + knobs.depth);
+        return match t.Join() {
+            Result::Ok(v) => Result::Ok(v),
+            Result::Error(_) => Result::Error(ParallelError::Cancelled),
+        };
+    });
+}
+
+test shared_and_copied_captures_reach_the_task {
+    Result<i64, ParallelError> result = Measure(Config { path: "a", width: 40_i64 }, Knobs { depth: 2_i64 });
+    Assert.Equal<i64>(ScopeValue(result), 42_i64, "Shared and Copied captures are visible in the task");
+}
+
+test spawn_try_error_fails_the_task {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> t = s.SpawnTry<i64>(() => Result::Error("no input"));
+        match t.Join() {
+            Result::Error(TaskError::Failed(failure)) => {
+                Assert.Equal<i64>(failure.index, 0_i64, "the first spawn has index 0");
+                Assert.Equal<string>(failure.message, "no input", "the Error message is the failure message");
+            },
+            _ => Assert.True(false, "a SpawnTry Error fails the task"),
+        };
+        return Result::Ok(0_i64);
+    });
+    match result {
+        Result::Error(ParallelError::Failed(failures)) => Assert.Equal<i64>(failures.Count(), 1_i64, "the scope reports the joined failure"),
+        _ => Assert.True(false, "a failed task fails its scope"),
+    };
+}
+
+test second_join_is_refused {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> t = s.Spawn(() => 7_i64);
+        i64 first = OrZero(t.Join());
+        match t.Join() {
+            Result::Error(TaskError::Joined) => Assert.True(true, "a second Join reports Joined"),
+            _ => Assert.True(false, "a task is joined at most once"),
+        };
+        return Result::Ok(first);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 7_i64, "the first Join takes the value");
+}
+
+test join_after_the_scope_returned_is_refused {
+    Result<Task<i64>, ParallelError> escaped = Parallel.Scope<Task<i64>>((Scope s) => {
+        return Result::Ok(s.Spawn(() => 1_i64));
+    });
+    match escaped {
+        Result::Ok(t) => match t.Join() {
+            Result::Error(TaskError::Joined) => Assert.True(true, "the scope already joined the task"),
+            _ => Assert.True(false, "a task is unusable after its scope returned"),
+        },
+        Result::Error(_) => Assert.True(false, "the scope completes"),
+    };
+}
+
+// ---- 0.6.3: structured failure ----
+
+test failures_are_reported_in_spawn_order {
+    mut i64 run = 0_i64;
+    while run < 10_i64 {
+        Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+            Task<i64> slow = s.SpawnTry<i64>(() => {
+                Spin(30_i64);
+                return Result::Error("slow");
+            });
+            Task<i64> fine = s.Spawn(() => 1_i64);
+            Task<i64> fast = s.SpawnTry<i64>(() => Result::Error("fast"));
+            return Result::Ok(0_i64);
+        });
+        match result {
+            Result::Error(ParallelError::Failed(failures)) => {
+                Assert.Equal<i64>(failures.Count(), 2_i64, "both failures are reported");
+                match failures.TryGet(0_i64) {
+                    Option::Some(first) => {
+                        Assert.Equal<i64>(first.index, 0_i64, "the slow failure comes first");
+                        Assert.Equal<string>(first.message, "slow", "first message");
+                    },
+                    Option::None => Assert.True(false, "first failure present"),
+                };
+                match failures.TryGet(1_i64) {
+                    Option::Some(second) => {
+                        Assert.Equal<i64>(second.index, 2_i64, "the fast failure keeps its spawn index");
+                        Assert.Equal<string>(second.message, "fast", "second message");
+                    },
+                    Option::None => Assert.True(false, "second failure present"),
+                };
+            },
+            _ => Assert.True(false, "two failing tasks fail the scope"),
+        };
+        run = run + 1_i64;
+    }
+}
+
+test failure_cancels_siblings {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> waiting = s.Spawn(() => AwaitCancel(5000_i64));
+        Task<i64> failing = s.SpawnTry<i64>(() => Result::Error("down"));
+        return Result::Ok(OrZero(waiting.Join()));
+    });
+    match result {
+        Result::Error(ParallelError::Failed(failures)) => {
+            Assert.Equal<i64>(failures.Count(), 1_i64, "only the panicking task failed");
+            match failures.First() {
+                Option::Some(failure) => Assert.Equal<i64>(failure.index, 1_i64, "the failure has spawn index 1"),
+                Option::None => Assert.True(false, "one failure present"),
+            };
+        },
+        _ => Assert.True(false, "a failed sibling fails the scope"),
+    };
+}
+
+test tolerated_failure_is_a_value {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<Result<i64, string>> t = s.Spawn<Result<i64, string>>(() => Result::Error("skip"));
+        match t.Join() {
+            Result::Ok(Result::Error(reason)) => Assert.Equal<string>(reason, "skip", "the tolerated error is the value"),
+            _ => Assert.True(false, "an Error value is not a task failure"),
+        };
+        return Result::Ok(0_i64);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 0_i64, "a tolerated failure does not fail the scope");
+}
+
+test scope_cancel_cancels_every_task {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> a = s.Spawn(() => AwaitCancel(5000_i64));
+        Task<i64> b = s.Spawn(() => AwaitCancel(5000_i64));
+        s.Cancel();
+        return Result::Ok(1_i64);
+    });
+    match result {
+        Result::Error(ParallelError::Cancelled) => Assert.True(true, "a cancelled scope reports Cancelled"),
+        _ => Assert.True(false, "Scope.Cancel makes the scope Cancelled"),
+    };
+}
+
+// ---- 0.6.3: nesting and serial elision ----
+
+i64 InnerPair() {
+    Result<i64, ParallelError> inner = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> a = s.Spawn(() => 1_i64);
+        Task<i64> b = s.Spawn(() => 1_i64);
+        return Result::Ok(OrZero(a.Join()) + OrZero(b.Join()));
+    });
+    return ScopeValue(inner);
+}
+
+test nested_scopes_complete {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> left = s.Spawn(() => InnerPair());
+        Task<i64> right = s.Spawn(() => InnerPair());
+        return Result::Ok(OrZero(left.Join()) + OrZero(right.Join()));
+    });
+    Assert.Equal<i64>(ScopeValue(result), 4_i64, "every nested result is summed");
+}
+
+test serial_scope_runs_every_body_on_the_caller {
+    Isolate main = Isolate.Main();
+    Result<i64, ParallelError> result = Parallel.ScopeWith<i64>(ScopeOptions { workers: 0_i64, serial: true }, (Scope s) => {
+        Task<bool> placement = s.Spawn(() => Isolate.Current().Equals(main));
+        Task<i64> left = s.Spawn(() => 20_i64);
+        Task<i64> right = s.Spawn(() => 22_i64);
+        match placement.Join() {
+            Result::Ok(onMain) => Assert.True(onMain, "a serial body runs on the main isolate"),
+            Result::Error(_) => Assert.True(false, "a serial body completes"),
+        };
+        return Result::Ok(OrZero(left.Join()) + OrZero(right.Join()));
+    });
+    Assert.Equal<i64>(ScopeValue(result), 42_i64, "serial elision gives the parallel result");
+}
+
+// ---- 0.6.3: ReadOnlyArray ----
+
+ReadOnlyArray<string> LoadWords() {
+    mut string[] words = Array.Empty<string>();
+    words = Array.Append<string>(words, "alpha");
+    words = Array.Append<string>(words, "beta");
+    return ReadOnlyArray.Freeze<string>(move words);
+}
+
+test frozen_array_is_shared_with_a_task {
+    ReadOnlyArray<string> words = LoadWords();
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Task<i64> t = s.Spawn(() => words.Count());
+        return match t.Join() {
+            Result::Ok(n) => Result::Ok(n),
+            Result::Error(_) => Result::Ok(-1_i64),
+        };
+    });
+    Assert.Equal<i64>(ScopeValue(result), 2_i64, "the task reads the frozen array");
+    Assert.Equal<string>(words.Get(1_i64), "beta", "Get reads by index");
+    Assert.False(Option.HasValue<string>(words.TryGet(2_i64)), "TryGet out of range is None");
+}
+
+// ---- 0.6.4: ports ----
+
+test bounded_producer_and_consumer {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<i64> values = s.PortWith<i64>(4_i64);
+        Task<unit> producer = s.Spawn(() => {
+            mut i64 i = 0_i64;
+            while i < 100_i64 {
+                values.Send(i);
+                i = i + 1_i64;
+            }
+            values.Close();
+            return;
+        });
+        mut i64 total = 0_i64;
+        mut bool open = true;
+        while open {
+            match values.Receive() {
+                Result::Ok(v) => { total = total + v; },
+                Result::Error(_) => { open = false; },
+            };
+        }
+        return Result::Ok(total);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 4950_i64, "every sent value is received once");
+}
+
+test try_receive_on_an_empty_open_port_would_block {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<i64> empty = s.Port<i64>();
+        match empty.TryReceive() {
+            TryResult::WouldBlock => Assert.True(true, "an empty open port would block"),
+            _ => Assert.True(false, "TryReceive never parks and invents no value"),
+        };
+        return Result::Ok(0_i64);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 0_i64, "the scope completes");
+}
+
+test closed_port_drains_then_reports_closed {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<i64> p = s.Port<i64>();
+        p.Send(5_i64);
+        p.Close();
+        p.Close();
+        i64 first = match p.Receive() {
+            Result::Ok(v) => v,
+            Result::Error(_) => -1_i64,
+        };
+        match p.Receive() {
+            Result::Error(PortError::Closed) => Assert.True(true, "a drained closed port reports Closed"),
+            _ => Assert.True(false, "no value after the drain"),
+        };
+        match p.Send(6_i64) {
+            Result::Error(PortError::Closed) => Assert.True(true, "a closed port refuses sends"),
+            _ => Assert.True(false, "Send on a closed port is Closed"),
+        };
+        return Result::Ok(first);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 5_i64, "the buffered value survives Close");
+}
+
+test port_handle_crosses_a_port {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<Port<i64>> replyTo = s.Port<Port<i64>>();
+        Task<unit> server = s.Spawn(() => {
+            match replyTo.Receive() {
+                Result::Ok(reply) => { reply.Send(42_i64); },
+                Result::Error(_) => { },
+            };
+            return;
+        });
+        Port<i64> fresh = s.Port<i64>();
+        replyTo.Send(fresh);
+        return match fresh.Receive() {
+            Result::Ok(v) => Result::Ok(v),
+            Result::Error(_) => Result::Ok(-1_i64),
+        };
+    });
+    Assert.Equal<i64>(ScopeValue(result), 42_i64, "the reply arrives through the sent port");
+}
+
+unit SumInbox(Port<i64> inbox, Port<i64> done) {
+    mut i64 sum = 0_i64;
+    mut bool open = true;
+    while open {
+        match inbox.Receive() {
+            Result::Ok(v) => { sum = sum + v; },
+            Result::Error(_) => { open = false; },
+        };
+    }
+    done.Send(sum);
+    return;
+}
+
+test two_workers_share_one_inbox {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<i64> inbox = s.Port<i64>();
+        Port<i64> done = s.Port<i64>();
+        Isolate first = s.Isolate(() => SumInbox(inbox, done));
+        Isolate second = s.Isolate(() => SumInbox(inbox, done));
+        mut i64 v = 1_i64;
+        while v <= 100_i64 {
+            inbox.Send(v);
+            v = v + 1_i64;
+        }
+        inbox.Close();
+        i64 a = match done.Receive() { Result::Ok(x) => x, Result::Error(_) => 0_i64 };
+        i64 b = match done.Receive() { Result::Ok(x) => x, Result::Error(_) => 0_i64 };
+        return Result::Ok(a + b);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 5050_i64, "each value is received by exactly one worker");
+}
+
+test worker_panic_fails_the_scope {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<i64> inbox = s.Port<i64>();
+        Isolate worker = s.Isolate(() => {
+            match inbox.Receive() {
+                Result::Ok(_) => { __panic_str("worker down"); },
+                Result::Error(_) => { },
+            };
+            return;
+        });
+        mut i64 i = 0_i64;
+        mut bool open = true;
+        while open && i < 1000_i64 {
+            match inbox.Send(i) {
+                Result::Ok(_) => { i = i + 1_i64; },
+                Result::Error(_) => { open = false; },
+            };
+        }
+        return Result::Ok(0_i64);
+    });
+    match result {
+        Result::Error(ParallelError::Failed(failures)) => match failures.First() {
+            Option::Some(failure) => Assert.Equal<string>(failure.message, "worker down", "the worker's panic message"),
+            Option::None => Assert.True(false, "one failure present"),
+        },
+        _ => Assert.True(false, "a long-lived isolate's panic fails the scope"),
+    };
+}
+
+// ---- 0.6.4: pipelines ----
+
+test three_stage_pipeline_keeps_input_order {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<string> lines = s.PortWith<string>(2000_i64);
+        Result<i64, ParallelError> consumed = s
+            .Source((Port<i64> out) => {
+                mut i64 i = 1_i64;
+                while i <= 1000_i64 {
+                    out.Send(i);
+                    i = i + 1_i64;
+                }
+                return;
+            })
+            .Stage(4_i64, (n) => n * n)
+            .Ordered()
+            .Stage(2_i64, (sq) => "${sq}")
+            .Ordered()
+            .Sink((line) => {
+                lines.Send(line);
+                return;
+            });
+        mut i64 expected = 1_i64;
+        mut bool inOrder = true;
+        mut bool more = true;
+        while more {
+            match lines.TryReceive() {
+                TryResult::Ok(line) => {
+                    i64 square = expected * expected;
+                    if line != "${square}" {
+                        inOrder = false;
+                    }
+                    expected = expected + 1_i64;
+                },
+                _ => { more = false; },
+            };
+        }
+        Assert.True(inOrder, "Ordered stages deliver records in input order");
+        return consumed;
+    });
+    Assert.Equal<i64>(ScopeValue(result), 1000_i64, "the sink consumes every record");
+}
+
+test stage_failure_cancels_the_pipeline {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        return s
+            .Source((Port<i64> out) => {
+                mut i64 i = 1_i64;
+                while i <= 1000_i64 {
+                    match out.Send(i) {
+                        Result::Ok(_) => { i = i + 1_i64; },
+                        Result::Error(_) => { i = 1001_i64; },
+                    };
+                }
+                return;
+            })
+            .Stage(2_i64, (n) => {
+                if n == 500_i64 {
+                    __panic_str("bad record");
+                }
+                return n;
+            })
+            .Sink((n) => { return; });
+    });
+    match result {
+        Result::Error(ParallelError::Failed(failures)) => Assert.Equal<i64>(failures.Count(), 1_i64, "one stage failure"),
+        _ => Assert.True(false, "a panicking stage fails the scope"),
+    };
+}
+
+// ---- 0.6.5: parallel sequences ----
+
+i64 SerialSumOfSquaresOfEvens(List<i64> values) {
+    mut i64 total = 0_i64;
+    mut i64 i = 0_i64;
+    while i < values.Count() {
+        i64 x = match values.TryGet(i) { Option::Some(v) => v, Option::None => 0_i64 };
+        if x % 2_i64 == 0_i64 {
+            total = total + x * x;
+        }
+        i = i + 1_i64;
+    }
+    return total;
+}
+
+test where_and_map_fuse_into_a_reduction {
+    List<i64> values = Numbers(1000_i64);
+    i64 parallel = values
+        .Parallel()
+        .Where((x) => x % 2_i64 == 0_i64)
+        .Map((x) => x * x)
+        .Reduce(0_i64, SumI64 { });
+    Assert.Equal<i64>(parallel, 166167000_i64, "sum of squares of evens below 1000");
+    Assert.Equal<i64>(parallel, SerialSumOfSquaresOfEvens(values), "parallel equals serial elision");
+}
+
+test source_stays_usable_and_count_matches {
+    List<i64> values = Numbers(1000_i64);
+    ParallelSeq<i64> seq = values.Parallel();
+    i64 n = seq.Count();
+    Assert.Equal<i64>(n, 1000_i64, "Count counts every element");
+    Assert.Equal<i64>(values.Count(), 1000_i64, "the borrowed source stays usable");
+}
+
+test collect_preserves_input_order {
+    List<i64> values = Numbers(10000_i64);
+    List<i64> doubled = values.Parallel().Chunk(7_i64).Map((x) => x * 2_i64).Collect();
+    Assert.Equal<i64>(doubled.Count(), 10000_i64, "Collect keeps every element");
+    mut bool ordered = true;
+    mut i64 i = 0_i64;
+    while i < doubled.Count() {
+        match doubled.TryGet(i) {
+            Option::Some(v) => { if v != 2_i64 * i { ordered = false; } },
+            Option::None => { ordered = false; },
+        };
+        i = i + 1_i64;
+    }
+    Assert.True(ordered, "element i of the result is 2 * i");
+}
+
+test min_chunk_collect_equals_the_input {
+    List<i64> values = Numbers(10000_i64);
+    List<i64> copy = values.Parallel().MinChunk(4096_i64).Collect();
+    Assert.Equal<i64>(copy.Count(), 10000_i64, "MinChunk keeps every element");
+    match copy.TryGet(9999_i64) {
+        Option::Some(last) => Assert.Equal<i64>(last, 9999_i64, "the last element keeps its position"),
+        Option::None => Assert.True(false, "the last element is kept"),
+    };
+}
+
+test ordered_reduce_preserves_association_order {
+    mut string[] words = Array.Empty<string>();
+    words = Array.Append<string>(words, "a");
+    words = Array.Append<string>(words, "b");
+    words = Array.Append<string>(words, "c");
+    words = Array.Append<string>(words, "d");
+    string joined = Parallel.OfArray<string>(words).Chunk(1_i64).Reduce("", Concat { });
+    Assert.Equal<string>(joined, "abcd", "Reduce combines chunk results in input order");
+}
+
+[Immutable]
+pub type Stats {
+    pub i64 count,
+    pub f64 total,
+    pub f64 max,
+}
+
+[Immutable]
+pub type MergeStats : Associative<Stats>, Commutative<Stats> {
+    pub Stats Combine(Stats a, Stats b) {
+        mut f64 m = a.max;
+        if b.max > m {
+            m = b.max;
+        }
+        return Stats { count: a.count + b.count, total: a.total + b.total, max: m };
+    }
+}
+
+test user_combiner_with_both_markers {
+    mut f64[] samples = Array.Empty<f64>();
+    samples = Array.Append<f64>(samples, 1.0);
+    samples = Array.Append<f64>(samples, 4.0);
+    samples = Array.Append<f64>(samples, 2.0);
+    Stats stats = Parallel.OfArray<f64>(samples)
+        .Map((s) => Stats { count: 1_i64, total: s, max: s })
+        .ReduceUnordered(Stats { count: 0_i64, total: 0.0, max: -1.0e308 }, MergeStats { });
+    Assert.Equal<i64>(stats.count, 3_i64, "count");
+    Assert.True(stats.total == 7.0, "total");
+    Assert.True(stats.max == 4.0, "max");
+}
+
+test for_each_applies_the_body_to_every_element {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Scope s) => {
+        Port<i64> seen = s.PortWith<i64>(200_i64);
+        Numbers(100_i64).Parallel().ForEach((x) => {
+            seen.Send(x);
+            return;
+        });
+        mut i64 total = 0_i64;
+        mut bool more = true;
+        while more {
+            match seen.TryReceive() {
+                TryResult::Ok(v) => { total = total + v; },
+                _ => { more = false; },
+            };
+        }
+        return Result::Ok(total);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 4950_i64, "ForEach visits every element exactly once");
+}
+
+test shipped_combiners {
+    List<i64> values = Numbers(10_i64);
+    Assert.Equal<i64>(values.Parallel().Reduce(0_i64, MaxI64 { }), 9_i64, "MaxI64");
+    Assert.Equal<i64>(values.Parallel().Reduce(100_i64, MinI64 { }), 0_i64, "MinI64");
+    Assert.Equal<i64>(values.Parallel().Map((x) => 1_i64).Reduce(0_i64, Count { }), 10_i64, "Count");
+}

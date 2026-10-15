@@ -23,7 +23,9 @@ use Core.Parallel.Combiners;
 
 // The borrowed source. The terminal parks its caller, so nothing writes the array while the
 // workers read it; the array reaches the workers by pointer, rooted by the terminal's scope.
+// `[ScopeBorrowed]` makes it Shared for every transferable `T`.
 [Immutable]
+[ScopeBorrowed]
 type SeqSource<T> {
     [ImmutableStorage] T[] items,
 }
@@ -123,6 +125,8 @@ pub type ParallelSeq<T> {
 
     /// Folds each chunk left to right from `seed`, then combines the chunk results in input
     /// order, which equals the serial left fold's association for an associative combiner.
+    /// Every chunk starts from `seed`, so the seed must be Shared or Copied: a Moved seed is
+    /// rejected (E1236). Build a Moved accumulator inside the combiner instead.
     pub T Reduce<C>(T seed, C combiner) where T: Core.Parallel.Transferable, C: Associative<T>, C: Core.Parallel.Transferable {
         return Drive<T, T, T>(
             this.count, this.chunkMax, this.chunkMin, this.element,
@@ -133,6 +137,7 @@ pub type ParallelSeq<T> {
     }
 
     /// `Reduce` that may combine the chunk results in any order. Requires a commutative combiner.
+    /// The seed must be Shared or Copied, as for `Reduce`.
     pub T ReduceUnordered<C>(T seed, C combiner) where T: Core.Parallel.Transferable, C: Associative<T>, C: Commutative<T>, C: Core.Parallel.Transferable {
         return Drive<T, T, T>(
             this.count, this.chunkMax, this.chunkMin, this.element,

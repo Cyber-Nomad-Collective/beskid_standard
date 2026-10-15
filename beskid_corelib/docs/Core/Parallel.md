@@ -6,7 +6,7 @@ Package: `corelib_concurrency`. Modules:
 
 | Module | Contents |
 | --- | --- |
-| `Core.Parallel` | `Parallel.Scope`, `Parallel.ScopeWith`, `Parallel.IsCancelled`, `Parallel.Of`, `Parallel.OfArray`; the transfer contracts `Transferable`, `Shared`, `Moved`, `Copied`; the marker attributes |
+| `Core.Parallel` | `Parallel.Scope`, `Parallel.ScopeWith`, `Parallel.IsCancelled`, `Parallel.Of`, `Parallel.OfArray`; the transfer contracts `Transferable`, `Shared`, `Moved`, `Copied` (the marker attributes are declared in `Core.Attributes`) |
 | `Core.Parallel.Scopes` | `Scope`, `ScopeOptions`, `Task<T>`, `TaskError`, `TaskFailure`, `ParallelError`, `PipelineStage<T>` |
 | `Core.Parallel.Isolate` | `Isolate` (`Current`, `Main`, `Equals`, `Cancel`) |
 | `Core.Parallel.Port` | `Port<T>`, `PortError`, `SendOk` |
@@ -87,6 +87,7 @@ i64 SumOfSquaresOfEvens(List<i64> values) {
 
 - Without `Chunk` or `MinChunk`, the sequence starts with one chunk per isolate. A worker splits its remaining range in half when another pool isolate is idle and the range holds at least twice the floor. The floor is the number of elements that the worker processed in its first heartbeat (1 ms), so short bodies get large chunks and long bodies get small ones.
 - `Collect` and `Reduce` keep input order. `ReduceUnordered` is the only operation whose combination order depends on scheduling.
+- Every chunk of `Reduce` and `ReduceUnordered` starts from the seed, so the seed must be `Shared` or `Copied`. A `Moved` seed is rejected (E1236).
 - A combiner is a transferable type that conforms to `Associative<T>` (and `Commutative<T>` for `ReduceUnordered`). The compiler does not prove these claims.
 - A plan whose lambdas use no `Port`, no `ReduceUnordered`, no clock, no random source and no I/O gives the serial result on every run and for every isolate count.
 

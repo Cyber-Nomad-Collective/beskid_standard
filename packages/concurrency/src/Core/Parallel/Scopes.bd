@@ -13,6 +13,7 @@ use Core.Collections.List;
 use Core.Collections.I64Map;
 use Core.Optional.Option;
 use Core.Parallel.Isolate;
+use Core.Parallel;
 use Core.Parallel.Port;
 
 // ---- Values ----
@@ -232,15 +233,15 @@ pub Result<T, ParallelError> Run<T>(ScopeOptions options, (Scope) => Result<T, P
         __panic_str("ScopeOptions.workers must not be negative");
     }
     i64 id = __isolate_scope_open(options.workers);
-    Scope scope = Scope {
+    Scope owner = Scope {
         id: id,
         serial: options.serial,
         tasks: Array.Empty<i64>(),
         cancelled: false,
         closed: false,
     };
-    Result<T, ParallelError> outcome = body(scope);
-    return scope.Finish<T>(outcome);
+    Result<T, ParallelError> outcome = body(owner);
+    return owner.Finish<T>(outcome);
 }
 
 // ---- Pipelines ----
@@ -254,19 +255,19 @@ enum Sequenced<T> {
 /// Stages never join and resend.
 [NeverTransferable]
 pub type PipelineStage<T> {
-    Scope scope,
+    Scope owner,
     Port<Sequenced<T>> output,
 
     /// Starts `workers` isolates (at least 1) that apply `step` to every record of this stage and
     /// send the results to a fresh port. With `workers > 1` the results may be reordered; apply
     /// `Ordered` to restore input order.
     pub PipelineStage<U> Stage<U>(i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
-        return StartStage<T, U>(this.scope, this.output, workers, step);
+        return StartStage<T, U>(this.owner, this.output, workers, step);
     }
 
     /// Delivers this stage's records in input order, buffering by input sequence number.
     pub PipelineStage<T> Ordered() where T: Core.Parallel.Transferable {
-        return StartOrdered<T>(this.scope, this.output);
+        return StartOrdered<T>(this.owner, this.output);
     }
 
     /// Runs `sink` on the calling isolate for every record and returns the number of records
@@ -276,19 +277,19 @@ pub type PipelineStage<T> {
     }
 }
 
-PipelineStage<T> StartSource<T>(Scope scope, [Captures(Bound: Transferable)] (Port<T>) => unit source) where T: Core.Parallel.Transferable {
-    Port<T> raw = scope.Port<T>();
-    Port<Sequenced<T>> numbered = scope.Port<Sequenced<T>>();
-    Isolate producer = scope.Isolate(() => {
+PipelineStage<T> StartSource<T>(Scope owner, [Captures(Bound: Transferable)] (Port<T>) => unit source) where T: Core.Parallel.Transferable {
+    Port<T> raw = owner.Port<T>();
+    Port<Sequenced<T>> numbered = owner.Port<Sequenced<T>>();
+    Isolate producer = owner.Isolate(() => {
         source(raw);
         raw.Close();
         return;
     });
-    Isolate numberer = scope.Isolate(() => {
+    Isolate numberer = owner.Isolate(() => {
         Number<T>(raw, numbered);
         return;
     });
-    return PipelineStage<T> { scope: scope, output: numbered };
+    return PipelineStage<T> { owner: owner, output: numbered };
 }
 
 unit Number<T>(Port<T> input, Port<Sequenced<T>> output) where T: Core.Parallel.Transferable {
@@ -309,27 +310,27 @@ unit Number<T>(Port<T> input, Port<Sequenced<T>> output) where T: Core.Parallel.
     return;
 }
 
-PipelineStage<U> StartStage<T, U>(Scope scope, Port<Sequenced<T>> input, i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
+PipelineStage<U> StartStage<T, U>(Scope owner, Port<Sequenced<T>> input, i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
     mut i64 count = workers;
     if count < 1_i64 {
         count = 1_i64;
     }
-    Port<Sequenced<U>> output = scope.Port<Sequenced<U>>();
-    Port<i64> finished = scope.Port<i64>();
+    Port<Sequenced<U>> output = owner.Port<Sequenced<U>>();
+    Port<i64> finished = owner.Port<i64>();
     mut i64 w = 0_i64;
     while w < count {
-        Isolate worker = scope.Isolate(() => {
+        Isolate worker = owner.Isolate(() => {
             Work<T, U>(input, output, finished, step);
             return;
         });
         w = w + 1_i64;
     }
     i64 expected = count;
-    Isolate closer = scope.Isolate(() => {
+    Isolate closer = owner.Isolate(() => {
         CloseAfter<U>(finished, expected, output);
         return;
     });
-    return PipelineStage<U> { scope: scope, output: output };
+    return PipelineStage<U> { owner: owner, output: output };
 }
 
 unit Work<T, U>(Port<Sequenced<T>> input, Port<Sequenced<U>> output, Port<i64> finished, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
@@ -365,13 +366,13 @@ unit CloseAfter<U>(Port<i64> finished, i64 workers, Port<Sequenced<U>> output) w
     return;
 }
 
-PipelineStage<T> StartOrdered<T>(Scope scope, Port<Sequenced<T>> input) where T: Core.Parallel.Transferable {
-    Port<Sequenced<T>> output = scope.Port<Sequenced<T>>();
-    Isolate reorder = scope.Isolate(() => {
+PipelineStage<T> StartOrdered<T>(Scope owner, Port<Sequenced<T>> input) where T: Core.Parallel.Transferable {
+    Port<Sequenced<T>> output = owner.Port<Sequenced<T>>();
+    Isolate reorder = owner.Isolate(() => {
         Reorder<T>(input, output);
         return;
     });
-    return PipelineStage<T> { scope: scope, output: output };
+    return PipelineStage<T> { owner: owner, output: output };
 }
 
 unit Reorder<T>(Port<Sequenced<T>> input, Port<Sequenced<T>> output) where T: Core.Parallel.Transferable {

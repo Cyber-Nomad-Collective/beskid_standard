@@ -57,11 +57,11 @@ pub type Session: Disposable {
     }
 }
 
-Result<DataValue,SessionError> CallEncoded(Session session, u8[] binding, u8[] shapes, u8[] payload, Deadline deadline) {
+Result<DataValue,SessionError> CallEncoded(Session session, u8[] binding, u8[] shapes, move u8[] payload, Deadline deadline) {
     u64 requestId = session.nextRequest;
     session.nextRequest = session.nextRequest + 1_u64;
     session.phase = 2_u8;
-    Envelope request = Envelope { kind: 1_u8, generation: session.generation, request: requestId, library: session.library, binding: binding, shapes: shapes, payload: payload };
+    Envelope request = Envelope { kind: 1_u8, generation: session.generation, request: requestId, library: session.library, binding: Array.Copy<u8>(binding), shapes: Array.Copy<u8>(shapes), payload: payload };
     Result<Envelope,SessionError> exchanged = Exchange(session, request, deadline);
     return match exchanged {
         Result::Error(error) => CallFailed(session, error),
@@ -157,8 +157,8 @@ Result<Envelope,SessionError> ExchangeFrame(Session session, u8[] frame, Deadlin
     };
 }
 
-Result<Envelope,SessionError> ExchangeResponse(Session session, u8[] response) {
-    return match Envelope.Decode(response) {
+Result<Envelope,SessionError> ExchangeResponse(Session session, move u8[] response) {
+    return match Envelope.Decode(move response) {
         Result::Error(error) => Result::Error(SessionError::Protocol),
         Result::Ok(decoded) => ExchangeDecoded(session, decoded),
     };
@@ -185,12 +185,12 @@ pub Result<Session,SessionError> Open(ProcessStartInfo info, string library, u64
     };
 }
 
-Result<Session,SessionError> OpenEncoded(ProcessStartInfo info, string library, u64 generation, u8[] payload, Deadline deadline) {
+Result<Session,SessionError> OpenEncoded(ProcessStartInfo info, string library, u64 generation, move u8[] payload, Deadline deadline) {
     Envelope request = Envelope { kind: 0_u8, generation: generation, request: 0_u64, library: library, binding: Zero(), shapes: Array.Empty<u8>(), payload: payload };
     if !Envelope.Valid(request) { return Result::Error(SessionError::Protocol); }
     return match Process.SpawnUntil(info, deadline) {
         Result::Error(error) => Result::Error(SessionError::Transport),
-        Result::Ok(child) => OpenSpawned(child, library, generation, request, payload, deadline),
+        Result::Ok(child) => OpenSpawned(child, library, generation, request, request.payload, deadline),
     };
 }
 
@@ -339,8 +339,8 @@ Result<u8[],SessionError> EncodeRequest(Session session, u64 request, u8[] bindi
         Result::Ok(payload) => EncodeEnvelope(session, request, binding, shapes, payload),
     };
 }
-Result<u8[],SessionError> EncodeEnvelope(Session session, u64 request, u8[] binding, u8[] shapes, u8[] payload) {
-    Envelope message = Envelope { kind: 1_u8, generation: session.generation, request: request, library: session.library, binding: binding, shapes: shapes, payload: payload };
+Result<u8[],SessionError> EncodeEnvelope(Session session, u64 request, u8[] binding, u8[] shapes, move u8[] payload) {
+    Envelope message = Envelope { kind: 1_u8, generation: session.generation, request: request, library: session.library, binding: Array.Copy<u8>(binding), shapes: Array.Copy<u8>(shapes), payload: payload };
     return match Envelope.Encode(message) {
         Result::Ok(bytes) => Result::Ok(bytes),
         Result::Error(error) => Result::Error(SessionError::Protocol),

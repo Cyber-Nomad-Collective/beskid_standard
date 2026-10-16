@@ -96,6 +96,18 @@ test scope_joins_every_task_before_returning {
     Assert.Equal<i64>(ScopeValue(result), 42_i64, "two tasks sum to 42");
 }
 
+// A `unit` task: `Task<unit>.Join()` binds a `unit` value, which has no storage.
+test unit_task_joins_without_a_value {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
+        Task<unit> t = s.Spawn(() => { Spin(1_i64); return; });
+        return match t.Join() {
+            Result::Ok(_) => Result::Ok(1_i64),
+            Result::Error(_) => Result::Error(ParallelError::Cancelled),
+        };
+    });
+    Assert.Equal<i64>(ScopeValue(result), 1_i64, "a unit task joins Ok");
+}
+
 test early_error_return_still_joins {
     Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
         Task<i64> waiting = s.Spawn(() => AwaitCancel(5000_i64));
@@ -595,7 +607,7 @@ test ordered_reduce_preserves_association_order {
     words = Array.Append<string>(words, "b");
     words = Array.Append<string>(words, "c");
     words = Array.Append<string>(words, "d");
-    string joined = Parallel.OfArray<string>(words).Chunk(1_i64).Reduce("", Concat { });
+    string joined = Parallel.OfArray<string>(move words).Chunk(1_i64).Reduce("", Concat { });
     Assert.Equal<string>(joined, "abcd", "Reduce combines chunk results in input order");
 }
 
@@ -622,7 +634,7 @@ test user_combiner_with_both_markers {
     samples = Array.Append<f64>(samples, 1.0);
     samples = Array.Append<f64>(samples, 4.0);
     samples = Array.Append<f64>(samples, 2.0);
-    Stats stats = Parallel.OfArray<f64>(samples)
+    Stats stats = Parallel.OfArray<f64>(move samples)
         .Map((s) => Stats { count: 1_i64, total: s, max: s })
         .ReduceUnordered(Stats { count: 0_i64, total: 0.0, max: -1.0e308 }, MergeStats { });
     Assert.Equal<i64>(stats.count, 3_i64, "count");

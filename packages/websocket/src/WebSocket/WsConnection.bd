@@ -64,7 +64,7 @@ pub WsOptions DefaultOptions() {
     };
 }
 
-pub WsOptions WithProtocols(WsOptions o, string[] protocols) {
+pub WsOptions WithProtocols(WsOptions o, move string[] protocols) {
     return WsOptions { protocols: protocols, origin: o.origin, maxMessageBytes: o.maxMessageBytes, handshakeTimeoutMillis: o.handshakeTimeoutMillis, closeTimeoutMillis: o.closeTimeoutMillis, readTimeoutMillis: o.readTimeoutMillis, tls: o.tls };
 }
 
@@ -579,7 +579,7 @@ pub Result<WsMessage, WsError> ReceiveOn(WsConnection self) {
             Result::Ok(value) => { frame = value; },
         };
         i64 opcode = frame.opcode;
-        u8[] payload = frame.payload;
+        u8[] payload = move frame.payload;
         if opcode == WsFrame.OpPing() {
             if self.st[0] == StateOpen() {
                 Result<unit, WsError> pong = WriteFrame(self, true, WsFrame.OpPong(), payload);
@@ -595,7 +595,7 @@ pub Result<WsMessage, WsError> ReceiveOn(WsConnection self) {
             continue;
         }
         if opcode == WsFrame.OpClose() { return HandleClose(self, payload); }
-        Result<i64, WsError> step = Accumulate(self, frame.fin, opcode, payload);
+        Result<i64, WsError> step = Accumulate(self, frame.fin, opcode, move payload);
         match step {
             Result::Error(error) => { return Result::Error(Fail(self, error)); },
             Result::Ok(messageOpcode) => {
@@ -609,7 +609,7 @@ pub Result<WsMessage, WsError> ReceiveOn(WsConnection self) {
 
 // Adds one data frame to the message being reassembled. Returns the message opcode
 // when the frame completes a message, 0 otherwise.
-Result<i64, WsError> Accumulate(WsConnection self, bool fin, i64 opcode, u8[] payload) {
+Result<i64, WsError> Accumulate(WsConnection self, bool fin, i64 opcode, move u8[] payload) {
     i64 length = Slice.Len(payload);
     if opcode == WsFrame.OpContinuation() {
         if self.st[1] == 0_i64 { return Result::Error(WsError::ProtocolError(WsFrame.ReasonUnexpectedContinuation())); }
@@ -626,12 +626,12 @@ Result<i64, WsError> Accumulate(WsConnection self, bool fin, i64 opcode, u8[] pa
         return Result::Error(WsError::InvalidUtf8);
     }
     if self.st[2] == 0_i64 {
-        self.partial = payload;
+        self.partial = move payload;
     } else if length > 0_i64 {
         u8[] joined = Mem.Zeroed(total);
         Mem.Copy(joined, 0_i64, self.partial, 0_i64, self.st[2]);
         Mem.Copy(joined, self.st[2], payload, 0_i64, length);
-        self.partial = joined;
+        self.partial = move joined;
     }
     self.st[2] = total;
     if !fin { return Result::Ok(0_i64); }

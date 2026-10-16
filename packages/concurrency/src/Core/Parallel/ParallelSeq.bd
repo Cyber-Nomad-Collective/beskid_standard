@@ -1,0 +1,408 @@
+/// Data-parallel sequences.
+///
+/// A `ParallelSeq<T>` borrows its source (a `List<T>` or `T[]`) and describes a plan. Operators
+/// (`Where`, `Map`, `Chunk`, `MinChunk`) are lazy and run nothing. Terminals (`Count`,
+/// `Collect`, `ForEach`, `Reduce`, `ReduceUnordered`) open an internal scope, evaluate the plan
+/// once per element inside the worker that owns the element's chunk (one fused pass per chunk, no
+/// intermediate collection), join and return.
+///
+/// Order is preserved by default: `Collect` returns elements in input order and `Reduce`
+/// combines chunk results in input order. `ReduceUnordered` is the one explicit opt-out. A plan
+/// whose lambdas use no `Port`, no `ReduceUnordered`, no clock, no random source and no I/O gives
+/// the serial result on every run and every isolate count; with one isolate it runs serially on
+/// the calling isolate in input order.
+use Core.Results;
+use Core.Collections.Array;
+use Core.Collections.List;
+use Core.Optional.Option;
+use Concurrency;
+use Core.Parallel.Scopes;
+use Core.Parallel.Combiners;
+use Core.Parallel;
+
+// ---- Source ----
+
+// The borrowed source. The terminal parks its caller, so nothing writes the array while the
+// workers read it; the array reaches the workers by pointer, rooted by the terminal's scope.
+// `[ScopeBorrowed]` makes it Shared for every transferable `T`.
+[Immutable]
+[ScopeBorrowed]
+type SeqSource<T> {
+    [ImmutableStorage] T[] items,
+
+    // The element at `index`. A method keeps the storage read out of the lambdas that run on workers.
+    pub Option<T> At(i64 index) {
+        return Option::Some(Array.Get<T>(this.items, index));
+    }
+}
+
+/// A sequence over the elements of `values`, without copying them.
+pub ParallelSeq<T> OfList<T>(List<T> values) where T: Core.Parallel.Transferable {
+    return FromSource<T>(SeqSource<T> { items: values.BorrowStorage() }, values.Count());
+}
+
+/// A sequence over the elements of `values`, without copying them. The caller keeps `values`:
+/// the `[ScopeBorrowed]` source borrows the array for the terminal's scope.
+pub ParallelSeq<T> OfArray<T>(T[] values) where T: Core.Parallel.Transferable {
+    return FromSource<T>(SeqSource<T> { items: values }, Array.Len<T>(values));
+}
+
+ParallelSeq<T> FromSource<T>(SeqSource<T> source, i64 count) where T: Core.Parallel.Transferable {
+    return ParallelSeq<T> {
+        count: count,
+        element: (i64 index) => source.At(index),
+        chunkMax: 0_i64,
+        chunkMin: 0_i64,
+    };
+}
+
+impl<T> List<T> {
+    /// `Parallel.Of<T>(this)`: a parallel sequence that borrows this list.
+    pub ParallelSeq<T> Parallel() where T: Core.Parallel.Transferable {
+        return OfList<T>(this);
+    }
+}
+
+// ---- Sequence ----
+
+/// A lazy data-parallel plan over `count` source positions. `element(i)` yields the plan's value
+/// for source position `i`, or `None` when an operator dropped it.
+pub type ParallelSeq<T> {
+    i64 count,
+    [Captures(Bound: Transferable)] (i64) => Option<T> element,
+    i64 chunkMax,
+    i64 chunkMin,
+
+    /// Keeps the elements for which `predicate` is true. Lazy.
+    pub ParallelSeq<T> Where([Captures(Bound: Transferable)] (T) => bool predicate) where T: Core.Parallel.Transferable {
+        return Filtered<T>(this, this.element, predicate);
+    }
+
+    /// Applies `project` exactly once to every surviving element. Lazy.
+    pub ParallelSeq<U> Map<U>([Captures(Bound: Transferable)] (T) => U project) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
+        return Mapped<T, U>(this, this.element, project);
+    }
+
+    /// Every chunk holds at most `n` elements (the last may hold fewer). Panics when `n < 1`.
+    pub ParallelSeq<T> Chunk(i64 n) where T: Core.Parallel.Transferable {
+        if n < 1_i64 {
+            __panic_str("ParallelSeq.Chunk: n must be at least 1");
+        }
+        return ParallelSeq<T> { count: this.count, element: this.element, chunkMax: n, chunkMin: this.chunkMin };
+    }
+
+    /// Every chunk holds at least `n` elements unless the input has fewer. Panics when `n < 1`.
+    pub ParallelSeq<T> MinChunk(i64 n) where T: Core.Parallel.Transferable {
+        if n < 1_i64 {
+            __panic_str("ParallelSeq.MinChunk: n must be at least 1");
+        }
+        return ParallelSeq<T> { count: this.count, element: this.element, chunkMax: this.chunkMax, chunkMin: n };
+    }
+
+    /// Number of elements: `Map((x) => 1_i64).Reduce(0_i64, SumI64 { })`.
+    pub i64 Count() where T: Core.Parallel.Transferable {
+        return this.Map<i64>((T value) => 1_i64).Reduce<SumI64>(0_i64, SumI64 { });
+    }
+
+    /// The elements in input order. Each worker builds its partial lists in its own heap; they
+    /// are adopted at join and concatenated once in the caller.
+    pub List<T> Collect() where T: Core.Parallel.Transferable {
+        List<List<T>> parts = Drive<T, List<T>, List<List<T>>>(
+            this.count, this.chunkMax, this.chunkMin, this.element,
+            () => List.New<T>(),
+            (List<T> leaf, T value) => leaf.Push(value),
+            (List<T> leaf) => List.New<List<T>>().Push(leaf),
+            (List<List<T>> left, List<List<T>> right) => left.Concat(right));
+        return Flatten<T>(parts);
+    }
+
+    /// Applies `body` to every element exactly once, with no order between isolates.
+    pub unit ForEach([Captures(Bound: Transferable)] (T) => unit body) where T: Core.Parallel.Transferable {
+        i64 applied = Drive<T, i64, i64>(
+            this.count, this.chunkMax, this.chunkMin, this.element,
+            () => 0_i64,
+            (i64 seen, T value) => {
+                body(value);
+                return seen + 1_i64;
+            },
+            (i64 seen) => seen,
+            (i64 left, i64 right) => left + right);
+        return;
+    }
+
+    /// Folds each chunk left to right from `seed`, then combines the chunk results in input
+    /// order, which equals the serial left fold's association for an associative combiner.
+    /// Every chunk starts from `seed`, so the seed must be Shared or Copied: a Moved seed is
+    /// rejected (E1236). Build a Moved accumulator inside the combiner instead.
+    pub T Reduce<C>(T seed, C combiner) where T: Core.Parallel.Transferable, C: Associative<T>, C: Core.Parallel.Transferable {
+        return Drive<T, T, T>(
+            this.count, this.chunkMax, this.chunkMin, this.element,
+            () => seed,
+            (T acc, T value) => combiner.Combine(acc, value),
+            (T leaf) => leaf,
+            (T left, T right) => combiner.Combine(left, right));
+    }
+
+    /// `Reduce` that may combine the chunk results in any order. Requires a commutative combiner.
+    /// The seed must be Shared or Copied, as for `Reduce`.
+    pub T ReduceUnordered<C>(T seed, C combiner) where T: Core.Parallel.Transferable, C: Associative<T>, C: Commutative<T>, C: Core.Parallel.Transferable {
+        return Drive<T, T, T>(
+            this.count, this.chunkMax, this.chunkMin, this.element,
+            () => seed,
+            (T acc, T value) => combiner.Combine(acc, value),
+            (T leaf) => leaf,
+            (T left, T right) => combiner.Combine(left, right));
+    }
+}
+
+// ---- Operators ----
+
+ParallelSeq<T> Filtered<T>(
+    ParallelSeq<T> source,
+    [Captures(Bound: Transferable)] (i64) => Option<T> element,
+    [Captures(Bound: Transferable)] (T) => bool predicate
+) where T: Core.Parallel.Transferable {
+    return ParallelSeq<T> {
+        count: source.count,
+        element: (i64 index) => Keep<T>(element(index), predicate),
+        chunkMax: source.chunkMax,
+        chunkMin: source.chunkMin,
+    };
+}
+
+Option<T> Keep<T>(Option<T> item, (T) => bool predicate) {
+    return match item {
+        Option::Some(value) => KeepValue<T>(value, predicate),
+        Option::None => Option::None,
+    };
+}
+
+Option<T> KeepValue<T>(T value, (T) => bool predicate) {
+    if predicate(value) {
+        return Option::Some(value);
+    }
+    return Option::None;
+}
+
+ParallelSeq<U> Mapped<T, U>(
+    ParallelSeq<T> source,
+    [Captures(Bound: Transferable)] (i64) => Option<T> element,
+    [Captures(Bound: Transferable)] (T) => U project
+) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
+    return ParallelSeq<U> {
+        count: source.count,
+        element: (i64 index) => Project<T, U>(element(index), project),
+        chunkMax: source.chunkMax,
+        chunkMin: source.chunkMin,
+    };
+}
+
+Option<U> Project<T, U>(Option<T> item, (T) => U project) {
+    return match item {
+        Option::Some(value) => Option::Some(project(value)),
+        Option::None => Option::None,
+    };
+}
+
+// The single concatenation of `Collect`: one pass appending every partial list in order.
+List<T> Flatten<T>(List<List<T>> parts) {
+    mut List<T> result = List.New<T>();
+    mut i64 part = 0_i64;
+    while part < parts.Count() {
+        match parts.TryGet(part) {
+            Option::Some(chunk) => {
+                mut i64 index = 0_i64;
+                while index < chunk.Count() {
+                    match chunk.TryGet(index) {
+                        Option::Some(value) => { result = result.Push(value); },
+                        Option::None => { },
+                    };
+                    index = index + 1_i64;
+                }
+            },
+            Option::None => { },
+        };
+        part = part + 1_i64;
+    }
+    return result;
+}
+
+// ---- Evaluation ----
+
+// Heartbeat of the adaptive splitter. A worker reads the clock every `HeartbeatStride()`
+// elements; once per `HeartbeatMillis()` it may split its remaining range in half when another
+// pool isolate is idle and the range holds at least twice the floor. The floor is the number of
+// elements the worker processed in its first heartbeat (at least `MinChunk`), so short bodies get
+// large chunks and long bodies get small ones.
+i64 HeartbeatMillis() { return 1_i64; }
+i64 HeartbeatStride() { return 64_i64; }
+
+// Runs a plan: one chunk per isolate the terminal's scope may use (`Chunk(n)` fixes the chunk
+// size instead, `MinChunk(n)` bounds it from below), each chunk on its own task, chunk results
+// merged in input order. A task failure fails the terminal in the caller.
+R Drive<T, L, R>(
+    i64 count,
+    i64 chunkMax,
+    i64 chunkMin,
+    [Captures(Bound: Transferable)] (i64) => Option<T> element,
+    [Captures(Bound: Transferable)] () => L start,
+    [Captures(Bound: Transferable)] (L, T) => L step,
+    [Captures(Bound: Transferable)] (L) => R finish,
+    [Captures(Bound: Transferable)] (R, R) => R merge
+) where T: Core.Parallel.Transferable, L: Core.Parallel.Transferable, R: Core.Parallel.Transferable {
+    mut i64 chunks = __isolate_pool_size();
+    mut bool adaptive = true;
+    mut i64 floor = 1_i64;
+    if chunkMax > 0_i64 {
+        chunks = (count + chunkMax - 1_i64) / chunkMax;
+        adaptive = false;
+    }
+    if chunkMax == 0_i64 && chunkMin > 0_i64 {
+        floor = chunkMin;
+        i64 byFloor = count / chunkMin;
+        if byFloor < chunks {
+            chunks = byFloor;
+        }
+    }
+    if chunks > count {
+        chunks = count;
+    }
+    if chunks < 1_i64 {
+        chunks = 1_i64;
+    }
+    i64 total = chunks;
+    i64 limit = chunkMax;
+    bool split = adaptive;
+    i64 least = floor;
+    Result<R, ParallelError> outcome = Scopes.Run<R>(Scopes.DefaultOptions(), (Scope s) => {
+        mut Task<R>[] tasks = Array.Empty<Task<R>>();
+        mut i64 k = 0_i64;
+        while k < total {
+            i64 lo = ChunkStart(k, total, count, limit);
+            i64 hi = ChunkStart(k + 1_i64, total, count, limit);
+            tasks = Array.Append<Task<R>>(tasks, s.Spawn<R>(() => Evaluate<T, L, R>(lo, hi, least, split, element, start, step, finish, merge)));
+            k = k + 1_i64;
+        }
+        return JoinInOrder<R>(tasks, merge);
+    });
+    return match outcome {
+        Result::Ok(value) => value,
+        Result::Error(error) => __panic_str(Describe(error)),
+    };
+}
+
+// Start of chunk `k` of `total`: fixed `size` chunks, or an even split when `size` is 0.
+i64 ChunkStart(i64 k, i64 total, i64 count, i64 size) {
+    if size > 0_i64 {
+        i64 at = k * size;
+        if at > count {
+            return count;
+        }
+        return at;
+    }
+    return k * count / total;
+}
+
+Result<R, ParallelError> JoinInOrder<R>(Task<R>[] tasks, (R, R) => R merge) where R: Core.Parallel.Transferable {
+    mut Option<R> acc = Option::None;
+    mut i64 k = 0_i64;
+    while k < Array.Len<Task<R>>(tasks) {
+        match Array.Get<Task<R>>(tasks, k).Join() {
+            Result::Ok(part) => {
+                Option<R> next = match acc {
+                    Option::Some(left) => Option::Some(merge(left, part)),
+                    Option::None => Option::Some(part),
+                };
+                acc = next;
+            },
+            Result::Error(_) => { return Result::Error(ParallelError::Cancelled); },
+        };
+        k = k + 1_i64;
+    }
+    return match acc {
+        Option::Some(value) => Result::Ok(value),
+        Option::None => Result::Error(ParallelError::Cancelled),
+    };
+}
+
+string Describe(ParallelError error) {
+    return match error {
+        ParallelError::Failed(failures) => match failures.First() {
+            Option::Some(first) => "Core.Parallel: a sequence task failed: " + first.message,
+            Option::None => "Core.Parallel: a sequence task failed",
+        },
+        ParallelError::Cancelled => "Core.Parallel: the sequence was cancelled",
+    };
+}
+
+// Evaluates positions `lo .. hi` in one fused pass. When `adaptive`, splits the remaining range
+// on a heartbeat (lazy binary splitting with a heartbeat-derived floor).
+R Evaluate<T, L, R>(
+    i64 lo,
+    i64 hi,
+    i64 floorMin,
+    bool adaptive,
+    [Captures(Bound: Transferable)] (i64) => Option<T> element,
+    [Captures(Bound: Transferable)] () => L start,
+    [Captures(Bound: Transferable)] (L, T) => L step,
+    [Captures(Bound: Transferable)] (L) => R finish,
+    [Captures(Bound: Transferable)] (R, R) => R merge
+) where T: Core.Parallel.Transferable, L: Core.Parallel.Transferable, R: Core.Parallel.Transferable {
+    mut L acc = start();
+    mut i64 index = lo;
+    mut i64 floor = floorMin;
+    mut bool measured = false;
+    mut i64 beat = Concurrency.NowMillis() + HeartbeatMillis();
+    while index < hi {
+        match element(index) {
+            Option::Some(value) => { acc = step(acc, value); },
+            Option::None => { },
+        };
+        index = index + 1_i64;
+        if adaptive && (index - lo) % HeartbeatStride() == 0_i64 {
+            i64 now = Concurrency.NowMillis();
+            if now >= beat {
+                if !measured {
+                    measured = true;
+                    if index - lo > floor {
+                        floor = index - lo;
+                    }
+                }
+                beat = now + HeartbeatMillis();
+                if hi - index >= 2_i64 * floor && __isolate_idle_count() > 0_i64 {
+                    R done = finish(acc);
+                    R rest = Split<T, L, R>(index, hi, floor, element, start, step, finish, merge);
+                    return merge(done, rest);
+                }
+            }
+        }
+    }
+    return finish(acc);
+}
+
+// Splits `lo .. hi` in half: the upper half becomes a task of a nested scope, the lower half
+// continues here; the halves merge in input order.
+R Split<T, L, R>(
+    i64 lo,
+    i64 hi,
+    i64 floor,
+    [Captures(Bound: Transferable)] (i64) => Option<T> element,
+    [Captures(Bound: Transferable)] () => L start,
+    [Captures(Bound: Transferable)] (L, T) => L step,
+    [Captures(Bound: Transferable)] (L) => R finish,
+    [Captures(Bound: Transferable)] (R, R) => R merge
+) where T: Core.Parallel.Transferable, L: Core.Parallel.Transferable, R: Core.Parallel.Transferable {
+    i64 mid = lo + (hi - lo) / 2_i64;
+    Result<R, ParallelError> outcome = Scopes.Run<R>(Scopes.DefaultOptions(), (Scope s) => {
+        Task<R> upper = s.Spawn<R>(() => Evaluate<T, L, R>(mid, hi, floor, true, element, start, step, finish, merge));
+        R lower = Evaluate<T, L, R>(lo, mid, floor, true, element, start, step, finish, merge);
+        return match upper.Join() {
+            Result::Ok(value) => Result::Ok(merge(lower, value)),
+            Result::Error(_) => Result::Error(ParallelError::Cancelled),
+        };
+    });
+    return match outcome {
+        Result::Ok(value) => value,
+        Result::Error(error) => __panic_str(Describe(error)),
+    };
+}

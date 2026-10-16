@@ -59,7 +59,7 @@ u8[] Label(HashAlgorithm h, u8[] secret, string label, i64 length) {
     };
 }
 
-PacketKeys Assemble(i64 suite, u8[] secret, u8[] key, u8[] iv, u8[] hp, AesKey[] hpAes) {
+PacketKeys Assemble(i64 suite, move u8[] secret, move u8[] key, move u8[] iv, move u8[] hp, AesKey[] hpAes) {
     mut AesGcmKey[] gcm = Array.Empty<AesGcmKey>();
     if suite != 2_i64 {
         match AesGcm.New(key) { Result::Ok(k) => { Array.Append<AesGcmKey>(gcm, k); }, Result::Error(_) => (), };
@@ -76,7 +76,7 @@ pub PacketKeys DeriveKeys(i64 suite, u8[] secret) {
     if suite != 2_i64 {
         match Aes.NewKey(hp) { Result::Ok(k) => { Array.Append<AesKey>(hpAes, k); }, Result::Error(_) => (), };
     }
-    return Assemble(suite, secret, Label(h, secret, "quic key", kl), Label(h, secret, "quic iv", 12_i64), hp, hpAes);
+    return Assemble(suite, Slice.SubSlice(secret, 0_i64, Slice.Len(secret)), Label(h, secret, "quic key", kl), Label(h, secret, "quic iv", 12_i64), move hp, hpAes);
 }
 
 /// Next-generation keys after a key update (RFC 9001 section 6): a new secret from
@@ -85,7 +85,9 @@ pub PacketKeys NextKeys(PacketKeys k) {
     HashAlgorithm h = HashOf(k.suite);
     u8[] next = Label(h, k.secret, "quic ku", Hmac.HashLength(h));
     i64 kl = KeyLength(k.suite);
-    return Assemble(k.suite, next, Label(h, next, "quic key", kl), Label(h, next, "quic iv", 12_i64), k.hp, k.hpAes);
+    u8[] key = Label(h, next, "quic key", kl);
+    u8[] iv = Label(h, next, "quic iv", 12_i64);
+    return Assemble(k.suite, move next, move key, move iv, k.hp, k.hpAes);
 }
 
 /// The QUIC version 1 initial salt (RFC 9001 section 5.2).
@@ -281,7 +283,7 @@ pub bool RetryValid(u8[] odcid, u8[] buf, i64 start, i64 end) {
 pub u8[] BuildRetry(u8[] odcid, u8[] dcid, u8[] scid, u8[] token) {
     i64 n = 7_i64 + Slice.Len(dcid) + Slice.Len(scid) + Slice.Len(token);
     u8[] out = Mem.Zeroed(n + 16_i64);
-    Writer w = QuicWire.NewWriter(out, 0_i64, n);
+    Writer w = QuicWire.NewWriter(move out, 0_i64, n);
     QuicWire.PutByte(w, 255_i64);
     QuicWire.PutUint(w, 4_i64, 1_i64);
     QuicWire.PutByte(w, Slice.Len(dcid));
@@ -289,6 +291,6 @@ pub u8[] BuildRetry(u8[] odcid, u8[] dcid, u8[] scid, u8[] token) {
     QuicWire.PutByte(w, Slice.Len(scid));
     QuicWire.PutAll(w, scid);
     QuicWire.PutAll(w, token);
-    Mem.Copy(out, n, RetryTag(odcid, out, 0_i64, n), 0_i64, 16_i64);
-    return out;
+    Mem.Copy(w.buf, n, RetryTag(odcid, w.buf, 0_i64, n), 0_i64, 16_i64);
+    return QuicWire.TakeBuffer(w);
 }

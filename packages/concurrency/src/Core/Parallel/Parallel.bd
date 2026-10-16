@@ -1,0 +1,85 @@
+/// Core.Parallel: structured parallelism over isolates.
+///
+/// An isolate is a runtime instance with its own heap, collector and fiber scheduler on its own
+/// OS thread. Values cross between isolates only by their transfer class: Shared values by
+/// pointer, Moved values by hand-over, Copied values by copy. This module holds the transfer
+/// marker contracts and the module-level entry points:
+///
+/// - `Parallel.Scope` / `Parallel.ScopeWith`: fork-join scopes (`Core.Parallel.Scopes`).
+/// - `Parallel.Of` / `Parallel.OfArray`: data-parallel sequences (`Core.Parallel.ParallelSeq`).
+/// - `Parallel.IsCancelled`: the cancellation probe of the current task.
+///
+/// The cost of each transfer is published in `docs/Core/Parallel.md`.
+use Core.Collections.List;
+
+// ---- Transfer marker contracts ----
+//
+// The compiler proves these from a type's transfer class. A type never lists them as
+// conformances (E1607). A bound `where T: M` is proven structurally: primitives and `string` are
+// Shared, `T[]` is Moved when `T` is transferable, and a nominal type takes its class from
+// `[Immutable]`, `[Isolated]` or `[Copyable]` (declared in `Core.Attributes`) and the classes of
+// its fields.
+
+/// A value that may cross a heap boundary: Shared, Moved or Copied.
+[CompilerDerived]
+pub contract Transferable { }
+
+/// A value that nothing can write, so several heaps may reference it.
+[CompilerDerived]
+pub contract Shared { }
+
+/// A value with exactly one owner; the owner changes when the value is handed over.
+[CompilerDerived]
+pub contract Moved { }
+
+/// Plain data copied on every transfer.
+[CompilerDerived]
+pub contract Copied { }
+
+// The marker attributes (`Immutable`, `Isolated`, `Copyable`, `NeverTransferable`,
+// `ImmutableStorage`, `Captures`, `ScopeBorrowed`) are declared once, in `Core.Attributes`.
+
+// ---- Fork-join entry points ----
+
+/// Runs `body` with a fresh scope on the calling isolate and returns once every task and
+/// isolate started in the scope is terminal.
+///
+/// The result is `Error(ParallelError::Failed(failures))` when any task failed (failures in
+/// spawn order), `Error(ParallelError::Cancelled)` when the scope was cancelled, and otherwise
+/// the result of `body`.
+pub Core.Results.Result<T, Core.Parallel.Scopes.ParallelError> Scope<T>(
+    (Core.Parallel.Scopes.Scope) => Core.Results.Result<T, Core.Parallel.Scopes.ParallelError> body
+) {
+    return Core.Parallel.Scopes.Run<T>(Core.Parallel.Scopes.DefaultOptions(), body);
+}
+
+/// `Scope` with explicit options: `workers` caps the isolates this scope uses at once (0 means
+/// the process bound `BESKID_ISOLATES_MAX`); `serial: true` runs every body on the calling
+/// isolate in program order.
+pub Core.Results.Result<T, Core.Parallel.Scopes.ParallelError> ScopeWith<T>(
+    Core.Parallel.Scopes.ScopeOptions options,
+    (Core.Parallel.Scopes.Scope) => Core.Results.Result<T, Core.Parallel.Scopes.ParallelError> body
+) {
+    return Core.Parallel.Scopes.Run<T>(options, body);
+}
+
+/// True when cancellation of the calling task (or of the isolate that runs it) was requested.
+/// A task body that loops without parking polls this to end early; parking operations observe
+/// cancellation on their own.
+pub bool IsCancelled() {
+    return __isolate_cancel_requested() != 0_u8;
+}
+
+// ---- Data-parallel entry points ----
+
+/// A parallel sequence over `values`. The list is borrowed: it stays usable and no element is
+/// copied to build the sequence.
+pub Core.Parallel.ParallelSeq.ParallelSeq<T> Of<T>(List<T> values) where T: Transferable {
+    return Core.Parallel.ParallelSeq.OfList<T>(values);
+}
+
+/// A parallel sequence over `values`. The sequence borrows the array: no element is copied and
+/// the array stays usable.
+pub Core.Parallel.ParallelSeq.ParallelSeq<T> OfArray<T>(T[] values) where T: Transferable {
+    return Core.Parallel.ParallelSeq.OfArray<T>(values);
+}

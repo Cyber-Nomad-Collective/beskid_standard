@@ -102,7 +102,7 @@ pub H3Conn Open(QuicLink link, bool isServer, H3Config config) {
     conn.st[1] = encoderStream;
     conn.st[2] = decoderStream;
     mut u8[] first = H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeControl());
-    first = H3Frame.AppendFrame(first, H3Frame.TypeSettings(), H3Settings.Encode(LocalSettings(config)));
+    first = H3Frame.AppendFrame(move first, H3Frame.TypeSettings(), H3Settings.Encode(LocalSettings(config)));
     bool sent = H3Quic.Write(link, control, first, false);
     bool sentEncoder = H3Quic.Write(link, encoderStream, H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeEncoder()), false);
     bool sentDecoder = H3Quic.Write(link, decoderStream, H3Frame.AppendVarint(Slice.New(0_i64), StreamTypeDecoder()), false);
@@ -173,10 +173,10 @@ pub unit FailStream(H3Conn conn, H3Req req, i64 code) {
 
 /// Encodes a field section and writes it as a HEADERS frame (QPACK
 /// encoder stream data is flushed first).
-pub u8[] HeadersFrame(mut H3Conn conn, i64 streamId, HeaderField[] fields, mut u8[] out) {
+pub u8[] HeadersFrame(mut H3Conn conn, i64 streamId, HeaderField[] fields, move u8[] out) {
     u8[] section = QpackEncoder.EncodeSection(conn.encoder, streamId, fields);
     FlushQpack(conn);
-    return H3Frame.AppendFrame(out, H3Frame.TypeHeaders(), section);
+    return H3Frame.AppendFrame(move out, H3Frame.TypeHeaders(), section);
 }
 
 /// Largest DATA frame payload written. Kept at 4 KiB so neither side ever
@@ -195,7 +195,7 @@ pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] 
         mut i64 chunk = total - at;
         if chunk > DataChunk() { chunk = DataChunk(); }
         mut u8[] frame = H3Frame.AppendVarint(Slice.New(0_i64), H3Frame.TypeData());
-        frame = H3Frame.AppendVarint(frame, chunk);
+        frame = H3Frame.AppendVarint(move frame, chunk);
         i64 head = Slice.Len(frame);
         u8[] data = Mem.Zeroed(head + chunk);
         Mem.Copy(data, 0_i64, frame, 0_i64, head);
@@ -204,7 +204,7 @@ pub bool WriteMessage(mut H3Conn conn, i64 streamId, HeaderField[] fields, u8[] 
         at = at + chunk;
     }
     mut u8[] tail = Slice.New(0_i64);
-    if Array.Len<HeaderField>(trailers) > 0_i64 { tail = HeadersFrame(conn, streamId, trailers, tail); }
+    if Array.Len<HeaderField>(trailers) > 0_i64 { tail = HeadersFrame(conn, streamId, trailers, move tail); }
     return H3Quic.Write(conn.link, streamId, tail, true);
 }
 
@@ -342,12 +342,12 @@ i64 PumpControl(mut H3Conn conn, u8[] data) {
 // Reads one peer unidirectional stream. Returns 0 or a connection error.
 i64 PumpUni(mut H3Conn conn, H3Uni uni) {
     u8[] data = H3Quic.Read(conn.link, uni.id, 65536_i64);
-    mut u8[] rest = data;
+    mut u8[] rest = Slice.New(0_i64);
     if uni.kind == -1_i64 {
         u8[] head = Concat(uni.head, 0_i64, data);
         i64 kind = H3Frame.VarintAt(head, 0_i64, Slice.Len(head));
         if kind < 0_i64 {
-            uni.head = head;
+            uni.head = move head;
             if H3Quic.IsFinished(conn.link, uni.id) { uni.kind = -2_i64; }
             return 0_i64;
         }
@@ -372,6 +372,8 @@ i64 PumpUni(mut H3Conn conn, H3Uni uni) {
         if conn.st[slot] >= 0_i64 { return H3Errors.StreamCreationError(); }
         conn.st[slot] = uni.id;
         uni.kind = kind;
+    } else {
+        rest = data;
     }
     if uni.kind == -2_i64 { return 0_i64; }
     mut i64 code = 0_i64;

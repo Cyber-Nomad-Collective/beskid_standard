@@ -189,19 +189,19 @@ test list_get_rejects_direct_bounds {
 
 // ---- PersistenceTests.bd (formerly target `CollectionsPersistenceTests`) ----
 
-// Persistent collections keep every version intact when two versions grow from one base.
-// `Array.Append` grows storage in place when capacity allows, so branching must copy.
+// Collection methods consume `this`, so one version can no longer fork into two. Two
+// collections built from the same borrowed source must still never share storage:
+// `Array.Append` grows storage in place when capacity allows, so construction must copy.
 
 test list_branches_keep_their_own_tail {
-    mut List<i64> base = List.New<i64>();
-    base = base.Push(1);
-    List<i64> left = base.Push(2);
-    List<i64> right = base.Push(3);
+    i64[] source = [1_i64];
+    List<i64> left = List.FromArray<i64>(source).Push(2);
+    List<i64> right = List.FromArray<i64>(source).Push(3);
     i64 leftTail = match left.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     i64 rightTail = match right.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(leftTail, 2, "left branch keeps its element");
     Assert.Equal(rightTail, 3, "right branch keeps its element");
-    Assert.Equal(base.Count(), 1, "base version is unchanged");
+    Assert.Equal(Array.Len<i64>(source), 1, "the borrowed source is unchanged");
 }
 
 test list_linear_growth_stays_correct {
@@ -217,10 +217,8 @@ test list_linear_growth_stays_correct {
 }
 
 test stack_branches_keep_their_own_top {
-    mut Stack<i64> base = Stack.New<i64>();
-    base = base.Push(1);
-    Stack<i64> left = base.Push(2);
-    Stack<i64> right = base.Push(3);
+    Stack<i64> left = Stack.New<i64>().Push(1).Push(2);
+    Stack<i64> right = Stack.New<i64>().Push(1).Push(3);
     i64 leftTop = match left.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     i64 rightTop = match right.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(leftTop, 2, "left stack top");
@@ -228,10 +226,8 @@ test stack_branches_keep_their_own_top {
 }
 
 test queue_branches_keep_their_own_back {
-    mut Queue<i64> base = Queue.New<i64>();
-    base = base.Enqueue(1);
-    Queue<i64> left = base.Enqueue(2).Dequeue();
-    Queue<i64> right = base.Enqueue(3).Dequeue();
+    Queue<i64> left = Queue.New<i64>().Enqueue(1).Enqueue(2).Dequeue();
+    Queue<i64> right = Queue.New<i64>().Enqueue(1).Enqueue(3).Dequeue();
     i64 leftFront = match left.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     i64 rightFront = match right.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(leftFront, 2, "left queue element");
@@ -239,16 +235,12 @@ test queue_branches_keep_their_own_back {
 }
 
 test set_and_map_branches_do_not_share_members {
-    mut Set<i64> setBase = Set.New<i64>();
-    setBase = setBase.Add(1);
-    Set<i64> setLeft = setBase.Add(2);
-    Set<i64> setRight = setBase.Add(3);
+    Set<i64> setLeft = Set.New<i64>().Add(1).Add(2);
+    Set<i64> setRight = Set.New<i64>().Add(1).Add(3);
     Assert.False(setLeft.Contains(3), "left set has no right member");
     Assert.False(setRight.Contains(2), "right set has no left member");
-    mut Map<i64, i64> mapBase = Map.New<i64, i64>();
-    mapBase = mapBase.Insert(1, 10);
-    Map<i64, i64> mapLeft = mapBase.Insert(2, 20);
-    Map<i64, i64> mapRight = mapBase.Insert(3, 30);
+    Map<i64, i64> mapLeft = Map.New<i64, i64>().Insert(1, 10).Insert(2, 20);
+    Map<i64, i64> mapRight = Map.New<i64, i64>().Insert(1, 10).Insert(3, 30);
     Assert.False(mapLeft.ContainsKey(3), "left map has no right key");
     Assert.False(mapRight.ContainsKey(2), "right map has no left key");
 }

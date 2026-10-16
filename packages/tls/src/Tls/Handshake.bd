@@ -181,7 +181,8 @@ pub Result<HandshakeEngine, TlsError> NewClientAfterHello(TlsClientConfig config
 
 // ---------------------------------------------------------------- small helpers
 
-unit SetB(HandshakeEngine e, i64 index, u8[] data) { e.b[index] = TlsConfig.Blob { data: data }; return; }
+// The engine keeps its own copy: the caller still uses its bytes (events, derivations).
+unit SetB(HandshakeEngine e, i64 index, u8[] data) { e.b[index] = TlsConfig.Blob { data: Slice.SubSlice(data, 0_i64, Slice.Len(data)) }; return; }
 
 u8[] GetB(HandshakeEngine e, i64 index) {
     TlsConfig.Blob x = e.b[index];
@@ -261,7 +262,8 @@ pub bool HasEvent(HandshakeEngine e) { return e.st[SEventIndex()] < Array.Len<Tl
 pub TlsEvent TakeEvent(HandshakeEngine e) {
     i64 i = e.st[SEventIndex()];
     e.st[SEventIndex()] = i + 1_i64;
-    TlsEvent ev = e.events[i];
+    // The drained slot keeps the payload-free `Connected` placeholder until the queue resets.
+    TlsEvent ev = exchange(e.events[i], TlsEvent::Connected);
     if i + 1_i64 == Array.Len<TlsEvent>(e.events) {
         e.events = Array.Empty<TlsEvent>();
         e.st[SEventIndex()] = 0_i64;
@@ -346,7 +348,7 @@ Result<unit, TlsError> DoFeed(HandshakeEngine e, i64 level, u8[] data, i64 offse
         u8[] msg = Mem.SubSlice(e.inbuf, 0_i64, n);
         e.inbuf = Mem.SubSlice(e.inbuf, n, have - n);
         i64 before = e.st[SLevel()];
-        Dispatch(e, Messages.Frame(msg))?;
+        Dispatch(e, Messages.Frame(move msg))?;
         if e.st[SLevel()] != before && Slice.Len(e.inbuf) > 0_i64 { return Result::Error(F(Alert.UnexpectedMessage())); }
     }
     return Result::Ok(());

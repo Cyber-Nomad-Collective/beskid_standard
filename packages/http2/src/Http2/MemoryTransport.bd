@@ -24,7 +24,7 @@ pub type MemoryTransport: Stream, Reader, Writer, Closer {
     pub Result<unit, IoError> Close() { return DoClose(this); }
 }
 
-pub MemoryTransport New(u8[] input) {
+pub MemoryTransport New(move u8[] input) {
     return MemoryTransport { input: input, position: [0_i64, 0_i64], output: Slice.New(0_i64), closed: false };
 }
 
@@ -42,12 +42,9 @@ Result<i64, IoError> DoRead(MemoryTransport self, u8[] destination, i64 offset, 
 
 Result<i64, IoError> DoWrite(MemoryTransport self, u8[] source, i64 offset, i64 count) {
     if !Slice.IsValidRange(Slice.Len(source), offset, count) { return Result::Error(IoError::InvalidRange); }
-    // Byte-wise append on a local copy is what passes in 0.5.2; Slice.New
-    // based growth exhausted the heap (docs/networking/COMPILER-GAPS.md).
-    mut u8[] out = self.output;
+    // Grows the record's own buffer in place (geometric growth through the field owner).
     mut i64 i = 0_i64;
-    while i < count { Array.Append<u8>(out, source[offset + i]); i = i + 1_i64; }
-    self.output = out;
+    while i < count { Array.Append<u8>(self.output, source[offset + i]); i = i + 1_i64; }
     self.position[1] = self.position[1] + count;
     return Result::Ok(count);
 }

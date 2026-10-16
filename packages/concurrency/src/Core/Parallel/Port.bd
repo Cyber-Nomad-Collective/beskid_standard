@@ -1,0 +1,97 @@
+/// Typed bounded ports between isolates.
+///
+/// A `Port<T>` is an `[Immutable]` handle over a process-wide port id, so it is Shared: it may be
+/// captured by any task body and sent through another port. A scope creates ports with
+/// `s.Port<T>()` / `s.PortWith<T>(capacity)` and closes them when it returns.
+///
+/// A Shared value crosses by pointer, a Copied value arrives as a fresh object graph in the
+/// receiver's heap, and a Moved value is consumed by `Send`.
+use Core.Results;
+use Concurrency.TryResult;
+
+/// Success marker of `Port.Send`.
+[Immutable]
+pub type SendOk {
+}
+
+/// Failure of a port operation.
+/// @variant(Closed) The port is closed (and, for a receive, drained).
+/// @variant(Cancelled) The calling fiber or its isolate was cancelled while parked.
+pub enum PortError {
+    Closed,
+    Cancelled,
+}
+
+// Descriptor-backed box for the traced ABI value slot of one send, like `Channel`'s box. The
+// runtime moves the slot; it never reads the payload's scalar bits.
+type PortValue<T> { T value, }
+
+[Immutable]
+pub type Port<T> {
+    i64 id,
+
+    /// Buffers `value`, parking while the port holds `capacity` unreceived values.
+    /// A Moved argument is passed with `move` and consumed; a Shared or Copied argument is not.
+    pub Result<SendOk, PortError> Send(move T value) where T: Core.Parallel.Transferable {
+        i64 status = __port_send(this.id, PortValue<T> { value: value }, __transfer_class<T>());
+        if status == 0 {
+            return Result::Ok(SendOk { });
+        }
+        return Result::Error(ErrorOf(status));
+    }
+
+    /// Receives the next value in send order, parking while the port is empty and open.
+    /// After `Close` the buffered values are still delivered; then `Error(PortError::Closed)`.
+    pub Result<T, PortError> Receive() where T: Core.Parallel.Transferable {
+        i64 status = __port_receive(this.id);
+        if status == 0 {
+            return Result::Ok(__port_receive_value<T>(this.id));
+        }
+        return Result::Error(ErrorOf(status));
+    }
+
+    /// Receives without parking: `WouldBlock` when the port is empty and open.
+    pub TryResult<T, PortError> TryReceive() where T: Core.Parallel.Transferable {
+        i64 status = __port_try_receive(this.id);
+        if status == 0 {
+            return TryResult::Ok(__port_receive_value<T>(this.id));
+        }
+        if status == 3 {
+            return TryResult::WouldBlock;
+        }
+        return TryResult::Err(ErrorOf(status));
+    }
+
+    /// Closes the port. Idempotent; any isolate holding the handle may close it.
+    pub unit Close() where T: Core.Parallel.Transferable {
+        __port_close(this.id);
+        return;
+    }
+
+    /// True when both handles name the same port.
+    pub bool Equals(Port<T> other) where T: Core.Parallel.Transferable {
+        return this.id == other.id;
+    }
+}
+
+/// Creates a port of `capacity` owned by the runtime scope `scope`. `Scope.Port` and
+/// `Scope.PortWith` call this; the runtime fails closed on an id that names no live scope.
+pub Port<T> Open<T>(i64 owner, i64 capacity) where T: Core.Parallel.Transferable {
+    if capacity < 1 {
+        __panic_str("Scope.PortWith: capacity must be at least 1");
+    }
+    i64 id = __port_create(capacity);
+    if id < 0 {
+        __panic_str("Scope.PortWith: the system allocator refused the port ring");
+    }
+    __isolate_scope_port(owner, id);
+    return Port<T> { id: id };
+}
+
+/// Port status code 1 is closed, 2 is cancelled; nothing else reaches here.
+PortError ErrorOf(i64 status) {
+    if status == 2 {
+        return PortError::Cancelled;
+    }
+    return PortError::Closed;
+}

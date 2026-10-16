@@ -1,9 +1,10 @@
 /// Fork-join scopes over the isolate pool.
 ///
 /// `Parallel.Scope(body)` runs `body` with a fresh `Scope`. Tasks started with `s.Spawn`,
-/// `s.SpawnTry` and `s.Isolate` run on pool isolates when one is free; otherwise the body runs on
-/// the calling isolate (elision), so a scope never waits for a pool slot and nested scopes cannot
-/// deadlock. The scope returns only after every task it started is terminal, on every exit path.
+/// `s.SpawnTry` and `s.Isolate` run on pool isolates when one is free; otherwise the body runs as a
+/// fiber of the calling isolate (elision), scheduled in spawn order, so a scope never waits for a
+/// pool slot and nested scopes cannot deadlock. The scope returns only after every task it started
+/// is terminal, on every exit path.
 ///
 /// Structured failure: a failed task (a panic, or a `SpawnTry` body that returned `Error`)
 /// cancels every other task of its scope, and the scope reports every failure in spawn order.
@@ -119,7 +120,9 @@ pub type Scope {
     bool closed,
 
     /// Starts `body` as a task and returns its handle. On a free pool isolate the body runs in
-    /// parallel; otherwise it runs to completion on the calling isolate before `Spawn` returns.
+    /// parallel; otherwise (and always in a `serial` scope) it runs as a fiber of the calling
+    /// isolate, scheduled after the tasks started before it: it runs when the caller parks or
+    /// yields, parks on a full or empty port, and observes cancellation at its safepoints.
     /// Shared captures are passed by pointer, Copied captures are copied once, Moved captures are
     /// consumed here.
     pub Task<T> Spawn<T>([Captures(Bound: Transferable)] () => T body) where T: Core.Parallel.Transferable {
@@ -130,7 +133,6 @@ pub type Scope {
         }
         if handle < 0_i64 {
             handle = __isolate_spawn_local<T>(body, this.id);
-            __isolate_wait(handle);
         }
         this.tasks = Array.Append<i64>(this.tasks, handle);
         return Task<T> { id: handle };

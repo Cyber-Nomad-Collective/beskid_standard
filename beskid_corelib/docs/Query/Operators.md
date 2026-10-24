@@ -4,10 +4,10 @@
 
 ```beskid
 pub type QueryState<T> {
-    T[] source,
-    i64 index,
-    i64 length,
-    Core.Optional.Option<T> first,
+    T[] source;
+    i64 index;
+    i64 length;
+    Core.Optional.Option<T> first;
 }
 ```
 

@@ -6,8 +6,8 @@
 
 ```beskid
 pub type TextCursor {
-    string source,
-    i64 pos,
+    string source;
+    i64 pos;
 }
 ```
 

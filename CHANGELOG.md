@@ -47,7 +47,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `Main` park too and let other fibers run.
 - `HubError` and `MutexError` gain `Unexpected(i64 code)`; unknown statuses
   were `Closed(0)` and `Cancelled(0)`. A failed `Hub.Register` names the
-  member index, and an empty or unknown hub reports `Closed(-1)`.
+  member index, and `HubError::Empty` reports an empty or unknown hub.
 - CoreSuite covers concatenating and slicing a `Core.Args` string (storage
   outside the managed heap) across collections.
 - `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the

@@ -42,7 +42,7 @@ bool IsError<T>(Result<T, HttpError> result, HttpError expected) {
     }, };
 }
 
-test http_request_parser_normalizes_headers_and_keeps_content_length_body {
+test HttpRequestParserNormalizesHeadersAndKeepsContentLengthBody {
     u8[] wire = Wire("POST /submit HTTP/1.1|Host: example.test|Content-Length: 3||abc");
     match Codec.ParseRequest(wire, Types.DefaultLimits()) {
         Result::Error(_) => Assert.Fail("valid content-length request parses"),
@@ -56,7 +56,7 @@ test http_request_parser_normalizes_headers_and_keeps_content_length_body {
     };
 }
 
-test http_rejects_bare_lf_and_conflicting_framing {
+test HttpRejectsBareLfAndConflictingFraming {
     u8[] requestLf = Wire("GET / HTTP/1.1~Host: example.test||");
     Assert.True(IsError<Request>(Codec.ParseRequest(requestLf, Types.DefaultLimits()), HttpError::InvalidFraming()), "bare LF after the request line is not HTTP/1.1 framing");
     u8[] headerLf = Wire("GET / HTTP/1.1|Host: example.test~|");
@@ -67,7 +67,7 @@ test http_rejects_bare_lf_and_conflicting_framing {
     Assert.True(IsError<Request>(Codec.ParseRequest(ambiguous, Types.DefaultLimits()), HttpError::AmbiguousFraming()), "length and transfer coding never coexist");
 }
 
-test http_chunked_decoder_requires_boundaries_and_terminator {
+test HttpChunkedDecoderRequiresBoundariesAndTerminator {
     u8[] wire = Wire("POST / HTTP/1.1|Host: t|Transfer-Encoding: chunked||3|abc|2|de|0||");
     match Codec.ParseRequest(wire, Types.DefaultLimits()) {
         Result::Error(_) => Assert.Fail("valid chunked request parses"),
@@ -80,7 +80,7 @@ test http_chunked_decoder_requires_boundaries_and_terminator {
     Assert.True(IsError<Request>(Codec.ParseRequest(malformed, Types.DefaultLimits()), HttpError::InvalidChunk()), "non hexadecimal chunk size is rejected");
 }
 
-test http_fixed_limits_reject_oversized_declared_body_before_allocating {
+test HttpFixedLimitsRejectOversizedDeclaredBodyBeforeAllocating {
     Limits limits = Types.DefaultLimits();
     limits.maxBodyBytes = 2_i64;
     u8[] wire = Wire("POST / HTTP/1.1|Host: t|Content-Length: 3||abc");
@@ -94,7 +94,7 @@ i64 RequireEnd(Result<i64, HttpError> value) {
     return match value { Result::Ok(result) => result, Result::Error(_) => -1_i64, };
 }
 
-test http_message_end_waits_for_head_and_reports_declared_total {
+test HttpMessageEndWaitsForHeadAndReportsDeclaredTotal {
     Limits limits = Types.DefaultLimits();
     Assert.Equal(RequireEnd(Codec.MessageEnd(Wire("POST / HTTP/1.1|Content-Len"), limits, MessageRole::Request())), 0_i64, "incomplete head needs more bytes");
     u8[] partial = Wire("POST / HTTP/1.1|Host: a|Content-Length: 10||abc");
@@ -103,7 +103,7 @@ test http_message_end_waits_for_head_and_reports_declared_total {
     Assert.Equal(RequireEnd(Codec.MessageEnd(bare, limits, MessageRole::Request())), Slice.Len(bare), "an unframed message ends at its head");
 }
 
-test http_message_end_walks_chunks_without_copying {
+test HttpMessageEndWalksChunksWithoutCopying {
     Limits limits = Types.DefaultLimits();
     Assert.Equal(RequireEnd(Codec.MessageEnd(Wire("POST / HTTP/1.1|Host: a|Transfer-Encoding: chunked||3|ab"), limits, MessageRole::Request())), 0_i64, "split chunk data needs more bytes");
     u8[] done = Wire("POST / HTTP/1.1|Host: a|Transfer-Encoding: chunked||3|abc|0||");
@@ -112,14 +112,14 @@ test http_message_end_walks_chunks_without_copying {
     Assert.True(IsError<i64>(Codec.MessageEnd(bad, limits, MessageRole::Request()), HttpError::InvalidChunk()), "missing chunk CRLF is rejected");
 }
 
-test http_message_end_bounds_head_and_rejects_bare_lf {
+test HttpMessageEndBoundsHeadAndRejectsBareLf {
     Limits limits = Types.DefaultLimits();
     limits.maxHeaderBytes = 8_i64;
     Assert.True(IsError<i64>(Codec.MessageEnd(Wire("GET /aaaaaaaaaaaaaaaa"), limits, MessageRole::Request()), HttpError::HeaderTooLarge()), "unterminated head past the limit is rejected");
     Assert.True(IsError<i64>(Codec.MessageEnd(Wire("GET / HTTP/1.1~"), Types.DefaultLimits(), MessageRole::Request()), HttpError::InvalidFraming()), "bare LF is rejected before the head completes");
 }
 
-test http_request_requires_exactly_one_host {
+test HttpRequestRequiresExactlyOneHost {
     Limits limits = Types.DefaultLimits();
     Assert.True(IsError<Request>(Codec.ParseRequest(Wire("GET / HTTP/1.1|Accept: x||"), limits), HttpError::MissingHost()), "a request without Host is rejected");
     u8[] duplicate = Wire("POST / HTTP/1.1|Host: a|Host: b|Content-Length: 3||abc");
@@ -136,7 +136,7 @@ test http_request_requires_exactly_one_host {
     Assert.True(match Codec.ParseRequest(Wire("GET / HTTP/1.1|Host:||"), limits) { Result::Ok(_) => true, _ => false, }, "an empty Host value is accepted");
 }
 
-test http_request_rejects_invalid_host_before_body_framing {
+test HttpRequestRejectsInvalidHostBeforeBodyFraming {
     Limits limits = Types.DefaultLimits();
     u8[] withheldBody = Wire("POST / HTTP/1.1|Host: a|Host: b|Content-Length: 10000||");
     Assert.True(IsError<i64>(Codec.MessageEnd(withheldBody, limits, MessageRole::Request()), HttpError::InvalidHost()), "duplicate Host is rejected before waiting for a declared body");
@@ -144,7 +144,7 @@ test http_request_rejects_invalid_host_before_body_framing {
     Assert.True(IsError<i64>(Codec.MessageEnd(badLength, limits, MessageRole::Request()), HttpError::InvalidHost()), "Host validation precedes framing diagnostics");
 }
 
-test http_response_head_role_ignores_content_length {
+test HttpResponseHeadRoleIgnoresContentLength {
     Limits limits = Types.DefaultLimits();
     u8[] head = Wire("HTTP/1.1 200 OK|Content-Length: 1234||");
     Assert.Equal(RequireEnd(Codec.MessageEnd(head, limits, MessageRole::HeadResponse())), Slice.Len(head), "a HEAD response ends at its head");
@@ -162,7 +162,7 @@ test http_response_head_role_ignores_content_length {
     Assert.True(IsError<Response>(Codec.ParseResponse(ambiguous, limits, MessageRole::Response()), HttpError::AmbiguousFraming()), "conflicting framing wins over the no-body rule");
 }
 
-test http_response_204_with_body_octets_is_trailing_bytes {
+test HttpResponse204WithBodyOctetsIsTrailingBytes {
     Limits limits = Types.DefaultLimits();
     u8[] head = Wire("HTTP/1.1 204 No Content|Content-Length: 3||");
     Assert.Equal(RequireEnd(Codec.MessageEnd(head, limits, MessageRole::Response())), Slice.Len(head), "a 204 response ends at its head");
@@ -172,7 +172,7 @@ test http_response_204_with_body_octets_is_trailing_bytes {
     Assert.True(match Codec.ParseResponse(notModified, limits, MessageRole::Response()) { Result::Ok(_) => true, _ => false, }, "an unframed 304 response is complete");
 }
 
-test http_unframed_2xx_response_is_close_delimited {
+test HttpUnframed2xxResponseIsCloseDelimited {
     Limits limits = Types.DefaultLimits();
     u8[] head = Wire("HTTP/1.1 200 OK||");
     Assert.True(IsError<i64>(Codec.MessageEnd(head, limits, MessageRole::Response()), HttpError::CloseDelimitedBody()), "boundary detection rejects a close-delimited response");
@@ -180,7 +180,7 @@ test http_unframed_2xx_response_is_close_delimited {
     Assert.Equal(RequireEnd(Codec.MessageEnd(Wire("GET / HTTP/1.1|Host: a||"), limits, MessageRole::Request())), Slice.Len(Wire("GET / HTTP/1.1|Host: a||")), "an unframed request still has an empty body");
 }
 
-test http_interim_response_is_rejected {
+test HttpInterimResponseIsRejected {
     Limits limits = Types.DefaultLimits();
     u8[] interim = Wire("HTTP/1.1 100 Continue||");
     Assert.Equal(RequireEnd(Codec.MessageEnd(interim, limits, MessageRole::Response())), Slice.Len(interim), "boundary detection reads exactly the interim head");
@@ -204,7 +204,7 @@ bool IsTransportCause(HttpError error, TransferFailure expected) {
     };
 }
 
-test http_io_errors_keep_transfer_failure_cause {
+test HttpIoErrorsKeepTransferFailureCause {
     Assert.True(IsTransportCause(Errors.FromIoError(IoError::ReadFailed(TransferFailure::PeerReset())), TransferFailure::PeerReset()), "read cause reaches the HTTP caller unchanged");
     Assert.True(IsTransportCause(Errors.FromIoError(IoError::WriteFailed(TransferFailure::Cancelled())), TransferFailure::Cancelled()), "write cause reaches the HTTP caller unchanged");
     Assert.True(IsTransportCause(Errors.FromIoError(IoError::InvalidRange()), TransferFailure::Unspecified()), "invalid range is an unspecified transport failure");

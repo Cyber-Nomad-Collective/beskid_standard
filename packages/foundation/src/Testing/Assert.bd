@@ -1,9 +1,22 @@
 /// Shouldly-style assertion helpers for Beskid `test` blocks and user tests.
-/// Prefer actual-first argument order: `Testing.Assert.equal(len, 3, "because")`.
+/// Prefer actual-first argument order: `Testing.Assert.Equal(len, 3, "because")`.
+///
+/// A failed assertion ends the test with one framed failure record instead of free text.
+/// `beskid test` recognizes the record, prints `assertion failed: expected 3, found 4` with the
+/// because text and the call site under the test name, and reports a runtime trap that carries
+/// no record as `test crashed`.
+///
+/// Every public helper takes the caller-information parameters `file`, `line` and `column`. A call
+/// omits them and the compiler passes the position of the call; a helper that forwards a failure
+/// passes its own caller information on explicitly.
+///
+/// Record layout: `BESKID-TEST-FAILURE/1`, then the headline, the because text, the expected text,
+/// the actual text, the file, the line and the column, each preceded by the separator `~~|~~`.
+/// An empty text is absent.
 
 use Core.String;
 
-/// Emits a message and forces a runtime crash.
+/// Emits a message and ends the test process through the runtime abort path.
 unit TriggerFailure(string message) {
     __panic_str(message);
 }
@@ -15,19 +28,37 @@ pub unit CollectGarbage() {
     return;
 }
 
-/// Unconditionally fails the current test.
-/// @arg(message) Failure reason surfaced to the user.
-pub unit Fail(string message) {
-    TriggerFailure("Assertion failed: ${message}");
+/// Builds the framed failure record that `beskid test` parses.
+string FailureRecord(string headline, string because, string expected, string actual, string file, i64 line, i64 column) {
+    return "BESKID-TEST-FAILURE/1~~|~~" + headline + "~~|~~" + because + "~~|~~" + expected + "~~|~~" + actual
+        + "~~|~~" + file + "~~|~~" + "${line}" + "~~|~~" + "${column}";
 }
 
-unit FailWithBecause(string headline, string because) {
-    if because == "" {
-        Fail(headline);
-        return;
-    }
-    // The first failure traps the process, so the context must travel in the same message.
-    Fail(headline + ": " + because);
+string Quoted(string text) {
+    return "\"" + text + "\"";
+}
+
+/// Unconditionally fails the current test.
+/// @arg(message) Failure reason surfaced to the user.
+pub unit Fail(string message, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
+    TriggerFailure(FailureRecord(message, "", "", "", file, line, column));
+}
+
+unit FailWithBecause(string headline, string because, string file, i64 line, i64 column) {
+    TriggerFailure(FailureRecord(headline, because, "", "", file, line, column));
+}
+
+unit FailWithValues(string headline, string because, string expected, string actual, string file, i64 line, i64 column) {
+    TriggerFailure(FailureRecord(headline, because, expected, actual, file, line, column));
+}
+
+/// Fails the current test with an expected and an observed value that are already rendered as text.
+/// Typed helpers such as `Testing.Expect.EqualI64` use it to show both values.
+/// @arg(expected) Rendered expected value.
+/// @arg(actual) Rendered observed value.
+/// @arg(because) Optional diagnostic context (pass `""` when omitted).
+pub unit FailEqual(string expected, string actual, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
+    FailWithValues("expected " + expected + ", found " + actual, because, expected, actual, file, line, column);
 }
 
 /// Fails when actual and expected values differ.
@@ -35,11 +66,11 @@ unit FailWithBecause(string headline, string because) {
 /// @arg(actual) Observed value.
 /// @arg(expected) Expected value.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit Equal<T>(T actual, T expected, string because) {
+pub unit Equal<T>(T actual, T expected, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
     if actual == expected {
         return;
     }
-    FailWithBecause("should equal the expected value", because);
+    FailWithBecause("the values are not equal", because, file, line, column);
 }
 
 /// Fails when actual and expected values are equal.
@@ -47,40 +78,40 @@ pub unit Equal<T>(T actual, T expected, string because) {
 /// @arg(actual) Observed value.
 /// @arg(expected) Value that must differ from `actual`.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit NotEqual<T>(T actual, T expected, string because) {
+pub unit NotEqual<T>(T actual, T expected, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
     if actual != expected {
         return;
     }
-    FailWithBecause("should not equal the expected value", because);
+    FailWithBecause("the values must differ but are equal", because, file, line, column);
 }
 
 /// Fails when condition is not true.
 /// @arg(condition) Predicate that must hold.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit True(bool condition, string because) {
+pub unit True(bool condition, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
     if condition {
         return;
     }
-    FailWithBecause("should be true but was false", because);
+    FailWithValues("expected true, found false", because, "true", "false", file, line, column);
 }
 
 /// Fails when condition is true.
 /// @arg(condition) Predicate that must be false.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit False(bool condition, string because) {
+pub unit False(bool condition, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
     if !condition {
         return;
     }
-    FailWithBecause("should be false but was true", because);
+    FailWithValues("expected false, found true", because, "false", "true", file, line, column);
 }
 
 /// Fails when needle is not found in text.
 /// @arg(text) Haystack UTF-8 string.
 /// @arg(needle) Needle UTF-8 string.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit Contains(string text, string needle, string because) {
+pub unit Contains(string text, string needle, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
     if String.Contains(text, needle) {
         return;
     }
-    FailWithBecause("should contain the needle", because);
+    FailWithValues("expected text containing " + Quoted(needle) + ", found " + Quoted(text), because, needle, text, file, line, column);
 }

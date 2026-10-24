@@ -8,6 +8,9 @@
 /// with the because text and the call site under the test name, and reports a runtime trap without a
 /// record as `test crashed`. Outside `beskid test` the variable is absent and only the abort message remains.
 ///
+/// `Equal` and `NotEqual` take any `T` that conforms to `Core.Text.Formatting` (every integer and
+/// float type, `bool`, `char` and `string`) and put the text form of both values into the record.
+///
 /// Every public helper takes the caller-information parameters `file`, `line` and `column`. A call
 /// omits them and the compiler passes the position of the call; a helper that forwards a failure
 /// passes its own caller information on explicitly.
@@ -18,6 +21,7 @@ use Core.FS;
 use Core.FS.FsError;
 use Core.Optional.Option;
 use Core.Results;
+use Core.Text.Formatting;
 
 /// Name of the environment variable that carries the failure file path.
 pub string FailureFileVariable() {
@@ -86,16 +90,12 @@ pub unit Fail(string message, [CallerFilePath] string file, [CallerLineNumber] i
     Raise(FailureRecord { headline: message, because: "", expected: "", actual: "", file: file, line: line, column: column });
 }
 
-unit FailWithBecause(string headline, string because, string file, i64 line, i64 column) {
-    Raise(FailureRecord { headline: headline, because: because, expected: "", actual: "", file: file, line: line, column: column });
-}
-
 unit FailWithValues(string headline, string because, string expected, string actual, string file, i64 line, i64 column) {
     Raise(FailureRecord { headline: headline, because: because, expected: expected, actual: actual, file: file, line: line, column: column });
 }
 
 /// Fails the current test with an expected and an observed value that are already rendered as text.
-/// Typed helpers such as `Testing.Expect.EqualI64` use it to show both values.
+/// `Equal`, `NotEqual` and `Testing.Expect.Equal` use it with the `Formatting` text of both values.
 /// @arg(expected) Rendered expected value.
 /// @arg(actual) Rendered observed value.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
@@ -103,28 +103,32 @@ pub unit FailEqual(string expected, string actual, string because, [CallerFilePa
     FailWithValues("expected " + expected + ", found " + actual, because, expected, actual, file, line, column);
 }
 
-/// Fails when actual and expected values differ.
-/// @par(T) Type of values being compared.
+/// Fails when actual and expected values differ. The failure shows both values as text.
+/// @par(T) Type of values being compared; its `Format` gives the text of each value.
 /// @arg(actual) Observed value.
 /// @arg(expected) Expected value.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit Equal<T>(T actual, T expected, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
+pub unit Equal<T>(T actual, T expected, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) where T: Formatting {
     if actual == expected {
         return;
     }
-    FailWithBecause("the values are not equal", because, file, line, column);
+    string expectedText = expected.Format();
+    string actualText = actual.Format();
+    FailWithValues("expected " + expectedText + ", found " + actualText, because, expectedText, actualText, file, line, column);
 }
 
-/// Fails when actual and expected values are equal.
-/// @par(T) Type of values being compared.
+/// Fails when actual and expected values are equal. The failure shows the shared value as text.
+/// @par(T) Type of values being compared; its `Format` gives the text of each value.
 /// @arg(actual) Observed value.
 /// @arg(expected) Value that must differ from `actual`.
 /// @arg(because) Optional diagnostic context (pass `""` when omitted).
-pub unit NotEqual<T>(T actual, T expected, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
+pub unit NotEqual<T>(T actual, T expected, string because, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) where T: Formatting {
     if actual != expected {
         return;
     }
-    FailWithBecause("the values must differ but are equal", because, file, line, column);
+    string expectedText = expected.Format();
+    string actualText = actual.Format();
+    FailWithValues("expected a value other than " + expectedText + ", found " + actualText, because, expectedText, actualText, file, line, column);
 }
 
 /// Fails when condition is not true.

@@ -10,7 +10,7 @@ All helpers take the actual value first and an optional `because` string (pass `
 
 | Function | Checks |
 |----------|--------|
-| `EqualI64`, `EqualString`, `EqualBool` | Equality; strings are shown quoted. |
+| `Equal<T>(actual, expected, because)` with `where T: Formatting` | Equality; the failure shows both values through `Core.Text.Formatting`. |
 | `NearF64(actual, expected, tolerance, because)` | `|actual - expected| <= tolerance`; NaN never matches. |
 | `ContainsText`, `StartsWithText` | Substring and prefix. |
 | `EqualI64Array`, `EqualStringArray` | Same length and elements; reports the first differing index. |

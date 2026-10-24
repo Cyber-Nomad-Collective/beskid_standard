@@ -465,6 +465,8 @@ without double or trailing underscores, and must be unique per target.
 - Symptom: `TcpListener.Accept(deadline)` called directly in a `test` body returns an error
   immediately instead of waiting; the same call inside `spawn` waits as expected.
 - Workaround: run network scenarios as `Fiber<unit> f = spawn Scenario(); f.Join();`.
+- Fixed in 0.6.7: `Main` and test bodies run as the root fiber; network, DNS, timer and
+  worker I/O waits there park and drive the scheduler (`ExternalWaitPark` root waiter).
 
 ## 2026-10-06, crypto CLIF optimization (0.5.3 CLI)
 

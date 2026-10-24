@@ -40,6 +40,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - `Channel.Receive`, `Channel.Send`, `WaitGroup.Wait`, `Mutex.Lock` and
   `Hub.WaitReceive` in `Main` park like in any other fiber (Main runs as the
   root fiber); `Receive` on an empty channel in `Main` returned `Closed(0)`.
+  `Time.Sleep`, `Network` operations, `Dns.Resolve` and `Process.Run` in
+  `Main` park too and let other fibers run.
+- `HubError` and `MutexError` gain `Unexpected(i64 code)`; unknown statuses
+  were `Closed(0)` and `Cancelled(0)`. A failed `Hub.Register` names the
+  member index, and an empty or unknown hub reports `Closed(-1)`.
 - CoreSuite covers concatenating and slicing a `Core.Args` string (storage
   outside the managed heap) across collections.
 - `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the

@@ -5,11 +5,11 @@
 ```beskid
 use Core.Collections.PriorityQueue;
 
-mut PriorityQueue<string> jobs = PriorityQueue.New<string>();
-jobs = jobs.Push("rebuild index", 5);
-jobs = jobs.Push("serve request", 1);
+PriorityQueue<string> jobs = PriorityQueue.New<string>();
+jobs.Push("rebuild index", 5);
+jobs.Push("serve request", 1);
 // jobs.Peek() is Some("serve request")
-jobs = jobs.Pop();
+Option<string> next = jobs.Pop();
 ```
 
-`Pop` on an empty queue returns it unchanged. Use negated priorities for max-first order. Queues are linear values: keep using the returned queue.
+`Push` and `Pop` change the queue in place. `Pop` returns the removed item, or `None` when the queue is empty. Use negated priorities for max-first order.

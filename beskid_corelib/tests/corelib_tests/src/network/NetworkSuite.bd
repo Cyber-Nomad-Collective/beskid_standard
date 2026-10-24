@@ -1204,3 +1204,26 @@ test network_tcp_fresh_stream_works_after_a_prior_dispose {
         Result::Error(_) => Assert.Fail("fresh-stream-after-dispose scenario completes"),
     };
 }
+
+// ---- v0.6.7: network waits in the root fiber park like in any other fiber ----
+
+test ResolveInTheRootFiberParksInsteadOfFailing {
+    ResolveIpv4();
+}
+
+unit CountTicks(i64[] ticks) {
+    Concurrency.Yield();
+    Array.Set<i64>(ticks, 0_i64, Array.Get<i64>(ticks, 0_i64) + 1_i64);
+    return;
+}
+
+test SleepInTheRootFiberRunsOtherFibers {
+    i64[] ticks = [0_i64];
+    Fiber<unit> counter = spawn (() => CountTicks(ticks));
+    match Time.Sleep(Time.FromMilliseconds(20_i64)) {
+        Result::Ok(_) => Assert.True(true, "the root sleep ends at its deadline"),
+        Result::Error(_) => Assert.Fail("Sleep in the root fiber must park, not fail"),
+    };
+    Assert.Equal(Array.Get<i64>(ticks, 0_i64), 1_i64, "the spawned fiber ran while the root slept");
+    counter.Detach();
+}

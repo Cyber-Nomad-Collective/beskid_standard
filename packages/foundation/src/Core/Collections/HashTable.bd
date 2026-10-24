@@ -6,7 +6,7 @@
 /// `Hash.Combine`. `StringMap` and `I64Map` wrap this table with built-in hashes.
 ///
 /// Iteration order is insertion order until the first removal; removal moves the last entry into
-/// the removed position. Tables are linear values: operations return the updated table.
+/// the removed position. `Insert` and `Remove` change the table in place through a `mut` parameter.
 use Core.Collections.Array;
 use Core.Optional.Option;
 
@@ -97,8 +97,8 @@ i64 FreeSlot(i64[] slots, i64 hash) {
     return position;
 }
 
-/// Rebuilds the slot index at `capacity` (a power of two larger than the entry count).
-HashTable<K, V> Reindex<K, V>(HashTable<K, V> table, i64 capacity) {
+/// Rebuilds the slot index of `table` at `capacity` (a power of two larger than the entry count).
+unit Reindex<K, V>(mut HashTable<K, V> table, i64 capacity) {
     mut i64[] slots = EmptySlots(capacity);
     mut i64 entry = 0;
     while entry < table.count {
@@ -106,14 +106,9 @@ HashTable<K, V> Reindex<K, V>(HashTable<K, V> table, i64 capacity) {
         slots = Array.Set<i64>(slots, position, entry);
         entry = entry + 1;
     }
-    return HashTable<K, V> {
-        keys: table.keys,
-        values: table.values,
-        hashes: table.hashes,
-        slots: slots,
-        count: table.count,
-        deleted: 0,
-    };
+    table.slots = slots;
+    table.deleted = 0;
+    return;
 }
 
 /// Returns true when `key` (with hash `hash`) is present.
@@ -140,22 +135,12 @@ pub V GetOr<K, V>(HashTable<K, V> table, K key, i64 hash, V fallback) {
 }
 
 /// Inserts or replaces the value for `key`.
-pub HashTable<K, V> Insert<K, V>(move HashTable<K, V> table, K key, i64 hash, V value) {
+pub unit Insert<K, V>(mut HashTable<K, V> table, K key, i64 hash, V value) {
     i64 found = FindSlot<K, V>(table, key, hash);
     if found >= 0 {
-        i64 entry = Array.Get<i64>(table.slots, found);
-        mut V[] values = table.values;
-        values = Array.Set<V>(values, entry, value);
-        return HashTable<K, V> {
-            keys: table.keys,
-            values: values,
-            hashes: table.hashes,
-            slots: table.slots,
-            count: table.count,
-            deleted: table.deleted,
-        };
+        Array.Set<V>(table.values, Array.Get<i64>(table.slots, found), value);
+        return;
     }
-    mut HashTable<K, V> current = table;
     i64 capacity = Array.Len<i64>(table.slots);
     // Keep live plus deleted slots at or below a 3/4 load factor.
     if (table.count + table.deleted + 1) * 4 > capacity * 3 {
@@ -163,68 +148,48 @@ pub HashTable<K, V> Insert<K, V>(move HashTable<K, V> table, K key, i64 hash, V 
         if (table.count + 1) * 2 > capacity {
             nextCapacity = capacity * 2;
         }
-        current = Reindex<K, V>(table, nextCapacity);
+        Reindex<K, V>(table, nextCapacity);
     }
-    i64 position = FreeSlot(current.slots, hash);
-    mut i64 deleted = current.deleted;
-    if Array.Get<i64>(current.slots, position) == DeletedSlot() {
-        deleted = deleted - 1;
+    i64 position = FreeSlot(table.slots, hash);
+    if Array.Get<i64>(table.slots, position) == DeletedSlot() {
+        table.deleted = table.deleted - 1;
     }
-    mut K[] keys = current.keys;
-    mut V[] values = current.values;
-    mut i64[] hashes = current.hashes;
-    mut i64[] slots = current.slots;
-    keys = Array.Append<K>(keys, key);
-    values = Array.Append<V>(values, value);
-    hashes = Array.Append<i64>(hashes, hash);
-    slots = Array.Set<i64>(slots, position, current.count);
-    return HashTable<K, V> {
-        keys: keys,
-        values: values,
-        hashes: hashes,
-        slots: slots,
-        count: current.count + 1,
-        deleted: deleted,
-    };
+    Array.Append<K>(table.keys, key);
+    Array.Append<V>(table.values, value);
+    Array.Append<i64>(table.hashes, hash);
+    Array.Set<i64>(table.slots, position, table.count);
+    table.count = table.count + 1;
+    return;
 }
 
-/// Removes `key` when present; returns the table unchanged otherwise.
-pub HashTable<K, V> Remove<K, V>(HashTable<K, V> table, K key, i64 hash) {
+/// Removes `key` when present; returns false when it is absent.
+pub bool Remove<K, V>(mut HashTable<K, V> table, K key, i64 hash) {
     i64 position = FindSlot<K, V>(table, key, hash);
     if position < 0 {
-        return table;
+        return false;
     }
     i64 entry = Array.Get<i64>(table.slots, position);
     i64 last = table.count - 1;
-    mut i64[] slots = table.slots;
-    slots = Array.Set<i64>(slots, position, DeletedSlot());
-    mut K[] keys = table.keys;
-    mut V[] values = table.values;
-    mut i64[] hashes = table.hashes;
+    Array.Set<i64>(table.slots, position, DeletedSlot());
     if entry != last {
         // Move the last entry into the hole and repoint its slot.
-        i64 lastHash = Array.Get<i64>(hashes, last);
-        i64 mask = Array.Len<i64>(slots) - 1;
+        i64 lastHash = Array.Get<i64>(table.hashes, last);
+        i64 mask = Array.Len<i64>(table.slots) - 1;
         mut i64 probe = lastHash & mask;
-        while Array.Get<i64>(slots, probe) != last {
+        while Array.Get<i64>(table.slots, probe) != last {
             probe = (probe + 1) & mask;
         }
-        slots = Array.Set<i64>(slots, probe, entry);
-        keys = Array.Set<K>(keys, entry, Array.Get<K>(keys, last));
-        values = Array.Set<V>(values, entry, Array.Get<V>(values, last));
-        hashes = Array.Set<i64>(hashes, entry, lastHash);
+        Array.Set<i64>(table.slots, probe, entry);
+        Array.Set<K>(table.keys, entry, Array.Get<K>(table.keys, last));
+        Array.Set<V>(table.values, entry, Array.Get<V>(table.values, last));
+        Array.Set<i64>(table.hashes, entry, lastHash);
     }
-    keys = Array.RemoveLast<K>(keys);
-    values = Array.RemoveLast<V>(values);
-    hashes = Array.RemoveLast<i64>(hashes);
-    return HashTable<K, V> {
-        keys: keys,
-        values: values,
-        hashes: hashes,
-        slots: slots,
-        count: last,
-        deleted: table.deleted + 1,
-    };
+    Array.RemoveLast<K>(table.keys);
+    Array.RemoveLast<V>(table.values);
+    Array.RemoveLast<i64>(table.hashes);
+    table.count = last;
+    table.deleted = table.deleted + 1;
+    return true;
 }
 
 /// Number of entries in `table`.

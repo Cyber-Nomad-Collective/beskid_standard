@@ -104,14 +104,24 @@ pub type ParallelSeq<T> {
         return this.Map<i64>((T value) => 1_i64).Reduce<SumI64>(0_i64, SumI64 { });
     }
 
-    /// The elements in input order. Each worker builds its partial lists in its own heap; they
-    /// are adopted at join and concatenated once in the caller.
+    /// The elements in input order. Each worker builds its partial arrays in its own heap; they
+    /// are adopted at join and concatenated once in the caller. A chunk accumulates into a `T[]`
+    /// that grows in place: a `List` accumulator would be a new name at every step (copy on
+    /// assignment), and its first write would copy the storage.
     pub List<T> Collect() where T: Core.Parallel.Transferable {
-        List<List<T>> parts = Drive<T, List<T>, List<List<T>>>(
+        List<List<T>> parts = Drive<T, T[], List<List<T>>>(
             this.count, this.chunkMax, this.chunkMin, this.element,
-            () => List.New<T>(),
-            (List<T> leaf, T value) => leaf.Push(value),
-            (List<T> leaf) => List.New<List<T>>().Push(leaf),
+            () => Array.Empty<T>(),
+            (T[] leaf, T value) => {
+                mut T[] grown = leaf;
+                Array.Append<T>(grown, value);
+                return grown;
+            },
+            (T[] leaf) => {
+                List<List<T>> one = List.New<List<T>>();
+                one.Push(List.FromArray<T>(leaf));
+                return one;
+            },
             (List<List<T>> left, List<List<T>> right) => left.Concat(right));
         return Flatten<T>(parts);
     }
@@ -206,7 +216,7 @@ Option<U> Project<T, U>(Option<T> item, (T) => U project) {
 
 // The single concatenation of `Collect`: one pass appending every partial list in order.
 List<T> Flatten<T>(List<List<T>> parts) {
-    mut List<T> result = List.New<T>();
+    List<T> result = List.New<T>();
     mut i64 part = 0_i64;
     while part < parts.Count() {
         match parts.TryGet(part) {
@@ -214,7 +224,7 @@ List<T> Flatten<T>(List<List<T>> parts) {
                 mut i64 index = 0_i64;
                 while index < chunk.Count() {
                     match chunk.TryGet(index) {
-                        Option::Some(value) => { result = result.Push(value); },
+                        Option::Some(value) => { result.Push(value); },
                         Option::None => { },
                     };
                     index = index + 1_i64;

@@ -1,6 +1,7 @@
 /// HTTP/2 throughput over prior-knowledge h2c on loopback TCP (see
-/// docs/networking/BENCHMARKS.md). The server answers every GET with one body that it
-/// allocated once; the client issues sequential GETs on one connection: 2048 x 4 KiB
+/// docs/networking/BENCHMARKS.md). The server answers every GET with a copy of one body
+/// that it allocated once (each Response owns its body); the client issues sequential
+/// GETs on one connection: 2048 x 4 KiB
 /// (8 MiB of DATA) and 64 x 16 KiB (1 MiB). The receiving side allocates every response
 /// body; above 4 KiB that allocation is the 0.5.3 append path (COMPILER-GAPS PERF1).
 /// Client and server are fibers of one process on one thread. No TLS, so the crypto
@@ -66,7 +67,7 @@ type Blob16k: RequestHandler {
     pub Response Handle(Request request) { return AnswerFor(this); }
 }
 
-Response AnswerFor(Blob16k handler) { return Answer(handler.body); }
+Response AnswerFor(Blob16k handler) { return Answer(Array.Copy<u8>(handler.body)); }
 
 Response Answer(u8[] body) {
     mut Header[] headers = Array.Empty<Header>();
@@ -81,7 +82,7 @@ Config BenchConfig() {
 }
 
 i64 ServeOne(TcpListener listener, u8[] body) {
-    Blob16k handler = Blob16k { body: body };
+    Blob16k handler = Blob16k { body: Array.Copy<u8>(body) };
     Result<i64,Http2Error> served = Server.AcceptAndServe(listener, handler, BenchConfig(), Within(60000_i64));
     return match served { Result::Ok(count) => count, Result::Error(error) => -100_i64 - FrameErrors.CodeOf(error), };
 }
@@ -155,6 +156,7 @@ unit Measure(string label, i64 size, i64 requests) {
 }
 
 test BenchH2cLoopbackData {
+    meta { tags = "bench"; }
     Measure("h2c 2048 GETs x 4KiB DATA (8MiB)", 4096_i64, 2048_i64);
     Measure("h2c 64 GETs x 16KiB DATA (1MiB)", 16384_i64, 64_i64);
 }
@@ -201,6 +203,7 @@ unit HpackRounds(mut Encoder encoder, mut Decoder decoder) {
 // Component timings for the h2c path: DATA frame decode and encode, HPACK encode and decode
 // of a browser-like request with Huffman strings, Huffman decode alone.
 test BenchH2Components {
+    meta { tags = "bench"; }
     u8[] body = Slice.New(4096_i64);
     u8[] frame = Frame.DataFrame(1_i64, body, false);
     i64 ops = 256_i64;

@@ -1,9 +1,9 @@
 /// Key/value map backed by a typed `MapEntry[]` linear scan.
 /// @tier(supported)
+/// `Insert`, `Remove` and `Clear` change the map in place.
 pub mod Core.Collections.Map.MapEntry;
 
 use Core.Collections.Array;
-use Core.Collections.Storage;
 use Core.Collections.Map.MapEntry;
 use Core.Optional.Option;
 use Core.Results;
@@ -21,20 +21,22 @@ pub type Map<TKey, TValue> {
         return this.count == 0;
     }
 
-    pub Map<TKey, TValue> Insert(move this, TKey key, TValue value) {
+    /// Inserts `value` for `key`, replacing the value of an existing entry.
+    pub unit Insert(mut this, TKey key, TValue value) {
         mut i64 index = 0;
         while index < this.count {
             MapEntry<TKey, TValue> entry = Array.Get<MapEntry<TKey, TValue>>(this.entries, index);
             if entry.key == key {
                 MapEntry<TKey, TValue> updated = MapEntry<TKey, TValue> { key: key, value: value };
                 Array.Set<MapEntry<TKey, TValue>>(this.entries, index, updated);
-                return this;
+                return;
             }
             index = index + 1;
         }
         MapEntry<TKey, TValue> fresh = MapEntry<TKey, TValue> { key: key, value: value };
-        MapEntry<TKey, TValue>[] nextEntries = Storage.AppendAt<MapEntry<TKey, TValue>>(this.entries, this.count, fresh);
-        return Map<TKey, TValue> { entries: nextEntries, count: this.count + 1 };
+        Array.Append<MapEntry<TKey, TValue>>(this.entries, fresh);
+        this.count = this.count + 1;
+        return;
     }
 
     pub Result<TValue, string> Get(TKey key) {
@@ -74,7 +76,8 @@ pub type Map<TKey, TValue> {
         return keys;
     }
 
-    pub Map<TKey, TValue> Remove(move this, TKey key) {
+    /// Removes the entry for `key`; returns false when it is absent.
+    pub bool Remove(mut this, TKey key) {
         mut i64 index = 0;
         while index < this.count {
             if Array.Get<MapEntry<TKey, TValue>>(this.entries, index).key == key {
@@ -83,14 +86,13 @@ pub type Map<TKey, TValue> {
                     Array.Set<MapEntry<TKey, TValue>>(this.entries, shift, Array.Get<MapEntry<TKey, TValue>>(this.entries, shift + 1));
                     shift = shift + 1;
                 }
-                return Map<TKey, TValue> {
-                    entries: Array.RemoveLast<MapEntry<TKey, TValue>>(this.entries),
-                    count: this.count - 1,
-                };
+                Array.RemoveLast<MapEntry<TKey, TValue>>(this.entries);
+                this.count = this.count - 1;
+                return true;
             }
             index = index + 1;
         }
-        return this;
+        return false;
     }
 
     /// Returns the value for `key`, or `None` when absent.
@@ -141,9 +143,11 @@ pub type Map<TKey, TValue> {
         return copy;
     }
 
-    /// Returns an empty map.
-    pub Map<TKey, TValue> Clear() {
-        return Map<TKey, TValue> { entries: Array.Empty<MapEntry<TKey, TValue>>(), count: 0 };
+    /// Removes every entry.
+    pub unit Clear(mut this) {
+        this.entries = Array.Empty<MapEntry<TKey, TValue>>();
+        this.count = 0;
+        return;
     }
 }
 

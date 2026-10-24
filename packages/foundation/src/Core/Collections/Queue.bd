@@ -1,7 +1,8 @@
 /// FIFO queue backed by typed `T[]` storage.
 /// @tier(supported)
+/// `Enqueue` and `Dequeue` change the queue in place.
 use Core.Collections.Array;
-use Core.Collections.Storage;
+use Core.Optional.Option;
 use Core.Results;
 
 [Isolated]
@@ -18,20 +19,29 @@ pub type Queue<T> {
         return this.count == 0;
     }
 
-    pub Queue<T> Enqueue(move this, T value) {
-        T[] nextStorage = Storage.AppendAt<T>(this.storage, this.head + this.count, value);
-        return Queue<T> { storage: nextStorage, head: this.head, count: this.count + 1 };
+    /// Adds `value` at the back of the queue.
+    pub unit Enqueue(mut this, T value) {
+        Array.Append<T>(this.storage, value);
+        this.count = this.count + 1;
+        return;
     }
 
-    pub Queue<T> Dequeue(move this) {
+    /// Removes and returns the front value, or `None` when empty.
+    pub Option<T> Dequeue(mut this) {
         if this.count == 0 {
-            return this;
+            return Option::None;
         }
+        Option<T> front = Option::Some(Array.Get<T>(this.storage, this.head));
         if this.count == 1 {
-            return Queue<T> { storage: Array.Empty<T>(), head: 0, count: 0 };
+            this.storage = Array.Empty<T>();
+            this.head = 0;
+            this.count = 0;
+            return front;
         }
-        T[] nextStorage = Array.Clear<T>(this.storage, this.head);
-        return Queue<T> { storage: nextStorage, head: this.head + 1, count: this.count - 1 };
+        Array.Clear<T>(this.storage, this.head);
+        this.head = this.head + 1;
+        this.count = this.count - 1;
+        return front;
     }
 
     pub Result<T, string> Peek() {
@@ -47,12 +57,12 @@ pub Queue<T> New<T>() {
 }
 
 /// Bulk constructor: packs call-site scalars into a queue.
-/// Iterates the bulk array and enqueues each value via `Queue.Enqueue`.
+/// Iterates the bulk array and enqueues each value with `Queue.Enqueue`.
 pub Queue<T> Of<T>(bulk T[] values) {
-    mut Queue<T> result = New<T>();
+    Queue<T> result = New<T>();
     mut i64 index = 0;
     while index < Array.Len<T>(values) {
-        result = result.Enqueue(Array.Get<T>(values, index));
+        result.Enqueue(Array.Get<T>(values, index));
         index = index + 1;
     }
     return result;

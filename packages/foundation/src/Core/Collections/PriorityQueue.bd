@@ -1,8 +1,8 @@
 /// Core.Collections.PriorityQueue — binary min-heap ordered by an `i64` priority.
 /// @tier(supported)
 /// The smallest priority is served first; equal priorities are served in insertion order.
-/// `Push` and `Pop` are `O(log n)`; `Peek` is `O(1)`. Queues are linear values: `Push` and `Pop`
-/// return the updated queue. Use negated priorities for max-first order.
+/// `Push` and `Pop` are `O(log n)` and change the queue in place; `Peek` is `O(1)`. Use negated
+/// priorities for max-first order.
 use Core.Collections.Array;
 use Core.Optional.Option;
 
@@ -41,13 +41,56 @@ pub type PriorityQueue<T> {
     }
 
     /// Queues `value` with `priority`.
-    pub PriorityQueue<T> Push(move this, T value, i64 priority) {
-        return PushIn<T>(this.items, this.priorities, this.sequence, this.count, this.nextSequence, value, priority);
+    pub unit Push(mut this, T value, i64 priority) {
+        Array.Append<T>(this.items, value);
+        Array.Append<i64>(this.priorities, priority);
+        Array.Append<i64>(this.sequence, this.nextSequence);
+        mut i64 child = this.count;
+        while child > 0 {
+            i64 parent = (child - 1) / 2;
+            if !Before(this.priorities, this.sequence, child, parent) {
+                break;
+            }
+            Swap<T>(this.items, this.priorities, this.sequence, child, parent);
+            child = parent;
+        }
+        this.count = this.count + 1;
+        this.nextSequence = this.nextSequence + 1;
+        return;
     }
 
-    /// Removes the item with the smallest priority; returns the queue unchanged when empty.
-    pub PriorityQueue<T> Pop(move this) {
-        return PopIn<T>(this.items, this.priorities, this.sequence, this.count, this.nextSequence);
+    /// Removes and returns the item with the smallest priority, or `None` when empty.
+    pub Option<T> Pop(mut this) {
+        if this.count == 0 {
+            return Option::None;
+        }
+        Option<T> top = Option::Some(Array.Get<T>(this.items, 0));
+        i64 last = this.count - 1;
+        Array.Set<T>(this.items, 0, Array.Get<T>(this.items, last));
+        Array.Set<i64>(this.priorities, 0, Array.Get<i64>(this.priorities, last));
+        Array.Set<i64>(this.sequence, 0, Array.Get<i64>(this.sequence, last));
+        Array.RemoveLast<T>(this.items);
+        Array.RemoveLast<i64>(this.priorities);
+        Array.RemoveLast<i64>(this.sequence);
+        this.count = last;
+        mut i64 parent = 0;
+        while true {
+            i64 left = parent * 2 + 1;
+            i64 right = left + 1;
+            mut i64 smallest = parent;
+            if left < last && Before(this.priorities, this.sequence, left, smallest) {
+                smallest = left;
+            }
+            if right < last && Before(this.priorities, this.sequence, right, smallest) {
+                smallest = right;
+            }
+            if smallest == parent {
+                break;
+            }
+            Swap<T>(this.items, this.priorities, this.sequence, parent, smallest);
+            parent = smallest;
+        }
+        return top;
     }
 }
 
@@ -62,15 +105,19 @@ pub PriorityQueue<T> New<T>() {
     };
 }
 
-/// Swaps two elements, holding one in a single-element array because 0.5.2 cannot lower locals
-/// whose type is a type parameter.
-T[] SwapItems<T>(T[] items, i64 a, i64 b) {
+/// Swaps the heap entries at `a` and `b` in all three parallel arrays.
+unit Swap<T>(T[] items, i64[] priorities, i64[] sequence, i64 a, i64 b) {
     mut T[] held = Array.Empty<T>();
-    held = Array.Append<T>(held, Array.Get<T>(items, a));
-    mut T[] next = items;
-    next = Array.Set<T>(next, a, Array.Get<T>(next, b));
-    next = Array.Set<T>(next, b, Array.Get<T>(held, 0));
-    return next;
+    Array.Append<T>(held, Array.Get<T>(items, a));
+    Array.Set<T>(items, a, Array.Get<T>(items, b));
+    Array.Set<T>(items, b, Array.Get<T>(held, 0));
+    i64 priority = Array.Get<i64>(priorities, a);
+    Array.Set<i64>(priorities, a, Array.Get<i64>(priorities, b));
+    Array.Set<i64>(priorities, b, priority);
+    i64 order = Array.Get<i64>(sequence, a);
+    Array.Set<i64>(sequence, a, Array.Get<i64>(sequence, b));
+    Array.Set<i64>(sequence, b, order);
+    return;
 }
 
 /// Heap order: lower priority first, then earlier insertion.
@@ -81,81 +128,4 @@ bool Before(i64[] priorities, i64[] sequence, i64 a, i64 b) {
         return pa < pb;
     }
     return Array.Get<i64>(sequence, a) < Array.Get<i64>(sequence, b);
-}
-
-PriorityQueue<T> PushIn<T>(T[] items, i64[] priorities, i64[] sequence, i64 count, i64 nextSequence, T value, i64 priority) {
-    mut T[] heapItems = items;
-    mut i64[] heapPriorities = priorities;
-    mut i64[] heapSequence = sequence;
-    heapItems = Array.Append<T>(heapItems, value);
-    heapPriorities = Array.Append<i64>(heapPriorities, priority);
-    heapSequence = Array.Append<i64>(heapSequence, nextSequence);
-    mut i64 child = count;
-    while child > 0 {
-        i64 parent = (child - 1) / 2;
-        if !Before(heapPriorities, heapSequence, child, parent) {
-            break;
-        }
-        heapItems = SwapItems<T>(heapItems, child, parent);
-        i64 prioritySwap = Array.Get<i64>(heapPriorities, child);
-        heapPriorities = Array.Set<i64>(heapPriorities, child, Array.Get<i64>(heapPriorities, parent));
-        heapPriorities = Array.Set<i64>(heapPriorities, parent, prioritySwap);
-        i64 sequenceSwap = Array.Get<i64>(heapSequence, child);
-        heapSequence = Array.Set<i64>(heapSequence, child, Array.Get<i64>(heapSequence, parent));
-        heapSequence = Array.Set<i64>(heapSequence, parent, sequenceSwap);
-        child = parent;
-    }
-    return PriorityQueue<T> {
-        items: heapItems,
-        priorities: heapPriorities,
-        sequence: heapSequence,
-        count: count + 1,
-        nextSequence: nextSequence + 1,
-    };
-}
-
-PriorityQueue<T> PopIn<T>(T[] items, move i64[] priorities, move i64[] sequence, i64 count, i64 nextSequence) {
-    if count == 0 {
-        return PriorityQueue<T> { items: items, priorities: priorities, sequence: sequence, count: 0, nextSequence: nextSequence };
-    }
-    i64 last = count - 1;
-    mut T[] heapItems = items;
-    mut i64[] heapPriorities = priorities;
-    mut i64[] heapSequence = sequence;
-    heapItems = Array.Set<T>(heapItems, 0, Array.Get<T>(heapItems, last));
-    heapPriorities = Array.Set<i64>(heapPriorities, 0, Array.Get<i64>(heapPriorities, last));
-    heapSequence = Array.Set<i64>(heapSequence, 0, Array.Get<i64>(heapSequence, last));
-    heapItems = Array.RemoveLast<T>(heapItems);
-    heapPriorities = Array.RemoveLast<i64>(heapPriorities);
-    heapSequence = Array.RemoveLast<i64>(heapSequence);
-    mut i64 parent = 0;
-    while true {
-        i64 left = parent * 2 + 1;
-        i64 right = left + 1;
-        mut i64 smallest = parent;
-        if left < last && Before(heapPriorities, heapSequence, left, smallest) {
-            smallest = left;
-        }
-        if right < last && Before(heapPriorities, heapSequence, right, smallest) {
-            smallest = right;
-        }
-        if smallest == parent {
-            break;
-        }
-        heapItems = SwapItems<T>(heapItems, parent, smallest);
-        i64 prioritySwap = Array.Get<i64>(heapPriorities, parent);
-        heapPriorities = Array.Set<i64>(heapPriorities, parent, Array.Get<i64>(heapPriorities, smallest));
-        heapPriorities = Array.Set<i64>(heapPriorities, smallest, prioritySwap);
-        i64 sequenceSwap = Array.Get<i64>(heapSequence, parent);
-        heapSequence = Array.Set<i64>(heapSequence, parent, Array.Get<i64>(heapSequence, smallest));
-        heapSequence = Array.Set<i64>(heapSequence, smallest, sequenceSwap);
-        parent = smallest;
-    }
-    return PriorityQueue<T> {
-        items: heapItems,
-        priorities: heapPriorities,
-        sequence: heapSequence,
-        count: last,
-        nextSequence: nextSequence,
-    };
 }

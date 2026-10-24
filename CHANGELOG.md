@@ -27,6 +27,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   (arguments, count, `Exit(code)`). `Exit` ends the program through the host:
   open scopes run their `dispose` hooks innermost first, then the global
   `dispose` hooks run; `Process.Exit` stays the immediate exit.
+- Collections change in place through `mut this` methods: `List.Push`,
+  `Stack.Push`, `Queue.Enqueue`, `Map.Insert`, `PriorityQueue.Push`,
+  `I64Map.Insert` and `StringMap.Insert` return `unit`; `Pop` and `Dequeue`
+  return the removed value as `Option<T>`; `Remove` and `Set.Add` return
+  `bool`; `List.Set`/`Insert` return `Result<unit, CollectionError>` and
+  `List.RemoveAt` returns the removed element. `HashTable.Insert`/`Remove`
+  take a `mut` table.
+- `List<T>` is `[CopyOnAssign]` with a copy-on-write `Copy` method: assigning a
+  list, passing it to a parameter that is not `mut`, returning, capturing or
+  binding it in a `for` loop gives the new name its own list, which shares the
+  backing array until the first write through either name. The other
+  collections keep sharing between names.
+- `move` is removed from ordinary code across Corelib; it stays only at isolate
+  crossings (`Port.Send`). `ReadOnlyArray.Freeze` copies its array.
+  `ParallelSeq.Collect` accumulates each chunk in a `T[]`, and `Scopes`
+  pushes and inserts in place.
+- Generated `Project.lock` files of package test projects are no longer tracked.
 
 ### Removed
 

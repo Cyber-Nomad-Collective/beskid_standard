@@ -12,6 +12,7 @@ use Core.Collections.Queue;
 use Core.Collections.Set;
 use Core.Collections.Map;
 use Core.String;
+use Core.Memory.Managed;
 
 // ---- ArrayTests.bd (formerly target `CollectionsArrayTests`) ----
 
@@ -135,10 +136,10 @@ test TypedArrayLengthAndEmptySemantics {
 // Cross-collection public API integration coverage.
 
 test CollectionReceiverMethodsAreThePublicSurface {
-    mut List<i64> list = List.New<i64>();
-    list = list.Push(42);
-    mut Stack<i64> stack = Stack.New<i64>();
-    stack = stack.Push(42);
+    List<i64> list = List.New<i64>();
+    list.Push(42);
+    Stack<i64> stack = Stack.New<i64>();
+    stack.Push(42);
     Assert.Equal(list.Count(), 1, "list receiver method updates count");
     Assert.Equal(stack.Count(), 1, "stack receiver method updates count");
 }
@@ -148,10 +149,10 @@ test CollectionReceiverMethodsAreThePublicSurface {
 // Public API coverage for `Core.Collections.List`.
 
 test ListRetainsValuesAcrossGrowth {
-    mut List<i64> values = List.New<i64>();
-    values = values.Push(10);
-    values = values.Push(20);
-    values = values.Push(30);
+    List<i64> values = List.New<i64>();
+    values.Push(10);
+    values.Push(20);
+    values.Push(30);
     Assert.Equal(values.Count(), 3, "list count after growth");
     i64 first = match values.Get(0) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     i64 last = match values.Get(2) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
@@ -160,20 +161,20 @@ test ListRetainsValuesAcrossGrowth {
 }
 
 test ListPopRemovesOnlyTheTail {
-    mut List<i64> values = List.New<i64>();
-    values = values.Push(7);
-    values = values.Push(8);
-    values = values.Pop();
+    List<i64> values = List.New<i64>();
+    values.Push(7);
+    values.Push(8);
+    values.Pop();
     Assert.Equal(values.Count(), 1, "pop decrements count");
     i64 retained = match values.Get(0) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(retained, 7, "pop retains preceding values");
 }
 
 test ListPopClearsPointerTailBeforeCollection {
-    mut List<string> values = List.New<string>();
-    values = values.Push("retained");
-    values = values.Push("removed");
-    values = values.Pop();
+    List<string> values = List.New<string>();
+    values.Push("retained");
+    values.Push("removed");
+    values.Pop();
     Assert.CollectGarbage();
     string retained = match values.Get(0) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => "error" };
     Assert.Equal(retained, "retained", "pop clears the removed tail without losing retained pointers");
@@ -187,28 +188,210 @@ test ListGetRejectsDirectBounds {
     Assert.True(atEnd, "index at count is out of bounds");
 }
 
-// ---- PersistenceTests.bd (formerly target `CollectionsPersistenceTests`) ----
+// ---- In-place mutation and copy on assignment ----
 
-// Collection methods consume `this`, so one version can no longer fork into two. Two
-// collections built from the same borrowed source must still never share storage:
-// `Array.Append` grows storage in place when capacity allows, so construction must copy.
+// Collections change in place: `items.Push(x);` needs no rebinding. A `List` is copied on
+// assignment and when it is passed to a parameter that is not `mut`, returned, captured or bound
+// by a `for` loop; the copy is copy-on-write, so two names share the backing array only until
+// one of them writes. A `mut` parameter shares the caller's list.
 
-test ListBranchesKeepTheirOwnTail {
-    i64[] source = [1_i64];
-    List<i64> left = List.FromArray<i64>(source).Push(2);
-    List<i64> right = List.FromArray<i64>(source).Push(3);
-    i64 leftTail = match left.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
-    i64 rightTail = match right.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
-    Assert.Equal(leftTail, 2, "left branch keeps its element");
-    Assert.Equal(rightTail, 3, "right branch keeps its element");
-    Assert.Equal(Array.Len<i64>(source), 1, "the borrowed source is unchanged");
+test list_push_changes_the_list_in_place {
+    List<string> items = List.New<string>();
+    items.Push("milk");
+    items.Push("bread");
+    Assert.Equal(items.Count(), 2, "push changes the receiver");
+    Assert.Equal(StringOr(items.Get(1), "?"), "bread", "push appends at the tail");
+    Assert.Equal(StringOrNone(items.Pop()), "bread", "pop returns the tail");
+    Assert.Equal(items.Count(), 1, "pop changes the receiver");
+}
+
+test list_assignment_copies {
+    List<i64> a = List.New<i64>();
+    a.Push(1);
+    List<i64> b = a;
+    b.Push(2);
+    Assert.Equal(a.Count(), 1, "the source keeps its count");
+    Assert.Equal(b.Count(), 2, "the copy grows on its own");
+    b.Set(0, 9);
+    Assert.Equal(I64Or(a.Get(0), -1), 1, "a write through the copy is not visible in the source");
+    a.Set(0, 5);
+    Assert.Equal(I64Or(b.Get(0), -1), 9, "a write through the source is not visible in the copy");
+}
+
+test list_reassignment_copies {
+    List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
+    mut List<i64> b = List.New<i64>();
+    b = a;
+    a.Push(3);
+    Assert.Equal(b.Count(), 2, "an assigned list does not see later pushes to its source");
+}
+
+test list_growth_does_not_write_into_shared_storage {
+    List<i64> a = List.New<i64>();
+    a.Push(0);
+    a.Pop();
+    List<i64> b = a;
+    b.Push(1);
+    a.Push(2);
+    Assert.Equal(I64Or(b.Get(0), -1), 1, "the copy holds its own element");
+    Assert.Equal(I64Or(a.Get(0), -1), 2, "the source holds its own element");
+    mut i64 index = 0;
+    while index < 64 {
+        a.Push(index);
+        index = index + 1;
+    }
+    Assert.Equal(b.Count(), 1, "growth of the source does not change the copy");
+    Assert.Equal(I64Or(b.Get(0), -1), 1, "growth of the source keeps the copy's element");
+}
+
+unit GrowCopy(List<i64> l) {
+    l.Push(9);
+    return;
+}
+
+unit GrowShared(mut List<i64> l) {
+    l.Push(9);
+    return;
+}
+
+test list_parameter_gets_its_own_copy {
+    List<i64> a = List.New<i64>();
+    GrowCopy(a);
+    Assert.Equal(a.Count(), 0, "a parameter that is not mut does not change the caller's list");
+}
+
+test list_mut_parameter_shares_the_callers_list {
+    List<i64> a = List.New<i64>();
+    GrowShared(a);
+    Assert.Equal(a.Count(), 1, "a mut parameter changes the caller's list");
+}
+
+type ListHolder {
+    List<i64> items,
+}
+
+test list_field_store_copies {
+    List<i64> a = List.FromArray<i64>([1_i64]);
+    ListHolder holder = ListHolder { items: a };
+    a.Push(2);
+    Assert.Equal(holder.items.Count(), 1, "a list stored in a field is a copy");
+    List<i64> read = holder.items;
+    read.Push(3);
+    Assert.Equal(holder.items.Count(), 1, "a list read from a field is a copy");
+    holder.items.Push(4);
+    Assert.Equal(holder.items.Count(), 2, "a method call through the field changes the field");
+}
+
+test list_collections_of_lists_hold_copies {
+    List<i64> inner = List.FromArray<i64>([1_i64]);
+    List<List<i64>> outer = List.New<List<i64>>();
+    outer.Push(inner);
+    inner.Push(2);
+    i64 stored = match outer.Get(0) {
+        Core.Results.Result::Ok(list) => list.Count(),
+        Core.Results.Result::Error(_) => -1,
+    };
+    Assert.Equal(stored, 1, "an element pushed into a list is a copy");
+}
+
+test stack_queue_set_and_map_change_in_place {
+    Stack<i64> stack = Stack.New<i64>();
+    stack.Push(1);
+    stack.Push(2);
+    Assert.Equal(I64OrNone(stack.Pop()), 2, "stack pop returns the top");
+    Queue<i64> queue = Queue.New<i64>();
+    queue.Enqueue(1);
+    queue.Enqueue(2);
+    Assert.Equal(I64OrNone(queue.Dequeue()), 1, "dequeue returns the front");
+    Assert.Equal(queue.Count(), 1, "dequeue changes the queue");
+    Set<i64> set = Set.New<i64>();
+    Assert.True(set.Add(1), "add of a new member");
+    Assert.False(set.Add(1), "add of an existing member");
+    Assert.True(set.Remove(1), "remove of a member");
+    Map<i64, i64> map = Map.New<i64, i64>();
+    map.Insert(1, 10);
+    Assert.True(map.Remove(1), "remove of a present key");
+    Assert.False(map.Remove(1), "remove of an absent key");
+}
+
+test list_copy_shares_storage_until_a_write {
+    List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
+    List<i64> b = a;
+    Assert.True(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "a read-only copy copies no elements");
+    b.Set(0, 7);
+    Assert.False(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "the first write copies the array");
+    Assert.Equal(I64Or(a.Get(0), -1), 1, "the source keeps its element");
+    Assert.Equal(I64Or(b.Get(0), -1), 7, "the copy holds the write");
+    a.Pop();
+    Assert.Equal(b.Count(), 2, "a pop through the source does not shrink the copy");
+}
+
+test list_for_variable_is_a_copy {
+    List<i64>[] lists = [List.FromArray<i64>([1_i64])];
+    for item in lists {
+        item.Push(2);
+    }
+    Assert.Equal(lists[0].Count(), 1, "a write through the loop variable does not reach the element");
+}
+
+test list_capture_is_a_copy {
+    List<i64> a = List.FromArray<i64>([1_i64]);
+    let grow = () => {
+        a.Push(2);
+        return a.Count();
+    };
+    Assert.Equal(grow(), 2, "the closure writes its own copy");
+    Assert.Equal(a.Count(), 1, "a write through a capture does not reach the captured list");
+}
+
+Core.Results.Result<List<i64>, string> Wrapped(List<i64> list) {
+    return Core.Results.Result::Ok(list);
+}
+
+Core.Results.Result<i64, string> TakeAndGrow(Core.Results.Result<List<i64>, string> held) {
+    List<i64> taken = held?;
+    taken.Push(9);
+    return Core.Results.Result::Ok(taken.Count());
+}
+
+test list_try_payload_is_a_copy {
+    List<i64> a = List.FromArray<i64>([1_i64]);
+    Core.Results.Result<List<i64>, string> held = Wrapped(a);
+    Assert.Equal(I64Or(TakeAndGrow(held), -1), 2, "the payload taken with ? is written");
+    List<i64> again = match held {
+        Core.Results.Result::Ok(list) => list,
+        Core.Results.Result::Error(_) => List.New<i64>(),
+    };
+    Assert.Equal(again.Count(), 1, "the Result still holds the unwritten list");
+}
+
+i64 GrowBound(Core.Optional.Option<List<i64>> held) {
+    mut i64 count = -1;
+    match held {
+        Core.Optional.Option::Some(list) => {
+            list.Push(5);
+            count = list.Count();
+        },
+        Core.Optional.Option::None => { },
+    };
+    return count;
+}
+
+test list_pattern_binding_is_a_copy {
+    Core.Optional.Option<List<i64>> held = Core.Optional.Option::Some(List.FromArray<i64>([1_i64]));
+    Assert.Equal(GrowBound(held), 2, "the arm writes its own copy");
+    i64 stored = match held {
+        Core.Optional.Option::Some(list) => list.Count(),
+        Core.Optional.Option::None => -1,
+    };
+    Assert.Equal(stored, 1, "a write through a pattern binding does not reach the matched value");
 }
 
 test ListLinearGrowthStaysCorrect {
-    mut List<i64> values = List.New<i64>();
+    List<i64> values = List.New<i64>();
     mut i64 index = 0;
     while index < 100 {
-        values = values.Push(index);
+        values.Push(index);
         index = index + 1;
     }
     i64 last = match values.Get(99) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
@@ -216,44 +399,15 @@ test ListLinearGrowthStaysCorrect {
     Assert.Equal(last, 99, "linear pushes keep order");
 }
 
-test StackBranchesKeepTheirOwnTop {
-    Stack<i64> left = Stack.New<i64>().Push(1).Push(2);
-    Stack<i64> right = Stack.New<i64>().Push(1).Push(3);
-    i64 leftTop = match left.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
-    i64 rightTop = match right.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
-    Assert.Equal(leftTop, 2, "left stack top");
-    Assert.Equal(rightTop, 3, "right stack top");
-}
-
-test QueueBranchesKeepTheirOwnBack {
-    Queue<i64> left = Queue.New<i64>().Enqueue(1).Enqueue(2).Dequeue();
-    Queue<i64> right = Queue.New<i64>().Enqueue(1).Enqueue(3).Dequeue();
-    i64 leftFront = match left.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
-    i64 rightFront = match right.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
-    Assert.Equal(leftFront, 2, "left queue element");
-    Assert.Equal(rightFront, 3, "right queue element");
-}
-
-test SetAndMapBranchesDoNotShareMembers {
-    Set<i64> setLeft = Set.New<i64>().Add(1).Add(2);
-    Set<i64> setRight = Set.New<i64>().Add(1).Add(3);
-    Assert.False(setLeft.Contains(3), "left set has no right member");
-    Assert.False(setRight.Contains(2), "right set has no left member");
-    Map<i64, i64> mapLeft = Map.New<i64, i64>().Insert(1, 10).Insert(2, 20);
-    Map<i64, i64> mapRight = Map.New<i64, i64>().Insert(1, 10).Insert(3, 30);
-    Assert.False(mapLeft.ContainsKey(3), "left map has no right key");
-    Assert.False(mapRight.ContainsKey(2), "right map has no left key");
-}
-
 // ---- MapTests.bd (formerly target `CollectionsMapTests`) ----
 
 // Public API coverage for `Core.Collections.Map`.
 
 test MapInsertGetAndUpdateOwnRealEntries {
-    mut Map<i64, i64> values = Map.New<i64, i64>();
-    values = values.Insert(1, 10);
-    values = values.Insert(2, 20);
-    values = values.Insert(1, 11);
+    Map<i64, i64> values = Map.New<i64, i64>();
+    values.Insert(1, 10);
+    values.Insert(2, 20);
+    values.Insert(1, 11);
     Assert.Equal(values.Count(), 2, "updating a key preserves count");
     i64 updated = match values.Get(1) { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(updated, 11, "updated value replaces prior value");
@@ -261,21 +415,21 @@ test MapInsertGetAndUpdateOwnRealEntries {
 }
 
 test MapPointerAggregateSurvivesForcedGcGrowth {
-    mut Map<string, string> values = Map.New<string, string>();
-    values = values.Insert("first", "one");
+    Map<string, string> values = Map.New<string, string>();
+    values.Insert("first", "one");
     Assert.CollectGarbage();
-    values = values.Insert("second", "two");
+    values.Insert("second", "two");
     Assert.CollectGarbage();
     string first = match values.Get("first") { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => "error" };
     Assert.Equal(first, "one", "MapEntry pointer fields survive rooted growth and publication");
 }
 
 test MapRemovePreservesRemainingEntries {
-    mut Map<i64, i64> values = Map.New<i64, i64>();
-    values = values.Insert(1, 10);
-    values = values.Insert(2, 20);
-    values = values.Insert(3, 30);
-    values = values.Remove(2);
+    Map<i64, i64> values = Map.New<i64, i64>();
+    values.Insert(1, 10);
+    values.Insert(2, 20);
+    values.Insert(3, 30);
+    values.Remove(2);
     Assert.Equal(values.Count(), 2, "remove decrements count");
     Assert.True(values.ContainsKey(1), "remove preserves earlier entry");
     Assert.True(values.ContainsKey(3), "remove preserves later entry");
@@ -290,12 +444,12 @@ test MapKeysOfEmptyMapIsEmpty {
 }
 
 test MapKeysFollowEntryOrderAfterUpdateAndRemove {
-    mut Map<string, i64> values = Map.New<string, i64>();
-    values = values.Insert("b", 1);
-    values = values.Insert("a", 2);
-    values = values.Insert("c", 3);
-    values = values.Insert("b", 4);
-    values = values.Remove("a");
+    Map<string, i64> values = Map.New<string, i64>();
+    values.Insert("b", 1);
+    values.Insert("a", 2);
+    values.Insert("c", 3);
+    values.Insert("b", 4);
+    values.Remove("a");
     string[] keys = values.Keys();
     Assert.Equal(Array.Len<string>(keys), 2, "keys match count after update and remove");
     Assert.Equal(Array.Get<string>(keys, 0), "b", "update keeps the entry position");
@@ -303,13 +457,13 @@ test MapKeysFollowEntryOrderAfterUpdateAndRemove {
 }
 
 test MapKeysSortInOrdinalUtf8Order {
-    mut Map<string, i64> values = Map.New<string, i64>();
-    values = values.Insert("é", 1);
-    values = values.Insert("abc", 2);
-    values = values.Insert("Z", 3);
-    values = values.Insert("ab", 4);
-    values = values.Insert("z", 5);
-    values = values.Insert("", 6);
+    Map<string, i64> values = Map.New<string, i64>();
+    values.Insert("é", 1);
+    values.Insert("abc", 2);
+    values.Insert("Z", 3);
+    values.Insert("ab", 4);
+    values.Insert("z", 5);
+    values.Insert("", 6);
     string[] keys = values.Keys();
     string[] sorted = String.SortOrdinal(keys);
     Assert.Equal(Array.Len<string>(sorted), 6, "sorting keeps every key");
@@ -326,13 +480,13 @@ test MapKeysSortInOrdinalUtf8Order {
 }
 
 test MapKeysSnapshotIsIndependentOfLaterMutation {
-    mut Map<string, i64> values = Map.New<string, i64>();
-    values = values.Insert("first", 1);
-    values = values.Insert("second", 2);
+    Map<string, i64> values = Map.New<string, i64>();
+    values.Insert("first", 1);
+    values.Insert("second", 2);
     string[] keys = values.Keys();
-    values = values.Remove("first");
-    values = values.Insert("third", 3);
-    values = values.Insert("second", 20);
+    values.Remove("first");
+    values.Insert("third", 3);
+    values.Insert("second", 20);
     Assert.CollectGarbage();
     Assert.Equal(Array.Len<string>(keys), 2, "later insert and remove do not resize the snapshot");
     Assert.Equal(Array.Get<string>(keys, 0), "first", "removed key stays in the snapshot");
@@ -345,20 +499,20 @@ test MapKeysSnapshotIsIndependentOfLaterMutation {
 // Public API coverage for `Core.Collections.Set`.
 
 test SetAddIsUniqueAndSearchable {
-    mut Set<i64> values = Set.New<i64>();
-    values = values.Add(42);
-    values = values.Add(42);
+    Set<i64> values = Set.New<i64>();
+    values.Add(42);
+    values.Add(42);
     Assert.Equal(values.Count(), 1, "duplicate add does not change count");
     Assert.True(values.Contains(42), "added value is retained");
     Assert.False(values.Contains(9), "missing value is absent");
 }
 
 test SetRemovePreservesOtherValues {
-    mut Set<i64> values = Set.New<i64>();
-    values = values.Add(1);
-    values = values.Add(2);
-    values = values.Add(3);
-    values = values.Remove(2);
+    Set<i64> values = Set.New<i64>();
+    values.Add(1);
+    values.Add(2);
+    values.Add(3);
+    values.Remove(2);
     Assert.Equal(values.Count(), 2, "remove decrements count");
     Assert.True(values.Contains(1), "remove preserves earlier value");
     Assert.True(values.Contains(3), "remove preserves later value");
@@ -370,27 +524,27 @@ test SetRemovePreservesOtherValues {
 // Public API coverage for `Core.Collections.Queue`.
 
 test QueueIsFifoAndRetainsValues {
-    mut Queue<i64> queue = Queue.New<i64>();
-    queue = queue.Enqueue(10);
-    queue = queue.Enqueue(20);
-    queue = queue.Enqueue(30);
+    Queue<i64> queue = Queue.New<i64>();
+    queue.Enqueue(10);
+    queue.Enqueue(20);
+    queue.Enqueue(30);
     i64 first = match queue.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(first, 10, "peek returns oldest value");
-    queue = queue.Dequeue();
+    queue.Dequeue();
     i64 second = match queue.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(second, 20, "dequeue advances in FIFO order");
     Assert.Equal(queue.Count(), 2, "dequeue decrements count");
 }
 
 test QueueHeadAdvancesAndClearedPointerSlotsSurviveGc {
-    mut Queue<string> queue = Queue.New<string>();
-    queue = queue.Enqueue("first");
-    queue = queue.Enqueue("second");
-    queue = queue.Dequeue();
+    Queue<string> queue = Queue.New<string>();
+    queue.Enqueue("first");
+    queue.Enqueue("second");
+    queue.Dequeue();
     Assert.CollectGarbage();
     string head = match queue.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => "error" };
     Assert.Equal(head, "second", "dequeue advances head without shifting retained pointer values");
-    queue = queue.Enqueue("third");
+    queue.Enqueue("third");
     Assert.CollectGarbage();
     Assert.Equal(queue.Count(), 2, "enqueue appends after an advanced head");
 }
@@ -406,12 +560,12 @@ test QueueEmptyPeekIsError {
 // Public API coverage for `Core.Collections.Stack`.
 
 test StackIsLifoAndRetainsValues {
-    mut Stack<i64> stack = Stack.New<i64>();
-    stack = stack.Push(10);
-    stack = stack.Push(20);
+    Stack<i64> stack = Stack.New<i64>();
+    stack.Push(10);
+    stack.Push(20);
     i64 top = match stack.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(top, 20, "peek returns latest value");
-    stack = stack.Pop();
+    stack.Pop();
     i64 next = match stack.Peek() { Core.Results.Result::Ok(value) => value, Core.Results.Result::Error(_) => -1 };
     Assert.Equal(next, 10, "pop reveals preceding value");
     Assert.Equal(stack.Count(), 1, "pop decrements count");
@@ -421,4 +575,32 @@ test StackEmptyPeekIsError {
     Stack<i64> stack = Stack.New<i64>();
     bool isError = match stack.Peek() { Core.Results.Result::Ok(_) => false, Core.Results.Result::Error(_) => true };
     Assert.True(isError, "empty stack has no top value");
+}
+
+i64 I64Or(Core.Results.Result<i64, string> value, i64 fallback) {
+    return match value {
+        Core.Results.Result::Ok(v) => v,
+        Core.Results.Result::Error(_) => fallback,
+    };
+}
+
+string StringOr(Core.Results.Result<string, string> value, string fallback) {
+    return match value {
+        Core.Results.Result::Ok(v) => v,
+        Core.Results.Result::Error(_) => fallback,
+    };
+}
+
+i64 I64OrNone(Core.Optional.Option<i64> value) {
+    return match value {
+        Core.Optional.Option::Some(v) => v,
+        Core.Optional.Option::None => -1,
+    };
+}
+
+string StringOrNone(Core.Optional.Option<string> value) {
+    return match value {
+        Core.Optional.Option::Some(v) => v,
+        Core.Optional.Option::None => "?",
+    };
 }

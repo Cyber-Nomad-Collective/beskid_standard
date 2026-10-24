@@ -1,18 +1,36 @@
 /// Growable list backed by typed `T[]` storage.
 /// @tier(supported)
-/// Lists are linear values: mutating operations return the updated list, and callers keep using
-/// the returned value. Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
+/// A list is a value: assigning it to a binding or a field, passing it to a parameter that is not
+/// `mut`, returning it, capturing it or binding it in a `for` loop gives the new name its own list
+/// (`[CopyOnAssign]` calls `Copy`). The copy is copy-on-write: both lists share the backing array
+/// until one of them changes, and that one first copies the array. Read-only use copies nothing.
+/// Mutating methods (`Push`, `Pop`, `Set`, `Insert`, `RemoveAt`, `Remove`, `Clear`) change the
+/// list in place, so `items.Push("milk");` needs no rebinding. A `mut List<T>` parameter shares the
+/// caller's list. Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
 /// primitives and strings by value and other types by identity.
 use Core.Collections.Array;
 use Core.Collections.CollectionError;
 use Core.Optional.Option;
-use Core.Collections.Storage;
 use Core.Results;
 
+/// The sharing state of one backing array: how many lists have held it. `List.Copy` raises it;
+/// it never falls, so a list that held a shared array copies it on its next write even when the
+/// other holders are gone.
 [Isolated]
+type ListShare {
+    i64 holders,
+}
+
+ListShare Unshared() {
+    return ListShare { holders: 1 };
+}
+
+[Isolated]
+[CopyOnAssign]
 pub type List<T> {
     T[] storage;
     i64 count;
+    ListShare share,
 
     pub i64 Count() {
         return this.count;
@@ -28,16 +46,50 @@ pub type List<T> {
         return this.storage;
     }
 
-    pub List<T> Push(move this, T value) {
-        T[] nextStorage = Storage.AppendAt<T>(this.storage, this.count, value);
-        return List<T> { storage: nextStorage, count: this.count + 1 };
+    /// A list holding the same elements. It shares the backing array, which is marked shared, so
+    /// the first write through either list copies the array (copy-on-write). The compiler calls
+    /// this method wherever a list gets a new name (`[CopyOnAssign]`).
+    pub List<T> Copy() {
+        this.share.holders = this.share.holders + 1;
+        return List<T> { storage: this.storage, count: this.count, share: this.share };
     }
 
-    pub List<T> Pop(move this) {
-        if this.count == 0 {
-            return this;
+    /// Before a write in place: a shared backing array is copied, so the write is not visible
+    /// through another list.
+    unit Own(mut this) {
+        if this.share.holders > 1 {
+            this.storage = CopyPrefix<T>(this.storage, this.count);
+            this.share = Unshared();
         }
-        return List<T> { storage: Array.RemoveLast<T>(this.storage), count: this.count - 1 };
+        return;
+    }
+
+    /// Before the backing array is replaced by a new one: the list stops holding the shared one.
+    unit Release(mut this) {
+        if this.share.holders > 1 {
+            this.share = Unshared();
+        }
+        return;
+    }
+
+    /// Appends `value`.
+    pub unit Push(mut this, T value) {
+        this.Own();
+        Array.Append<T>(this.storage, value);
+        this.count = this.count + 1;
+        return;
+    }
+
+    /// Removes and returns the last element, or `None` when empty.
+    pub Option<T> Pop(mut this) {
+        if this.count == 0 {
+            return Option::None;
+        }
+        this.Own();
+        Option<T> last = Option::Some(Array.Get<T>(this.storage, this.count - 1));
+        Array.RemoveLast<T>(this.storage);
+        this.count = this.count - 1;
+        return last;
     }
 
     pub Result<T, string> Get(i64 index) {
@@ -82,23 +134,56 @@ pub type List<T> {
     }
 
     /// Replaces the element at `index`.
-    pub Result<List<T>, CollectionError> Set(move this, i64 index, T value) {
-        return SetIn<T>(this.storage, this.count, index, value);
+    pub Result<unit, CollectionError> Set(mut this, i64 index, T value) {
+        if index < 0 || index >= this.count {
+            return Result::Error(CollectionError::IndexOutOfRange(index, this.count));
+        }
+        this.Own();
+        Array.Set<T>(this.storage, index, value);
+        return Result::Ok(());
     }
 
     /// Inserts `value` before `index`; `index == Count()` appends.
-    pub Result<List<T>, CollectionError> Insert(i64 index, T value) {
-        return InsertIn<T>(this.storage, this.count, index, value);
+    pub Result<unit, CollectionError> Insert(mut this, i64 index, T value) {
+        if index < 0 || index > this.count {
+            return Result::Error(CollectionError::IndexOutOfRange(index, this.count));
+        }
+        this.Release();
+        this.storage = InsertIn<T>(this.storage, this.count, index, value);
+        this.count = this.count + 1;
+        return Result::Ok(());
     }
 
-    /// Removes the element at `index`, shifting later elements left.
-    pub Result<List<T>, CollectionError> RemoveAt(i64 index) {
-        return RemoveAtIn<T>(this.storage, this.count, index);
+    /// Removes and returns the element at `index`, shifting later elements left.
+    pub Result<T, CollectionError> RemoveAt(mut this, i64 index) {
+        if index < 0 || index >= this.count {
+            return Result::Error(CollectionError::IndexOutOfRange(index, this.count));
+        }
+        Result<T, CollectionError> removed = Result::Ok(Array.Get<T>(this.storage, index));
+        this.Release();
+        this.storage = WithoutIndex<T>(this.storage, this.count, index);
+        this.count = this.count - 1;
+        return removed;
     }
 
-    /// Removes the first element equal to `value`; returns the list unchanged when absent.
-    pub List<T> Remove(move this, T value) {
-        return RemoveFirstIn<T>(this.storage, this.count, value);
+    /// Removes the first element equal to `value`; returns false when it is absent.
+    pub bool Remove(mut this, T value) {
+        i64 index = IndexOfIn<T>(this.storage, this.count, value);
+        if index < 0 {
+            return false;
+        }
+        this.Release();
+        this.storage = WithoutIndex<T>(this.storage, this.count, index);
+        this.count = this.count - 1;
+        return true;
+    }
+
+    /// Removes every element.
+    pub unit Clear(mut this) {
+        this.Release();
+        this.storage = Array.Empty<T>();
+        this.count = 0;
+        return;
     }
 
     /// Returns a new list with the elements in reverse order.
@@ -120,24 +205,19 @@ pub type List<T> {
     pub T[] ToArray() {
         return CopyPrefix<T>(this.storage, this.count);
     }
-
-    /// Returns an empty list.
-    pub List<T> Clear() {
-        return List<T> { storage: Array.Empty<T>(), count: 0 };
-    }
 }
 
 pub List<T> New<T>() {
-    return List<T> { storage: Array.Empty<T>(), count: 0 };
+    return List<T> { storage: Array.Empty<T>(), count: 0, share: Unshared() };
 }
 
 /// Bulk constructor: packs call-site scalars into a list.
-/// Iterates the bulk array and appends each value via `List.Push`.
+/// Iterates the bulk array and appends each value with `List.Push`.
 pub List<T> Of<T>(bulk T[] values) {
-    mut List<T> result = New<T>();
+    List<T> result = New<T>();
     mut i64 index = 0;
     while index < Array.Len<T>(values) {
-        result = result.Push(Array.Get<T>(values, index));
+        result.Push(Array.Get<T>(values, index));
         index = index + 1;
     }
     return result;
@@ -146,7 +226,7 @@ pub List<T> Of<T>(bulk T[] values) {
 /// Builds a list holding a copy of every element of `values`.
 pub List<T> FromArray<T>(T[] values) {
     i64 count = Array.Len<T>(values);
-    return List<T> { storage: CopyPrefix<T>(values, count), count: count };
+    return List<T> { storage: CopyPrefix<T>(values, count), count: count, share: Unshared() };
 }
 
 T[] CopyPrefix<T>(T[] source, i64 count) {
@@ -170,19 +250,8 @@ i64 IndexOfIn<T>(T[] storage, i64 count, T value) {
     return -1;
 }
 
-Result<List<T>, CollectionError> SetIn<T>(T[] storage, i64 count, i64 index, T value) {
-    if index < 0 || index >= count {
-        return Result<List<T>, CollectionError>::Error(CollectionError::IndexOutOfRange(index, count));
-    }
-    mut T[] copy = CopyPrefix<T>(storage, count);
-    copy = Array.Set<T>(copy, index, value);
-    return Result<List<T>, CollectionError>::Ok(List<T> { storage: copy, count: count });
-}
-
-Result<List<T>, CollectionError> InsertIn<T>(T[] storage, i64 count, i64 index, T value) {
-    if index < 0 || index > count {
-        return Result<List<T>, CollectionError>::Error(CollectionError::IndexOutOfRange(index, count));
-    }
+/// Storage holding the first `count` elements of `storage` with `value` inserted before `index`.
+T[] InsertIn<T>(T[] storage, i64 count, i64 index, T value) {
     mut T[] next = Array.Empty<T>();
     mut i64 i = 0;
     while i < count {
@@ -195,13 +264,11 @@ Result<List<T>, CollectionError> InsertIn<T>(T[] storage, i64 count, i64 index, 
     if index == count {
         Array.Append<T>(next, value);
     }
-    return Result<List<T>, CollectionError>::Ok(List<T> { storage: next, count: count + 1 });
+    return next;
 }
 
-Result<List<T>, CollectionError> RemoveAtIn<T>(T[] storage, i64 count, i64 index) {
-    if index < 0 || index >= count {
-        return Result<List<T>, CollectionError>::Error(CollectionError::IndexOutOfRange(index, count));
-    }
+/// Storage holding the first `count` elements of `storage` without the one at `index`.
+T[] WithoutIndex<T>(T[] storage, i64 count, i64 index) {
     mut T[] next = Array.Empty<T>();
     mut i64 i = 0;
     while i < count {
@@ -210,23 +277,7 @@ Result<List<T>, CollectionError> RemoveAtIn<T>(T[] storage, i64 count, i64 index
         }
         i = i + 1;
     }
-    return Result<List<T>, CollectionError>::Ok(List<T> { storage: next, count: count - 1 });
-}
-
-List<T> RemoveFirstIn<T>(T[] storage, i64 count, T value) {
-    i64 index = IndexOfIn<T>(storage, count, value);
-    if index < 0 {
-        return List<T> { storage: storage, count: count };
-    }
-    mut T[] next = Array.Empty<T>();
-    mut i64 i = 0;
-    while i < count {
-        if i != index {
-            Array.Append<T>(next, Array.Get<T>(storage, i));
-        }
-        i = i + 1;
-    }
-    return List<T> { storage: next, count: count - 1 };
+    return next;
 }
 
 List<T> ReverseIn<T>(T[] storage, i64 count) {
@@ -236,7 +287,7 @@ List<T> ReverseIn<T>(T[] storage, i64 count) {
         Array.Append<T>(next, Array.Get<T>(storage, i));
         i = i - 1;
     }
-    return List<T> { storage: next, count: count };
+    return List<T> { storage: next, count: count, share: Unshared() };
 }
 
 List<T> SliceIn<T>(T[] storage, i64 count, i64 start, i64 length) {
@@ -261,7 +312,7 @@ List<T> SliceIn<T>(T[] storage, i64 count, i64 start, i64 length) {
     if taken < 0 {
         taken = 0;
     }
-    return List<T> { storage: next, count: taken };
+    return List<T> { storage: next, count: taken, share: Unshared() };
 }
 
 List<T> ConcatIn<T>(T[] left, i64 leftCount, T[] right, i64 rightCount) {
@@ -271,5 +322,5 @@ List<T> ConcatIn<T>(T[] left, i64 leftCount, T[] right, i64 rightCount) {
         Array.Append<T>(next, Array.Get<T>(right, i));
         i = i + 1;
     }
-    return List<T> { storage: next, count: leftCount + rightCount };
+    return List<T> { storage: next, count: leftCount + rightCount, share: Unshared() };
 }

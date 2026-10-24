@@ -38,8 +38,8 @@ i64 IntFailure(HpackError e) {
 }
 
 /// Appends an integer with an N-bit prefix below the `flags` bits.
-pub u8[] WriteInt(move u8[] out, u8 flags, i64 prefixBits, i64 value) {
-    return HpackInteger.EncodeInteger(move out, flags, prefixBits, value);
+pub u8[] WriteInt(u8[] out, u8 flags, i64 prefixBits, i64 value) {
+    return HpackInteger.EncodeInteger(out, flags, prefixBits, value);
 }
 
 /// Reads a string literal whose Huffman flag is the bit just above the
@@ -66,48 +66,48 @@ pub QStr ReadStr(HuffmanTables tables, u8[] src, i64 offset, i64 prefixBits, i64
 }
 
 /// Appends a string literal; `flags` holds the bits above the Huffman flag.
-pub u8[] WriteStr(HuffmanTables tables, move u8[] out, u8 flags, i64 prefixBits, u8[] data, bool huffman) {
+pub u8[] WriteStr(HuffmanTables tables, mut u8[] out, u8 flags, i64 prefixBits, u8[] data, bool huffman) {
     if huffman {
         u8 h = u8((1_i64 << prefixBits) & 255_i64);
-        out = HpackInteger.EncodeInteger(move out, flags | h, prefixBits, HpackHuffman.HuffmanEncodedLength(tables, data));
-        return HpackHuffman.HuffmanEncode(tables, move out, data);
+        out = HpackInteger.EncodeInteger(out, flags | h, prefixBits, HpackHuffman.HuffmanEncodedLength(tables, data));
+        return HpackHuffman.HuffmanEncode(tables, out, data);
     }
-    out = HpackInteger.EncodeInteger(move out, flags, prefixBits, Slice.Len(data));
+    out = HpackInteger.EncodeInteger(out, flags, prefixBits, Slice.Len(data));
     return Mem.Join(out, data, 0_i64, Slice.Len(data));
 }
 
 // Encoder stream instructions (section 4.3).
 
 /// Set Dynamic Table Capacity: 001xxxxx.
-pub u8[] SetCapacity(move u8[] out, i64 capacity) { return WriteInt(move out, 32_u8, 5_i64, capacity); }
+pub u8[] SetCapacity(u8[] out, i64 capacity) { return WriteInt(out, 32_u8, 5_i64, capacity); }
 
 /// Insert With Name Reference: 1Txxxxxx (T = static), then the value.
-pub u8[] InsertWithNameRef(HuffmanTables tables, move u8[] out, bool isStatic, i64 index, u8[] value, bool huffman) {
+pub u8[] InsertWithNameRef(HuffmanTables tables, mut u8[] out, bool isStatic, i64 index, u8[] value, bool huffman) {
     mut u8 flags = 128_u8;
     if isStatic { flags = 192_u8; }
-    out = WriteInt(move out, flags, 6_i64, index);
-    return WriteStr(tables, move out, 0_u8, 7_i64, value, huffman);
+    out = WriteInt(out, flags, 6_i64, index);
+    return WriteStr(tables, out, 0_u8, 7_i64, value, huffman);
 }
 
 /// Insert With Literal Name: 01Hxxxxx name, then the value.
-pub u8[] InsertWithLiteralName(HuffmanTables tables, move u8[] out, u8[] name, u8[] value, bool huffman) {
-    out = WriteStr(tables, move out, 64_u8, 5_i64, name, huffman);
-    return WriteStr(tables, move out, 0_u8, 7_i64, value, huffman);
+pub u8[] InsertWithLiteralName(HuffmanTables tables, mut u8[] out, u8[] name, u8[] value, bool huffman) {
+    out = WriteStr(tables, out, 64_u8, 5_i64, name, huffman);
+    return WriteStr(tables, out, 0_u8, 7_i64, value, huffman);
 }
 
 /// Duplicate: 000xxxxx with a relative index.
-pub u8[] Duplicate(move u8[] out, i64 relativeIndex) { return WriteInt(move out, 0_u8, 5_i64, relativeIndex); }
+pub u8[] Duplicate(u8[] out, i64 relativeIndex) { return WriteInt(out, 0_u8, 5_i64, relativeIndex); }
 
 // Decoder stream instructions (section 4.4).
 
 /// Section Acknowledgment: 1xxxxxxx stream id.
-pub u8[] SectionAck(move u8[] out, i64 streamId) { return WriteInt(move out, 128_u8, 7_i64, streamId); }
+pub u8[] SectionAck(u8[] out, i64 streamId) { return WriteInt(out, 128_u8, 7_i64, streamId); }
 
 /// Stream Cancellation: 01xxxxxx stream id.
-pub u8[] StreamCancel(move u8[] out, i64 streamId) { return WriteInt(move out, 64_u8, 6_i64, streamId); }
+pub u8[] StreamCancel(u8[] out, i64 streamId) { return WriteInt(out, 64_u8, 6_i64, streamId); }
 
 /// Insert Count Increment: 00xxxxxx.
-pub u8[] InsertCountIncrement(move u8[] out, i64 increment) { return WriteInt(move out, 0_u8, 6_i64, increment); }
+pub u8[] InsertCountIncrement(u8[] out, i64 increment) { return WriteInt(out, 0_u8, 6_i64, increment); }
 
 // Field section prefix (section 4.5.1).
 
@@ -134,8 +134,8 @@ pub i64 DecodeInsertCount(i64 encoded, i64 maxEntries, i64 totalInserts) {
 }
 
 /// Appends the prefix for `requiredInsertCount` and `base`.
-pub u8[] WritePrefix(move u8[] out, i64 requiredInsertCount, i64 base, i64 maxEntries) {
-    out = WriteInt(move out, 0_u8, 8_i64, EncodeInsertCount(requiredInsertCount, maxEntries));
-    if base >= requiredInsertCount { return WriteInt(move out, 0_u8, 7_i64, base - requiredInsertCount); }
-    return WriteInt(move out, 128_u8, 7_i64, requiredInsertCount - base - 1_i64);
+pub u8[] WritePrefix(mut u8[] out, i64 requiredInsertCount, i64 base, i64 maxEntries) {
+    out = WriteInt(out, 0_u8, 8_i64, EncodeInsertCount(requiredInsertCount, maxEntries));
+    if base >= requiredInsertCount { return WriteInt(out, 0_u8, 7_i64, base - requiredInsertCount); }
+    return WriteInt(out, 128_u8, 7_i64, requiredInsertCount - base - 1_i64);
 }

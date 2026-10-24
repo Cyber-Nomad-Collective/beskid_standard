@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- Collections change in place through `mut this` methods: `List.Push`,
+  `Stack.Push`, `Queue.Enqueue`, `Map.Insert`, `PriorityQueue.Push`,
+  `I64Map.Insert` and `StringMap.Insert` return `unit`; `Pop` and `Dequeue`
+  return the removed value as `Option<T>`; `Remove` and `Set.Add` return
+  `bool`; `List.Set`/`Insert` return `Result<unit, CollectionError>` and
+  `List.RemoveAt` returns the removed element. `HashTable.Insert`/`Remove`
+  take a `mut` table.
+- `List<T>` is `[CopyOnAssign]` with a `Copy` method: assigning a list or
+  passing it to a parameter that is not `mut` gives the new name its own
+  storage.
+- `move` is removed from ordinary code across Corelib; it stays only at isolate
+  crossings (`Port.Send`). `ReadOnlyArray.Freeze` copies its array.
+- Generated `Project.lock` files of package test projects are no longer tracked.
+
 ### Removed
 
 - Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`

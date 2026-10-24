@@ -118,22 +118,22 @@ unit MaybeInsert(mut QEncoder e, HeaderField field) {
 // Appends a literal field line: with a static name reference when the name
 // is in the static table, else with dynamic relative name index
 // `relative` (>= 0), else with a literal name. The N bit marks sensitive fields.
-u8[] AppendLiteral(QEncoder e, move u8[] lines, HeaderField field, i64 relative) {
+u8[] AppendLiteral(QEncoder e, mut u8[] lines, HeaderField field, i64 relative) {
     mut i64 never = 0_i64;
     if field.sensitive { never = 1_i64; }
     bool huffman = UseHuffman(e, field.value) && !field.sensitive;
     i64 staticName = QpackStatic.FindName(e.statics, field);
     if staticName >= 0_i64 {
-        lines = QpackWire.WriteInt(move lines, u8(80_i64 + never * 32_i64), 4_i64, staticName);
-        return QpackWire.WriteStr(e.huffman, move lines, 0_u8, 7_i64, field.value, huffman);
+        lines = QpackWire.WriteInt(lines, u8(80_i64 + never * 32_i64), 4_i64, staticName);
+        return QpackWire.WriteStr(e.huffman, lines, 0_u8, 7_i64, field.value, huffman);
     }
     if relative >= 0_i64 {
-        lines = QpackWire.WriteInt(move lines, u8(64_i64 + never * 32_i64), 4_i64, relative);
-        return QpackWire.WriteStr(e.huffman, move lines, 0_u8, 7_i64, field.value, huffman);
+        lines = QpackWire.WriteInt(lines, u8(64_i64 + never * 32_i64), 4_i64, relative);
+        return QpackWire.WriteStr(e.huffman, lines, 0_u8, 7_i64, field.value, huffman);
     }
     bool nameHuffman = UseHuffman(e, field.name);
-    lines = QpackWire.WriteStr(e.huffman, move lines, u8(32_i64 + never * 16_i64), 3_i64, field.name, nameHuffman);
-    return QpackWire.WriteStr(e.huffman, move lines, 0_u8, 7_i64, field.value, huffman);
+    lines = QpackWire.WriteStr(e.huffman, lines, u8(32_i64 + never * 16_i64), 3_i64, field.name, nameHuffman);
+    return QpackWire.WriteStr(e.huffman, lines, 0_u8, 7_i64, field.value, huffman);
 }
 
 /// Encodes one field section for `streamId` (the HEADERS frame payload).
@@ -159,19 +159,19 @@ pub u8[] EncodeSection(mut QEncoder e, i64 streamId, HeaderField[] fields) {
             if named >= drainLimit && named < base { dynamicName = named; }
         }
         if exact >= 0_i64 && !field.sensitive {
-            lines = QpackWire.WriteInt(move lines, 192_u8, 6_i64, exact);
+            lines = QpackWire.WriteInt(lines, 192_u8, 6_i64, exact);
         } else {
             if dynamicExact >= 0_i64 {
-                lines = QpackWire.WriteInt(move lines, 128_u8, 6_i64, base - 1_i64 - dynamicExact);
+                lines = QpackWire.WriteInt(lines, 128_u8, 6_i64, base - 1_i64 - dynamicExact);
                 if dynamicExact + 1_i64 > required { required = dynamicExact + 1_i64; }
                 if dynamicExact < minRef { minRef = dynamicExact; }
             } else {
                 if dynamicName >= 0_i64 && QpackStatic.FindName(e.statics, field) < 0_i64 {
                     if dynamicName + 1_i64 > required { required = dynamicName + 1_i64; }
                     if dynamicName < minRef { minRef = dynamicName; }
-                    lines = AppendLiteral(e, move lines, field, base - 1_i64 - dynamicName);
+                    lines = AppendLiteral(e, lines, field, base - 1_i64 - dynamicName);
                 } else {
-                    lines = AppendLiteral(e, move lines, field, -1_i64);
+                    lines = AppendLiteral(e, lines, field, -1_i64);
                 }
                 MaybeInsert(e, field);
             }
@@ -181,7 +181,7 @@ pub u8[] EncodeSection(mut QEncoder e, i64 streamId, HeaderField[] fields) {
     mut u8[] out = Slice.New(0_i64);
     mut i64 sectionBase = base;
     if required == 0_i64 { sectionBase = 0_i64; }
-    out = QpackWire.WritePrefix(move out, required, sectionBase, QpackTable.MaxEntries(e.table));
+    out = QpackWire.WritePrefix(out, required, sectionBase, QpackTable.MaxEntries(e.table));
     out = Mem.Join(out, lines, 0_i64, Slice.Len(lines));
     if required > 0_i64 {
         Array.Append<i64>(e.secStream, streamId);
@@ -210,9 +210,9 @@ unit RemoveSection(mut QEncoder e, i64 at) {
         }
         i = i + 1_i64;
     }
-    e.secStream = move ids;
-    e.secRequired = move reqs;
-    e.secMinRef = move mins;
+    e.secStream = ids;
+    e.secRequired = reqs;
+    e.secMinRef = mins;
     return;
 }
 
@@ -265,6 +265,6 @@ pub i64 OnDecoderStream(mut QEncoder e, u8[] data) {
     if count - pos > 16_i64 { return Fail(e); }
     u8[] rest = Mem.Zeroed(count - pos);
     if count > pos { Mem.Copy(rest, 0_i64, buf, pos, count - pos); }
-    e.pending = move rest;
+    e.pending = rest;
     return 0_i64;
 }

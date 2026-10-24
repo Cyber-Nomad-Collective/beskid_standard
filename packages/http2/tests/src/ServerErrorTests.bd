@@ -53,8 +53,8 @@ Config Cfg() {
     return c;
 }
 
-u8[] Serve(move u8[] input, Config config) {
-    MemoryTransport t = MemoryTransport.New(move input);
+u8[] Serve(u8[] input, Config config) {
+    MemoryTransport t = MemoryTransport.New(input);
     Fixed handler = Fixed { tag: 0_i64 };
     Server.ServeConnection(t, handler, config);
     return MemoryTransport.Written(t);
@@ -100,12 +100,12 @@ test server_sends_settings_and_acks_client_settings {
 test server_rejects_bad_preface {
     u8[] input = Frame.SettingsFrame(Array.Empty<i64>(), Array.Empty<i64>());
     u8[] padded = MemoryTransport.Join(input, Slice.New(30_i64));
-    Assert.Equal<i64>(GoAwayCode(Serve(move padded, Cfg())), FrameErrors.ProtocolError(), "PROTOCOL_ERROR");
+    Assert.Equal<i64>(GoAwayCode(Serve(padded, Cfg())), FrameErrors.ProtocolError(), "PROTOCOL_ERROR");
 }
 
 test server_requires_settings_first {
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.PingFrame(Slice.New(8_i64), false));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.ProtocolError(), "PING before SETTINGS");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "PING before SETTINGS");
 }
 
 test server_answers_ping {
@@ -119,21 +119,21 @@ test server_invalid_enable_push {
     i64[] ids = [2_i64];
     i64[] values = [2_i64];
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(ids, values));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.ProtocolError(), "ENABLE_PUSH=2");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "ENABLE_PUSH=2");
 }
 
 test server_invalid_initial_window {
     i64[] ids = [4_i64];
     i64[] values = [2147483648_i64];
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(ids, values));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.FlowControlError(), "window > 2^31-1");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.FlowControlError(), "window > 2^31-1");
 }
 
 test server_invalid_max_frame_size {
     i64[] ids = [5_i64];
     i64[] values = [100_i64];
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(ids, values));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.ProtocolError(), "max frame size < 16384");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "max frame size < 16384");
 }
 
 test server_answers_get {
@@ -148,27 +148,27 @@ test stream_id_reuse_is_connection_error {
     Encoder enc = NewEnc();
     u8[] first = MemoryTransport.Join(Start(), Headers(enc, 1_i64, GetFields("/"), true));
     u8[] input = MemoryTransport.Join(first, Headers(enc, 1_i64, GetFields("/"), true));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.StreamClosed(), "STREAM_CLOSED");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.StreamClosed(), "STREAM_CLOSED");
 }
 
 test lower_stream_id_is_protocol_error {
     Encoder enc = NewEnc();
     u8[] first = MemoryTransport.Join(Start(), Headers(enc, 5_i64, GetFields("/"), true));
     u8[] input = MemoryTransport.Join(first, Headers(enc, 3_i64, GetFields("/"), true));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.ProtocolError(), "id 3 after 5");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "id 3 after 5");
 }
 
 test even_stream_id_from_client_is_protocol_error {
     Encoder enc = NewEnc();
     u8[] input = MemoryTransport.Join(Start(), Headers(enc, 2_i64, GetFields("/"), true));
-    Assert.Equal<i64>(GoAwayCode(Serve(move input, Cfg())), FrameErrors.ProtocolError(), "even id");
+    Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "even id");
 }
 
 test data_on_closed_stream_is_stream_closed {
     Encoder enc = NewEnc();
     u8[] first = MemoryTransport.Join(Start(), Headers(enc, 1_i64, GetFields("/"), true));
     u8[] input = MemoryTransport.Join(first, Frame.DataFrame(1_i64, [1_u8], false));
-    u8[] out = Serve(move input, Cfg());
+    u8[] out = Serve(input, Cfg());
     Assert.Equal<i64>(RstCode(out, 1_i64), FrameErrors.StreamClosed(), "RST_STREAM STREAM_CLOSED");
     Assert.Equal<i64>(GoAwayCode(out), -1_i64, "connection survives");
 }

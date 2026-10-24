@@ -12,6 +12,7 @@ use Core.Collections.Queue;
 use Core.Collections.Set;
 use Core.Collections.Map;
 use Core.String;
+use Core.Memory.Managed;
 
 // ---- ArrayTests.bd (formerly target `CollectionsArrayTests`) ----
 
@@ -190,8 +191,9 @@ test list_get_rejects_direct_bounds {
 // ---- In-place mutation and copy on assignment ----
 
 // Collections change in place: `items.Push(x);` needs no rebinding. A `List` is copied on
-// assignment and when it is passed to a parameter that is not `mut`, so two names never share
-// storage; a `mut` parameter shares the caller's list.
+// assignment and when it is passed to a parameter that is not `mut`, returned, captured or bound
+// by a `for` loop; the copy is copy-on-write, so two names share the backing array only until
+// one of them writes. A `mut` parameter shares the caller's list.
 
 test list_push_changes_the_list_in_place {
     List<string> items = List.New<string>();
@@ -310,6 +312,57 @@ test stack_queue_set_and_map_change_in_place {
     map.Insert(1, 10);
     Assert.True(map.Remove(1), "remove of a present key");
     Assert.False(map.Remove(1), "remove of an absent key");
+}
+
+test list_copy_shares_storage_until_a_write {
+    List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
+    List<i64> b = a;
+    Assert.True(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "a read-only copy copies no elements");
+    b.Set(0, 7);
+    Assert.False(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "the first write copies the array");
+    Assert.Equal(I64Or(a.Get(0), -1), 1, "the source keeps its element");
+    Assert.Equal(I64Or(b.Get(0), -1), 7, "the copy holds the write");
+    a.Pop();
+    Assert.Equal(b.Count(), 2, "a pop through the source does not shrink the copy");
+}
+
+test list_for_variable_is_a_copy {
+    List<i64>[] lists = [List.FromArray<i64>([1_i64])];
+    for item in lists {
+        item.Push(2);
+    }
+    Assert.Equal(lists[0].Count(), 1, "a write through the loop variable does not reach the element");
+}
+
+test list_capture_is_a_copy {
+    List<i64> a = List.FromArray<i64>([1_i64]);
+    let grow = () => {
+        a.Push(2);
+        return a.Count();
+    };
+    Assert.Equal(grow(), 2, "the closure writes its own copy");
+    Assert.Equal(a.Count(), 1, "a write through a capture does not reach the captured list");
+}
+
+Core.Results.Result<List<i64>, string> Wrapped(List<i64> list) {
+    return Core.Results.Result::Ok(list);
+}
+
+Core.Results.Result<i64, string> TakeAndGrow(Core.Results.Result<List<i64>, string> held) {
+    List<i64> taken = held?;
+    taken.Push(9);
+    return Core.Results.Result::Ok(taken.Count());
+}
+
+test list_try_payload_is_a_copy {
+    List<i64> a = List.FromArray<i64>([1_i64]);
+    Core.Results.Result<List<i64>, string> held = Wrapped(a);
+    Assert.Equal(I64Or(TakeAndGrow(held), -1), 2, "the payload taken with ? is written");
+    List<i64> again = match held {
+        Core.Results.Result::Ok(list) => list,
+        Core.Results.Result::Error(_) => List.New<i64>(),
+    };
+    Assert.Equal(again.Count(), 1, "the Result still holds the unwritten list");
 }
 
 test list_linear_growth_stays_correct {

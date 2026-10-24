@@ -69,20 +69,24 @@ pub i64 Capacity<T>(T[] values) {
     return Len<T>(values);
 }
 
-/// Extends logical length by one through the compiler-owned rooted protocol.
-/// Growth is geometric: when the array is full, the replacement has twice the capacity (at least
-/// 4 elements), so a sequence of appends costs amortized O(1) per element. When capacity remains,
-/// the element is stored in place and every handle to the same array observes the new length,
-/// as with `RemoveLast`.
-/// The first argument must identify mutable local or aggregate-field storage. Lowering validates
-/// overflow and emits grow, typed store/barrier, owner-slot store, owner publication, and exactly
-/// one construction finish. The return value is already published through that proven owner.
+/// Appends `value` and returns the array that holds it.
+/// When the first argument owns its array (a local, a `mut` parameter or an aggregate field), the
+/// compiler lowers the call to the rooted in-place growth operation: growth is geometric (when
+/// the array is full, the replacement has twice the capacity, at least 4 elements), so a sequence
+/// of appends costs amortized O(1) per element; when capacity remains, the element is stored in
+/// place and every handle to the same array observes the new length, as with `RemoveLast`. The
+/// owner's slot is updated, so `Array.Append<T>(items, v);` needs no rebinding.
+/// Any other array (a parameter that is not `mut`, a loop or pattern variable, a call result, an
+/// element) is not owned by the caller: this body copies it into a fresh array, appends there and
+/// returns the copy, and the argument is unchanged.
 pub T[] Append<T>(mut T[] values, T value) {
-    // Canonical calls are replaced by the compiler-owned rooted growth operation.
-    return values;
+    mut T[] grown = Copy<T>(values);
+    Append<T>(grown, value);
+    return grown;
 }
 
-/// Checked rooted append. False leaves the owner and logical contents unchanged.
+/// Checked rooted append. False leaves the owner and logical contents unchanged; an array whose
+/// owner is not proven (see `Append`) is never extended, so the call returns false.
 /// Argument evaluation follows ordinary source semantics before checked admission.
 pub bool TryAppend<T>(mut T[] values, T value) {
     // Exact registered declaration is lowered as a checked owner transaction.

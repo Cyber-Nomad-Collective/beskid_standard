@@ -39,7 +39,17 @@ private source-issued capabilities and cannot be constructed from native tokens.
 
 `Run(executable, arguments)` uses the same child authority to capture stdout and
 stderr concurrently. It closes stdin, inherits the environment and returns
-`ProcessOutput { exitCode, stdout, stderr }` for zero exit. Nonzero exit returns
-`ProcessError::ExitCode(code, stderr)`. Capture admits at most 16 MiB combined
-output and returns typed `IOError` for invalid UTF-8 or budget exhaustion. Use
-the streaming interfaces for binary data and larger output.
+`Ok(ProcessOutput { exitCode, stdout, stderr })` whenever the child started,
+whatever its exit code. Check `exitCode`; both streams are kept for a failing
+child. An error means the child could not start or its output could not be
+read. Capture admits at most 16 MiB combined output and returns typed `IOError`
+for invalid UTF-8 or budget exhaustion. Use the streaming interfaces for binary
+data and larger output.
+
+An executable without a path separator (`/`, or `\` on Windows) is a program
+name. The spawn searches the directories of the child's `PATH`, in order, and
+runs the first match, like `execvp`. On Windows a name without an extension
+gets `.exe`. A name that is in no `PATH` directory is `ProcessError::NotFound`.
+
+`Process.Message(error)` returns one readable line for a `ProcessError`, for
+logs and user messages.

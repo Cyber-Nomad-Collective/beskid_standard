@@ -117,13 +117,14 @@ test discriminant_roundtrip {
     Assert.Equal(Status.Discriminant(Status.FromCode(2)), 2, "Discriminant(FromCode(2)) is 2");
 }
 
-test discriminant_unknown_code_defaults_to_ok {
+test FromCodeUnknownIsUnexpected {
     Status status = Status.FromCode(999);
-    i64 label = match status {
-        Status::Ok => 0,
-        _ => 1,
+    i64 code = match status {
+        Status::Unexpected(raw) => raw,
+        _ => -1,
     };
-    Assert.Equal(label, 0, "unknown code falls back to Ok");
+    Assert.Equal(code, 999, "an unknown code is Unexpected with its raw code, never Ok");
+    Assert.Equal(Status.Discriminant(status), 999, "Unexpected round-trips its raw code");
 }
 
 // ---- ChannelApiTests.bd (formerly target `ConcurrencyChannelApiTests`) ----
@@ -222,6 +223,7 @@ test mutex_try_lock_returns_try_result {
     match result {
         TryResult::Ok(_) => { },
         TryResult::Err(MutexError::Cancelled(_)) => { },
+        TryResult::Err(MutexError::Unexpected(_)) => Assert.Fail("a fresh mutex never reports an unexpected status"),
         TryResult::WouldBlock => { },
     };
     Assert.True(true, "TryLock returns TryResult<MutexGuard, MutexError>");
@@ -233,6 +235,7 @@ test mutex_lock_returns_result {
     match result {
         Result::Ok(_) => { },
         Result::Error(MutexError::Cancelled(_)) => { },
+        Result::Error(MutexError::Unexpected(_)) => Assert.Fail("a fresh mutex never reports an unexpected status"),
     };
     Assert.True(true, "Lock returns Result");
 }
@@ -275,6 +278,7 @@ test hub_register_returns_result {
         Result::Error(HubError::Limit(_, _)) => { },
         Result::Error(HubError::Cancelled(_)) => { },
         Result::Error(HubError::Closed(_)) => { },
+        Result::Error(HubError::Unexpected(_)) => Assert.Fail("Register never reports an unexpected status for a live hub and channel"),
     };
 }
 
@@ -287,6 +291,7 @@ test hub_unregister_does_not_panic {
         Result::Error(HubError::Limit(_, _)) => { },
         Result::Error(HubError::Cancelled(_)) => { },
         Result::Error(HubError::Closed(_)) => { },
+        Result::Error(HubError::Unexpected(_)) => Assert.Fail("Register never reports an unexpected status for a live hub and channel"),
     };
     Hub.Unregister<i64>(hub, 0_i64);
     Assert.True(true, "Unregister completes");
@@ -429,4 +434,105 @@ test one_hub_registers_one_thousand_channels_and_receives_from_the_last {
         Result::Ok(received) => Assert.Equal(received.index, 999_i64, "the hub delivers from the only ready member"),
         Result::Error(_) => Assert.True(false, "a ready member satisfies WaitReceive"),
     };
+}
+
+// ---- Channel error mapping and Main as the root fiber (v0.6.7) ----
+
+test MapReceiveErrorTurnsWouldBlockIntoUnexpected {
+    Concurrency.ChannelError error = Channel.MapReceiveError(Status::WouldBlock, 5_i64);
+    i64 code = match error {
+        Concurrency.ChannelError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 3_i64, "a status outside the receive contract is Unexpected, not Closed(0)");
+}
+
+test MapReceiveErrorClosedNamesTheEndpoint {
+    Concurrency.ChannelError error = Channel.MapReceiveError(Status.FromCode(1), 5_i64);
+    i64 endpoint = match error {
+        Concurrency.ChannelError::Closed(id) => id,
+        _ => -1_i64,
+    };
+    Assert.Equal(endpoint, 5_i64, "Closed carries the channel handle, not 0");
+}
+
+test ReceiveOnAClosedChannelNamesItsHandle {
+    Channel<i64> other = Channel<i64>.Create();
+    Channel.Close<i64>(other);
+    i64 expected = Channel.Handle<i64>(other);
+    match Channel.Receive<i64>(other) {
+        Result::Error(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, expected, "Closed names the closed channel"),
+        _ => Assert.True(false, "a closed, empty channel reports Closed"),
+    };
+}
+
+unit SendAfterYields(Channel<i64> ch, i64 value) {
+    Concurrency.Yield();
+    Concurrency.Yield();
+    let sent = Channel.Send<i64>(ch, value);
+    return;
+}
+
+test ReceiveInTheRootFiberParksUntilAFiberSends {
+    Channel<i64> ch = Channel<i64>.Create();
+    Fiber<unit> sender = spawn (() => SendAfterYields(ch, 41_i64));
+    match Channel.Receive<i64>(ch) {
+        Result::Ok(value) => Assert.Equal(value, 41_i64, "the root fiber parks on an empty channel and receives the sent value"),
+        Result::Error(_) => Assert.True(false, "Receive in the root fiber must park, not fail"),
+    };
+    match sender.Join() {
+        Result::Ok(_) => Assert.True(true, "the sender finished"),
+        Result::Error(_) => Assert.True(false, "the sender must finish"),
+    };
+}
+
+unit DoneAfterYields(WaitGroup group) {
+    Concurrency.Yield();
+    WaitGroup.Done(group);
+    return;
+}
+
+test WaitInTheRootFiberParksUntilAFiberCallsDone {
+    WaitGroup group = WaitGroup.Create();
+    WaitGroup.Add(group, 1_i64);
+    Fiber<unit> finisher = spawn (() => DoneAfterYields(group));
+    WaitGroup.Wait(group);
+    finisher.Detach();
+    Assert.True(true, "the root fiber waited for Done");
+}
+
+// ---- v0.6.7: Hub and Mutex statuses outside their contract are Unexpected ----
+
+test MapLockErrorTurnsAnUnknownStatusIntoUnexpected {
+    i64 code = match Mutex.MapLockError(Status.FromCode(42)) {
+        MutexError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 42_i64, "an unknown lock status is Unexpected with its code, not Cancelled(0)");
+    i64 cancelled = match Mutex.MapLockError(Status.FromCode(1)) {
+        MutexError::Cancelled(_) => 1_i64,
+        _ => 0_i64,
+    };
+    Assert.Equal(cancelled, 1_i64, "lock status 1 stays the documented cancellation");
+}
+
+test MapRegisterErrorNamesTheMemberIndex {
+    i64 member = match Hub.MapRegisterError(Status.FromCode(6), 17_i64) {
+        HubError::Closed(index) => index,
+        _ => -100_i64,
+    };
+    Assert.Equal(member, 17_i64, "a not-found registration names the member index, not 0");
+    i64 code = match Hub.MapRegisterError(Status::WouldBlock, 17_i64) {
+        HubError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 3_i64, "a status outside the register contract is Unexpected, not Closed(0)");
+}
+
+test MapWaitReceiveErrorTurnsAnUnknownStatusIntoUnexpected {
+    i64 code = match Hub.MapWaitReceiveError(Status.FromCode(1)) {
+        HubError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 1_i64, "a status outside the wait contract is Unexpected, not Closed(0)");
 }

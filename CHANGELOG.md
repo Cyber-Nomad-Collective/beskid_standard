@@ -6,6 +6,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Changed
+
+- `Process.Run` returns `Ok(ProcessOutput)` whenever the child started, whatever
+  its exit code; the caller checks `exitCode`, and stdout and stderr are kept
+  for a failing child. `ProcessError::ExitCode` is removed.
+- A bare program name passed to `Process.Run` or `Process.Spawn` resolves
+  through the `PATH` of the child's environment, like `execvp`.
+- `Concurrency.Status.FromCode` maps an unknown code to the new
+  `Status::Unexpected(code)`, not `Ok`. `ChannelError` gains
+  `Unexpected(i64 code)`: a status outside the channel contract is no longer
+  reported as `Closed(0)`, and `ChannelError::Closed` carries the channel
+  handle.
+
+### Added
+
+- `Process.Message(error)` returns one readable line for a `ProcessError`.
+
 ### Removed
 
 - Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`
@@ -20,6 +37,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `Channel.Receive`, `Channel.Send`, `WaitGroup.Wait`, `Mutex.Lock` and
+  `Hub.WaitReceive` in `Main` park like in any other fiber (Main runs as the
+  root fiber); `Receive` on an empty channel in `Main` returned `Closed(0)`.
+  `Time.Sleep`, `Network` operations, `Dns.Resolve` and `Process.Run` in
+  `Main` park too and let other fibers run.
+- `HubError` and `MutexError` gain `Unexpected(i64 code)`; unknown statuses
+  were `Closed(0)` and `Cancelled(0)`. A failed `Hub.Register` names the
+  member index, and an empty or unknown hub reports `Closed(-1)`.
 - CoreSuite covers concatenating and slicing a `Core.Args` string (storage
   outside the managed heap) across collections.
 - `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the

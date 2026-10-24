@@ -31,9 +31,17 @@ pub Core.Results.Result<SendOk, HubError> Register<T>(
     Status status = Status.FromCode(raw);
     return match status {
         Status::Ok => Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.HubError>::Ok(SendOk { }),
-        Status::HubLimit(cap) => Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.HubError>::Error(HubError::Limit(cap, index)),
-        Status::HubNotFound(idx) => Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.HubError>::Error(HubError::Closed(idx)),
-        _ => Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.HubError>::Error(HubError::Closed(0)),
+        _ => Core.Results.Result<Concurrency.Channel.SendOk, Concurrency.HubError>::Error(MapRegisterError(status, index)),
+    };
+}
+
+/// Maps a failed `Register` status. The member `index` is the id a `Limit` or `Closed` names
+/// (the hub or the channel was not found); any other status is `Unexpected` with its raw code.
+pub HubError MapRegisterError(Status status, i64 index) {
+    return match status {
+        Status::HubLimit(cap) => HubError::Limit(cap, index),
+        Status::HubNotFound(_) => HubError::Closed(index),
+        _ => HubError::Unexpected(Status.Discriminant(status)),
     };
 }
 
@@ -48,9 +56,17 @@ pub Core.Results.Result<HubReceiveResult<T>, HubError> WaitReceive<T>(Hub<T> sel
     Status status = Status.FromCode(raw);
     return match status {
         Status::Ok => Results.Success<HubReceiveResult<T>, HubError>(HubReceiveResult<T> { index: __hub_wait_receive_index(self.handle), value: __hub_wait_receive_value<T>(self.handle) }),
-        Status::Cancelled(reason) => Results.Failure<HubReceiveResult<T>, HubError>(HubError::Cancelled(reason)),
-        Status::HubEmpty => Results.Failure<HubReceiveResult<T>, HubError>(HubError::Closed(-1_i64)),
-        Status::HubNotFound(idx) => Results.Failure<HubReceiveResult<T>, HubError>(HubError::Closed(idx)),
-        _ => Results.Failure<HubReceiveResult<T>, HubError>(HubError::Closed(0_i64)),
+        _ => Results.Failure<HubReceiveResult<T>, HubError>(MapWaitReceiveError(status)),
+    };
+}
+
+/// Maps a failed `WaitReceive` status. An empty or unknown hub names no member, so its
+/// `Closed` carries -1; any status outside the contract is `Unexpected` with its raw code.
+pub HubError MapWaitReceiveError(Status status) {
+    return match status {
+        Status::Cancelled(reason) => HubError::Cancelled(reason),
+        Status::HubEmpty => HubError::Closed(-1_i64),
+        Status::HubNotFound(_) => HubError::Closed(-1_i64),
+        _ => HubError::Unexpected(Status.Discriminant(status)),
     };
 }

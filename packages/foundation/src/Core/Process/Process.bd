@@ -20,10 +20,29 @@ pub bool IsCurrentProcess(i32 pid) { return pid == Id(); }
 
 pub type EnvironmentEntry { pub string key, pub string value, }
 pub enum EnvironmentPolicy { Inherit(), Replace(EnvironmentEntry[] entries), Extend(EnvironmentEntry[] entries), }
+/// `executable` is a path, or a bare program name (no `/` or `\`) that the spawn resolves through
+/// the `PATH` of the child's environment, the first entry that runs, like `execvp`.
 pub type ProcessStartInfo { pub string executable, pub string[] arguments, pub EnvironmentPolicy environment, pub string cwd, }
+/// Why a child could not be started, driven or cleaned up. A child that ran and exited with a
+/// nonzero code is not an error: `Run` reports it in `ProcessOutput.exitCode`.
 pub enum ProcessError {
-    NotFound(string executable), PermissionDenied(string executable), ExitCode(i64 code, string stderr), IOError(string message),
+    NotFound(string executable), PermissionDenied(string executable), IOError(string message),
     InvalidInput(), Cancelled(), TimedOut(), Closed(), Busy(), CleanupFailed(), Unsupported(),
+}
+/// A readable, one-line description of `error` for logs and user messages.
+pub string Message(ProcessError error) {
+    return match error {
+        ProcessError::NotFound(executable) => "executable not found: ${executable}",
+        ProcessError::PermissionDenied(executable) => "permission denied: ${executable}",
+        ProcessError::IOError(message) => message,
+        ProcessError::InvalidInput => "invalid process input: an argument, environment entry or path cannot be passed to the child",
+        ProcessError::Cancelled => "child process operation cancelled",
+        ProcessError::TimedOut => "child process operation timed out",
+        ProcessError::Closed => "child process stream is closed",
+        ProcessError::Busy => "child process table is full",
+        ProcessError::CleanupFailed => "child process cleanup failed",
+        ProcessError::Unsupported => "child processes are not supported here",
+    };
 }
 pub type ProcessExit { pub i64 exitCode, }
 pub type ProcessOutput { pub i64 exitCode, pub string stdout, pub string stderr, }
@@ -175,7 +194,11 @@ pub Result<ChildProcess, ProcessError> SpawnUntil(ProcessStartInfo info, Deadlin
     return Result::Ok(ChildProcess { token: token });
 }
 
-/// Capture both streams concurrently through nonblocking probes; never drain one to EOF first.
+/// Runs `command` with `args` to completion and captures stdout and stderr (UTF-8, 16 MiB in
+/// total). Returns `Ok` whenever the child started, whatever its exit code: check
+/// `output.exitCode`. An error means the child could not start or its output could not be read.
+/// A bare `command` is resolved through `PATH`. Both streams are captured concurrently through
+/// nonblocking probes; neither is drained to EOF first.
 pub Result<ProcessOutput, ProcessError> Run(string command, move string[] args) {
     Result<ChildProcess, ProcessError> started = Spawn(ProcessStartInfo { executable: command, arguments: args, environment: EnvironmentPolicy::Inherit, cwd: "" });
     return match started {
@@ -217,9 +240,7 @@ Result<ProcessOutput, ProcessError> Capture(ChildProcess child) {
 }
 Result<ProcessOutput, ProcessError> CapturedOutput(u8[] output, u8[] errors, i64 exit) {
     if !ValidOutput(output) || !ValidOutput(errors) { return Result::Error(ProcessError::IOError("captured output is not UTF-8")); }
-    string stderr = Utf8.FromUtf8CodeUnits(errors);
-    if exit != 0_i64 { return Result::Error(ProcessError::ExitCode(exit, stderr)); }
-    return Result::Ok(ProcessOutput { exitCode: exit, stdout: Utf8.FromUtf8CodeUnits(output), stderr: stderr });
+    return Result::Ok(ProcessOutput { exitCode: exit, stdout: Utf8.FromUtf8CodeUnits(output), stderr: Utf8.FromUtf8CodeUnits(errors) });
 }
 bool ValidOutput(u8[] bytes) {
     mut i64 index = 0_i64;

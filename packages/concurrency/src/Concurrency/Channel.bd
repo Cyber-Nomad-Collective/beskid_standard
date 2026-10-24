@@ -42,23 +42,23 @@ pub Channel<T> CreateWithOptions<T>(ChannelOptions options) {
 /// without retracting it; exactly one successful receiver becomes its owner.
 pub Core.Results.Result<SendOk, ChannelError> Send<T>(Channel<T> self, T value) {
     i64 raw = __channel_send(self.handle, ChannelValue<T> { value: value });
-    return MapSendStatus(Status.FromCode(raw));
+    return MapSendStatus(Status.FromCode(raw), self.handle);
 }
 
-/// Receives a value; parks when empty and open.
+/// Receives a value; parks when empty and open. In `Main` it parks like in any other fiber.
 pub Core.Results.Result<T, ChannelError> Receive<T>(Channel<T> self) {
     i64 raw = __channel_receive_status(self.handle);
     Status status = Status.FromCode(raw);
     return match status {
         Status::Ok => Results.Success<T, ChannelError>(__channel_receive_value<T>(self.handle)),
-        _ => Results.Failure<T, ChannelError>(MapReceiveError(status)),
+        _ => Results.Failure<T, ChannelError>(MapReceiveError(status, self.handle)),
     };
 }
 
 /// Non-blocking send; `WouldBlock` when full, `Err` on close or cancel.
 pub TryResult<SendOk, ChannelError> TrySend<T>(Channel<T> self, T value) {
     i64 raw = __channel_try_send(self.handle, ChannelValue<T> { value: value });
-    return MapTrySendStatus(Status.FromCode(raw));
+    return MapTrySendStatus(Status.FromCode(raw), self.handle);
 }
 
 /// Non-blocking receive; `WouldBlock` when empty, `Err` on close or cancel.
@@ -69,8 +69,8 @@ pub TryResult<T, ChannelError> TryReceive<T>(Channel<T> self) {
         Status::Ok => TryResult::Ok(__channel_receive_value<T>(self.handle)),
         Status::WouldBlock => TryResult::WouldBlock,
         Status::Cancelled(reason) => TryResult::Err(ChannelError::Cancelled(reason)),
-        Status::Closed(endpoint) => TryResult::Err(ChannelError::Closed(endpoint)),
-        _ => TryResult::WouldBlock,
+        Status::Closed(_) => TryResult::Err(ChannelError::Closed(self.handle)),
+        _ => TryResult::Err(MapReceiveError(status, self.handle)),
     };
 }
 
@@ -81,29 +81,30 @@ pub unit Close<T>(Channel<T> self) {
     return;
 }
 
-pub Core.Results.Result<SendOk, ChannelError> MapSendStatus(Status status) {
+/// Maps a blocking-send status. `endpoint` is the channel handle that a `Closed` error names.
+pub Core.Results.Result<SendOk, ChannelError> MapSendStatus(Status status, i64 endpoint) {
     return match status {
         Status::Ok => Results.Success<SendOk, ChannelError>(SendOk { }),
-        Status::Closed(endpoint) => Results.Failure<SendOk, ChannelError>(ChannelError::Closed(endpoint)),
-        Status::Cancelled(reason) => Results.Failure<SendOk, ChannelError>(ChannelError::Cancelled(reason)),
-        _ => Results.Failure<SendOk, ChannelError>(ChannelError::Closed(0)),
+        _ => Results.Failure<SendOk, ChannelError>(MapReceiveError(status, endpoint)),
     };
 }
 
-pub ChannelError MapReceiveError(Status status) {
+/// Maps a failed channel status to its error. `Closed` names `endpoint` (the channel handle);
+/// a status outside the channel contract (including `WouldBlock` from a blocking call) is
+/// `Unexpected` with its raw code, never a close.
+pub ChannelError MapReceiveError(Status status, i64 endpoint) {
     return match status {
         Status::Cancelled(reason) => ChannelError::Cancelled(reason),
-        Status::Closed(endpoint) => ChannelError::Closed(endpoint),
-        _ => ChannelError::Closed(0),
+        Status::Closed(_) => ChannelError::Closed(endpoint),
+        _ => ChannelError::Unexpected(Status.Discriminant(status)),
     };
 }
 
-pub TryResult<SendOk, ChannelError> MapTrySendStatus(Status status) {
+/// Maps a non-blocking send status. `endpoint` is the channel handle that a `Closed` error names.
+pub TryResult<SendOk, ChannelError> MapTrySendStatus(Status status, i64 endpoint) {
     return match status {
         Status::Ok => TryResult::Ok(SendOk { }),
         Status::WouldBlock => TryResult::WouldBlock,
-        Status::Closed(endpoint) => TryResult::Err(ChannelError::Closed(endpoint)),
-        Status::Cancelled(reason) => TryResult::Err(ChannelError::Cancelled(reason)),
-        _ => TryResult::WouldBlock,
+        _ => TryResult::Err(MapReceiveError(status, endpoint)),
     };
 }

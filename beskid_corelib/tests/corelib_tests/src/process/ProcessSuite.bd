@@ -42,7 +42,6 @@ string ErrorName(ProcessError error) {
     return match error {
         ProcessError::NotFound(executable) => "NotFound",
         ProcessError::PermissionDenied(executable) => "PermissionDenied",
-        ProcessError::ExitCode(code, stderr) => "ExitCode",
         // The message carries the OS error code of a failed spawn, so a failing case names it.
         ProcessError::IOError(message) => "IOError(" + message + ")",
         ProcessError::InvalidInput => "InvalidInput",
@@ -197,11 +196,8 @@ test process_wait_returns_exit_code_and_run_reports_typed_exit_and_missing_execu
     };
     Assert.True(Results.IsOk(child.Close()), "a reaped child closes cleanly");
     match Process.Run(Fixture(), ["exit", "7"]) {
-        Result::Ok(_) => Assert.Fail("a nonzero exit is not success"),
-        Result::Error(error) => match error {
-            ProcessError::ExitCode(code, stderr) => Assert.Equal(code, 7_i64, "Run reports the nonzero exit code"),
-            _ => Assert.Fail("a nonzero exit is the typed ExitCode error, not " + ErrorName(error)),
-        },
+        Result::Error(error) => Assert.Fail("a child that ran is Ok whatever its exit code, not " + ErrorName(error)),
+        Result::Ok(output) => Assert.Equal(output.exitCode, 7_i64, "Run reports the nonzero exit code in the output"),
     };
     match Process.Run(Fixture(), ["exit", "0"]) {
         Result::Error(error) => Assert.Fail("a zero exit is success: " + ErrorName(error)),
@@ -289,4 +285,58 @@ test process_spawn_failure_with_an_os_error_is_typed_and_names_the_code {
         Result::Error(error) => Assert.Fail("spawning works after an OS-level spawn failure: " + ErrorName(error)),
         Result::Ok(output) => Assert.Equal(output.exitCode, 0_i64, "later child exits successfully"),
     };
+}
+
+// ---- v0.6.7: Run keeps the output of a failing child, PATH lookup, readable errors ----
+
+test RunKeepsStderrOfAChildThatExitsNonzero {
+    match Process.Run(Fixture(), ["no-such-mode"]) {
+        Result::Error(error) => Assert.Fail("a child that ran is Ok: " + Process.Message(error)),
+        Result::Ok(output) => {
+            Assert.Equal(output.exitCode, 64_i64, "the fixture's usage exit code is reported");
+            Assert.True(String.Contains(output.stderr, "unknown mode"), "stderr of the failing child is kept");
+            Assert.Equal(output.stdout, "", "stdout is kept (empty here) and separate from stderr");
+        },
+    };
+}
+
+i64 LastSeparator(string path) {
+    mut i64 last = -1_i64;
+    mut i64 index = 0_i64;
+    while index < String.Len(path) {
+        u8 code = String.ByteAt(path, index);
+        if code == 47_u8 || code == 92_u8 { last = index; }
+        index = index + 1_i64;
+    }
+    return last;
+}
+
+test SpawnResolvesABareNameThroughPath {
+    string fixture = Fixture();
+    i64 separator = LastSeparator(fixture);
+    Assert.True(separator > 0_i64, "the fixture path names a directory");
+    string directory = String.SubSlice(fixture, 0_i64, separator);
+    string name = String.SubSlice(fixture, separator + 1_i64, String.Len(fixture) - separator - 1_i64);
+    EnvironmentEntry[] path = [EnvironmentEntry { key: "PATH", value: directory }];
+    match Process.Spawn(ProcessStartInfo { executable: name, arguments: ["exit", "5"], environment: EnvironmentPolicy::Extend(path), cwd: "" }) {
+        Result::Error(error) => Assert.Fail("a bare name on PATH starts: " + Process.Message(error)),
+        Result::Ok(child) => {
+            match child.Wait(DeadlineIn(10000_i64)) {
+                Result::Ok(exit) => Assert.Equal(exit.exitCode, 5_i64, "the PATH-resolved child ran"),
+                Result::Error(error) => Assert.Fail("the PATH-resolved child is waited: " + Process.Message(error)),
+            };
+            Assert.True(Results.IsOk(child.Close()), "the child closes");
+        },
+    };
+    EnvironmentEntry[] same = [EnvironmentEntry { key: "PATH", value: directory }];
+    match Process.Spawn(ProcessStartInfo { executable: "beskid-no-such-program", arguments: ["exit", "0"], environment: EnvironmentPolicy::Extend(same), cwd: "" }) {
+        Result::Ok(child) => { child.Close(); Assert.Fail("a name on no PATH entry cannot start"); },
+        Result::Error(error) => Assert.Equal(ErrorName(error), "NotFound", "a bare name on no PATH entry is NotFound"),
+    };
+}
+
+test ProcessErrorMessageIsReadable {
+    Assert.Equal(Process.Message(ProcessError::NotFound("tool")), "executable not found: tool", "NotFound names the executable");
+    Assert.Equal(Process.Message(ProcessError::IOError("child process spawn failed: OS error 2")), "child process spawn failed: OS error 2", "IOError is its message");
+    Assert.Equal(Process.Message(ProcessError::TimedOut), "child process operation timed out", "unit variants have fixed text");
 }

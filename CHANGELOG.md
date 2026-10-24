@@ -10,7 +10,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 - `Console.Hosting`: the `ConsoleHost` base host for console programs
   (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service
-  (arguments, count, `Exit(code)`).
+  (arguments, count, `Exit(code)`). `Exit` ends the program through the host:
+  open scopes run their `dispose` hooks innermost first, then the global
+  `dispose` hooks run; `Process.Exit` stays the immediate exit.
 
 ### Removed
 

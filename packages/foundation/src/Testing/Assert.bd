@@ -1,9 +1,17 @@
 /// Shouldly-style assertion helpers for Beskid `test` blocks and user tests.
-/// Prefer actual-first argument order: `Testing.Assert.equal(len, 3, "because")`.
+/// Prefer actual-first argument order: `Testing.Assert.Equal(len, 3, "because")`.
+///
+/// A failed assertion ends the test with one framed failure record instead of free text.
+/// `beskid test` recognizes the record, prints `assertion failed: expected 3, found 4` with the
+/// because text and the call site under the test name, and reports a runtime trap that carries
+/// no record as `test crashed`.
+///
+/// Record layout: `BESKID-TEST-FAILURE/1`, then the headline, the because text, the expected
+/// text and the actual text, each preceded by the separator `~~|~~`. An empty text is absent.
 
 use Core.String;
 
-/// Emits a message and forces a runtime crash.
+/// Emits a message and ends the test process through the runtime abort path.
 unit TriggerFailure(string message) {
     __panic_str(message);
 }
@@ -15,19 +23,36 @@ pub unit CollectGarbage() {
     return;
 }
 
+/// Builds the framed failure record that `beskid test` parses.
+string FailureRecord(string headline, string because, string expected, string actual) {
+    return "BESKID-TEST-FAILURE/1~~|~~" + headline + "~~|~~" + because + "~~|~~" + expected + "~~|~~" + actual;
+}
+
+string Quoted(string text) {
+    return "\"" + text + "\"";
+}
+
 /// Unconditionally fails the current test.
 /// @arg(message) Failure reason surfaced to the user.
 pub unit Fail(string message) {
-    TriggerFailure("Assertion failed: ${message}");
+    TriggerFailure(FailureRecord(message, "", "", ""));
 }
 
 unit FailWithBecause(string headline, string because) {
-    if because == "" {
-        Fail(headline);
-        return;
-    }
-    // The first failure traps the process, so the context must travel in the same message.
-    Fail(headline + ": " + because);
+    TriggerFailure(FailureRecord(headline, because, "", ""));
+}
+
+unit FailWithValues(string headline, string because, string expected, string actual) {
+    TriggerFailure(FailureRecord(headline, because, expected, actual));
+}
+
+/// Fails the current test with an expected and an observed value that are already rendered as text.
+/// Typed helpers such as `Testing.Expect.EqualI64` use it to show both values.
+/// @arg(expected) Rendered expected value.
+/// @arg(actual) Rendered observed value.
+/// @arg(because) Optional diagnostic context (pass `""` when omitted).
+pub unit FailEqual(string expected, string actual, string because) {
+    FailWithValues("expected " + expected + ", found " + actual, because, expected, actual);
 }
 
 /// Fails when actual and expected values differ.
@@ -39,7 +64,7 @@ pub unit Equal<T>(T actual, T expected, string because) {
     if actual == expected {
         return;
     }
-    FailWithBecause("should equal the expected value", because);
+    FailWithBecause("the values are not equal", because);
 }
 
 /// Fails when actual and expected values are equal.
@@ -51,7 +76,7 @@ pub unit NotEqual<T>(T actual, T expected, string because) {
     if actual != expected {
         return;
     }
-    FailWithBecause("should not equal the expected value", because);
+    FailWithBecause("the values must differ but are equal", because);
 }
 
 /// Fails when condition is not true.
@@ -61,7 +86,7 @@ pub unit True(bool condition, string because) {
     if condition {
         return;
     }
-    FailWithBecause("should be true but was false", because);
+    FailWithValues("expected true, found false", because, "true", "false");
 }
 
 /// Fails when condition is true.
@@ -71,7 +96,7 @@ pub unit False(bool condition, string because) {
     if !condition {
         return;
     }
-    FailWithBecause("should be false but was true", because);
+    FailWithValues("expected false, found true", because, "false", "true");
 }
 
 /// Fails when needle is not found in text.
@@ -82,5 +107,5 @@ pub unit Contains(string text, string needle, string because) {
     if String.Contains(text, needle) {
         return;
     }
-    FailWithBecause("should contain the needle", because);
+    FailWithValues("expected text containing " + Quoted(needle) + ", found " + Quoted(text), because, needle, text);
 }

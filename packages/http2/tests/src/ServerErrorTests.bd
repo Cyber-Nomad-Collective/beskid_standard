@@ -89,7 +89,7 @@ i64 RstCode(u8[] out, i64 id) { return Field32(out, Frame.TypeRstStream(), id, 0
 
 // ---- tests ----
 
-test server_sends_settings_and_acks_client_settings {
+test ServerSendsSettingsAndAcksClientSettings {
     u8[] out = Serve(Start(), Cfg());
     FrameHeader first = Frame.ParseHeader(out, 0_i64);
     Assert.Equal<i64>(first.kind, Frame.TypeSettings(), "server SETTINGS first");
@@ -97,46 +97,46 @@ test server_sends_settings_and_acks_client_settings {
     Assert.Equal<i64>(GoAwayCode(out), -1_i64, "no GOAWAY on clean EOF");
 }
 
-test server_rejects_bad_preface {
+test ServerRejectsBadPreface {
     u8[] input = Frame.SettingsFrame(Array.Empty<i64>(), Array.Empty<i64>());
     u8[] padded = MemoryTransport.Join(input, Slice.New(30_i64));
     Assert.Equal<i64>(GoAwayCode(Serve(padded, Cfg())), FrameErrors.ProtocolError(), "PROTOCOL_ERROR");
 }
 
-test server_requires_settings_first {
+test ServerRequiresSettingsFirst {
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.PingFrame(Slice.New(8_i64), false));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "PING before SETTINGS");
 }
 
-test server_answers_ping {
+test ServerAnswersPing {
     u8[] opaque = [9_u8, 8_u8, 7_u8, 6_u8, 5_u8, 4_u8, 3_u8, 2_u8];
     u8[] out = Serve(MemoryTransport.Join(Start(), Frame.PingFrame(opaque, false)), Cfg());
     Assert.Equal<i64>(Count(out, Frame.TypePing(), Frame.FlagAck()), 1_i64, "PING ACK");
     Assert.Equal<i64>(Field32(out, Frame.TypePing(), 0_i64, 0_i64), 151521030_i64, "opaque echoed");
 }
 
-test server_invalid_enable_push {
+test ServerInvalidEnablePush {
     i64[] ids = [2_i64];
     i64[] values = [2_i64];
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(ids, values));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "ENABLE_PUSH=2");
 }
 
-test server_invalid_initial_window {
+test ServerInvalidInitialWindow {
     i64[] ids = [4_i64];
     i64[] values = [2147483648_i64];
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(ids, values));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.FlowControlError(), "window > 2^31-1");
 }
 
-test server_invalid_max_frame_size {
+test ServerInvalidMaxFrameSize {
     i64[] ids = [5_i64];
     i64[] values = [100_i64];
     u8[] input = MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(ids, values));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "max frame size < 16384");
 }
 
-test server_answers_get {
+test ServerAnswersGet {
     Encoder enc = NewEnc();
     u8[] out = Serve(MemoryTransport.Join(Start(), Headers(enc, 1_i64, GetFields("/"), true)), Cfg());
     Assert.Equal<i64>(Count(out, Frame.TypeHeaders(), Frame.FlagEndHeaders()), 1_i64, "response HEADERS");
@@ -144,27 +144,27 @@ test server_answers_get {
     Assert.Equal<i64>(RstCode(out, 1_i64), -1_i64, "no reset");
 }
 
-test stream_id_reuse_is_connection_error {
+test StreamIdReuseIsConnectionError {
     Encoder enc = NewEnc();
     u8[] first = MemoryTransport.Join(Start(), Headers(enc, 1_i64, GetFields("/"), true));
     u8[] input = MemoryTransport.Join(first, Headers(enc, 1_i64, GetFields("/"), true));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.StreamClosed(), "STREAM_CLOSED");
 }
 
-test lower_stream_id_is_protocol_error {
+test LowerStreamIdIsProtocolError {
     Encoder enc = NewEnc();
     u8[] first = MemoryTransport.Join(Start(), Headers(enc, 5_i64, GetFields("/"), true));
     u8[] input = MemoryTransport.Join(first, Headers(enc, 3_i64, GetFields("/"), true));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "id 3 after 5");
 }
 
-test even_stream_id_from_client_is_protocol_error {
+test EvenStreamIdFromClientIsProtocolError {
     Encoder enc = NewEnc();
     u8[] input = MemoryTransport.Join(Start(), Headers(enc, 2_i64, GetFields("/"), true));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "even id");
 }
 
-test data_on_closed_stream_is_stream_closed {
+test DataOnClosedStreamIsStreamClosed {
     Encoder enc = NewEnc();
     u8[] first = MemoryTransport.Join(Start(), Headers(enc, 1_i64, GetFields("/"), true));
     u8[] input = MemoryTransport.Join(first, Frame.DataFrame(1_i64, [1_u8], false));

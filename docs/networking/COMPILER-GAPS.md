@@ -284,7 +284,7 @@ Each `test` costs 1 to 2 s fixed in `beskid test` (compile/JIT per test), and a 
 ~40 tests.
 
 Also: test and function names beginning with `host_` fail to parse ("expected Identifier",
-the lexer appears to treat `host` as a keyword prefix); test names must be snake_case
+the lexer appears to treat `host` as a keyword prefix); test names are PascalCase
 without double or trailing underscores, and must be unique per target.
 ## 2026-10-05, crypto (public-key half)
 

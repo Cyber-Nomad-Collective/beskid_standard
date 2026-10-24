@@ -109,3 +109,99 @@ test ContractValuesInFieldsSurviveCollections
     }
     Assert.True(total > 0_i64, "every read reached a live implementation");
 }
+
+contract Reader
+{
+    i64 Read();
+}
+
+contract Channel
+{
+    Reader;
+    i64 Flush();
+}
+
+type File : Channel
+{
+    i64 position;
+    pub i64 Read() { return this.position; }
+    pub i64 Flush() { return 100_i64; }
+}
+
+contract Repo<T>
+{
+    T Get();
+}
+
+type Numbers : Repo<i64>
+{
+    pub i64 Get() { return 9_i64; }
+}
+
+enum Choice
+{
+    First,
+    Second,
+}
+
+i64 RankOf<T>(T value) where T: Greeter
+{
+    return value.Rank();
+}
+
+i64 ReadFrom(Reader reader)
+{
+    return reader.Read();
+}
+
+test EqualityOfContractValuesComparesTheHeldValues
+{
+    Hello hello = Hello {};
+    Greeter first = hello;
+    Greeter second = hello;
+    Greeter other = Hello {};
+    Assert.True(first == second, "the same object through two contract values");
+    Assert.True(first != other, "two objects of one type are different values");
+    mut Formatting left = 3_i32;
+    mut Formatting right = 3_i32;
+    Assert.True(left == right, "equal boxed primitives of one type");
+    right = 3_i64;
+    Assert.True(left != right, "equal bits of different primitive types differ");
+    left = 0.0_f64;
+    right = -0.0_f64;
+    Assert.True(left == right, "boxed floats compare as floats");
+}
+
+test AContractValueConvertsToAnEmbeddedContract
+{
+    mut Channel channel = File { position: 7_i64 };
+    Reader reader = channel;
+    Assert.Equal<i64>(reader.Read(), 7_i64, "the embedded contract's method slot");
+    Assert.Equal<i64>(ReadFrom(channel), 7_i64, "a converted argument");
+    Assert.Equal<i64>(channel.Flush(), 100_i64, "the source value is unchanged");
+}
+
+test BranchesArmsAndLambdasConvertToTheExpectedContract
+{
+    bool flag = false;
+    Greeter chosen = flag ? Hello {} : Bye { extra: 1_i64 };
+    Assert.Equal<i64>(chosen.Rank(), 11_i64, "the else branch");
+    Choice choice = Choice::First;
+    Greeter matched = match choice
+    {
+        Choice::First => Hello {},
+        Choice::Second => Bye { extra: 0_i64 },
+    };
+    Assert.Equal<i64>(matched.Rank(), 1_i64, "the first arm");
+    Greeter() make = () => Bye { extra: 4_i64 };
+    Assert.Equal<i64>(make().Rank(), 14_i64, "a lambda body");
+}
+
+test ContractTypeArgumentsAndGenericContracts
+{
+    mut Greeter g = Hello {};
+    g = Bye { extra: 2_i64 };
+    Assert.Equal<i64>(RankOf<Greeter>(g), 12_i64, "T = Greeter dispatches at run time");
+    mut Repo<i64> repo = Numbers {};
+    Assert.Equal<i64>(repo.Get(), 9_i64, "a generic contract value");
+}

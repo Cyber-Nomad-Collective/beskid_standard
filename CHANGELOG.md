@@ -6,6 +6,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `Console.Hosting`: the `ConsoleHost` base host for console programs
+  (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service
+  (arguments, count, `Exit(code)`).
+
 ### Removed
 
 - Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`

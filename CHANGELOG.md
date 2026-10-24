@@ -22,8 +22,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 ### Added
 
 - `Process.Message(error)` returns one readable line for a `ProcessError`.
-### Added
-
 - `Console.Hosting`: the `ConsoleHost` base host for console programs
   (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service
   (arguments, count, `Exit(code)`).

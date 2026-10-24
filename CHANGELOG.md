@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ## [Unreleased]
 
+### Added
+
+- `Core.Text.Formatting`: the contract `Formatting` (`string Format()`), implemented for every
+  integer type, `word`, `f32`, `f64`, `bool`, `char` and `string`.
+
+### Changed
+
+- `Testing.Assert.Equal<T>` and `NotEqual<T>` require `T: Formatting` and write the text of the
+  expected and the actual value into the failure record.
+- `Testing.Expect.Equal<T>` (with `T: Formatting`) replaces `EqualI64`, `EqualString` and
+  `EqualBool`.
+
 ### Removed
 
 - Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`

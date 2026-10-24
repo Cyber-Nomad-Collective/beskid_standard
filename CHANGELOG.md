@@ -49,7 +49,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ParallelSeq.Collect` accumulates each chunk in a `T[]`, and `Scopes`
   pushes and inserts in place.
 - Generated `Project.lock` files of package test projects are no longer tracked.
-
 - `Core.Text.Formatting`: the contract `Formatting` (`string Format()`), implemented for every
   integer type, `word`, `f32`, `f64`, `bool`, `char` and `string`.
 

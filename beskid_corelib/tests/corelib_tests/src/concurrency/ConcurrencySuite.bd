@@ -223,6 +223,7 @@ test mutex_try_lock_returns_try_result {
     match result {
         TryResult::Ok(_) => { },
         TryResult::Err(MutexError::Cancelled(_)) => { },
+        TryResult::Err(MutexError::Unexpected(_)) => Assert.Fail("a fresh mutex never reports an unexpected status"),
         TryResult::WouldBlock => { },
     };
     Assert.True(true, "TryLock returns TryResult<MutexGuard, MutexError>");
@@ -234,6 +235,7 @@ test mutex_lock_returns_result {
     match result {
         Result::Ok(_) => { },
         Result::Error(MutexError::Cancelled(_)) => { },
+        Result::Error(MutexError::Unexpected(_)) => Assert.Fail("a fresh mutex never reports an unexpected status"),
     };
     Assert.True(true, "Lock returns Result");
 }
@@ -276,6 +278,7 @@ test hub_register_returns_result {
         Result::Error(HubError::Limit(_, _)) => { },
         Result::Error(HubError::Cancelled(_)) => { },
         Result::Error(HubError::Closed(_)) => { },
+        Result::Error(HubError::Unexpected(_)) => Assert.Fail("Register never reports an unexpected status for a live hub and channel"),
     };
 }
 
@@ -288,6 +291,7 @@ test hub_unregister_does_not_panic {
         Result::Error(HubError::Limit(_, _)) => { },
         Result::Error(HubError::Cancelled(_)) => { },
         Result::Error(HubError::Closed(_)) => { },
+        Result::Error(HubError::Unexpected(_)) => Assert.Fail("Register never reports an unexpected status for a live hub and channel"),
     };
     Hub.Unregister<i64>(hub, 0_i64);
     Assert.True(true, "Unregister completes");
@@ -495,4 +499,40 @@ test WaitInTheRootFiberParksUntilAFiberCallsDone {
     WaitGroup.Wait(group);
     finisher.Detach();
     Assert.True(true, "the root fiber waited for Done");
+}
+
+// ---- v0.6.7: Hub and Mutex statuses outside their contract are Unexpected ----
+
+test MapLockErrorTurnsAnUnknownStatusIntoUnexpected {
+    i64 code = match Mutex.MapLockError(Status.FromCode(42)) {
+        MutexError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 42_i64, "an unknown lock status is Unexpected with its code, not Cancelled(0)");
+    i64 cancelled = match Mutex.MapLockError(Status.FromCode(1)) {
+        MutexError::Cancelled(_) => 1_i64,
+        _ => 0_i64,
+    };
+    Assert.Equal(cancelled, 1_i64, "lock status 1 stays the documented cancellation");
+}
+
+test MapRegisterErrorNamesTheMemberIndex {
+    i64 member = match Hub.MapRegisterError(Status.FromCode(6), 17_i64) {
+        HubError::Closed(index) => index,
+        _ => -100_i64,
+    };
+    Assert.Equal(member, 17_i64, "a not-found registration names the member index, not 0");
+    i64 code = match Hub.MapRegisterError(Status::WouldBlock, 17_i64) {
+        HubError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 3_i64, "a status outside the register contract is Unexpected, not Closed(0)");
+}
+
+test MapWaitReceiveErrorTurnsAnUnknownStatusIntoUnexpected {
+    i64 code = match Hub.MapWaitReceiveError(Status.FromCode(1)) {
+        HubError::Unexpected(raw) => raw,
+        _ => -1_i64,
+    };
+    Assert.Equal(code, 1_i64, "a status outside the wait contract is Unexpected, not Closed(0)");
 }

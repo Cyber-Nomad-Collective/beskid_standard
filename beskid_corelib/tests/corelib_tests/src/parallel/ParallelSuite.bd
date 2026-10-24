@@ -410,6 +410,34 @@ test PortHandleCrossesAPort {
     Assert.Equal<i64>(ScopeValue(result), 42_i64, "the reply arrives through the sent port");
 }
 
+contract Scored { i64 Score(); }
+type Low : Scored { pub i64 Score() { return 1_i64; } }
+type High : Scored { i64 bonus; pub i64 Score() { return 100_i64 + this.bonus; } }
+
+test ContractValueCrossesAPort {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
+        Port<Scored> scores = s.PortWith<Scored>(2_i64);
+        Task<unit> producer = s.Spawn(() => {
+            Scored low = Low {};
+            scores.Send(move low);
+            Scored high = High { bonus: 5_i64 };
+            scores.Send(move high);
+            scores.Close();
+            return;
+        });
+        mut i64 total = 0_i64;
+        mut bool open = true;
+        while open {
+            match scores.Receive() {
+                Result::Ok(v) => { total = total + v.Score(); },
+                Result::Error(_) => { open = false; },
+            };
+        }
+        return Result::Ok(total);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 106_i64, "each received contract value dispatches to its own type");
+}
+
 unit SumInbox(Port<i64> inbox, Port<i64> done) {
     mut i64 sum = 0_i64;
     mut bool open = true;

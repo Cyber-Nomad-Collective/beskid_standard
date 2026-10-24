@@ -1,0 +1,111 @@
+/// Contract values (runtime dispatch, v0.6.7): a value of a type that conforms to a contract is
+/// usable wherever the contract type is expected, and a call through the contract value reaches
+/// the implementation of the value's type at run time.
+
+use Testing.Assert;
+use Core.Text.Formatting;
+use Collections.List;
+
+contract Greeter
+{
+    string Greet();
+    i64 Rank();
+}
+
+type Hello : Greeter
+{
+    pub string Greet() { return "hello"; }
+    pub i64 Rank() { return 1_i64; }
+}
+
+type Bye : Greeter
+{
+    i64 extra;
+    pub string Greet() { return "bye"; }
+    pub i64 Rank() { return 10_i64 + this.extra; }
+}
+
+type Holder
+{
+    Greeter greeter;
+}
+
+i64 Through(Greeter g)
+{
+    return g.Rank();
+}
+
+Greeter Pick(bool first)
+{
+    if first { return Hello {}; }
+    return Bye { extra: 5_i64 };
+}
+
+test AMutableContractLocalDispatchesToItsCurrentValue
+{
+    mut Greeter g = Hello {};
+    Assert.Equal<string>(g.Greet(), "hello", "the first value");
+    g = Bye { extra: 1_i64 };
+    Assert.Equal<string>(g.Greet(), "bye", "the second value");
+    Assert.Equal<i64>(g.Rank(), 11_i64, "the second method slot");
+}
+
+test TwoImplementationsInOneArrayCalledInALoop
+{
+    Greeter[] all = [Hello {}, Bye { extra: 5_i64 }, Hello {}];
+    mut i64 total = 0_i64;
+    mut i64 i = 0_i64;
+    while i < 3_i64
+    {
+        total = total + all[i].Rank();
+        i = i + 1_i64;
+    }
+    Assert.Equal<i64>(total, 17_i64, "each element dispatches to its own type");
+}
+
+test ContractValuesInAListDispatch
+{
+    mut List<Greeter> greeters = List.New<Greeter>();
+    greeters.Push(Hello {});
+    greeters.Push(Bye { extra: 2_i64 });
+    Assert.Equal<i64>(greeters.Get(0_i64).Rank(), 1_i64, "the first element");
+    Assert.Equal<i64>(greeters.Get(1_i64).Rank(), 12_i64, "the second element");
+}
+
+test ContractTypedFieldsParametersAndReturnsDispatch
+{
+    Holder holder = Holder { greeter: Bye { extra: 2_i64 } };
+    Assert.Equal<i64>(holder.greeter.Rank(), 12_i64, "a plain contract-typed field");
+    Assert.Equal<i64>(Through(holder.greeter), 12_i64, "a contract value passed on");
+    Assert.Equal<i64>(Through(Hello {}), 1_i64, "a concrete argument");
+    Assert.Equal<i64>(Pick(false).Rank(), 15_i64, "a returned contract value");
+    Assert.Equal<string>(Pick(true).Greet(), "hello", "another returned contract value");
+}
+
+test APrimitiveIsBoxedIntoAContractValue
+{
+    Formatting number = 42_i32;
+    Assert.Equal<string>(number.Format(), "42", "an i32 through Formatting");
+    mut Formatting value = true;
+    Assert.Equal<string>(value.Format(), "true", "a bool through Formatting");
+    value = 1.5_f64;
+    Assert.Equal<string>(value.Format(), "1.5", "an f64 through Formatting");
+    value = "text";
+    Assert.Equal<string>(value.Format(), "text", "a string through Formatting");
+    Formatting[] mixed = [7_i64, false, 'A'];
+    Assert.Equal<string>(mixed[0].Format() + mixed[1].Format() + mixed[2].Format(), "7falseA", "mixed primitives in one array");
+}
+
+test ContractValuesInFieldsSurviveCollections
+{
+    mut Holder[] holders = [Holder { greeter: Hello {} }, Holder { greeter: Bye { extra: 3_i64 } }];
+    mut i64 i = 0_i64;
+    mut i64 total = 0_i64;
+    while i < 2000_i64
+    {
+        holders[i % 2_i64] = Holder { greeter: Pick(i % 2_i64 == 0_i64) };
+        total = total + holders[(i + 1_i64) % 2_i64].greeter.Rank();
+        i = i + 1_i64;
+    }
+    Assert.True(total > 0_i64, "every read reached a live implementation");
+}

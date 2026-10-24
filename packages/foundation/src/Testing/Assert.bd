@@ -1,20 +1,28 @@
 /// Shouldly-style assertion helpers for Beskid `test` blocks and user tests.
 /// Prefer actual-first argument order: `Testing.Assert.Equal(len, 3, "because")`.
 ///
-/// A failed assertion ends the test with one framed failure record instead of free text.
-/// `beskid test` recognizes the record, prints `assertion failed: expected 3, found 4` with the
-/// because text and the call site under the test name, and reports a runtime trap that carries
-/// no record as `test crashed`.
+/// A failed assertion ends the test through a dedicated failure file, not through free text.
+/// The runner of `beskid test` names the file in the environment variable `BESKID_TEST_FAILURE_FILE`;
+/// the failure writes one framed `FailureRecord` there and then aborts the process with the headline
+/// as its message. `beskid test` reads only that file, prints `assertion failed: expected 3, found 4`
+/// with the because text and the call site under the test name, and reports a runtime trap without a
+/// record as `test crashed`. Outside `beskid test` the variable is absent and only the abort message remains.
 ///
 /// Every public helper takes the caller-information parameters `file`, `line` and `column`. A call
 /// omits them and the compiler passes the position of the call; a helper that forwards a failure
 /// passes its own caller information on explicitly.
-///
-/// Record layout: `BESKID-TEST-FAILURE/1`, then the headline, the because text, the expected text,
-/// the actual text, the file, the line and the column, each preceded by the separator `~~|~~`.
-/// An empty text is absent.
 
 use Core.String;
+use Core.Environment;
+use Core.FS;
+use Core.FS.FsError;
+use Core.Optional.Option;
+use Core.Results;
+
+/// Name of the environment variable that carries the failure file path.
+pub string FailureFileVariable() {
+    return "BESKID_TEST_FAILURE_FILE";
+}
 
 /// Emits a message and ends the test process through the runtime abort path.
 unit TriggerFailure(string message) {
@@ -28,10 +36,44 @@ pub unit CollectGarbage() {
     return;
 }
 
-/// Builds the framed failure record that `beskid test` parses.
-string FailureRecord(string headline, string because, string expected, string actual, string file, i64 line, i64 column) {
-    return "BESKID-TEST-FAILURE/1~~|~~" + headline + "~~|~~" + because + "~~|~~" + expected + "~~|~~" + actual
-        + "~~|~~" + file + "~~|~~" + "${line}" + "~~|~~" + "${column}";
+/// One failed assertion. `Frame` is the file format that `beskid test` reads: the line
+/// `BESKID-TEST-FAILURE/2`, then each field as `<byte length>:<bytes>` and a newline, in the order
+/// headline, because, expected, actual, file, line, column. An empty text is absent.
+pub type FailureRecord {
+    string headline,
+    string because,
+    string expected,
+    string actual,
+    string file,
+    i64 line,
+    i64 column,
+
+    string Field(string text) {
+        return "${String.Len(text)}:" + text + "
+";
+    }
+
+    pub string Frame() {
+        return "BESKID-TEST-FAILURE/2
+" + Field(this.headline) + Field(this.because) + Field(this.expected) + Field(this.actual)
+            + Field(this.file) + Field("${this.line}") + Field("${this.column}");
+    }
+}
+
+/// Writes the record to the failure file named by the environment, then aborts with the headline.
+unit Raise(FailureRecord record) {
+    Option<string> path = Environment.TryGet(FailureFileVariable());
+    match path {
+        Option::Some(target) => {
+            Result<unit, FsError> written = FS.WriteAllText(target, record.Frame());
+            match written {
+                Result::Ok(_) => {},
+                Result::Error(_) => {},
+            };
+        },
+        Option::None => {},
+    };
+    TriggerFailure("assertion failed: " + record.headline);
 }
 
 string Quoted(string text) {
@@ -41,15 +83,15 @@ string Quoted(string text) {
 /// Unconditionally fails the current test.
 /// @arg(message) Failure reason surfaced to the user.
 pub unit Fail(string message, [CallerFilePath] string file, [CallerLineNumber] i64 line, [CallerColumnNumber] i64 column) {
-    TriggerFailure(FailureRecord(message, "", "", "", file, line, column));
+    Raise(FailureRecord { headline: message, because: "", expected: "", actual: "", file: file, line: line, column: column });
 }
 
 unit FailWithBecause(string headline, string because, string file, i64 line, i64 column) {
-    TriggerFailure(FailureRecord(headline, because, "", "", file, line, column));
+    Raise(FailureRecord { headline: headline, because: because, expected: "", actual: "", file: file, line: line, column: column });
 }
 
 unit FailWithValues(string headline, string because, string expected, string actual, string file, i64 line, i64 column) {
-    TriggerFailure(FailureRecord(headline, because, expected, actual, file, line, column));
+    Raise(FailureRecord { headline: headline, because: because, expected: expected, actual: actual, file: file, line: line, column: column });
 }
 
 /// Fails the current test with an expected and an observed value that are already rendered as text.

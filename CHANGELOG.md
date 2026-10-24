@@ -19,6 +19,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   reported as `Closed(0)`, and `ChannelError::Closed` carries the channel
   handle.
 
+- `Testing.Assert.Equal<T>` and `NotEqual<T>` require `T: Formatting` and write the text of the
+  expected and the actual value into the failure record.
+- `Testing.Expect.Equal<T>` (with `T: Formatting`) replaces `EqualI64`, `EqualString` and
+  `EqualBool`.
+
 ### Added
 
 - `Process.Message(error)` returns one readable line for a `ProcessError`.
@@ -44,6 +49,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ParallelSeq.Collect` accumulates each chunk in a `T[]`, and `Scopes`
   pushes and inserts in place.
 - Generated `Project.lock` files of package test projects are no longer tracked.
+
+- `Core.Text.Formatting`: the contract `Formatting` (`string Format()`), implemented for every
+  integer type, `word`, `f32`, `f64`, `bool`, `char` and `string`.
 
 ### Removed
 

@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Hub.WaitReceive` returns `HubError::Closed(member)` when every member is
+  closed and drained, also in `Main`. `Hub.MapWaitReceiveError` takes the
+  member index the runtime reports.
 - `Core.IO.Stream` embeds `Reader`, `Writer` and `Closer`; a `Stream` value
   passes to `IO.Read`, `IO.ReadExact` and `IO.WriteAll` directly.
 - `Testing.Assert.FailureRecord` fields are public.

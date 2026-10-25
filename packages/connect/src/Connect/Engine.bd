@@ -24,53 +24,96 @@ use Connect.Order;
 
 // Hard bound on attempts per race; flag storage is preallocated so child
 // fibers never observe a reallocated array.
-pub i64 MaxRaceAttempts() { return 64_i64; }
+pub i64 MaxRaceAttempts()
+{
+    return 64_i64;
+}
 
 // Poll period of the coordinator while nothing is ready.
-i64 PollMillis() { return 2_i64; }
+i64 PollMillis()
+{
+    return 2_i64;
+}
 
 // Verdicts of the coordinator loop.
-i64 Running() { return 0_i64; }
-i64 Won() { return 1_i64; }
-i64 AllFailed() { return 2_i64; }
-i64 Expired() { return 3_i64; }
-i64 CancelledVerdict() { return 4_i64; }
-i64 Unresolved() { return 5_i64; }
-i64 Empty() { return 6_i64; }
+i64 Running()
+{
+    return 0_i64;
+}
 
-Result<TcpStream, NetworkError> AttemptBody(i64[] done, i64 index, SocketAddress address, SocketOptions options, Option<Deadline> deadline) {
+i64 Won()
+{
+    return 1_i64;
+}
+
+i64 AllFailed()
+{
+    return 2_i64;
+}
+
+i64 Expired()
+{
+    return 3_i64;
+}
+
+i64 CancelledVerdict()
+{
+    return 4_i64;
+}
+
+i64 Unresolved()
+{
+    return 5_i64;
+}
+
+i64 Empty()
+{
+    return 6_i64;
+}
+
+Result<TcpStream, NetworkError> AttemptBody(i64[] done, i64 index, SocketAddress address, SocketOptions options, Option<Deadline> deadline)
+{
     Result<TcpStream, NetworkError> result = TcpStream.Connect(address, options, deadline);
     done[index] = 1_i64;
     return result;
 }
 
-Result<SocketAddress[], NetworkError> ResolveBody(i64[] done, i64 index, string hostName, Port port, AddressFamily family, Option<Deadline> deadline) {
+Result<SocketAddress[], NetworkError> ResolveBody(i64[] done, i64 index, string hostName, Port port, AddressFamily family, Option<Deadline> deadline)
+{
     Result<SocketAddress[], NetworkError> result = Dns.Resolve(hostName, port, Option.FromValue<AddressFamily>(family), deadline);
     done[index] = 1_i64;
     return result;
 }
 
-Fiber<Result<TcpStream, NetworkError>> SpawnAttempt(i64[] done, i64 index, SocketAddress address, SocketOptions options, Option<Deadline> deadline) {
+Fiber<Result<TcpStream, NetworkError>> SpawnAttempt(i64[] done, i64 index, SocketAddress address, SocketOptions options, Option<Deadline> deadline)
+{
     return spawn (() => AttemptBody(done, index, address, options, deadline));
 }
 
-Fiber<Result<SocketAddress[], NetworkError>> SpawnResolve(i64[] done, i64 index, string hostName, Port port, AddressFamily family, Option<Deadline> deadline) {
+Fiber<Result<SocketAddress[], NetworkError>> SpawnResolve(i64[] done, i64 index, string hostName, Port port, AddressFamily family, Option<Deadline> deadline)
+{
     return spawn (() => ResolveBody(done, index, hostName, port, family, deadline));
 }
 
-i64[] Flags(i64 count) {
+i64[] Flags(i64 count)
+{
     mut i64[] flags = Array.Empty<i64>();
     mut i64 index = 0_i64;
-    while index < count {
+    while (index < count)
+    {
         Array.Append<i64>(flags, 0_i64);
         index = index + 1_i64;
     }
     return flags;
 }
 
-unit CloseIfOpen(Result<TcpStream, NetworkError> result) {
-    match result {
-        Result::Ok(stream) => { stream.Close(); },
+unit CloseIfOpen(Result<TcpStream, NetworkError> result)
+{
+    match (result)
+    {
+        Result::Ok(stream) => {
+            stream.Close();
+        },
         Result::Error(_) => (),
     };
     return;
@@ -78,103 +121,156 @@ unit CloseIfOpen(Result<TcpStream, NetworkError> result) {
 
 // A joined attempt: the stream, the attempt's own error, or Cancelled when the
 // fiber ended without a value.
-Result<TcpStream, NetworkError> JoinAttempt(Fiber<Result<TcpStream, NetworkError>> child) {
-    return match child.Join() {
+Result<TcpStream, NetworkError> JoinAttempt(Fiber<Result<TcpStream, NetworkError>> child)
+{
+    return match (child.Join())
+    {
         Result::Ok(result) => result,
         Result::Error(_) => Result::Error(NetworkError::Cancelled),
     };
 }
 
-Result<SocketAddress[], NetworkError> JoinResolve(Fiber<Result<SocketAddress[], NetworkError>> child) {
-    return match child.Join() {
+Result<SocketAddress[], NetworkError> JoinResolve(Fiber<Result<SocketAddress[], NetworkError>> child)
+{
+    return match (child.Join())
+    {
         Result::Ok(result) => result,
         Result::Error(_) => Result::Error(NetworkError::Cancelled),
     };
 }
 
-bool IsOk(Result<TcpStream, NetworkError> result) {
-    return match result { Result::Ok(_) => true, Result::Error(_) => false, };
+bool IsOk(Result<TcpStream, NetworkError> result)
+{
+    return match (result)
+    {
+        Result::Ok(_) => true,
+        Result::Error(_) => false,
+    };
 }
 
-Option<TcpStream> StreamOf(Result<TcpStream, NetworkError> result) {
-    return match result {
+Option<TcpStream> StreamOf(Result<TcpStream, NetworkError> result)
+{
+    return match (result)
+    {
         Result::Ok(stream) => Option.FromValue<TcpStream>(stream),
         Result::Error(_) => Option.Empty<TcpStream>(),
     };
 }
 
-NetworkError ErrorOf(Result<TcpStream, NetworkError> result) {
-    return match result {
+NetworkError ErrorOf(Result<TcpStream, NetworkError> result)
+{
+    return match (result)
+    {
         Result::Ok(_) => NetworkError::Closed,
         Result::Error(error) => error,
     };
 }
 
-SocketAddress[] AddressesOf(Result<SocketAddress[], NetworkError> result) {
-    return match result {
+SocketAddress[] AddressesOf(Result<SocketAddress[], NetworkError> result)
+{
+    return match (result)
+    {
         Result::Ok(addresses) => addresses,
         Result::Error(_) => Array.Empty<SocketAddress>(),
     };
 }
 
-Option<NetworkError> ResolveErrorOf(Result<SocketAddress[], NetworkError> result) {
-    return match result {
+Option<NetworkError> ResolveErrorOf(Result<SocketAddress[], NetworkError> result)
+{
+    return match (result)
+    {
         Result::Ok(_) => Option.Empty<NetworkError>(),
         Result::Error(error) => Option.FromValue<NetworkError>(error),
     };
 }
 
-Option<Deadline> OverallDeadline(i64 timeoutMillis) {
-    if timeoutMillis < 0_i64 { return Option.Empty<Deadline>(); }
-    return match Deadline.After(Time.FromMilliseconds(timeoutMillis)) {
+Option<Deadline> OverallDeadline(i64 timeoutMillis)
+{
+    if (timeoutMillis < 0_i64)
+    {
+        return Option.Empty<Deadline>();
+    }
+    return match (Deadline.After(Time.FromMilliseconds(timeoutMillis)))
+    {
         Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
         Result::Error(_) => Option.Empty<Deadline>(),
     };
 }
 
-i64 ElapsedMillis(Instant startedAt) {
+i64 ElapsedMillis(Instant startedAt)
+{
     return Time.DurationToMilliseconds(Time.SubtractInstants(Time.MonotonicNow(), startedAt));
 }
 
 // Checked on the same monotonic clock as the Deadline handed to every child,
 // so an attempt that timed out on the budget never starts another one.
-bool BudgetSpent(Instant startedAt, i64 timeoutMillis) {
-    if timeoutMillis < 0_i64 || timeoutMillis > 9223372036854_i64 { return false; }
+bool BudgetSpent(Instant startedAt, i64 timeoutMillis)
+{
+    if (timeoutMillis < 0_i64 || timeoutMillis > 9223372036854_i64)
+    {
+        return false;
+    }
     i64 elapsed = Time.DurationToNanoseconds(Time.SubtractInstants(Time.MonotonicNow(), startedAt));
     return elapsed >= timeoutMillis * Time.NanosPerMillisecond();
 }
 
-AttemptFailure Failure(SocketAddress address, NetworkError error) {
-    return AttemptFailure { address: address, error: error };
+AttemptFailure Failure(SocketAddress address, NetworkError error)
+{
+    return AttemptFailure
+    {
+        address: address,
+        error: error,
+    };
 }
 
-Result<TcpStream, ConnectError> Finish(i64 verdict, Option<TcpStream> winner, AttemptFailure[] failures, Option<NetworkError> resolveError) {
-    if verdict == Won() {
-        return match winner {
+Result<TcpStream, ConnectError> Finish(i64 verdict, Option<TcpStream> winner, AttemptFailure[] failures, Option<NetworkError> resolveError)
+{
+    if (verdict == Won())
+    {
+        return match (winner)
+        {
             Option::Some(stream) => Result::Ok(stream),
             Option::None => Result::Error(ConnectError::AllAttemptsFailed(failures)),
         };
     }
-    if verdict == Expired() { return Result::Error(ConnectError::DeadlineExceeded(failures)); }
-    if verdict == CancelledVerdict() { return Result::Error(ConnectError::Cancelled(failures)); }
-    if verdict == Unresolved() {
-        return match resolveError {
+    if (verdict == Expired())
+    {
+        return Result::Error(ConnectError::DeadlineExceeded(failures));
+    }
+    if (verdict == CancelledVerdict())
+    {
+        return Result::Error(ConnectError::Cancelled(failures));
+    }
+    if (verdict == Unresolved())
+    {
+        return match (resolveError)
+        {
             Option::Some(error) => Result::Error(ConnectError::ResolutionFailed(error)),
             Option::None => Result::Error(ConnectError::NoAddresses),
         };
     }
-    if verdict == Empty() { return Result::Error(ConnectError::NoAddresses); }
+    if (verdict == Empty())
+    {
+        return Result::Error(ConnectError::NoAddresses);
+    }
     return Result::Error(ConnectError::AllAttemptsFailed(failures));
 }
 
 /// Runs one Happy Eyeballs race. With `resolve` the addresses come from
 /// Network.Dns for `hostName`/`port`; otherwise `given` is used as-is.
-pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddress[] given, bool resolve, ConnectPolicy policy) {
-    if !Policy.IsValid(policy) { return Result::Error(ConnectError::InvalidPolicy); }
+pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddress[] given, bool resolve, ConnectPolicy policy)
+{
+    if (!Policy.IsValid(policy))
+    {
+        return Result::Error(ConnectError::InvalidPolicy);
+    }
     i64 attemptDelay = Policy.AttemptDelayMillis(policy);
     i64 resolutionDelay = Policy.ResolutionDelayMillis(policy);
     mut i64 maxAttempts = Policy.MaxAttemptCount(policy);
-    if maxAttempts > MaxRaceAttempts() { maxAttempts = MaxRaceAttempts(); }
+    if (maxAttempts > MaxRaceAttempts())
+    {
+        maxAttempts = MaxRaceAttempts();
+    }
     i64 timeoutMillis = Policy.TimeoutMillis(policy);
     Instant startedAt = Time.MonotonicNow();
     Option<Deadline> deadline = OverallDeadline(timeoutMillis);
@@ -205,15 +301,19 @@ pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddres
     mut i64 resolutionWaitUntil = -1_i64;
     mut i64 verdict = Running();
 
-    if resolve {
-        if Option.HasValue<AddressFamily>(filter) {
+    if (resolve)
+    {
+        if (Option.HasValue<AddressFamily>(filter))
+        {
             AddressFamily only = Option.UnwrapOr<AddressFamily>(filter, preferred);
             Array.Append<Fiber<Result<SocketAddress[], NetworkError>>>(resolvers, SpawnResolve(resolveDone, 0_i64, hostName, port, only, deadline));
             Array.Append<AddressFamily>(resolverFamilies, only);
             Array.Append<bool>(resolverJoined, false);
             resolving = 1_i64;
             preferredPending = Order.SameFamily(only, preferred);
-        } else {
+        }
+        else
+        {
             AddressFamily other = Order.OtherFamily(preferred);
             Array.Append<Fiber<Result<SocketAddress[], NetworkError>>>(resolvers, SpawnResolve(resolveDone, 0_i64, hostName, port, preferred, deadline));
             Array.Append<Fiber<Result<SocketAddress[], NetworkError>>>(resolvers, SpawnResolve(resolveDone, 1_i64, hostName, port, other, deadline));
@@ -224,39 +324,66 @@ pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddres
             resolving = 2_i64;
             preferredPending = true;
         }
-    } else {
+    }
+    else
+    {
         pending = Order.Interleave(given, preferred, lead, filter);
         connecting = true;
-        if Array.Len<SocketAddress>(pending) == 0_i64 { verdict = Empty(); }
+        if (Array.Len<SocketAddress>(pending) == 0_i64)
+        {
+            verdict = Empty();
+        }
     }
 
-    while verdict == Running() {
+    while (verdict == Running())
+    {
         mut bool progressed = false;
-        if BudgetSpent(startedAt, timeoutMillis) { verdict = Expired(); }
-
+        if (BudgetSpent(startedAt, timeoutMillis))
+        {
+            verdict = Expired();
+        }
         // Collect finished name queries (RFC 8305 section 3).
         mut i64 r = 0_i64;
-        while verdict == Running() && r < Array.Len<bool>(resolverJoined) {
-            if !resolverJoined[r] && resolveDone[r] == 1_i64 {
+        while (verdict == Running() && r < Array.Len<bool>(resolverJoined))
+        {
+            if (!resolverJoined[r] && resolveDone[r] == 1_i64)
+            {
                 Result<SocketAddress[], NetworkError> answer = JoinResolve(resolvers[r]);
                 resolverJoined[r] = true;
                 resolving = resolving - 1_i64;
                 progressed = true;
                 bool isPreferred = Order.SameFamily(resolverFamilies[r], preferred);
-                if isPreferred { preferredPending = false; }
+                if (isPreferred)
+                {
+                    preferredPending = false;
+                }
                 Option<NetworkError> failed = ResolveErrorOf(answer);
-                if Option.HasValue<NetworkError>(failed) {
-                    if isPreferred || !Option.HasValue<NetworkError>(resolveError) { resolveError = failed; }
+                if (Option.HasValue<NetworkError>(failed))
+                {
+                    if (isPreferred || !Option.HasValue<NetworkError>(resolveError))
+                    {
+                        resolveError = failed;
+                    }
                 }
                 SocketAddress[] answers = AddressesOf(answer);
-                if connecting {
+                if (connecting)
+                {
                     pending = Order.Interleave(Order.Concat(pending, answers), preferred, lead, filter);
-                } else {
+                }
+                else
+                {
                     resolved = Order.Concat(resolved, answers);
-                    if Array.Len<SocketAddress>(resolved) > 0_i64 {
-                        if preferredPending {
-                            if resolutionWaitUntil < 0_i64 { resolutionWaitUntil = ElapsedMillis(startedAt) + resolutionDelay; }
-                        } else {
+                    if (Array.Len<SocketAddress>(resolved) > 0_i64)
+                    {
+                        if (preferredPending)
+                        {
+                            if (resolutionWaitUntil < 0_i64)
+                            {
+                                resolutionWaitUntil = ElapsedMillis(startedAt) + resolutionDelay;
+                            }
+                        }
+                        else
+                        {
                             connecting = true;
                             pending = Order.Interleave(resolved, preferred, lead, filter);
                         }
@@ -265,23 +392,28 @@ pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddres
             }
             r = r + 1_i64;
         }
-        if verdict == Running() && !connecting && resolutionWaitUntil >= 0_i64 && ElapsedMillis(startedAt) >= resolutionWaitUntil {
+        if (verdict == Running() && !connecting && resolutionWaitUntil >= 0_i64 && ElapsedMillis(startedAt) >= resolutionWaitUntil)
+        {
             connecting = true;
             pending = Order.Interleave(resolved, preferred, lead, filter);
         }
-
         // Collect finished attempts; the first stream wins.
         mut i64 a = 0_i64;
-        while verdict == Running() && a < started {
-            if !attemptJoined[a] && attemptDone[a] == 1_i64 {
+        while (verdict == Running() && a < started)
+        {
+            if (!attemptJoined[a] && attemptDone[a] == 1_i64)
+            {
                 Result<TcpStream, NetworkError> outcome = JoinAttempt(attempts[a]);
                 attemptJoined[a] = true;
                 outstanding = outstanding - 1_i64;
                 progressed = true;
-                if IsOk(outcome) {
+                if (IsOk(outcome))
+                {
                     winner = StreamOf(outcome);
                     verdict = Won();
-                } else {
+                }
+                else
+                {
                     Array.Append<AttemptFailure>(failures, Failure(attempted[a], ErrorOf(outcome)));
                     kick = true;
                 }
@@ -290,8 +422,10 @@ pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddres
         }
 
         // Start the next attempt on the attempt delay, after a failure, or when idle.
-        if verdict == Running() && connecting && Array.Len<SocketAddress>(pending) > 0_i64 && started < maxAttempts {
-            if kick || outstanding == 0_i64 || ElapsedMillis(startedAt) >= nextAttemptAt {
+        if (verdict == Running() && connecting && Array.Len<SocketAddress>(pending) > 0_i64 && started < maxAttempts)
+        {
+            if (kick || outstanding == 0_i64 || ElapsedMillis(startedAt) >= nextAttemptAt)
+            {
                 SocketAddress next = pending[0];
                 pending = Order.Tail(pending);
                 Array.Append<SocketAddress>(attempted, next);
@@ -304,43 +438,66 @@ pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddres
                 progressed = true;
             }
         }
-
-        if verdict == Running() && connecting && outstanding == 0_i64 {
+        if (verdict == Running() && connecting && outstanding == 0_i64)
+        {
             bool exhausted = Array.Len<SocketAddress>(pending) == 0_i64 || started >= maxAttempts;
-            if exhausted && (resolving == 0_i64 || started >= maxAttempts) {
-                if started == 0_i64 { verdict = Empty(); } else { verdict = AllFailed(); }
+            if (exhausted && (resolving == 0_i64 || started >= maxAttempts))
+            {
+                if (started == 0_i64)
+                {
+                    verdict = Empty();
+                }
+                else
+                {
+                    verdict = AllFailed();
+                }
             }
         }
-        if verdict == Running() && !connecting && resolving == 0_i64 { verdict = Unresolved(); }
-
-        if verdict == Running() && !progressed {
-            match Time.Sleep(Time.FromMilliseconds(PollMillis())) {
+        if (verdict == Running() && !connecting && resolving == 0_i64)
+        {
+            verdict = Unresolved();
+        }
+        if (verdict == Running() && !progressed)
+        {
+            match (Time.Sleep(Time.FromMilliseconds(PollMillis())))
+            {
                 Result::Ok(_) => (),
-                Result::Error(_) => { verdict = CancelledVerdict(); },
+                Result::Error(_) => {
+                    verdict = CancelledVerdict();
+                },
             };
         }
     }
 
     // An outcome observed after the budget ran out is a deadline failure.
-    if verdict != Won() && verdict != CancelledVerdict() && BudgetSpent(startedAt, timeoutMillis) {
+    if (verdict != Won() && verdict != CancelledVerdict() && BudgetSpent(startedAt, timeoutMillis))
+    {
         verdict = Expired();
     }
-
     // Cancel and join every child. Losers that connected anyway are closed;
     // attempts cut short carry the reason they stopped.
     mut i64 k = 0_i64;
-    while k < started {
-        if !attemptJoined[k] {
+    while (k < started)
+    {
+        if (!attemptJoined[k])
+        {
             Fiber<Result<TcpStream, NetworkError>> child = attempts[k];
             child.Cancel();
             Result<TcpStream, NetworkError> late = JoinAttempt(child);
             attemptJoined[k] = true;
-            if IsOk(late) {
+            if (IsOk(late))
+            {
                 CloseIfOpen(late);
-            } else {
-                if verdict != Won() {
+            }
+            else
+            {
+                if (verdict != Won())
+                {
                     mut NetworkError cause = ErrorOf(late);
-                    if verdict == Expired() { cause = NetworkError::TimedOut; }
+                    if (verdict == Expired())
+                    {
+                        cause = NetworkError::TimedOut;
+                    }
                     Array.Append<AttemptFailure>(failures, Failure(attempted[k], cause));
                 }
             }
@@ -348,8 +505,10 @@ pub Result<TcpStream, ConnectError> Run(string hostName, Port port, SocketAddres
         k = k + 1_i64;
     }
     mut i64 q = 0_i64;
-    while q < Array.Len<bool>(resolverJoined) {
-        if !resolverJoined[q] {
+    while (q < Array.Len<bool>(resolverJoined))
+    {
+        if (!resolverJoined[q])
+        {
             Fiber<Result<SocketAddress[], NetworkError>> query = resolvers[q];
             query.Cancel();
             JoinResolve(query);

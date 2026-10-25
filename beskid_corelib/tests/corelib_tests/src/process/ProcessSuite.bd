@@ -19,29 +19,52 @@ use Core.Time;
 use Core.Time.Deadline;
 use Testing.Assert;
 
-string Fixture() {
-    return match Environment.Get("BESKID_V06_RELEASE_FIXTURE") {
+string Fixture()
+{
+    return match (Environment.Get("BESKID_V06_RELEASE_FIXTURE"))
+    {
         Result::Ok(path) => path,
-        Result::Error(_) => { Assert.Fail("BESKID_V06_RELEASE_FIXTURE must name the release fixture binary"); return ""; },
+        Result::Error(_) => {
+            Assert.Fail("BESKID_V06_RELEASE_FIXTURE must name the release fixture binary");
+            return "";
+        },
     };
 }
 
-Deadline DeadlineIn(i64 milliseconds) {
-    return match Deadline.After(Time.FromMilliseconds(milliseconds)) {
+Deadline DeadlineIn(i64 milliseconds)
+{
+    return match (Deadline.After(Time.FromMilliseconds(milliseconds)))
+    {
         Result::Ok(deadline) => deadline,
-        Result::Error(_) => { Assert.Fail("bounded monotonic deadline"); return DeadlineIn(milliseconds); },
+        Result::Error(_) => {
+            Assert.Fail("bounded monotonic deadline");
+            return DeadlineIn(milliseconds);
+        },
     };
 }
 
-ChildProcess Start(string[] arguments) {
-    return match Process.Spawn(ProcessStartInfo { executable: Fixture(), arguments: arguments, environment: EnvironmentPolicy::Inherit, cwd: "" }) {
+ChildProcess Start(string[] arguments)
+{
+    return match (Process.Spawn(ProcessStartInfo
+    {
+        executable: Fixture(),
+        arguments: arguments,
+        environment: EnvironmentPolicy::Inherit,
+        cwd: "",
+    }))
+    {
         Result::Ok(child) => child,
-        Result::Error(_) => { Assert.Fail("release fixture child starts"); return Start(["exit", "0"]); },
+        Result::Error(_) => {
+            Assert.Fail("release fixture child starts");
+            return Start(["exit", "0"]);
+        },
     };
 }
 
-string ErrorName(ProcessError error) {
-    return match error {
+string ErrorName(ProcessError error)
+{
+    return match (error)
+    {
         ProcessError::NotFound(executable) => "NotFound",
         ProcessError::PermissionDenied(executable) => "PermissionDenied",
         // The message carries the OS error code of a failed spawn, so a failing case names it.
@@ -56,18 +79,24 @@ string ErrorName(ProcessError error) {
     };
 }
 
-i64 ElapsedMilliseconds(i64 startNanos) {
+i64 ElapsedMilliseconds(i64 startNanos)
+{
     return (Time.MonotonicNow().nanos - startNanos) / 1000000_i64;
 }
 
 /// Compact JSON string of `text`: only quote and backslash need escaping for these fixture arguments;
 /// UTF-8 is copied unchanged, as the fixture's serializer does.
-string JsonString(string text) {
+string JsonString(string text)
+{
     mut u8[] bytes = [34_u8];
     mut i64 index = 0_i64;
-    while (index < String.Len(text)) {
+    while (index < String.Len(text))
+    {
         u8 byte = String.ByteAt(text, index);
-        if (byte == 34_u8 || byte == 92_u8) { Array.Append<u8>(bytes, 92_u8); }
+        if (byte == 34_u8 || byte == 92_u8)
+        {
+            Array.Append<u8>(bytes, 92_u8);
+        }
         Array.Append<u8>(bytes, byte);
         index = index + 1_i64;
     }
@@ -75,19 +104,25 @@ string JsonString(string text) {
     return String.FromUtf8CodeUnits(bytes);
 }
 
-test ProcessSpawnPassesUnicodeSpaceQuoteAndShellMetacharacterArgvExactly {
+test ProcessSpawnPassesUnicodeSpaceQuoteAndShellMetacharacterArgvExactly
+{
     string[] passed = ["plain", "two words", "zażółć 🙂", "$(echo injected); rm -rf / | & > <", "*?[]", "quote\"and'apostrophe", "back\\slash", ""];
     mut string[] arguments = ["echo-argv-json"];
     mut string expected = "[";
     mut i64 index = 0_i64;
-    while (index < Array.Len<string>(passed)) {
+    while (index < Array.Len<string>(passed))
+    {
         Array.Append<string>(arguments, passed[index]);
-        if (index > 0_i64) { expected = expected + ","; }
+        if (index > 0_i64)
+        {
+            expected = expected + ",";
+        }
         expected = expected + JsonString(passed[index]);
         index = index + 1_i64;
     }
     expected = expected + "]" + String.FromUtf8CodeUnits([10_u8]);
-    match Process.Run(Fixture(), arguments) {
+    match (Process.Run(Fixture(), arguments))
+    {
         Result::Error(error) => Assert.Fail("argv fixture runs: " + ErrorName(error)),
         Result::Ok(output) => {
             Assert.Equal(output.exitCode, 0_i64, "argv fixture exits successfully");
@@ -96,11 +131,13 @@ test ProcessSpawnPassesUnicodeSpaceQuoteAndShellMetacharacterArgvExactly {
     };
 }
 
-test ProcessBinaryStdinStdoutRoundtripWithPartialTransfersPreservesOrder {
+test ProcessBinaryStdinStdoutRoundtripWithPartialTransfersPreservesOrder
+{
     i64 total = 204800_i64;
     mut u8[] source = [];
     mut i64 index = 0_i64;
-    while (index < total) {
+    while (index < total)
+    {
         Array.Append<u8>(source, u8((index * 31_i64 + 7_i64) % 256_i64));
         index = index + 1_i64;
     }
@@ -114,48 +151,76 @@ test ProcessBinaryStdinStdoutRoundtripWithPartialTransfersPreservesOrder {
     mut bool inputClosed = false;
     mut bool eof = false;
     i64 started = Time.MonotonicNow().nanos;
-    while (!eof) {
+    while (!eof)
+    {
         Assert.True(ElapsedMilliseconds(started) < 60000_i64, "binary pipe transfer completes within one minute");
         mut bool progressed = false;
-        if (written < total) {
+        if (written < total)
+        {
             mut i64 count = total - written;
-            if (count > 65536_i64) { count = 65536_i64; }
-            match input.TryWrite(source, written, count) {
+            if (count > 65536_i64)
+            {
+                count = 65536_i64;
+            }
+            match (input.TryWrite(source, written, count))
+            {
                 Result::Error(_) => Assert.Fail("stdin write to a live child"),
-                Result::Ok(sent) => match sent {
-                    Option::Some(bytes) => { if (bytes > 0_i64) { written = written + bytes; progressed = true; } },
+                Result::Ok(sent) => match (sent)
+                {
+                    Option::Some(bytes) => {
+                        if (bytes > 0_i64)
+                        {
+                            written = written + bytes;
+                            progressed = true;
+                        }
+                    },
                     // A pending write: the child is not ready for input yet.
                     Option::None => { },
                 },
             };
-        } else {
-            if (!inputClosed) {
+        }
+        else
+        {
+            if (!inputClosed)
+            {
                 Assert.True(Results.IsOk(input.Close()), "closing stdin signals end of input");
                 inputClosed = true;
                 progressed = true;
             }
         }
-        match output.TryRead(buffer, 0_i64, 4096_i64) {
+        match (output.TryRead(buffer, 0_i64, 4096_i64))
+        {
             Result::Error(_) => Assert.Fail("stdout read from a live child"),
             Result::Ok(read) => {
-                match read {
+                match (read)
+                {
                     // 0 is end of stream.
                     Option::Some(bytes) => {
-                        if (bytes == 0_i64) { eof = true; }
+                        if (bytes == 0_i64)
+                        {
+                            eof = true;
+                        }
                         mut i64 copied = 0_i64;
-                        while (copied < bytes) {
+                        while (copied < bytes)
+                        {
                             Array.Append<u8>(received, buffer[copied]);
                             copied = copied + 1_i64;
                         }
-                        if (bytes > 0_i64) { reads = reads + 1_i64; progressed = true; }
+                        if (bytes > 0_i64)
+                        {
+                            reads = reads + 1_i64;
+                            progressed = true;
+                        }
                     },
                     // Pending readiness: no output is available yet.
                     Option::None => { },
                 };
             },
         };
-        if (!progressed && !eof) {
-            match Process.WaitReady(DeadlineIn(50_i64)) {
+        if (!progressed && !eof)
+        {
+            match (Process.WaitReady(DeadlineIn(50_i64)))
+            {
                 Result::Ok(_) => { },
                 Result::Error(error) => Assert.Equal(ErrorName(error), "TimedOut", "readiness wait only expires"),
             };
@@ -165,21 +230,28 @@ test ProcessBinaryStdinStdoutRoundtripWithPartialTransfersPreservesOrder {
     Assert.True(reads > 1_i64, "the transfer is observed as several partial reads");
     index = 0_i64;
     mut i64 mismatches = 0_i64;
-    while (index < total) {
-        if (received[index] != source[index]) { mismatches = mismatches + 1_i64; }
+    while (index < total)
+    {
+        if (received[index] != source[index])
+        {
+            mismatches = mismatches + 1_i64;
+        }
         index = index + 1_i64;
     }
     Assert.Equal(mismatches, 0_i64, "binary bytes, including NUL, CR, LF and 0x1A, keep their order");
-    match child.Wait(DeadlineIn(10000_i64)) {
+    match (child.Wait(DeadlineIn(10000_i64)))
+    {
         Result::Error(error) => Assert.Fail("binary fixture exits: " + ErrorName(error)),
         Result::Ok(exit) => Assert.Equal(exit.exitCode, 0_i64, "binary fixture exits successfully"),
     };
     Assert.True(Results.IsOk(child.Close()), "child resources are released");
 }
 
-test ProcessStderrFloodIsDrainedConcurrentlyWithoutDeadlock {
+test ProcessStderrFloodIsDrainedConcurrentlyWithoutDeadlock
+{
     i64 started = Time.MonotonicNow().nanos;
-    match Process.Run(Fixture(), ["flood-stderr", "1048576"]) {
+    match (Process.Run(Fixture(), ["flood-stderr", "1048576"]))
+    {
         Result::Error(error) => Assert.Fail("stderr flood completes: " + ErrorName(error)),
         Result::Ok(output) => {
             Assert.Equal(String.Len(output.stderr), 1048576_i64, "all of stderr is captured while stdout is also drained");
@@ -190,30 +262,37 @@ test ProcessStderrFloodIsDrainedConcurrentlyWithoutDeadlock {
     Assert.True(ElapsedMilliseconds(started) < 120000_i64, "a flooded pipe never blocks the capture");
 }
 
-test ProcessWaitReturnsExitCodeAndRunReportsTypedExitAndMissingExecutable {
+test ProcessWaitReturnsExitCodeAndRunReportsTypedExitAndMissingExecutable
+{
     ChildProcess child = Start(["exit", "3"]);
-    match child.Wait(DeadlineIn(10000_i64)) {
+    match (child.Wait(DeadlineIn(10000_i64)))
+    {
         Result::Error(error) => Assert.Fail("exited child is waited: " + ErrorName(error)),
         Result::Ok(exit) => Assert.Equal(exit.exitCode, 3_i64, "Wait returns the child's exit code"),
     };
     Assert.True(Results.IsOk(child.Close()), "a reaped child closes cleanly");
-    match Process.Run(Fixture(), ["exit", "7"]) {
+    match (Process.Run(Fixture(), ["exit", "7"]))
+    {
         Result::Error(error) => Assert.Fail("a child that ran is Ok whatever its exit code, not " + ErrorName(error)),
         Result::Ok(output) => Assert.Equal(output.exitCode, 7_i64, "Run reports the nonzero exit code in the output"),
     };
-    match Process.Run(Fixture(), ["exit", "0"]) {
+    match (Process.Run(Fixture(), ["exit", "0"]))
+    {
         Result::Error(error) => Assert.Fail("a zero exit is success: " + ErrorName(error)),
         Result::Ok(output) => Assert.Equal(output.exitCode, 0_i64, "zero exit code"),
     };
-    match Process.Run(Fixture() + ".missing", ["exit", "0"]) {
+    match (Process.Run(Fixture() + ".missing", ["exit", "0"]))
+    {
         Result::Ok(_) => Assert.Fail("a missing executable cannot run"),
         Result::Error(error) => Assert.Equal(ErrorName(error), "NotFound", "a missing executable is the typed NotFound error"),
     };
 }
 
-test ProcessWaitDeadlineExpiryIsTimedOutAndCloseReaps {
+test ProcessWaitDeadlineExpiryIsTimedOutAndCloseReaps
+{
     ChildProcess child = Start(["sleep-forever"]);
-    match child.Wait(DeadlineIn(200_i64)) {
+    match (child.Wait(DeadlineIn(200_i64)))
+    {
         Result::Ok(_) => Assert.Fail("a sleeping child does not exit before the deadline"),
         Result::Error(error) => Assert.Equal(ErrorName(error), "TimedOut", "deadline expiry is TimedOut, distinct from Cancelled"),
     };
@@ -222,11 +301,13 @@ test ProcessWaitDeadlineExpiryIsTimedOutAndCloseReaps {
     Assert.True(ElapsedMilliseconds(started) <= 5500_i64, "Close settles within its five second bound");
 }
 
-test ProcessTerminateAndCloseReapTheChildTreeWithinFiveSeconds {
+test ProcessTerminateAndCloseReapTheChildTreeWithinFiveSeconds
+{
     ChildProcess child = Start(["sleep-forever"]);
     Assert.True(Results.IsOk(child.Terminate()), "Terminate is delivered to a live child");
     i64 started = Time.MonotonicNow().nanos;
-    match child.Wait(DeadlineIn(5000_i64)) {
+    match (child.Wait(DeadlineIn(5000_i64)))
+    {
         Result::Ok(_) => { },
         Result::Error(error) => Assert.True(ErrorName(error) != "TimedOut", "a terminated child is reaped before the five second deadline"),
     };
@@ -239,7 +320,8 @@ test ProcessTerminateAndCloseReapTheChildTreeWithinFiveSeconds {
     Assert.True(ElapsedMilliseconds(closing) <= 5500_i64, "the tree is reaped within five seconds even though a grandchild inherited the pipes");
 }
 
-test ProcessCloseIsIdempotentThroughAliases {
+test ProcessCloseIsIdempotentThroughAliases
+{
     ChildProcess child = Start(["sleep-forever"]);
     ChildProcess alias = child;
     Assert.True(Results.IsOk(child.Close()), "first Close settles the child");
@@ -251,19 +333,42 @@ test ProcessCloseIsIdempotentThroughAliases {
     Assert.True(Results.IsOk(finished.Close()), "the child closes after its pipes");
 }
 
-test ProcessFailedSpawnSetupLeavesNoChildAndLaterSpawnsSucceed {
-    match Process.Spawn(ProcessStartInfo { executable: Fixture() + ".missing", arguments: ["exit", "0"], environment: EnvironmentPolicy::Inherit, cwd: "" }) {
-        Result::Ok(child) => { child.Close(); Assert.Fail("a missing executable cannot start"); },
+test ProcessFailedSpawnSetupLeavesNoChildAndLaterSpawnsSucceed
+{
+    match (Process.Spawn(ProcessStartInfo
+    {
+        executable: Fixture() + ".missing",
+        arguments: ["exit", "0"],
+        environment: EnvironmentPolicy::Inherit,
+        cwd: "",
+    }))
+    {
+        Result::Ok(child) => {
+            child.Close();
+            Assert.Fail("a missing executable cannot start");
+        },
         Result::Error(error) => Assert.Equal(ErrorName(error), "NotFound", "missing executable fails during setup with NotFound"),
     };
     string withNul = String.FromUtf8CodeUnits([97_u8, 0_u8, 98_u8]);
-    match Process.Spawn(ProcessStartInfo { executable: Fixture(), arguments: ["echo-argv-json", withNul], environment: EnvironmentPolicy::Inherit, cwd: "" }) {
-        Result::Ok(child) => { child.Close(); Assert.Fail("an argument containing NUL cannot be passed exactly"); },
+    match (Process.Spawn(ProcessStartInfo
+    {
+        executable: Fixture(),
+        arguments: ["echo-argv-json", withNul],
+        environment: EnvironmentPolicy::Inherit,
+        cwd: "",
+    }))
+    {
+        Result::Ok(child) => {
+            child.Close();
+            Assert.Fail("an argument containing NUL cannot be passed exactly");
+        },
         Result::Error(error) => Assert.Equal(ErrorName(error), "InvalidInput", "an unrepresentable argument fails setup with InvalidInput"),
     };
     mut i64 round = 0_i64;
-    while (round < 3_i64) {
-        match Process.Run(Fixture(), ["exit", "0"]) {
+    while (round < 3_i64)
+    {
+        match (Process.Run(Fixture(), ["exit", "0"]))
+        {
             Result::Error(error) => Assert.Fail("spawning works after failed setups: " + ErrorName(error)),
             Result::Ok(output) => Assert.Equal(output.exitCode, 0_i64, "later child exits successfully"),
         };
@@ -271,19 +376,32 @@ test ProcessFailedSpawnSetupLeavesNoChildAndLaterSpawnsSucceed {
     }
 }
 
-test ProcessSpawnFailureWithAnOsErrorIsTypedAndNamesTheCode {
+test ProcessSpawnFailureWithAnOsErrorIsTypedAndNamesTheCode
+{
     // A missing working directory fails child creation itself: POSIX chdir reports ENOENT, the typed
     // NotFound; CreateProcessW reports ERROR_DIRECTORY, an IOError that must name the OS error code.
     string missing = Fixture() + ".missing-directory";
-    match Process.Spawn(ProcessStartInfo { executable: Fixture(), arguments: ["exit", "0"], environment: EnvironmentPolicy::Inherit, cwd: missing }) {
-        Result::Ok(child) => { child.Close(); Assert.Fail("a missing working directory cannot start a child"); },
-        Result::Error(error) => match error {
+    match (Process.Spawn(ProcessStartInfo
+    {
+        executable: Fixture(),
+        arguments: ["exit", "0"],
+        environment: EnvironmentPolicy::Inherit,
+        cwd: missing,
+    }))
+    {
+        Result::Ok(child) => {
+            child.Close();
+            Assert.Fail("a missing working directory cannot start a child");
+        },
+        Result::Error(error) => match (error)
+        {
             ProcessError::NotFound(executable) => { },
             ProcessError::IOError(message) => Assert.True(String.StartsWith(message, "child process spawn failed: OS error "), "the spawn IOError names the OS error code, not " + message),
             _ => Assert.Fail("a missing working directory is NotFound or an OS-coded IOError, not " + ErrorName(error)),
         },
     };
-    match Process.Run(Fixture(), ["exit", "0"]) {
+    match (Process.Run(Fixture(), ["exit", "0"]))
+    {
         Result::Error(error) => Assert.Fail("spawning works after an OS-level spawn failure: " + ErrorName(error)),
         Result::Ok(output) => Assert.Equal(output.exitCode, 0_i64, "later child exits successfully"),
     };
@@ -291,8 +409,10 @@ test ProcessSpawnFailureWithAnOsErrorIsTypedAndNamesTheCode {
 
 // ---- v0.6.7: Run keeps the output of a failing child, PATH lookup, readable errors ----
 
-test RunKeepsStderrOfAChildThatExitsNonzero {
-    match Process.Run(Fixture(), ["no-such-mode"]) {
+test RunKeepsStderrOfAChildThatExitsNonzero
+{
+    match (Process.Run(Fixture(), ["no-such-mode"]))
+    {
         Result::Error(error) => Assert.Fail("a child that ran is Ok: " + Process.Message(error)),
         Result::Ok(output) => {
             Assert.Equal(output.exitCode, 64_i64, "the fixture's usage exit code is reported");
@@ -302,66 +422,104 @@ test RunKeepsStderrOfAChildThatExitsNonzero {
     };
 }
 
-i64 LastSeparator(string path) {
+i64 LastSeparator(string path)
+{
     mut i64 last = -1_i64;
     mut i64 index = 0_i64;
-    while index < String.Len(path) {
+    while (index < String.Len(path))
+    {
         u8 code = String.ByteAt(path, index);
-        if code == 47_u8 || code == 92_u8 { last = index; }
+        if (code == 47_u8 || code == 92_u8)
+        {
+            last = index;
+        }
         index = index + 1_i64;
     }
     return last;
 }
 
-test SpawnResolvesABareNameThroughPath {
+test SpawnResolvesABareNameThroughPath
+{
     string fixture = Fixture();
     i64 separator = LastSeparator(fixture);
     Assert.True(separator > 0_i64, "the fixture path names a directory");
     string directory = String.SubSlice(fixture, 0_i64, separator);
     string name = String.SubSlice(fixture, separator + 1_i64, String.Len(fixture) - separator - 1_i64);
-    EnvironmentEntry[] path = [EnvironmentEntry { key: "PATH", value: directory }];
-    match Process.Spawn(ProcessStartInfo { executable: name, arguments: ["exit", "5"], environment: EnvironmentPolicy::Extend(path), cwd: "" }) {
+    EnvironmentEntry[] path = [EnvironmentEntry
+    {
+        key: "PATH",
+        value: directory,
+    }];
+    match (Process.Spawn(ProcessStartInfo
+    {
+        executable: name,
+        arguments: ["exit", "5"],
+        environment: EnvironmentPolicy::Extend(path),
+        cwd: "",
+    }))
+    {
         Result::Error(error) => Assert.Fail("a bare name on PATH starts: " + Process.Message(error)),
         Result::Ok(child) => {
-            match child.Wait(DeadlineIn(10000_i64)) {
+            match (child.Wait(DeadlineIn(10000_i64)))
+            {
                 Result::Ok(exit) => Assert.Equal(exit.exitCode, 5_i64, "the PATH-resolved child ran"),
                 Result::Error(error) => Assert.Fail("the PATH-resolved child is waited: " + Process.Message(error)),
             };
             Assert.True(Results.IsOk(child.Close()), "the child closes");
         },
     };
-    EnvironmentEntry[] same = [EnvironmentEntry { key: "PATH", value: directory }];
-    match Process.Spawn(ProcessStartInfo { executable: "beskid-no-such-program", arguments: ["exit", "0"], environment: EnvironmentPolicy::Extend(same), cwd: "" }) {
-        Result::Ok(child) => { child.Close(); Assert.Fail("a name on no PATH entry cannot start"); },
+    EnvironmentEntry[] same = [EnvironmentEntry
+    {
+        key: "PATH",
+        value: directory,
+    }];
+    match (Process.Spawn(ProcessStartInfo
+    {
+        executable: "beskid-no-such-program",
+        arguments: ["exit", "0"],
+        environment: EnvironmentPolicy::Extend(same),
+        cwd: "",
+    }))
+    {
+        Result::Ok(child) => {
+            child.Close();
+            Assert.Fail("a name on no PATH entry cannot start");
+        },
         Result::Error(error) => Assert.Equal(ErrorName(error), "NotFound", "a bare name on no PATH entry is NotFound"),
     };
 }
 
-test ProcessErrorMessageIsReadable {
+test ProcessErrorMessageIsReadable
+{
     Assert.Equal(Process.Message(ProcessError::NotFound("tool")), "executable not found: tool", "NotFound names the executable");
     Assert.Equal(Process.Message(ProcessError::IOError("child process spawn failed: OS error 2")), "child process spawn failed: OS error 2", "IOError is its message");
     Assert.Equal(Process.Message(ProcessError::TimedOut), "child process operation timed out", "unit variants have fixed text");
 }
 
-unit TickUntilStopped(i64[] state) {
-    while Array.Get<i64>(state, 1_i64) == 0_i64 {
+unit TickUntilStopped(i64[] state)
+{
+    while (Array.Get<i64>(state, 1_i64) == 0_i64)
+    {
         Array.Set<i64>(state, 0_i64, Array.Get<i64>(state, 0_i64) + 1_i64);
         Concurrency.Yield();
     }
     return;
 }
 
-test RunInTheRootFiberLetsOtherFibersRun {
+test RunInTheRootFiberLetsOtherFibersRun
+{
     // state[0] counts ticks, state[1] stops the ticker.
     i64[] state = [0_i64, 0_i64];
     Fiber<unit> ticker = spawn (() => TickUntilStopped(state));
-    match Process.Run(Fixture(), ["exit", "0"]) {
+    match (Process.Run(Fixture(), ["exit", "0"]))
+    {
         Result::Error(error) => Assert.Fail("the child runs: " + Process.Message(error)),
         Result::Ok(output) => Assert.Equal(output.exitCode, 0_i64, "the child exits successfully"),
     };
     Assert.True(Array.Get<i64>(state, 0_i64) > 0_i64, "another fiber ran while the root waited for its child");
     Array.Set<i64>(state, 1_i64, 1_i64);
-    match ticker.Join() {
+    match (ticker.Join())
+    {
         Result::Ok(_) => Assert.True(true, "the ticker stops"),
         Result::Error(_) => Assert.Fail("the ticker must stop"),
     };

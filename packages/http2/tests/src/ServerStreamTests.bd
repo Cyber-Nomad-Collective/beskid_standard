@@ -14,27 +14,43 @@ use Http2.Server;
 // Server-side stream and header errors over an in-memory transport: the client bytes
 // are scripted, and the frames the server wrote are inspected.
 
-type Fixed: RequestHandler {
+type Fixed : RequestHandler
+{
     i64 tag;
-    pub Response Handle(Request request) { return Hello(); }
+
+    pub Response Handle(Request request)
+    {
+        return Hello();
+    }
 }
 
-Response Hello() {
-    return Response { status: 200_i64, reason: "OK", headers: Array.Empty<Header>(), body: [104_u8, 105_u8] };
+Response Hello()
+{
+    return Response
+    {
+        status: 200_i64,
+        reason: "OK",
+        headers: Array.Empty<Header>(),
+        body: [104_u8, 105_u8],
+    };
 }
 
-u8[] Start() {
+u8[] Start()
+{
     return MemoryTransport.Join(Connection.Preface(), Frame.SettingsFrame(Array.Empty<i64>(), Array.Empty<i64>()));
 }
 
-Encoder NewEnc() {
-    return match HpackEncoder.NewEncoder(HpackEncoder.DefaultEncoderPolicy()) {
+Encoder NewEnc()
+{
+    return match (HpackEncoder.NewEncoder(HpackEncoder.DefaultEncoderPolicy()))
+    {
         Result::Ok(e) => e,
         Result::Error(_) => NewEnc(),
     };
 }
 
-HeaderField[] GetFields(string path) {
+HeaderField[] GetFields(string path)
+{
     mut HeaderField[] f = Array.Empty<HeaderField>();
     Array.Append<HeaderField>(f, Hpack.Field(":method", "GET"));
     Array.Append<HeaderField>(f, Hpack.Field(":scheme", "http"));
@@ -43,7 +59,8 @@ HeaderField[] GetFields(string path) {
     return f;
 }
 
-HeaderField[] PostFields(string length) {
+HeaderField[] PostFields(string length)
+{
     mut HeaderField[] f = Array.Empty<HeaderField>();
     Array.Append<HeaderField>(f, Hpack.Field(":method", "POST"));
     Array.Append<HeaderField>(f, Hpack.Field(":scheme", "http"));
@@ -53,19 +70,25 @@ HeaderField[] PostFields(string length) {
     return f;
 }
 
-u8[] Headers(Encoder enc, i64 id, HeaderField[] fields, bool endStream) {
+u8[] Headers(Encoder enc, i64 id, HeaderField[] fields, bool endStream)
+{
     return Frame.HeadersFrame(id, HpackEncoder.Encode(enc, fields), endStream, true);
 }
 
-Config Cfg() {
+Config Cfg()
+{
     Config c = Connection.DefaultConfig();
     c.timeoutMillis = 2000_i64;
     return c;
 }
 
-u8[] Serve(u8[] input, Config config) {
+u8[] Serve(u8[] input, Config config)
+{
     MemoryTransport t = MemoryTransport.New(input);
-    Fixed handler = Fixed { tag: 0_i64 };
+    Fixed handler = Fixed
+    {
+        tag: 0_i64,
+    };
     Server.ServeConnection(t, handler, config);
     return MemoryTransport.Written(t);
 }
@@ -73,41 +96,64 @@ u8[] Serve(u8[] input, Config config) {
 // ---- output inspection ----
 
 // Payload u32 at `at` of the first frame of `kind` (and stream `id` when id >= 0); -1 if absent.
-i64 Field32(u8[] out, i64 kind, i64 id, i64 at) {
+i64 Field32(u8[] out, i64 kind, i64 id, i64 at)
+{
     mut i64 pos = 0_i64;
-    while pos + 9_i64 <= Slice.Len(out) {
+    while (pos + 9_i64 <= Slice.Len(out))
+    {
         FrameHeader h = Frame.ParseHeader(out, pos);
-        if h.kind == kind && (id < 0_i64 || h.streamId == id) { return Frame.GetU32(out, pos + 9_i64 + at); }
+        if (h.kind == kind && (id < 0_i64 || h.streamId == id))
+        {
+            return Frame.GetU32(out, pos + 9_i64 + at);
+        }
         pos = pos + 9_i64 + h.length;
     }
     return -1_i64;
 }
 
-i64 Count(u8[] out, i64 kind, i64 flags) {
+i64 Count(u8[] out, i64 kind, i64 flags)
+{
     mut i64 n = 0_i64;
     mut i64 pos = 0_i64;
-    while pos + 9_i64 <= Slice.Len(out) {
+    while (pos + 9_i64 <= Slice.Len(out))
+    {
         FrameHeader h = Frame.ParseHeader(out, pos);
-        if h.kind == kind && (h.flags & flags) == flags { n = n + 1_i64; }
+        if (h.kind == kind && (h.flags & flags) == flags)
+        {
+            n = n + 1_i64;
+        }
         pos = pos + 9_i64 + h.length;
     }
     return n;
 }
 
-i64 GoAwayCode(u8[] out) { return Field32(out, Frame.TypeGoAway(), -1_i64, 4_i64); }
-i64 GoAwayLast(u8[] out) { return Field32(out, Frame.TypeGoAway(), -1_i64, 0_i64); }
-i64 RstCode(u8[] out, i64 id) { return Field32(out, Frame.TypeRstStream(), id, 0_i64); }
+i64 GoAwayCode(u8[] out)
+{
+    return Field32(out, Frame.TypeGoAway(), -1_i64, 4_i64);
+}
+
+i64 GoAwayLast(u8[] out)
+{
+    return Field32(out, Frame.TypeGoAway(), -1_i64, 0_i64);
+}
+
+i64 RstCode(u8[] out, i64 id)
+{
+    return Field32(out, Frame.TypeRstStream(), id, 0_i64);
+}
 
 // ---- tests ----
 
-test OversizedFrameIsFrameSizeError {
+test OversizedFrameIsFrameSizeError
+{
     u8[] header = Slice.New(9_i64);
     Frame.PutHeader(header, 0_i64, 20000_i64, Frame.TypeData(), 0_i64, 1_i64);
     u8[] input = MemoryTransport.Join(Start(), header);
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.FrameSizeError(), "FRAME_SIZE_ERROR");
 }
 
-test MissingPathIsStreamProtocolError {
+test MissingPathIsStreamProtocolError
+{
     Encoder enc = NewEnc();
     mut HeaderField[] f = Array.Empty<HeaderField>();
     Array.Append<HeaderField>(f, Hpack.Field(":method", "GET"));
@@ -116,7 +162,8 @@ test MissingPathIsStreamProtocolError {
     Assert.Equal<i64>(RstCode(out, 1_i64), FrameErrors.ProtocolError(), "RST_STREAM PROTOCOL_ERROR");
 }
 
-test PseudoAfterRegularIsStreamProtocolError {
+test PseudoAfterRegularIsStreamProtocolError
+{
     Encoder enc = NewEnc();
     mut HeaderField[] f = Array.Empty<HeaderField>();
     Array.Append<HeaderField>(f, Hpack.Field(":method", "GET"));
@@ -127,7 +174,8 @@ test PseudoAfterRegularIsStreamProtocolError {
     Assert.Equal<i64>(RstCode(out, 1_i64), FrameErrors.ProtocolError(), "order");
 }
 
-test UppercaseAndConnectionFieldsRejected {
+test UppercaseAndConnectionFieldsRejected
+{
     Encoder enc = NewEnc();
     mut HeaderField[] upper = GetFields("/");
     Array.Append<HeaderField>(upper, Hpack.Field("Accept", "*/*"));
@@ -139,7 +187,8 @@ test UppercaseAndConnectionFieldsRejected {
     Assert.Equal<i64>(RstCode(out, 3_i64), FrameErrors.ProtocolError(), "connection header");
 }
 
-test TeOtherThanTrailersRejected {
+test TeOtherThanTrailersRejected
+{
     Encoder enc = NewEnc();
     mut HeaderField[] f = GetFields("/");
     Array.Append<HeaderField>(f, Hpack.Field("te", "gzip"));
@@ -147,14 +196,16 @@ test TeOtherThanTrailersRejected {
     Assert.Equal<i64>(RstCode(out, 1_i64), FrameErrors.ProtocolError(), "te: gzip");
 }
 
-test ContentLengthMismatchRejected {
+test ContentLengthMismatchRejected
+{
     Encoder enc = NewEnc();
     u8[] a = MemoryTransport.Join(Start(), Headers(enc, 1_i64, PostFields("5"), false));
     u8[] out = Serve(MemoryTransport.Join(a, Frame.DataFrame(1_i64, [1_u8, 2_u8], true)), Cfg());
     Assert.Equal<i64>(RstCode(out, 1_i64), FrameErrors.ProtocolError(), "2 != 5");
 }
 
-test ContinuationInterleavingIsProtocolError {
+test ContinuationInterleavingIsProtocolError
+{
     Encoder enc = NewEnc();
     u8[] block = HpackEncoder.Encode(enc, GetFields("/"));
     u8[] a = MemoryTransport.Join(Start(), Frame.HeadersFrame(1_i64, block, true, false));
@@ -162,7 +213,8 @@ test ContinuationInterleavingIsProtocolError {
     Assert.Equal<i64>(GoAwayCode(out), FrameErrors.ProtocolError(), "PING inside a header block");
 }
 
-test ContinuationAssemblesHeaderBlock {
+test ContinuationAssemblesHeaderBlock
+{
     Encoder enc = NewEnc();
     u8[] block = HpackEncoder.Encode(enc, GetFields("/split"));
     i64 half = Slice.Len(block) / 2_i64;
@@ -171,12 +223,14 @@ test ContinuationAssemblesHeaderBlock {
     Assert.Equal<i64>(Count(out, Frame.TypeData(), Frame.FlagEndStream()), 1_i64, "request served");
 }
 
-test WindowUpdateOverflowIsFlowControlError {
+test WindowUpdateOverflowIsFlowControlError
+{
     u8[] a = MemoryTransport.Join(Start(), Frame.WindowUpdateFrame(0_i64, 2147483647_i64));
     Assert.Equal<i64>(GoAwayCode(Serve(a, Cfg())), FrameErrors.FlowControlError(), "connection window overflow");
 }
 
-test ConcurrencyLimitRefusesStream {
+test ConcurrencyLimitRefusesStream
+{
     Encoder enc = NewEnc();
     Config c = Cfg();
     c.maxConcurrentStreams = 1_i64;
@@ -186,7 +240,8 @@ test ConcurrencyLimitRefusesStream {
     Assert.Equal<i64>(RstCode(out, 1_i64), -1_i64, "first stream stays");
 }
 
-test GracefulGoawayAfterMaxRequests {
+test GracefulGoawayAfterMaxRequests
+{
     Encoder enc = NewEnc();
     Config c = Cfg();
     c.maxRequests = 1_i64;
@@ -195,7 +250,8 @@ test GracefulGoawayAfterMaxRequests {
     Assert.Equal<i64>(GoAwayLast(out), 1_i64, "last stream id");
 }
 
-test DataOnIdleStreamIsProtocolError {
+test DataOnIdleStreamIsProtocolError
+{
     u8[] input = MemoryTransport.Join(Start(), Frame.DataFrame(7_i64, [1_u8], false));
     Assert.Equal<i64>(GoAwayCode(Serve(input, Cfg())), FrameErrors.ProtocolError(), "idle stream");
 }

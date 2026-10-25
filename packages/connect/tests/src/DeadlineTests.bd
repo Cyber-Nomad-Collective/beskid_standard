@@ -18,25 +18,46 @@ use Testing.Assert;
 
 // ---- shared loopback helpers (duplicated per target; targets are independent roots) ----
 
-pub SocketAddress Loopback4(i64 port) {
-    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
-    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
+pub SocketAddress Loopback4(i64 port)
+{
+    Port value = match (Network.Types.PortNumber(port))
+    {
+        Result::Ok(p) => p,
+        Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8),
+    };
+    return SocketAddress
+    {
+        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
+        port: value,
+    };
 }
 
-pub SocketAddress Loopback6(i64 port) {
-    Port value = match Network.Types.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8), };
-    return SocketAddress { address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32), port: value };
+pub SocketAddress Loopback6(i64 port)
+{
+    Port value = match (Network.Types.PortNumber(port))
+    {
+        Result::Ok(p) => p,
+        Result::Error(_) => Network.Types.PortBytes(0_u8, 0_u8),
+    };
+    return SocketAddress
+    {
+        address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32),
+        port: value,
+    };
 }
 
-pub Option<Deadline> Within(i64 millis) {
-    return match Deadline.After(Time.FromMilliseconds(millis)) {
+pub Option<Deadline> Within(i64 millis)
+{
+    return match (Deadline.After(Time.FromMilliseconds(millis)))
+    {
         Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
         Result::Error(_) => Option.Empty<Deadline>(),
     };
 }
 
 // A port that refuses connections: bind, read the port, close.
-pub Result<SocketAddress, NetworkError> ClosedPort4() {
+pub Result<SocketAddress, NetworkError> ClosedPort4()
+{
     TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     listener.Close()?;
@@ -44,32 +65,47 @@ pub Result<SocketAddress, NetworkError> ClosedPort4() {
 }
 
 // A listener whose accept queue is full, so new connects hang until their deadline.
-pub type Blackhole {
+pub type Blackhole
+{
     TcpListener listener;
     TcpStream[] fillers;
     SocketAddress address;
 }
 
-pub Result<Blackhole, NetworkError> OpenBlackhole() {
+pub Result<Blackhole, NetworkError> OpenBlackhole()
+{
     TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     mut TcpStream[] fillers = Array.Empty<TcpStream>();
     mut i64 tries = 0_i64;
     mut bool hanging = false;
-    while !hanging && tries < 16_i64 {
-        match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(100_i64)) {
-            Result::Ok(stream) => { Array.Append<TcpStream>(fillers, stream); },
-            Result::Error(_) => { hanging = true; },
+    while (!hanging && tries < 16_i64)
+    {
+        match (TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Within(100_i64)))
+        {
+            Result::Ok(stream) => {
+                Array.Append<TcpStream>(fillers, stream);
+            },
+            Result::Error(_) => {
+                hanging = true;
+            },
         };
         tries = tries + 1_i64;
     }
     Assert.True(hanging, "a full accept queue makes new connects hang");
-    return Result::Ok(Blackhole { listener: listener, fillers: fillers, address: address });
+    return Result::Ok(Blackhole
+    {
+        listener: listener,
+        fillers: fillers,
+        address: address,
+    });
 }
 
-pub unit CloseBlackhole(Blackhole hole) {
+pub unit CloseBlackhole(Blackhole hole)
+{
     mut i64 index = 0_i64;
-    while index < Array.Len<TcpStream>(hole.fillers) {
+    while (index < Array.Len<TcpStream>(hole.fillers))
+    {
         TcpStream filler = hole.fillers[index];
         filler.Close();
         index = index + 1_i64;
@@ -79,31 +115,53 @@ pub unit CloseBlackhole(Blackhole hole) {
 }
 
 // Accepts the connection a race produced, proves bytes flow, and closes both ends.
-pub Result<unit, NetworkError> Exchange(TcpListener listener, TcpStream client) {
+pub Result<unit, NetworkError> Exchange(TcpListener listener, TcpStream client)
+{
     TcpStream accepted = listener.Accept(Within(2000_i64))?;
-    Assert.True(match IO.WriteAll(accepted, [42_u8], 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "server writes one byte");
+    Assert.True(match (IO.WriteAll(accepted, [42_u8], 0_i64, 1_i64))
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "server writes one byte");
     u8[] bytes = Slice.New(1_i64);
-    Assert.True(match IO.ReadExact(client, bytes, 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "client reads the byte");
+    Assert.True(match (IO.ReadExact(client, bytes, 0_i64, 1_i64))
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "client reads the byte");
     Assert.Equal<u8>(bytes[0], 42_u8, "byte survives the winning stream");
     accepted.Close();
     client.Close();
     return Result::Ok(());
 }
 
-pub i64 PeerPort(TcpStream stream) {
-    return match stream.PeerAddress() { Result::Ok(address) => address.port.Value(), Result::Error(_) => -1_i64, };
+pub i64 PeerPort(TcpStream stream)
+{
+    return match (stream.PeerAddress())
+    {
+        Result::Ok(address) => address.port.Value(),
+        Result::Error(_) => -1_i64,
+    };
 }
 
-pub bool PeerIsV6(TcpStream stream) {
-    return match stream.PeerAddress() {
-        Result::Ok(address) => match address.address { IpAddress::V6(_, _, _, _) => true, _ => false, },
+pub bool PeerIsV6(TcpStream stream)
+{
+    return match (stream.PeerAddress())
+    {
+        Result::Ok(address) => match (address.address)
+        {
+            IpAddress::V6(_, _, _, _) => true,
+            _ => false,
+        },
         Result::Error(_) => false,
     };
 }
 
 // Error kinds as small codes so tests compare without nested pattern matches.
-pub i64 ErrorKind(ConnectError error) {
-    return match error {
+pub i64 ErrorKind(ConnectError error)
+{
+    return match (error)
+    {
         ConnectError::InvalidPolicy => 1_i64,
         ConnectError::ResolutionFailed(_) => 2_i64,
         ConnectError::NoAddresses => 3_i64,
@@ -113,8 +171,10 @@ pub i64 ErrorKind(ConnectError error) {
     };
 }
 
-pub i64 NetworkKind(NetworkError error) {
-    return match error {
+pub i64 NetworkKind(NetworkError error)
+{
+    return match (error)
+    {
         NetworkError::ConnectionRefused => 1_i64,
         NetworkError::TimedOut => 2_i64,
         NetworkError::Cancelled => 3_i64,
@@ -123,13 +183,15 @@ pub i64 NetworkKind(NetworkError error) {
     };
 }
 
-pub SocketAddress[] List1(SocketAddress a) {
+pub SocketAddress[] List1(SocketAddress a)
+{
     mut SocketAddress[] result = Array.Empty<SocketAddress>();
     Array.Append<SocketAddress>(result, a);
     return result;
 }
 
-pub SocketAddress[] List2(SocketAddress a, SocketAddress b) {
+pub SocketAddress[] List2(SocketAddress a, SocketAddress b)
+{
     mut SocketAddress[] result = List1(a);
     Array.Append<SocketAddress>(result, b);
     return result;
@@ -137,15 +199,20 @@ pub SocketAddress[] List2(SocketAddress a, SocketAddress b) {
 
 // ---- end shared helpers ----
 
-pub i64 AttemptCount(ConnectError error) { return Array.Len<AttemptFailure>(Failures.Attempts(error)); }
+pub i64 AttemptCount(ConnectError error)
+{
+    return Array.Len<AttemptFailure>(Failures.Attempts(error));
+}
 
-pub i64 AttemptKind(ConnectError error, i64 index) {
+pub i64 AttemptKind(ConnectError error, i64 index)
+{
     AttemptFailure[] attempts = Failures.Attempts(error);
     AttemptFailure failure = attempts[index];
     return NetworkKind(failure.error);
 }
 
-pub i64 AttemptPort(ConnectError error, i64 index) {
+pub i64 AttemptPort(ConnectError error, i64 index)
+{
     AttemptFailure[] attempts = Failures.Attempts(error);
     AttemptFailure failure = attempts[index];
     return failure.address.port.Value();
@@ -153,13 +220,18 @@ pub i64 AttemptPort(ConnectError error, i64 index) {
 
 // Every address hangs: the overall deadline ends the race with a typed error
 // that keeps both attempts as TimedOut.
-Result<unit, NetworkError> DeadlineResult() {
+Result<unit, NetworkError> DeadlineResult()
+{
     Blackhole first = OpenBlackhole()?;
     Blackhole second = OpenBlackhole()?;
     ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(400_i64)), Time.FromMilliseconds(100_i64));
     i64 before = Concurrency.NowMillis();
-    match Connect.ConnectAddresses(List2(first.address, second.address), policy) {
-        Result::Ok(stream) => { stream.Close(); Assert.Fail("a full accept queue cannot win"); },
+    match (Connect.ConnectAddresses(List2(first.address, second.address), policy))
+    {
+        Result::Ok(stream) => {
+            stream.Close();
+            Assert.Fail("a full accept queue cannot win");
+        },
         Result::Error(error) => {
             i64 elapsed = Concurrency.NowMillis() - before;
             Assert.Equal<i64>(ErrorKind(error), 5_i64, "DeadlineExceeded");
@@ -175,22 +247,37 @@ Result<unit, NetworkError> DeadlineResult() {
     return Result::Ok(());
 }
 
-unit DeadlineScenario() {
-    match DeadlineResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("deadline scenario has no NetworkError"), };
+unit DeadlineScenario()
+{
+    match (DeadlineResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("deadline scenario has no NetworkError"),
+    };
 }
 
-test DeadlineExceededKeepsTimedOutAttempts {
+test DeadlineExceededKeepsTimedOutAttempts
+{
     Fiber<unit> scenario = spawn DeadlineScenario();
-    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "deadline scenario joins");
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "deadline scenario joins");
 }
 
 // A deadline shorter than the attempt delay ends the race before a second attempt starts.
-Result<unit, NetworkError> ShortDeadlineResult() {
+Result<unit, NetworkError> ShortDeadlineResult()
+{
     Blackhole first = OpenBlackhole()?;
     Blackhole second = OpenBlackhole()?;
     ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(150_i64)), Time.FromMilliseconds(2000_i64));
-    match Connect.ConnectAddresses(List2(first.address, second.address), policy) {
-        Result::Ok(stream) => { stream.Close(); Assert.Fail("a full accept queue cannot win"); },
+    match (Connect.ConnectAddresses(List2(first.address, second.address), policy))
+    {
+        Result::Ok(stream) => {
+            stream.Close();
+            Assert.Fail("a full accept queue cannot win");
+        },
         Result::Error(error) => {
             Assert.Equal<i64>(ErrorKind(error), 5_i64, "DeadlineExceeded");
             Assert.Equal<i64>(AttemptCount(error), 1_i64, "only the first attempt started");
@@ -202,11 +289,21 @@ Result<unit, NetworkError> ShortDeadlineResult() {
     return Result::Ok(());
 }
 
-unit ShortDeadline() {
-    match ShortDeadlineResult() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("short deadline scenario has no NetworkError"), };
+unit ShortDeadline()
+{
+    match (ShortDeadlineResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("short deadline scenario has no NetworkError"),
+    };
 }
 
-test DeadlineShorterThanAttemptDelay {
+test DeadlineShorterThanAttemptDelay
+{
     Fiber<unit> scenario = spawn ShortDeadline();
-    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "short deadline scenario joins");
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "short deadline scenario joins");
 }

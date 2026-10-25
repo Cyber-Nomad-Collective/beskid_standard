@@ -25,25 +25,50 @@ use Core.Results;
 use Crypto.BigNat;
 use Crypto.PkErrors;
 
-pub u32 Xor(u32 a, u32 b) { return (a | b) - (a & b); }
+pub u32 Xor(u32 a, u32 b)
+{
+    return (a | b) - (a & b);
+}
 
 /// All-ones when `bit` is 1, zero when `bit` is 0.
-pub u32 MaskOf(u32 bit) { return 0_u32 - bit; }
+pub u32 MaskOf(u32 bit)
+{
+    return 0_u32 - bit;
+}
 
-pub i64 WRr(i64 n) { return 3_i64 * n + 3_i64; }
-pub i64 WOne(i64 n) { return 4_i64 * n + 3_i64; }
-pub i64 WSlot(i64 n, i64 index) { return 5_i64 * n + 3_i64 + index * n; }
+pub i64 WRr(i64 n)
+{
+    return 3_i64 * n + 3_i64;
+}
+
+pub i64 WOne(i64 n)
+{
+    return 4_i64 * n + 3_i64;
+}
+
+pub i64 WSlot(i64 n, i64 index)
+{
+    return 5_i64 * n + 3_i64 + index * n;
+}
 
 /// A workspace for an odd modulus `m > 1` of at most `BigNat.MaxLimbs()` significant limbs,
 /// with `slots` zeroed caller slots. Its width n is the significant limb count of `m`.
-pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
+pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots)
+{
     u32[] m = BigNat.Normalize(modulus);
     i64 n = BigNat.SignificantLimbs(m);
-    if n > BigNat.MaxLimbs() || !BigNat.IsOdd(m) { return Result::Error(PkError::InvalidModulus); }
-    if n == 1_i64 && m[0] == 1_u32 { return Result::Error(PkError::InvalidModulus); }
+    if (n > BigNat.MaxLimbs() || !BigNat.IsOdd(m))
+    {
+        return Result::Error(PkError::InvalidModulus);
+    }
+    if (n == 1_i64 && m[0] == 1_u32)
+    {
+        return Result::Error(PkError::InvalidModulus);
+    }
     u32[] w = BigNat.Zeros(WSlot(n, slots));
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[j] = m[j];
         j = j + 1_i64;
     }
@@ -51,18 +76,21 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
     u32 m0 = m[0];
     mut u32 inv = m0;
     mut i64 k = 0_i64;
-    while k < 5_i64 {
+    while (k < 5_i64)
+    {
         inv = inv * (2_u32 - m0 * inv);
         k = k + 1_i64;
     }
     w[n] = 0_u32 - inv;
-    if n % 8_i64 == 0_i64 {
+    if (n % 8_i64 == 0_i64)
+    {
         // Widths 8k run on 64-bit limbs (Mul8, MulWide) with -m^-1 mod 2^64 at limbs n+1..n+3;
         // the 32-bit CIOS accumulator that would live there is not used at these widths.
         i64 m64 = i64(m[0]) | (i64(m[1]) << 32_i64);
         mut i64 inv64 = m64;
         k = 0_i64;
-        while k < 6_i64 {
+        while (k < 6_i64)
+        {
             inv64 = inv64 * (2_i64 - m64 * inv64);
             k = k + 1_i64;
         }
@@ -76,7 +104,8 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
     // R * 2^t to R * 2^2t, so s squarings reach R * 2^(32n) = R^2.
     mut i64 odd = 32_i64 * n;
     mut i64 squarings = 0_i64;
-    while (odd & 1_i64) == 0_i64 {
+    while ((odd & 1_i64) == 0_i64)
+    {
         odd = odd / 2_i64;
         squarings = squarings + 1_i64;
     }
@@ -84,19 +113,25 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
     i64 top = BigNat.BitLength(m) - 1_i64;
     x[top / 32_i64] = 1_u32 << u32(top % 32_i64);
     mut i64 d = top;
-    while d < 32_i64 * n + odd {
+    while (d < 32_i64 * n + odd)
+    {
         BigNat.ShiftLeft1(x, 0_u32);
-        if BigNat.Compare(x, m) >= 0_i64 { BigNat.SubInPlace(x, m); }
+        if (BigNat.Compare(x, m) >= 0_i64)
+        {
+            BigNat.SubInPlace(x, m);
+        }
         d = d + 1_i64;
     }
     i64 rr = WRr(n);
     j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[rr + j] = x[j];
         j = j + 1_i64;
     }
     k = 0_i64;
-    while k < squarings {
+    while (k < squarings)
+    {
         WMul(w, n, rr, rr, rr);
         k = k + 1_i64;
     }
@@ -104,9 +139,11 @@ pub Result<u32[], PkError> NewWorkspace(u32[] modulus, i64 slots) {
 }
 
 /// Copies `src` (n limbs) into slot offset `dst`.
-pub unit WLoad(u32[] w, i64 n, i64 dst, u32[] src) {
+pub unit WLoad(u32[] w, i64 n, i64 dst, u32[] src)
+{
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[dst + j] = src[j];
         j = j + 1_i64;
     }
@@ -114,19 +151,23 @@ pub unit WLoad(u32[] w, i64 n, i64 dst, u32[] src) {
 }
 
 /// Copies slot offset `src` into a fresh n-limb array.
-pub u32[] WStore(u32[] w, i64 n, i64 src) {
+pub u32[] WStore(u32[] w, i64 n, i64 src)
+{
     u32[] out = BigNat.Zeros(n);
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         out[j] = w[src + j];
         j = j + 1_i64;
     }
     return out;
 }
 
-pub unit WCopy(u32[] w, i64 n, i64 dst, i64 src) {
+pub unit WCopy(u32[] w, i64 n, i64 dst, i64 src)
+{
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[dst + j] = w[src + j];
         j = j + 1_i64;
     }
@@ -134,9 +175,11 @@ pub unit WCopy(u32[] w, i64 n, i64 dst, i64 src) {
 }
 
 /// Sets slot `dst` to the small value `v` (plain, not Montgomery form).
-pub unit WSetSmall(u32[] w, i64 n, i64 dst, u32 v) {
+pub unit WSetSmall(u32[] w, i64 n, i64 dst, u32 v)
+{
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[dst + j] = 0_u32;
         j = j + 1_i64;
     }
@@ -145,9 +188,15 @@ pub unit WSetSmall(u32[] w, i64 n, i64 dst, u32 v) {
 }
 
 /// `w[out] = w[a] * w[b] * R^-1 mod m` (CIOS, branch-free final subtraction).
-pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
-    if n == 8_i64 { Mul8(w, out, a, b); return; }
-    if n % 8_i64 == 0_i64 {
+pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b)
+{
+    if (n == 8_i64)
+    {
+        Mul8(w, out, a, b);
+        return;
+    }
+    if (n % 8_i64 == 0_i64)
+    {
         i64[] t = WideScratch();
         i64[] meta = [out, a, b, n / 2_i64, 0_i64, 0_i64, 0_i64, 0_i64, WideLength(n)];
         MulWide(w, t, meta);
@@ -157,16 +206,19 @@ pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     i64 m0inv = i64(w[n]);
     i64 mask = 4294967295_i64;
     mut i64 j = 0_i64;
-    while j < n + 2_i64 {
+    while (j < n + 2_i64)
+    {
         w[t + j] = 0_u32;
         j = j + 1_i64;
     }
     mut i64 i = 0_i64;
-    while i < n {
+    while (i < n)
+    {
         i64 bi = i64(w[b + i]);
         mut i64 carry = 0_i64;
         j = 0_i64;
-        while j < n {
+        while (j < n)
+        {
             i64 s = i64(w[t + j]) + i64(w[a + j]) * bi + carry;
             w[t + j] = u32(s & mask);
             carry = s >> 32_i64;
@@ -179,7 +231,8 @@ pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
         i64 q = (t0 * m0inv) & mask;
         carry = (t0 + q * i64(w[0])) >> 32_i64;
         j = 1_i64;
-        while j < n {
+        while (j < n)
+        {
             i64 s = i64(w[t + j]) + q * i64(w[j]) + carry;
             w[t + j - 1_i64] = u32(s & mask);
             carry = s >> 32_i64;
@@ -192,7 +245,8 @@ pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     }
     mut i64 borrow = 0_i64;
     j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         i64 d = i64(w[t + j]) - i64(w[j]) - borrow;
         w[out + j] = u32(d & mask);
         borrow = (d >> 63_i64) & 1_i64;
@@ -201,7 +255,8 @@ pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     u32 keepT = MaskOf(u32(((i64(w[t + n]) - borrow) >> 63_i64) & 1_i64));
     u32 keepD = 4294967295_u32 - keepT;
     j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[out + j] = (w[t + j] & keepT) | (w[out + j] & keepD);
         j = j + 1_i64;
     }
@@ -209,13 +264,19 @@ pub unit WMul(u32[] w, i64 n, i64 out, i64 a, i64 b) {
 }
 
 /// `w[out] = w[a] + w[b] mod m`.
-pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
-    if n == 8_i64 { Add8(w, out, a, b); return; }
+pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b)
+{
+    if (n == 8_i64)
+    {
+        Add8(w, out, a, b);
+        return;
+    }
     i64 s = 2_i64 * n + 3_i64;
     i64 mask = 4294967295_i64;
     mut i64 carry = 0_i64;
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         i64 v = i64(w[a + j]) + i64(w[b + j]) + carry;
         w[s + j] = u32(v & mask);
         carry = v >> 32_i64;
@@ -223,7 +284,8 @@ pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     }
     mut i64 borrow = 0_i64;
     j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         i64 d = i64(w[s + j]) - i64(w[j]) - borrow;
         w[out + j] = u32(d & mask);
         borrow = (d >> 63_i64) & 1_i64;
@@ -232,7 +294,8 @@ pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     u32 keepS = MaskOf(u32(((carry - borrow) >> 63_i64) & 1_i64));
     u32 keepD = 4294967295_u32 - keepS;
     j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         w[out + j] = (w[s + j] & keepS) | (w[out + j] & keepD);
         j = j + 1_i64;
     }
@@ -240,12 +303,18 @@ pub unit WAdd(u32[] w, i64 n, i64 out, i64 a, i64 b) {
 }
 
 /// `w[out] = w[a] - w[b] mod m`.
-pub unit WSub(u32[] w, i64 n, i64 out, i64 a, i64 b) {
-    if n == 8_i64 { Sub8(w, out, a, b); return; }
+pub unit WSub(u32[] w, i64 n, i64 out, i64 a, i64 b)
+{
+    if (n == 8_i64)
+    {
+        Sub8(w, out, a, b);
+        return;
+    }
     i64 mask = 4294967295_i64;
     mut i64 borrow = 0_i64;
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         i64 d = i64(w[a + j]) - i64(w[b + j]) - borrow;
         w[out + j] = u32(d & mask);
         borrow = (d >> 63_i64) & 1_i64;
@@ -254,7 +323,8 @@ pub unit WSub(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     u32 addM = MaskOf(u32(borrow));
     mut i64 carry = 0_i64;
     j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         i64 v = i64(w[out + j]) + i64(w[j] & addM) + carry;
         w[out + j] = u32(v & mask);
         carry = v >> 32_i64;
@@ -263,15 +333,26 @@ pub unit WSub(u32[] w, i64 n, i64 out, i64 a, i64 b) {
     return;
 }
 
-pub unit WToMont(u32[] w, i64 n, i64 out, i64 a) { WMul(w, n, out, a, WRr(n)); return; }
-pub unit WFromMont(u32[] w, i64 n, i64 out, i64 a) { WMul(w, n, out, a, WOne(n)); return; }
+pub unit WToMont(u32[] w, i64 n, i64 out, i64 a)
+{
+    WMul(w, n, out, a, WRr(n));
+    return;
+}
+
+pub unit WFromMont(u32[] w, i64 n, i64 out, i64 a)
+{
+    WMul(w, n, out, a, WOne(n));
+    return;
+}
 
 /// `w[dst, dst+count) = w[src, src+count)` when `bit` is 1. Branch-free.
-pub unit WCondAssign(u32[] w, i64 count, i64 dst, i64 src, u32 bit) {
+pub unit WCondAssign(u32[] w, i64 count, i64 dst, i64 src, u32 bit)
+{
     u32 mask = MaskOf(bit);
     u32 keep = 4294967295_u32 - mask;
     mut i64 j = 0_i64;
-    while j < count {
+    while (j < count)
+    {
         w[dst + j] = (w[src + j] & mask) | (w[dst + j] & keep);
         j = j + 1_i64;
     }
@@ -279,10 +360,12 @@ pub unit WCondAssign(u32[] w, i64 count, i64 dst, i64 src, u32 bit) {
 }
 
 /// Swaps `w[a, a+count)` and `w[b, b+count)` when `bit` is 1. Branch-free.
-pub unit WCondSwap(u32[] w, i64 count, i64 a, i64 b, u32 bit) {
+pub unit WCondSwap(u32[] w, i64 count, i64 a, i64 b, u32 bit)
+{
     u32 mask = MaskOf(bit);
     mut i64 j = 0_i64;
-    while j < count {
+    while (j < count)
+    {
         u32 x = Xor(w[a + j], w[b + j]) & mask;
         w[a + j] = Xor(w[a + j], x);
         w[b + j] = Xor(w[b + j], x);
@@ -294,15 +377,18 @@ pub unit WCondSwap(u32[] w, i64 count, i64 a, i64 b, u32 bit) {
 /// `w[dst, dst+stride) = entry `index` of the table of `entries` records of `stride` limbs
 /// starting at `table`. Every entry is read with a mask, so the access pattern does not
 /// depend on `index`.
-pub unit WSelect(u32[] w, i64 stride, i64 dst, i64 table, i64 entries, u32 index) {
+pub unit WSelect(u32[] w, i64 stride, i64 dst, i64 table, i64 entries, u32 index)
+{
     mut i64 e = 0_i64;
-    while e < entries {
+    while (e < entries)
+    {
         u32 diff = Xor(u32(e), index);
         u32 mask = MaskOf(1_u32 - ((diff | (0_u32 - diff)) >> 31_u32));
         u32 keep = 4294967295_u32 - mask;
         i64 base = table + e * stride;
         mut i64 j = 0_i64;
-        while j < stride {
+        while (j < stride)
+        {
             w[dst + j] = (w[base + j] & mask) | (w[dst + j] & keep);
             j = j + 1_i64;
         }
@@ -312,10 +398,12 @@ pub unit WSelect(u32[] w, i64 stride, i64 dst, i64 table, i64 entries, u32 index
 }
 
 /// 1 when `w[a, a+count)` is all zero, else 0. Branch-free.
-pub u32 WIsZeroBit(u32[] w, i64 count, i64 a) {
+pub u32 WIsZeroBit(u32[] w, i64 count, i64 a)
+{
     mut u32 acc = 0_u32;
     mut i64 j = 0_i64;
-    while j < count {
+    while (j < count)
+    {
         acc = acc | w[a + j];
         j = j + 1_i64;
     }
@@ -323,10 +411,12 @@ pub u32 WIsZeroBit(u32[] w, i64 count, i64 a) {
 }
 
 /// 1 when slots `a` and `b` are equal, else 0. Branch-free.
-pub u32 WEqualBit(u32[] w, i64 n, i64 a, i64 b) {
+pub u32 WEqualBit(u32[] w, i64 n, i64 a, i64 b)
+{
     mut u32 acc = 0_u32;
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         acc = acc | Xor(w[a + j], w[b + j]);
         j = j + 1_i64;
     }
@@ -335,27 +425,35 @@ pub u32 WEqualBit(u32[] w, i64 n, i64 a, i64 b) {
 
 /// `w[out] = w[base]^exp` in Montgomery form for a big-endian public exponent; `acc` is a
 /// scratch slot distinct from `base`. The time depends on `exp`, never on `w[base]`.
-pub unit WPowPublic(u32[] w, i64 n, i64 out, i64 base, i64 acc, u8[] exp) {
+pub unit WPowPublic(u32[] w, i64 n, i64 out, i64 base, i64 acc, u8[] exp)
+{
     WToMont(w, n, acc, WOne(n));
-    if n == 8_i64 {
+    if (n == 8_i64)
+    {
         i64[] meta = [0_i64, 0_i64, acc, base];
         Pow8(w, exp, meta);
         WCopy(w, n, out, acc);
         return;
     }
-    if n % 8_i64 == 0_i64 {
+    if (n % 8_i64 == 0_i64)
+    {
         PowWide(w, n, acc, base, exp);
         WCopy(w, n, out, acc);
         return;
     }
     i64 len = Slice.Len(exp);
     mut i64 i = 0_i64;
-    while i < len {
+    while (i < len)
+    {
         u8 byte = exp[i];
         mut i64 bit = 7_i64;
-        while bit >= 0_i64 {
+        while (bit >= 0_i64)
+        {
             WMul(w, n, acc, acc, acc);
-            if ((byte >> u8(bit)) & u8(1)) == u8(1) { WMul(w, n, acc, acc, base); }
+            if (((byte >> u8(bit)) & u8(1)) == u8(1))
+            {
+                WMul(w, n, acc, acc, base);
+            }
             bit = bit - 1_i64;
         }
         i = i + 1_i64;
@@ -365,11 +463,13 @@ pub unit WPowPublic(u32[] w, i64 n, i64 out, i64 base, i64 acc, u8[] exp) {
 }
 
 /// `dst = src` when `bit` is 1, unchanged when 0. Branch-free.
-pub unit CondAssign(u32[] dst, u32[] src, u32 bit) {
+pub unit CondAssign(u32[] dst, u32[] src, u32 bit)
+{
     u32 mask = MaskOf(bit);
     i64 n = Array.Len<u32>(dst);
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         dst[j] = (src[j] & mask) | (dst[j] & (4294967295_u32 - mask));
         j = j + 1_i64;
     }
@@ -377,11 +477,13 @@ pub unit CondAssign(u32[] dst, u32[] src, u32 bit) {
 }
 
 /// Swaps `a` and `b` when `bit` is 1. Branch-free.
-pub unit CondSwap(u32[] a, u32[] b, u32 bit) {
+pub unit CondSwap(u32[] a, u32[] b, u32 bit)
+{
     u32 mask = MaskOf(bit);
     i64 n = Array.Len<u32>(a);
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         u32 x = Xor(a[j], b[j]) & mask;
         a[j] = Xor(a[j], x);
         b[j] = Xor(b[j], x);
@@ -391,11 +493,13 @@ pub unit CondSwap(u32[] a, u32[] b, u32 bit) {
 }
 
 /// 1 when every limb is zero, else 0. Branch-free over the fixed width.
-pub u32 IsZeroBit(u32[] a) {
+pub u32 IsZeroBit(u32[] a)
+{
     mut u32 acc = 0_u32;
     i64 n = Array.Len<u32>(a);
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         acc = acc | a[j];
         j = j + 1_i64;
     }
@@ -404,11 +508,13 @@ pub u32 IsZeroBit(u32[] a) {
 }
 
 /// 1 when `a == b` limb for limb, else 0. Branch-free over the fixed width.
-pub u32 EqualBit(u32[] a, u32[] b) {
+pub u32 EqualBit(u32[] a, u32[] b)
+{
     mut u32 acc = 0_u32;
     i64 n = Array.Len<u32>(a);
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         acc = acc | Xor(a[j], b[j]);
         j = j + 1_i64;
     }
@@ -416,11 +522,13 @@ pub u32 EqualBit(u32[] a, u32[] b) {
 }
 
 /// 1 when `a < b` (same width), else 0. Branch-free.
-pub u32 LessBit(u32[] a, u32[] b) {
+pub u32 LessBit(u32[] a, u32[] b)
+{
     i64 n = Array.Len<u32>(a);
     mut i64 borrow = 0_i64;
     mut i64 j = 0_i64;
-    while j < n {
+    while (j < n)
+    {
         i64 d = i64(a[j]) - i64(b[j]) - borrow;
         borrow = (d >> 63_i64) & 1_i64;
         j = j + 1_i64;
@@ -429,26 +537,34 @@ pub u32 LessBit(u32[] a, u32[] b) {
 }
 
 /// MulWide scratch: t[-1], t[0..n/2+2), rounded up to whole 4-word chunks.
-i64 WideLength(i64 n) { return ((n / 2_i64 + 3_i64 + 3_i64) / 4_i64) * 4_i64; }
+i64 WideLength(i64 n)
+{
+    return ((n / 2_i64 + 3_i64 + 3_i64) / 4_i64) * 4_i64;
+}
 
 /// A zeroed i64 scratch for MulWide, large enough for `BigNat.MaxLimbs()` (n = 256).
-i64[] WideScratch() {
+i64[] WideScratch()
+{
     return [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
 }
 
 /// `w[acc] = w[acc]^exp` (Montgomery form) for widths 8k, one scratch for every step.
-unit PowWide(u32[] w, i64 n, i64 acc, i64 base, u8[] exp) {
+unit PowWide(u32[] w, i64 n, i64 acc, i64 base, u8[] exp)
+{
     i64[] t = WideScratch();
     i64 len = Slice.Len(exp);
     i64 half = n / 2_i64;
     i64 tlen = WideLength(n);
     mut i64 i = 0_i64;
-    while i < len {
+    while (i < len)
+    {
         u8 byte = exp[i];
         mut i64 bit = 7_i64;
-        while bit >= 0_i64 {
+        while (bit >= 0_i64)
+        {
             MulWide(w, t, [acc, acc, acc, half, 0_i64, 0_i64, 0_i64, 0_i64, tlen]);
-            if ((byte >> u8(bit)) & u8(1)) == u8(1) {
+            if (((byte >> u8(bit)) & u8(1)) == u8(1))
+            {
                 MulWide(w, t, [acc, acc, base, half, 0_i64, 0_i64, 0_i64, 0_i64, tlen]);
             }
             bit = bit - 1_i64;
@@ -460,9 +576,9 @@ unit PowWide(u32[] w, i64 n, i64 acc, i64 base, u8[] exp) {
 
 // BEGIN GENERATED ModArithKernels (tools/clifgen.py)
 /// `w[out] = w[a] * R^-1 * w[b]` for width 8 (four 64-bit limbs).
-i64 Mul8(u32[] w, i64 out, i64 a, i64 b) {
-    return clif {
-        %wp1 = payload %0
+i64 Mul8(u32[] w, i64 out, i64 a, i64 b)
+{
+    return clif { %wp1 = payload %0
         %f2 = load.i64 %wp1+0
         %f3 = load.i64 %wp1+8
         %f4 = load.i64 %wp1+16
@@ -751,14 +867,13 @@ i64 Mul8(u32[] w, i64 out, i64 a, i64 b) {
         store %v347, %at351+8
         store %v348, %at351+16
         store %v349, %at351+24
-        return %c7
-    };
+        return %c7 };
 }
 
 /// `w[out] = w[a] + w[b]` for width 8 (four 64-bit limbs).
-i64 Add8(u32[] w, i64 out, i64 a, i64 b) {
-    return clif {
-        %wp1 = payload %0
+i64 Add8(u32[] w, i64 out, i64 a, i64 b)
+{
+    return clif { %wp1 = payload %0
         %f2 = load.i64 %wp1+0
         %f3 = load.i64 %wp1+8
         %f4 = load.i64 %wp1+16
@@ -819,14 +934,13 @@ i64 Add8(u32[] w, i64 out, i64 a, i64 b) {
         store %v67, %at71+8
         store %v68, %at71+16
         store %v69, %at71+24
-        return %c7
-    };
+        return %c7 };
 }
 
 /// `w[out] = w[a] - w[b]` for width 8 (four 64-bit limbs).
-i64 Sub8(u32[] w, i64 out, i64 a, i64 b) {
-    return clif {
-        %wp1 = payload %0
+i64 Sub8(u32[] w, i64 out, i64 a, i64 b)
+{
+    return clif { %wp1 = payload %0
         %f2 = load.i64 %wp1+0
         %f3 = load.i64 %wp1+8
         %f4 = load.i64 %wp1+16
@@ -884,22 +998,23 @@ i64 Sub8(u32[] w, i64 out, i64 a, i64 b) {
         store %s50, %at68+8
         store %s57, %at68+16
         store %s64, %at68+24
-        return %c7
-    };
+        return %c7 };
 }
 
 /// `w[meta[2]] = w[meta[2]] ^ e` (Montgomery form) for the big-endian public exponent `e`,
 /// width 8: square, then multiply by `w[meta[3]]` when the bit is set. `meta[0]` is the
 /// byte index and `meta[1]` the bit index (7 down to 0). The time depends only on `e`.
-i64 Pow8(u32[] w, u8[] e, i64[] meta) {
+i64 Pow8(u32[] w, u8[] e, i64[] meta)
+{
     mut i64 last = 0_i64;
     i64 len = Slice.Len(e);
-    while meta[0] < len {
+    while (meta[0] < len)
+    {
         u8 byte = e[meta[0]];
         mut i64 bit = 7_i64;
-        while bit >= 0_i64 {
-            last = clif {
-                %wp1 = payload %0
+        while (bit >= 0_i64)
+        {
+            last = clif { %wp1 = payload %0
                 %mp2 = payload %2
                 %f3 = load.i64 %wp1+0
                 %f4 = load.i64 %wp1+8
@@ -1182,11 +1297,10 @@ i64 Pow8(u32[] w, u8[] e, i64[] meta) {
                 store %v343, %at12+8
                 store %v344, %at12+16
                 store %v345, %at12+24
-                return %c8
-            };
-            if ((byte >> u8(bit)) & u8(1)) == u8(1) {
-                last = clif {
-                    %wp1 = payload %0
+                return %c8 };
+            if (((byte >> u8(bit)) & u8(1)) == u8(1))
+            {
+                last = clif { %wp1 = payload %0
                     %mp2 = payload %2
                     %f3 = load.i64 %wp1+0
                     %f4 = load.i64 %wp1+8
@@ -1476,8 +1590,7 @@ i64 Pow8(u32[] w, u8[] e, i64[] meta) {
                     store %v350, %at12+8
                     store %v351, %at12+16
                     store %v352, %at12+24
-                    return %c8
-                };
+                    return %c8 };
             }
             bit = bit - 1_i64;
         }
@@ -1489,11 +1602,12 @@ i64 Pow8(u32[] w, u8[] e, i64[] meta) {
 /// `w[meta[0]] = w[meta[1]] * w[meta[2]] * R^-1 mod m` for widths n = 8k (64-bit CIOS,
 /// Koc-Acar-Kaliski 1996, in 4-limb chunks). Branch-free in the operands; `t` holds
 /// meta[8] >= n/2 + 3 words. Outputs may alias inputs.
-i64 MulWide(u32[] w, i64[] t, i64[] meta) {
+i64 MulWide(u32[] w, i64[] t, i64[] meta)
+{
     mut i64 last = 0_i64;
-    while meta[5] < meta[8] {
-        last = clif {
-            %c1 = iconst.i64 0
+    while (meta[5] < meta[8])
+    {
+        last = clif { %c1 = iconst.i64 0
             %wp2 = payload %0
             %tp3 = payload %1
             %mp4 = payload %2
@@ -1508,23 +1622,21 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
             %c9 = iconst.i64 4
             %v10 = iadd %j5, %c9
             store %v10, %mp4+40
-            return %v10
-        };
+            return %v10 };
     }
-    last = clif {
-        %c1 = iconst.i64 0
+    last = clif { %c1 = iconst.i64 0
         %wp2 = payload %0
         %tp3 = payload %1
         %mp4 = payload %2
         store %c1, %mp4+32
         store %c1, %mp4+40
         store %c1, %mp4+48
-        return %c1
-    };
-    while meta[4] < meta[3] {
-        while meta[5] < meta[3] {
-            last = clif {
-                %c1 = iconst.i64 0
+        return %c1 };
+    while (meta[4] < meta[3])
+    {
+        while (meta[5] < meta[3])
+        {
+            last = clif { %c1 = iconst.i64 0
                 %wp2 = payload %0
                 %tp3 = payload %1
                 %mp4 = payload %2
@@ -1594,11 +1706,9 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
                 %c71 = iconst.i64 4
                 %v72 = iadd %j6, %c71
                 store %v72, %mp4+40
-                return %v72
-            };
+                return %v72 };
         }
-        last = clif {
-            %c1 = iconst.i64 0
+        last = clif { %c1 = iconst.i64 0
             %wp2 = payload %0
             %tp3 = payload %1
             %mp4 = payload %2
@@ -1622,11 +1732,10 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
             store %q20, %mp4+56
             store %c1, %mp4+40
             store %c1, %mp4+48
-            return %q20
-        };
-        while meta[5] < meta[3] {
-            last = clif {
-                %c1 = iconst.i64 0
+            return %q20 };
+        while (meta[5] < meta[3])
+        {
+            last = clif { %c1 = iconst.i64 0
                 %wp2 = payload %0
                 %tp3 = payload %1
                 %mp4 = payload %2
@@ -1686,11 +1795,9 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
                 %c61 = iconst.i64 4
                 %v62 = iadd %j5, %c61
                 store %v62, %mp4+40
-                return %v62
-            };
+                return %v62 };
         }
-        last = clif {
-            %c1 = iconst.i64 0
+        last = clif { %c1 = iconst.i64 0
             %wp2 = payload %0
             %tp3 = payload %1
             %mp4 = payload %2
@@ -1712,12 +1819,11 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
             %c17 = iconst.i64 1
             %v18 = iadd %i7, %c17
             store %v18, %mp4+32
-            return %v18
-        };
+            return %v18 };
     }
-    while meta[5] < meta[3] {
-        last = clif {
-            %c1 = iconst.i64 0
+    while (meta[5] < meta[3])
+    {
+        last = clif { %c1 = iconst.i64 0
             %wp2 = payload %0
             %tp3 = payload %1
             %mp4 = payload %2
@@ -1770,11 +1876,9 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
             %c54 = iconst.i64 4
             %v55 = iadd %j5, %c54
             store %v55, %mp4+40
-            return %v55
-        };
+            return %v55 };
     }
-    last = clif {
-        %c1 = iconst.i64 0
+    last = clif { %c1 = iconst.i64 0
         %wp2 = payload %0
         %tp3 = payload %1
         %mp4 = payload %2
@@ -1789,11 +1893,10 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
         %keep13 = sshr %v11, %c12
         store %keep13, %mp4+56
         store %c1, %mp4+40
-        return %keep13
-    };
-    while meta[5] < meta[3] {
-        last = clif {
-            %c1 = iconst.i64 0
+        return %keep13 };
+    while (meta[5] < meta[3])
+    {
+        last = clif { %c1 = iconst.i64 0
             %wp2 = payload %0
             %tp3 = payload %1
             %mp4 = payload %2
@@ -1827,8 +1930,7 @@ i64 MulWide(u32[] w, i64[] t, i64[] meta) {
             %c28 = iconst.i64 4
             %v29 = iadd %j5, %c28
             store %v29, %mp4+40
-            return %v29
-        };
+            return %v29 };
     }
     return last;
 }

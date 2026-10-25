@@ -10,32 +10,55 @@ use Http2.HpackEncoder;
 
 // Shared test helpers (each target is compiled on its own).
 
-i64 HexDigit(u8 b) {
-    if b >= 48_u8 && b <= 57_u8 { return i64(b - 48_u8); }
-    if b >= 97_u8 && b <= 102_u8 { return i64(b - 97_u8) + 10_i64; }
-    if b >= 65_u8 && b <= 70_u8 { return i64(b - 65_u8) + 10_i64; }
+i64 HexDigit(u8 b)
+{
+    if (b >= 48_u8 && b <= 57_u8)
+    {
+        return i64(b - 48_u8);
+    }
+    if (b >= 97_u8 && b <= 102_u8)
+    {
+        return i64(b - 97_u8) + 10_i64;
+    }
+    if (b >= 65_u8 && b <= 70_u8)
+    {
+        return i64(b - 65_u8) + 10_i64;
+    }
     return -1_i64;
 }
 
-u8[] Hex(string text) {
+u8[] Hex(string text)
+{
     mut u8[] out = [];
     mut i64 high = -1_i64;
     mut i64 i = 0_i64;
-    while i < String.Len(text) {
+    while (i < String.Len(text))
+    {
         i64 digit = HexDigit(String.ByteAt(text, i));
-        if digit >= 0_i64 {
-            if high < 0_i64 { high = digit; } else { Array.Append<u8>(out, u8(high * 16_i64 + digit)); high = -1_i64; }
+        if (digit >= 0_i64)
+        {
+            if (high < 0_i64)
+            {
+                high = digit;
+            }
+            else
+            {
+                Array.Append<u8>(out, u8(high * 16_i64 + digit));
+                high = -1_i64;
+            }
         }
         i = i + 1_i64;
     }
     return out;
 }
 
-string HexText(u8[] data) {
+string HexText(u8[] data)
+{
     string digits = "0123456789abcdef";
     mut string out = "";
     mut i64 i = 0_i64;
-    while i < Slice.Len(data) {
+    while (i < Slice.Len(data))
+    {
         i64 b = i64(data[i]);
         out = out + String.SubSlice(digits, b / 16_i64, 1_i64) + String.SubSlice(digits, b % 16_i64, 1_i64);
         i = i + 1_i64;
@@ -43,102 +66,148 @@ string HexText(u8[] data) {
     return out;
 }
 
-unit ExpectBytes(u8[] actual, string expectedHex, string because) {
+unit ExpectBytes(u8[] actual, string expectedHex, string because)
+{
     Assert.True(Hpack.BytesEqual(actual, Hex(expectedHex)), because + ": got " + HexText(actual) + " want " + HexText(Hex(expectedHex)));
     return;
 }
 
-string Text(u8[] data) {
-    return match Convert.BytesToString(data) { Result::Ok(text) => text, Result::Error(_) => "<binary " + HexText(data) + ">", };
+string Text(u8[] data)
+{
+    return match (Convert.BytesToString(data))
+    {
+        Result::Ok(text) => text,
+        Result::Error(_) => "<binary " + HexText(data) + ">",
+    };
 }
 
-unit ExpectField(HeaderField field, string name, string value, string because) {
-    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)) && Hpack.BytesEqual(field.value, Convert.StringToBytes(value)),
-        because + ": got " + Text(field.name) + ": " + Text(field.value) + " want " + name + ": " + value);
+unit ExpectField(HeaderField field, string name, string value, string because)
+{
+    Assert.True(Hpack.BytesEqual(field.name, Convert.StringToBytes(name)) && Hpack.BytesEqual(field.value, Convert.StringToBytes(value)), because + ": got " + Text(field.name) + ": " + Text(field.value) + " want " + name + ": " + value);
     return;
 }
 
 /// `expected` alternates names and values.
-unit ExpectFields(HeaderField[] fields, string[] expected, string because) {
+unit ExpectFields(HeaderField[] fields, string[] expected, string because)
+{
     Assert.Equal<i64>(Array.Len<HeaderField>(fields) * 2_i64, Array.Len<string>(expected), because + ": field count");
     mut i64 i = 0_i64;
-    while i < Array.Len<HeaderField>(fields) {
+    while (i < Array.Len<HeaderField>(fields))
+    {
         ExpectField(Array.Get<HeaderField>(fields, i), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because);
         i = i + 1_i64;
     }
     return;
 }
 
-HeaderField[] Fields(string[] pairs) {
+HeaderField[] Fields(string[] pairs)
+{
     mut HeaderField[] out = Array.Empty<HeaderField>();
     mut i64 i = 0_i64;
-    while i + 1_i64 < Array.Len<string>(pairs) {
+    while (i + 1_i64 < Array.Len<string>(pairs))
+    {
         Array.Append<HeaderField>(out, Hpack.Field(Array.Get<string>(pairs, i), Array.Get<string>(pairs, i + 1_i64)));
         i = i + 2_i64;
     }
     return out;
 }
 
-Decoder NewTestDecoder(i64 tableSize) {
+Decoder NewTestDecoder(i64 tableSize)
+{
     mut DecoderLimits limits = HpackDecoder.DefaultDecoderLimits();
     limits.settingsTableSize = tableSize;
-    Result<Decoder,HpackError> created = HpackDecoder.NewDecoder(limits);
-    match created {
-        Result::Ok(decoder) => { return decoder; },
-        Result::Error(_) => { Assert.Fail("NewDecoder"); },
+    Result<Decoder, HpackError> created = HpackDecoder.NewDecoder(limits);
+    match (created)
+    {
+        Result::Ok(decoder) => {
+            return decoder;
+        },
+        Result::Error(_) => {
+            Assert.Fail("NewDecoder");
+        },
     };
     return NewTestDecoder(4096_i64);
 }
 
-Encoder NewTestEncoder(EncoderPolicy policy) {
-    Result<Encoder,HpackError> created = HpackEncoder.NewEncoder(policy);
-    match created {
-        Result::Ok(encoder) => { return encoder; },
-        Result::Error(_) => { Assert.Fail("NewEncoder"); },
+Encoder NewTestEncoder(EncoderPolicy policy)
+{
+    Result<Encoder, HpackError> created = HpackEncoder.NewEncoder(policy);
+    match (created)
+    {
+        Result::Ok(encoder) => {
+            return encoder;
+        },
+        Result::Error(_) => {
+            Assert.Fail("NewEncoder");
+        },
     };
     return NewTestEncoder(HpackEncoder.DefaultEncoderPolicy());
 }
 
-HeaderField[] DecodeOk(mut Decoder decoder, string blockHex, string because) {
-    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
-    match result {
-        Result::Ok(fields) => { return fields; },
-        Result::Error(_) => { Assert.Fail(because + ": decode failed"); },
+HeaderField[] DecodeOk(mut Decoder decoder, string blockHex, string because)
+{
+    Result<HeaderField[], HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match (result)
+    {
+        Result::Ok(fields) => {
+            return fields;
+        },
+        Result::Error(_) => {
+            Assert.Fail(because + ": decode failed");
+        },
     };
     return Array.Empty<HeaderField>();
 }
 
-HpackError DecodeErr(mut Decoder decoder, string blockHex, string because) {
-    Result<HeaderField[],HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
-    match result {
-        Result::Ok(_) => { Assert.Fail(because + ": decode succeeded"); },
-        Result::Error(error) => { return error; },
+HpackError DecodeErr(mut Decoder decoder, string blockHex, string because)
+{
+    Result<HeaderField[], HpackError> result = HpackDecoder.Decode(decoder, Hex(blockHex));
+    match (result)
+    {
+        Result::Ok(_) => {
+            Assert.Fail(because + ": decode succeeded");
+        },
+        Result::Error(error) => {
+            return error;
+        },
     };
     return HpackError::Truncated;
 }
 
 /// Dynamic table expectations: `expected` alternates names and values, newest first.
-unit ExpectTable(Decoder decoder, string[] expected, i64 size, string because) {
+unit ExpectTable(Decoder decoder, string[] expected, i64 size, string because)
+{
     Assert.Equal<i64>(HpackDecoder.TableSize(decoder), size, because + ": table size");
     Assert.Equal<i64>(HpackDecoder.TableCount(decoder) * 2_i64, Array.Len<string>(expected), because + ": table count");
     mut i64 i = 0_i64;
-    while i < HpackDecoder.TableCount(decoder) {
+    while (i < HpackDecoder.TableCount(decoder))
+    {
         ExpectField(HpackDecoder.TableEntry(decoder, i + 1_i64), Array.Get<string>(expected, i * 2_i64), Array.Get<string>(expected, i * 2_i64 + 1_i64), because + ": table entry");
         i = i + 1_i64;
     }
     return;
 }
 
-EncoderPolicy RfcPolicy(i64 tableSize, bool huffman) {
+EncoderPolicy RfcPolicy(i64 tableSize, bool huffman)
+{
     mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
     policy.tableSize = tableSize;
-    if huffman { policy.huffman = HuffmanMode::Always; } else { policy.huffman = HuffmanMode::Never; }
+    if (huffman)
+    {
+        policy.huffman = HuffmanMode::Always;
+    }
+    else
+    {
+        policy.huffman = HuffmanMode::Never;
+    }
     return policy;
 }
 
 /// Stable numbers for HpackError variants, for compact assertions.
-i64 ErrorCode(HpackError error) {
-    return match error {
+i64 ErrorCode(HpackError error)
+{
+    return match (error)
+    {
         HpackError::Truncated => 1_i64,
         HpackError::IntegerOverflow => 2_i64,
         HpackError::InvalidIndex(_) => 3_i64,
@@ -157,7 +226,8 @@ i64 ErrorCode(HpackError error) {
     };
 }
 
-unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string because) {
+unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string because)
+{
     HpackError error = DecodeErr(decoder, blockHex, because);
     Assert.Equal<i64>(ErrorCode(error), code, because);
     return;
@@ -165,7 +235,8 @@ unit ExpectDecodeError(mut Decoder decoder, string blockHex, i64 code, string be
 
 // RFC 7541 Appendix C.5 and C.6 response sequences with a 256-octet table (generated from the RFC text).
 
-test C5ResponsesWithoutHuffmanDecode {
+test C5ResponsesWithoutHuffmanDecode
+{
     mut Decoder decoder = NewTestDecoder(256_i64);
     HeaderField[] block1 = DecodeOk(decoder, "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d", "C.5.1");
     ExpectFields(block1, [":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.5.1 header list");
@@ -178,7 +249,8 @@ test C5ResponsesWithoutHuffmanDecode {
     ExpectTable(decoder, ["set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", "content-encoding", "gzip", "date", "Mon, 21 Oct 2013 20:13:22 GMT"], 215_i64, "C.5.3");
 }
 
-test C5ResponsesWithoutHuffmanEncode {
+test C5ResponsesWithoutHuffmanEncode
+{
     mut Encoder encoder = NewTestEncoder(RfcPolicy(256_i64, false));
     ExpectBytes(HpackEncoder.Encode(encoder, Fields([":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"])), "4803333032580770726976617465611d4d6f6e2c203231204f637420323031332032303a31333a323120474d546e1768747470733a2f2f7777772e6578616d706c652e636f6d", "C.5.1");
     Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 222_i64, "C.5.1 encoder table size");
@@ -188,21 +260,47 @@ test C5ResponsesWithoutHuffmanEncode {
     Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 215_i64, "C.5.3 encoder table size");
 }
 
-test C5ResponsesWithoutHuffmanRoundTrip {
+test C5ResponsesWithoutHuffmanRoundTrip
+{
     mut Encoder encoder = NewTestEncoder(RfcPolicy(256_i64, false));
     mut Decoder decoder = NewTestDecoder(256_i64);
     u8[] wire1 = HpackEncoder.Encode(encoder, Fields([":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"]));
-    Result<HeaderField[],HpackError> decoded1 = HpackDecoder.Decode(decoder, wire1);
-    match decoded1 { Result::Ok(fields) => { ExpectFields(fields, [":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.5.1 round trip"); }, Result::Error(_) => { Assert.Fail("C.5.1 round trip decode"); }, };
+    Result<HeaderField[], HpackError> decoded1 = HpackDecoder.Decode(decoder, wire1);
+    match (decoded1)
+    {
+        Result::Ok(fields) => {
+            ExpectFields(fields, [":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.5.1 round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("C.5.1 round trip decode");
+        },
+    };
     u8[] wire2 = HpackEncoder.Encode(encoder, Fields([":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"]));
-    Result<HeaderField[],HpackError> decoded2 = HpackDecoder.Decode(decoder, wire2);
-    match decoded2 { Result::Ok(fields) => { ExpectFields(fields, [":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.5.2 round trip"); }, Result::Error(_) => { Assert.Fail("C.5.2 round trip decode"); }, };
+    Result<HeaderField[], HpackError> decoded2 = HpackDecoder.Decode(decoder, wire2);
+    match (decoded2)
+    {
+        Result::Ok(fields) => {
+            ExpectFields(fields, [":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.5.2 round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("C.5.2 round trip decode");
+        },
+    };
     u8[] wire3 = HpackEncoder.Encode(encoder, Fields([":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location", "https://www.example.com", "content-encoding", "gzip", "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"]));
-    Result<HeaderField[],HpackError> decoded3 = HpackDecoder.Decode(decoder, wire3);
-    match decoded3 { Result::Ok(fields) => { ExpectFields(fields, [":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location", "https://www.example.com", "content-encoding", "gzip", "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"], "C.5.3 round trip"); }, Result::Error(_) => { Assert.Fail("C.5.3 round trip decode"); }, };
+    Result<HeaderField[], HpackError> decoded3 = HpackDecoder.Decode(decoder, wire3);
+    match (decoded3)
+    {
+        Result::Ok(fields) => {
+            ExpectFields(fields, [":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location", "https://www.example.com", "content-encoding", "gzip", "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"], "C.5.3 round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("C.5.3 round trip decode");
+        },
+    };
 }
 
-test C6ResponsesWithHuffmanDecode {
+test C6ResponsesWithHuffmanDecode
+{
     mut Decoder decoder = NewTestDecoder(256_i64);
     HeaderField[] block1 = DecodeOk(decoder, "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3", "C.6.1");
     ExpectFields(block1, [":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.6.1 header list");
@@ -215,7 +313,8 @@ test C6ResponsesWithHuffmanDecode {
     ExpectTable(decoder, ["set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1", "content-encoding", "gzip", "date", "Mon, 21 Oct 2013 20:13:22 GMT"], 215_i64, "C.6.3");
 }
 
-test C6ResponsesWithHuffmanEncode {
+test C6ResponsesWithHuffmanEncode
+{
     mut Encoder encoder = NewTestEncoder(RfcPolicy(256_i64, true));
     ExpectBytes(HpackEncoder.Encode(encoder, Fields([":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"])), "488264025885aec3771a4b6196d07abe941054d444a8200595040b8166e082a62d1bff6e919d29ad171863c78f0b97c8e9ae82ae43d3", "C.6.1");
     Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 222_i64, "C.6.1 encoder table size");
@@ -225,16 +324,41 @@ test C6ResponsesWithHuffmanEncode {
     Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 215_i64, "C.6.3 encoder table size");
 }
 
-test C6ResponsesWithHuffmanRoundTrip {
+test C6ResponsesWithHuffmanRoundTrip
+{
     mut Encoder encoder = NewTestEncoder(RfcPolicy(256_i64, true));
     mut Decoder decoder = NewTestDecoder(256_i64);
     u8[] wire1 = HpackEncoder.Encode(encoder, Fields([":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"]));
-    Result<HeaderField[],HpackError> decoded1 = HpackDecoder.Decode(decoder, wire1);
-    match decoded1 { Result::Ok(fields) => { ExpectFields(fields, [":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.6.1 round trip"); }, Result::Error(_) => { Assert.Fail("C.6.1 round trip decode"); }, };
+    Result<HeaderField[], HpackError> decoded1 = HpackDecoder.Decode(decoder, wire1);
+    match (decoded1)
+    {
+        Result::Ok(fields) => {
+            ExpectFields(fields, [":status", "302", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.6.1 round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("C.6.1 round trip decode");
+        },
+    };
     u8[] wire2 = HpackEncoder.Encode(encoder, Fields([":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"]));
-    Result<HeaderField[],HpackError> decoded2 = HpackDecoder.Decode(decoder, wire2);
-    match decoded2 { Result::Ok(fields) => { ExpectFields(fields, [":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.6.2 round trip"); }, Result::Error(_) => { Assert.Fail("C.6.2 round trip decode"); }, };
+    Result<HeaderField[], HpackError> decoded2 = HpackDecoder.Decode(decoder, wire2);
+    match (decoded2)
+    {
+        Result::Ok(fields) => {
+            ExpectFields(fields, [":status", "307", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:21 GMT", "location", "https://www.example.com"], "C.6.2 round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("C.6.2 round trip decode");
+        },
+    };
     u8[] wire3 = HpackEncoder.Encode(encoder, Fields([":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location", "https://www.example.com", "content-encoding", "gzip", "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"]));
-    Result<HeaderField[],HpackError> decoded3 = HpackDecoder.Decode(decoder, wire3);
-    match decoded3 { Result::Ok(fields) => { ExpectFields(fields, [":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location", "https://www.example.com", "content-encoding", "gzip", "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"], "C.6.3 round trip"); }, Result::Error(_) => { Assert.Fail("C.6.3 round trip decode"); }, };
+    Result<HeaderField[], HpackError> decoded3 = HpackDecoder.Decode(decoder, wire3);
+    match (decoded3)
+    {
+        Result::Ok(fields) => {
+            ExpectFields(fields, [":status", "200", "cache-control", "private", "date", "Mon, 21 Oct 2013 20:13:22 GMT", "location", "https://www.example.com", "content-encoding", "gzip", "set-cookie", "foo=ASDJKHQKBZXOQWEOPIUAXQWEOIU; max-age=3600; version=1"], "C.6.3 round trip");
+        },
+        Result::Error(_) => {
+            Assert.Fail("C.6.3 round trip decode");
+        },
+    };
 }

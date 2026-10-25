@@ -4,9 +4,17 @@ use Codec.Builder;
 use Codec.Errors;
 use Codec.Hex;
 
-i64 Err<T>(Result<T, CodecError> r) { return match r { Result::Ok(_) => 0_i64, Result::Error(e) => Errors.Code(e), }; }
+i64 Err<T>(Result<T, CodecError> r)
+{
+    return match (r)
+    {
+        Result::Ok(_) => 0_i64,
+        Result::Error(e) => Errors.Code(e),
+    };
+}
 
-test WritesBigEndian {
+test WritesBigEndian
+{
     ByteBuilder b = Builder.New();
     Assert.Equal<i64>(Err(b.U8(1_i64)), 0_i64, "u8");
     Assert.Equal<i64>(Err(b.U16(0x0203_i64)), 0_i64, "u16");
@@ -18,7 +26,8 @@ test WritesBigEndian {
     Assert.Equal<i64>(b.Length(), 24_i64, "length");
 }
 
-test OverflowDoesNotModify {
+test OverflowDoesNotModify
+{
     ByteBuilder b = Builder.New();
     Assert.Equal<i64>(Err(b.U16(65536_i64)), 2_i64, "u16 overflow");
     Assert.Equal<i64>(Err(b.U8(-1_i64)), 2_i64, "negative");
@@ -26,7 +35,8 @@ test OverflowDoesNotModify {
     Assert.Equal<i64>(b.Length(), 0_i64, "still empty");
 }
 
-test VarintAndBytes {
+test VarintAndBytes
+{
     ByteBuilder b = Builder.New();
     Assert.Equal<i64>(Err(b.QuicVarint(494878333_i64)), 0_i64, "varint");
     Assert.Equal<i64>(Err(b.Bytes(Hex.Of("aabb"))), 0_i64, "bytes");
@@ -36,7 +46,8 @@ test VarintAndBytes {
     Assert.Equal<string>(Hex.Encode(b.ToArray()), "9d7f3e7daabb0203", "content");
 }
 
-test LimitIsEnforced {
+test LimitIsEnforced
+{
     ByteBuilder b = Builder.WithLimit(5_i64);
     Assert.Equal<i64>(Err(b.U32(1_i64)), 0_i64, "4 of 5");
     Assert.Equal<i64>(Err(b.U16(1_i64)), 3_i64, "would reach 6");
@@ -46,11 +57,15 @@ test LimitIsEnforced {
     Assert.Equal<i64>(Err(b.U8(9_i64)), 3_i64, "full");
 }
 
-test VecBackPatching {
+test VecBackPatching
+{
     ByteBuilder b = Builder.New();
     Result<VecMark, CodecError> m = b.BeginVec(2_i64);
-    match m {
-        Result::Error(_) => { Assert.Fail("begin"); },
+    match (m)
+    {
+        Result::Error(_) => {
+            Assert.Fail("begin");
+        },
         Result::Ok(mark) => {
             Assert.Equal<i64>(Err(b.Bytes(Hex.Of("010203"))), 0_i64, "body");
             Assert.Equal<i64>(Err(b.EndVec(mark, 0_i64, 65535_i64)), 0_i64, "end");
@@ -59,15 +74,22 @@ test VecBackPatching {
     Assert.Equal<string>(Hex.Encode(b.ToArray()), "0003010203", "vec16");
 }
 
-test NestedVectorsPatchIndependently {
+test NestedVectorsPatchIndependently
+{
     ByteBuilder b = Builder.New();
     Result<VecMark, CodecError> outer = b.BeginVec(2_i64);
-    match outer {
-        Result::Error(_) => { Assert.Fail("outer"); },
+    match (outer)
+    {
+        Result::Error(_) => {
+            Assert.Fail("outer");
+        },
         Result::Ok(o) => {
             Result<VecMark, CodecError> inner = b.BeginVec(1_i64);
-            match inner {
-                Result::Error(_) => { Assert.Fail("inner"); },
+            match (inner)
+            {
+                Result::Error(_) => {
+                    Assert.Fail("inner");
+                },
                 Result::Ok(i) => {
                     Assert.Equal<i64>(Err(b.U16(0xabcd_i64)), 0_i64, "inner body");
                     Assert.Equal<i64>(Err(b.EndVec(i, 0_i64, 255_i64)), 0_i64, "end inner");
@@ -80,11 +102,15 @@ test NestedVectorsPatchIndependently {
     Assert.Equal<string>(Hex.Encode(b.ToArray()), "000402abcdee", "nested");
 }
 
-test EndvecBounds {
+test EndvecBounds
+{
     ByteBuilder b = Builder.New();
     Result<VecMark, CodecError> m = b.BeginVec(1_i64);
-    match m {
-        Result::Error(_) => { Assert.Fail("begin"); },
+    match (m)
+    {
+        Result::Error(_) => {
+            Assert.Fail("begin");
+        },
         Result::Ok(mark) => {
             Assert.Equal<i64>(Err(b.EndVec(mark, 1_i64, 10_i64)), 4_i64, "empty below min");
             Assert.Equal<i64>(Err(b.Bytes(Hex.Of("0102030405"))), 0_i64, "body");
@@ -95,21 +121,30 @@ test EndvecBounds {
     Assert.Equal<string>(Hex.Encode(b.ToArray()), "050102030405", "patched");
 }
 
-test EndvecOverflowOfPrefix {
+test EndvecOverflowOfPrefix
+{
     ByteBuilder b = Builder.New();
     Result<VecMark, CodecError> m = b.BeginVec(1_i64);
-    match m {
-        Result::Error(_) => { Assert.Fail("begin"); },
+    match (m)
+    {
+        Result::Error(_) => {
+            Assert.Fail("begin");
+        },
         Result::Ok(mark) => {
             mut i64 i = 0_i64;
-            while i < 300_i64 { Result<unit, CodecError> w = b.U8(7_i64); i = i + 1_i64; }
+            while (i < 300_i64)
+            {
+                Result<unit, CodecError> w = b.U8(7_i64);
+                i = i + 1_i64;
+            }
             Assert.Equal<i64>(Err(b.EndVec(mark, 0_i64, 100000_i64)), 2_i64, "300 does not fit u8 prefix");
         },
     };
     Assert.Equal<i64>(b.Length(), 301_i64, "length");
 }
 
-test OneShotVecAndCrlf {
+test OneShotVecAndCrlf
+{
     ByteBuilder b = Builder.New();
     Assert.Equal<i64>(Err(b.Vec(1_i64, 1_i64, 3_i64, Hex.Of("aabb"))), 0_i64, "vec");
     Assert.Equal<i64>(Err(b.Vec(1_i64, 1_i64, 3_i64, Hex.Of(""))), 4_i64, "below min");

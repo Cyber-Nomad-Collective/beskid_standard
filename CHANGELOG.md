@@ -8,6 +8,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- A contract value crosses a port only when its contract embeds a transfer
+  marker: `ParallelSuite`'s `Scored` embeds `Transferable` and its
+  implementations are `[Isolated]`. Compile-fail fixtures
+  `PortOfUnmarkedContract` (E1610) and `LaunderedContractValue` (E1206) cover
+  the rule.
 - `Core.IO.Stream` embeds `Reader`, `Writer` and `Closer`; a `Stream` value
   passes to `IO.Read`, `IO.ReadExact` and `IO.WriteAll` directly.
 - `Testing.Assert.FailureRecord` fields are public.

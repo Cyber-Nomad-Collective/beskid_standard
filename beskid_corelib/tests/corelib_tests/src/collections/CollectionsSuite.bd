@@ -193,7 +193,8 @@ test ListGetRejectsDirectBounds {
 // Collections change in place: `items.Push(x);` needs no rebinding. A `List` is copied on
 // assignment and when it is passed to a parameter that is not `mut`, returned, captured or bound
 // by a `for` loop; the copy is copy-on-write, so two names share the backing array only until
-// one of them writes. A `mut` parameter shares the caller's list.
+// one of them writes. A plain parameter gets a lent view that copies before it writes; a `mut`
+// parameter shares the caller's list.
 
 test ListPushChangesTheListInPlace {
     List<string> items = List.New<string>();
@@ -292,6 +293,79 @@ test ListCollectionsOfListsHoldCopies {
         Core.Results.Result::Error(_) => -1,
     };
     Assert.Equal(stored, 1, "an element pushed into a list is a copy");
+}
+
+// A sole owner writes in place: a list built and returned by a function, and a list lent to a
+// call that only reads it (a plain parameter), stays the only holder of its backing array, so
+// a write after the call does not copy the array. A real copy (`kept = items`) does.
+
+Core.Results.Result<List<i64>, string> BuildNumbers(i64 count) {
+    List<i64> items = List.New<i64>();
+    mut i64 index = 0;
+    while index < count {
+        items.Push(index);
+        index = index + 1;
+    }
+    return Core.Results.Result::Ok(items);
+}
+
+i64 CountOf(List<i64> l) {
+    return l.Count();
+}
+
+/// Whether `Set(0, value)` keeps the backing array of `items` (no copy-on-write copy).
+bool WritesInPlace(mut List<i64> items, i64 value) {
+    i64[] before = items.BorrowStorage();
+    Core.Results.Result<unit, Core.Collections.CollectionError> written = items.Set(0, value);
+    return Managed.SameIdentity<i64[]>(before, items.BorrowStorage());
+}
+
+Core.Results.Result<bool, string> BuiltListIsTheSoleOwner() {
+    List<i64> items = BuildNumbers(8)?;
+    mut i64 index = 0;
+    mut i64 seen = 0;
+    while index < 32 {
+        seen = seen + CountOf(items);
+        items.Push(index);
+        index = index + 1;
+    }
+    return Core.Results.Result::Ok(WritesInPlace(items, seen));
+}
+
+test ListSoleOwnerWritesInPlaceAfterBorrowsAndBuilders {
+    bool inPlace = match BuiltListIsTheSoleOwner() {
+        Core.Results.Result::Ok(flag) => flag,
+        Core.Results.Result::Error(_) => false,
+    };
+    Assert.True(inPlace, "a built list lent to readers is still the sole owner of its array");
+    List<i64> items = List.FromArray<i64>([1_i64, 2_i64]);
+    GrowCopy(items);
+    Assert.True(WritesInPlace(items, 5), "a callee that copied its lent view leaves the caller the sole owner");
+    List<i64> kept = items;
+    Assert.False(WritesInPlace(items, 6), "a list with a copy copies its array before it writes");
+    Assert.Equal(I64Or(kept.Get(0), -1), 5, "the copy keeps the value from before the write");
+}
+
+/// Writes through the element `Get` returns: the element is a copy, so the list is unchanged.
+Core.Results.Result<i64, string> PushIntoFirst(List<List<i64>> lists) {
+    lists.Get(0)?.Push(5);
+    return Core.Results.Result::Ok(lists.Get(0)?.Count());
+}
+
+test ListElementWriteThroughGetDoesNotReachEitherList {
+    List<List<i64>> a = List.New<List<i64>>();
+    a.Push(List.FromArray<i64>([1_i64]));
+    List<List<i64>> b = a;
+    i64 counted = match PushIntoFirst(b) {
+        Core.Results.Result::Ok(count) => count,
+        Core.Results.Result::Error(_) => -1,
+    };
+    Assert.Equal(counted, 1, "a write through a returned element does not reach the list");
+    i64 inA = match a.Get(0) {
+        Core.Results.Result::Ok(list) => list.Count(),
+        Core.Results.Result::Error(_) => -1,
+    };
+    Assert.Equal(inA, 1, "the list that shares the array is unchanged");
 }
 
 test StackQueueSetAndMapChangeInPlace {

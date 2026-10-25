@@ -4,6 +4,10 @@
 /// `mut`, returning it, capturing it or binding it in a `for` loop gives the new name its own list
 /// (`[CopyOnAssign]` calls `Copy`). The copy is copy-on-write: both lists share the backing array
 /// until one of them changes, and that one first copies the array. Read-only use copies nothing.
+/// A call that only borrows the list (a plain parameter) gets a lent view (`Borrow`): the callee
+/// copies before it writes, and the caller's list stays the sole owner of its array, so it keeps
+/// writing in place after the call. A list sent to another isolate leaves with an array of its
+/// own (`Detached`).
 /// Mutating methods (`Push`, `Pop`, `Set`, `Insert`, `RemoveAt`, `Remove`, `Clear`) change the
 /// list in place, so `items.Push("milk");` needs no rebinding. A `mut List<T>` parameter shares the
 /// caller's list. Element equality (`Contains`, `IndexOf`, `Remove`) uses `==`, which compares
@@ -15,7 +19,9 @@ use Core.Results;
 
 /// The sharing state of one backing array: how many lists have held it. `List.Copy` raises it;
 /// it never falls, so a list that held a shared array copies it on its next write even when the
-/// other holders are gone.
+/// other holders are gone. A lent view (`Borrow`) is not a holder: it lives only for the call
+/// that borrows the list and copies before it writes. The state never crosses to another isolate:
+/// a list sent through a port is `Detached` first.
 [Isolated]
 type ListShare {
     i64 holders;
@@ -31,6 +37,8 @@ pub type List<T> {
     T[] storage;
     i64 count;
     ListShare share;
+    /// A view lent to a callee for one call: it copies the array before its first write.
+    bool lent;
 
     pub i64 Count() {
         return this.count;
@@ -51,23 +59,43 @@ pub type List<T> {
     /// this method wherever a list gets a new name (`[CopyOnAssign]`).
     pub List<T> Copy() {
         this.share.holders = this.share.holders + 1;
-        return List<T> { storage: this.storage, count: this.count, share: this.share };
+        return List<T> { storage: this.storage, count: this.count, share: this.share, lent: false };
     }
 
-    /// Before a write in place: a shared backing array is copied, so the write is not visible
-    /// through another list.
+    /// A view of this list for a call that only borrows it. The view shares the backing array
+    /// without becoming a holder and copies the array before its first write; the compiler calls
+    /// this method for an argument of a plain parameter. Whatever keeps the view calls `Copy`.
+    pub List<T> Borrow() {
+        return List<T> { storage: this.storage, count: this.count, share: this.share, lent: true };
+    }
+
+    /// This list with a backing array and sharing state of its own, for a port send: the
+    /// compiler calls this method on the operand of `move` that crosses to another isolate, so
+    /// no sharing state is reachable from two isolates. The moved name is not read again.
+    pub List<T> Detached() {
+        if this.lent || this.share.holders > 1 {
+            T[] storage = CopyPrefix<T>(this.storage, this.count);
+            return List<T> { storage: storage, count: this.count, share: Unshared(), lent: false };
+        }
+        return List<T> { storage: this.storage, count: this.count, share: this.share, lent: false };
+    }
+
+    /// Before a write in place: a shared or lent backing array is copied, so the write is not
+    /// visible through another list.
     unit Own(mut this) {
-        if this.share.holders > 1 {
+        if this.lent || this.share.holders > 1 {
             this.storage = CopyPrefix<T>(this.storage, this.count);
             this.share = Unshared();
+            this.lent = false;
         }
         return;
     }
 
     /// Before the backing array is replaced by a new one: the list stops holding the shared one.
     unit Release(mut this) {
-        if this.share.holders > 1 {
+        if this.lent || this.share.holders > 1 {
             this.share = Unshared();
+            this.lent = false;
         }
         return;
     }
@@ -208,7 +236,7 @@ pub type List<T> {
 }
 
 pub List<T> New<T>() {
-    return List<T> { storage: Array.Empty<T>(), count: 0, share: Unshared() };
+    return List<T> { storage: Array.Empty<T>(), count: 0, share: Unshared(), lent: false };
 }
 
 /// Bulk constructor: packs call-site scalars into a list.
@@ -226,7 +254,7 @@ pub List<T> Of<T>(bulk T[] values) {
 /// Builds a list holding a copy of every element of `values`.
 pub List<T> FromArray<T>(T[] values) {
     i64 count = Array.Len<T>(values);
-    return List<T> { storage: CopyPrefix<T>(values, count), count: count, share: Unshared() };
+    return List<T> { storage: CopyPrefix<T>(values, count), count: count, share: Unshared(), lent: false };
 }
 
 T[] CopyPrefix<T>(T[] source, i64 count) {
@@ -287,7 +315,7 @@ List<T> ReverseIn<T>(T[] storage, i64 count) {
         Array.Append<T>(next, Array.Get<T>(storage, i));
         i = i - 1;
     }
-    return List<T> { storage: next, count: count, share: Unshared() };
+    return List<T> { storage: next, count: count, share: Unshared(), lent: false };
 }
 
 List<T> SliceIn<T>(T[] storage, i64 count, i64 start, i64 length) {
@@ -312,7 +340,7 @@ List<T> SliceIn<T>(T[] storage, i64 count, i64 start, i64 length) {
     if taken < 0 {
         taken = 0;
     }
-    return List<T> { storage: next, count: taken, share: Unshared() };
+    return List<T> { storage: next, count: taken, share: Unshared(), lent: false };
 }
 
 List<T> ConcatIn<T>(T[] left, i64 leftCount, T[] right, i64 rightCount) {
@@ -322,5 +350,5 @@ List<T> ConcatIn<T>(T[] left, i64 leftCount, T[] right, i64 rightCount) {
         Array.Append<T>(next, Array.Get<T>(right, i));
         i = i + 1;
     }
-    return List<T> { storage: next, count: leftCount + rightCount, share: Unshared() };
+    return List<T> { storage: next, count: leftCount + rightCount, share: Unshared(), lent: false };
 }

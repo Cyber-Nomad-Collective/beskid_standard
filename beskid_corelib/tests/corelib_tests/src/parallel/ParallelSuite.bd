@@ -8,6 +8,7 @@ use Core.Results;
 use Core.Optional.Option;
 use Core.Collections.Array;
 use Core.Collections.List;
+use Core.Memory.Managed;
 use Concurrency;
 use Concurrency.TryResult;
 use Core.Parallel;
@@ -408,6 +409,42 @@ test PortHandleCrossesAPort {
         };
     });
     Assert.Equal<i64>(ScopeValue(result), 42_i64, "the reply arrives through the sent port");
+}
+
+// A list sent through a port leaves with a backing array of its own when another list shares
+// it (`kept = shared`), so no copy-on-write state is reachable from two isolates; a list that is
+// the sole owner of its array is handed over without a copy.
+test SentListLeavesWithStorageOfItsOwn {
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
+        Port<List<i64>> p = s.PortWith<List<i64>>(2_i64);
+        List<i64> shared = List.FromArray<i64>([1_i64, 2_i64]);
+        List<i64> kept = shared;
+        i64[] keptStorage = kept.BorrowStorage();
+        p.Send(move shared);
+        List<i64> alone = List.FromArray<i64>([3_i64]);
+        i64[] aloneStorage = alone.BorrowStorage();
+        p.Send(move alone);
+        mut i64 flags = 0_i64;
+        match p.Receive() {
+            Result::Ok(received) => {
+                if !Managed.SameIdentity<i64[]>(received.BorrowStorage(), keptStorage) {
+                    flags = flags + 1_i64;
+                }
+            },
+            Result::Error(_) => { },
+        };
+        match p.Receive() {
+            Result::Ok(received) => {
+                if Managed.SameIdentity<i64[]>(received.BorrowStorage(), aloneStorage) {
+                    flags = flags + 10_i64;
+                }
+            },
+            Result::Error(_) => { },
+        };
+        flags = flags + 100_i64 * kept.Count();
+        return Result::Ok(flags);
+    });
+    Assert.Equal<i64>(ScopeValue(result), 211_i64, "a shared list is detached at the send; a sole owner is not copied");
 }
 
 contract Scored { i64 Score(); }

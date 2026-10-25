@@ -8,6 +8,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Core.IO.Stream` embeds `Reader`, `Writer` and `Closer`; a `Stream` value
+  passes to `IO.Read`, `IO.ReadExact` and `IO.WriteAll` directly.
+- `Testing.Assert.FailureRecord` fields are public.
+- `Glue.Envelope` `Put` and `Copy` return the grown array, and the
+  serialization Mod calls `List.Push` and `Map.Insert` as statements; the
+  Corelib tests check clean across all targets.
+
 - `Process.Run` returns `Ok(ProcessOutput)` whenever the child started, whatever
   its exit code; the caller checks `exitCode`, and stdout and stderr are kept
   for a failing child. `ProcessError::ExitCode` is removed.

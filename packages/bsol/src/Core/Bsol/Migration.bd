@@ -10,6 +10,7 @@ use Core.Bsol.Writer;
 
 use Core.Collections.Array;
 
+
 use Core.Serialization.FloatDecimal;
 
 use Core.Serialization.Limits as SerializationPolicy;
@@ -173,6 +174,7 @@ bool SameScalar(Syntax.Node a, Syntax.Node b)
     {
         return a.text == b.text;
     }
+
     bool fractional = Fractional(a.raw);
     if (fractional != Fractional(b.raw))
     {
@@ -182,11 +184,11 @@ bool SameScalar(Syntax.Node a, Syntax.Node b)
     {
         return IntegerIdentity(a.raw) == IntegerIdentity(b.raw);
     }
-    return match (FloatDecimal.Parse(a.raw, 64_u8, SerializationPolicy.DefaultLimits()))
+    return match FloatDecimal.Parse(a.raw, 64_u8, SerializationPolicy.DefaultLimits())
     {
         Result::Error(_) => false,
 
-        Result::Ok(left) => match (FloatDecimal.Parse(b.raw, 64_u8, SerializationPolicy.DefaultLimits()))
+        Result::Ok(left) => match FloatDecimal.Parse(b.raw, 64_u8, SerializationPolicy.DefaultLimits())
         {
             Result::Error(_) => false,
 
@@ -280,6 +282,7 @@ i64 CloneValue(Syntax.Document target, Syntax.Document source, i64 index, mut Wo
         work.failed = true;
         return -1_i64;
     }
+
     Syntax.Node original = source.nodes[index];
     mut Syntax.Node result = CopyNode(original);
     result.children = Array.Empty<i64>();
@@ -338,6 +341,7 @@ bool When(Syntax.Document document, Syntax.Node block, Syntax.Document definitio
     {
         return false;
     }
+
     string field = Text(definitions, clause, "field");
     if (field != "")
     {
@@ -346,12 +350,14 @@ bool When(Syntax.Document document, Syntax.Node block, Syntax.Document definitio
         {
             return false;
         }
+
         i64 expected = Value(definitions, clause, "field_value");
         if (expected >= 0_i64 && !SameScalar(document.nodes[input], definitions.nodes[expected]))
         {
             return false;
         }
     }
+
     string missing = Text(definitions, clause, "missing_field");
     if (missing != "" && Property(document, block, missing) >= 0_i64)
     {
@@ -392,6 +398,7 @@ i64[] Selected(Syntax.Document document, Schema.Profile target, Syntax.Node migr
         {
             return selected;
         }
+
         Syntax.Node block = document.nodes[i];
         mut bool matches = false;
         if (block.kind == Syntax.NodeKind::Block)
@@ -405,6 +412,7 @@ i64[] Selected(Syntax.Document document, Schema.Profile target, Syntax.Node migr
                     {
                         return selected;
                     }
+
                     Syntax.Node clause = target.document.nodes[migration.children[j]];
                     if (clause.kind == Syntax.NodeKind::Block && clause.name == "when" && When(document, block, target.document, clause))
                     {
@@ -451,6 +459,7 @@ Result<Rewrite[], Schema.Diagnostic[]> Rewrites(Schema.Profile profile, Syntax.N
                 {
                     return Result::Error([Error("MigrationWorkLimit", section.span, profile.name)]);
                 }
+
                 Syntax.Node operation = profile.document.nodes[section.children[j]];
                 if (operation.kind == Syntax.NodeKind::Assignment && (operation.name == "add_field" || operation.name == "rename_field"))
                 {
@@ -459,6 +468,7 @@ Result<Rewrite[], Schema.Diagnostic[]> Rewrites(Schema.Profile profile, Syntax.N
                     {
                         return Result::Error([Error("InvalidMigrationRewrite", operation.span, profile.name)]);
                     }
+
                     Syntax.Node map = profile.document.nodes[mapIndex];
                     mut i64 entry = 0_i64;
                     while (entry < Array.Len<i64>(map.children))
@@ -468,6 +478,7 @@ Result<Rewrite[], Schema.Diagnostic[]> Rewrites(Schema.Profile profile, Syntax.N
                         {
                             return Result::Error([Error("InvalidMigrationRewrite", assignment.span, profile.name)]);
                         }
+
                         i64 value = assignment.children[0_i64];
                         if (operation.name == "add_field")
                         {
@@ -492,6 +503,7 @@ Result<Rewrite[], Schema.Diagnostic[]> Rewrites(Schema.Profile profile, Syntax.N
                     {
                         owner = section;
                     }
+
                     i64 from = Value(profile.document, owner, "from");
                     i64 to = Value(profile.document, owner, "to");
                     if (from < 0_i64 || to < 0_i64 || !Scalar(profile.document.nodes[from]) || !Scalar(profile.document.nodes[to]))
@@ -523,12 +535,14 @@ Result<MigrationPlan, Schema.Diagnostic[]> PlanWithWork(Syntax.Document document
         {
             return Result::Error([Error("MigrationWorkLimit", target.document.nodes[target.migrationNodes[i]].span, target.name)]);
         }
+
         Syntax.Node migration = target.document.nodes[target.migrationNodes[i]];
         string from = Text(target.document, migration, "from");
         if (from == target.name)
         {
             return Result::Error([Error("MigrationCycle", migration.span, target.name)]);
         }
+
         i64[] selected = Selected(document, target, migration, work);
         if (Array.Len<i64>(selected) > 0_i64)
         {
@@ -555,7 +569,7 @@ Result<MigrationPlan, Schema.Diagnostic[]> PlanWithWork(Syntax.Document document
     }
     if (chosen < 0_i64)
     {
-        match (Schema.Validate(document, target, limits))
+        match Schema.Validate(document, target, limits)
         {
             Result::Ok(_) => {
                 return Result::Error([Error("AlreadyAtTarget", Syntax.Span
@@ -575,8 +589,9 @@ Result<MigrationPlan, Schema.Diagnostic[]> PlanWithWork(Syntax.Document document
             end: 0_i64,
         }, target.name)]);
     }
+
     Syntax.Node migration = target.document.nodes[chosen];
-    return match (Rewrites(target, migration, work))
+    return match Rewrites(target, migration, work)
     {
         Result::Error(errors) => Result::Error(errors),
 
@@ -614,21 +629,21 @@ Result<MigrationPlan, Schema.Diagnostic[]> PlanOwned(Syntax.Document document, S
 /// source arenas cannot supply unchecked indices or invented profile models.
 pub Result<MigrationPlan, Schema.Diagnostic[]> PlanMigration(Syntax.Document document, Schema.Profile target, Limits.BsolLimits limits)
 {
-    match (Schema.ReownProfile(target, limits))
+    match Schema.ReownProfile(target, limits)
     {
         Result::Error(errors) => {
             return Result::Error(errors);
         },
 
         Result::Ok(ownedProfile) => {
-            match (Writer.Write(document, limits))
+            match Writer.Write(document, limits)
             {
                 Result::Error(error) => {
                     return Result::Error([Error("InvalidMigrationSource", error.span, target.name)]);
                 },
 
                 Result::Ok(text) => {
-                    match (Parser.Parse(text, limits))
+                    match Parser.Parse(text, limits)
                     {
                         Result::Error(error) => {
                             return Result::Error([Error("InvalidMigrationSource", error.span, target.name)]);
@@ -651,6 +666,7 @@ unit Replace(Syntax.Document document, i64 index, Syntax.Node from, Syntax.Node 
         work.failed = true;
         return;
     }
+
     Syntax.Node node = document.nodes[index];
     if (SameScalar(node, from))
     {
@@ -659,6 +675,7 @@ unit Replace(Syntax.Document document, i64 index, Syntax.Node from, Syntax.Node 
         Array.Set<Syntax.Node>(document.nodes, index, fresh);
         return;
     }
+
     mut i64 i = 0_i64;
     while (i < Array.Len<i64>(node.children))
     {
@@ -685,9 +702,10 @@ Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ApplyWithWork(MigrationPla
                     end: 0_i64,
                 }, plan.to)]);
             }
+
             i64 index = plan.blocks[blockIndex];
             mut Syntax.Node block = document.nodes[index];
-            match (plan.rewrites[operation])
+            match plan.rewrites[operation]
             {
                 Rewrite::AddField(key, value) => {
                     if (Property(document, block, key) < 0_i64)
@@ -697,6 +715,7 @@ Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ApplyWithWork(MigrationPla
                         {
                             return Result::Error([Error("MigrationNodeLimit", block.span, plan.to)]);
                         }
+
                         i64 assignment = Array.Len<Syntax.Node>(document.nodes);
                         Array.Append<Syntax.Node>(document.nodes, Syntax.Node
                         {
@@ -736,6 +755,7 @@ Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ApplyWithWork(MigrationPla
                             diagnostic.relatedSpan = document.nodes[collision].span;
                             return Result::Error([diagnostic]);
                         }
+
                         mut Syntax.Node renamed = CopyNode(document.nodes[assignment]);
                         renamed.name = to;
                         Array.Set<Syntax.Node>(document.nodes, assignment, renamed);
@@ -774,21 +794,21 @@ Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ApplyWithWork(MigrationPla
             end: 0_i64,
         }, plan.to)]);
     }
-    match (Writer.Write(document, limits))
+    match Writer.Write(document, limits)
     {
         Result::Error(error) => {
             return Result::Error([Error("InvalidMigrationOutput", error.span, plan.to)]);
         },
 
         Result::Ok(text) => {
-            match (Parser.Parse(text, limits))
+            match Parser.Parse(text, limits)
             {
                 Result::Error(error) => {
                     return Result::Error([Error("InvalidMigrationOutput", error.span, plan.to)]);
                 },
 
                 Result::Ok(owned) => {
-                    return match (Schema.Validate(owned, plan.target, limits))
+                    return match Schema.Validate(owned, plan.target, limits)
                     {
                         Result::Error(errors) => Result::Error(errors),
 
@@ -874,6 +894,7 @@ unit FindRoutes(string current, string target, RouteEdge[] edges, Schema.Profile
             routes.alternative = path[Array.Len<i64>(path) - 1_i64];
         }
     }
+
     mut i64 i = 0_i64;
     while (i < Array.Len<RouteEdge>(edges))
     {
@@ -881,6 +902,7 @@ unit FindRoutes(string current, string target, RouteEdge[] edges, Schema.Profile
         {
             return;
         }
+
         RouteEdge edge = edges[i];
         if (edge.from == current)
         {
@@ -954,7 +976,7 @@ pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> MigrateChain(Syntax.Do
             }, target)]);
         }
         bytes = bytes + String.Len(closure[i].source);
-        match (Schema.ReownProfile(closure[i], limits))
+        match Schema.ReownProfile(closure[i], limits)
         {
             Result::Error(errors) => {
                 return Result::Error(errors);
@@ -1004,6 +1026,7 @@ pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> MigrateChain(Syntax.Do
             end: 0_i64,
         }, target)]);
     }
+
     mut Routes routes = Routes
     {
         count: 0_i64,
@@ -1049,14 +1072,15 @@ pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> MigrateChain(Syntax.Do
         }
         return Result::Error([diagnostic]);
     }
+
     mut Syntax.Document current = CopyDocument(document);
-    match (Writer.Write(document, limits))
+    match Writer.Write(document, limits)
     {
         Result::Error(error) => {
             return Result::Error([Error("InvalidMigrationInput", error.span, target)]);
         },
 
-        Result::Ok(text) => match (Parser.Parse(text, limits))
+        Result::Ok(text) => match Parser.Parse(text, limits)
         {
             Result::Error(error) => {
                 return Result::Error([Error("InvalidMigrationInput", error.span, target)]);
@@ -1073,22 +1097,17 @@ pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> MigrateChain(Syntax.Do
         RouteEdge edge = edges[routes.chosen[i]];
         Schema.Profile owner = profiles[edge.profile];
         mut Schema.Profile stage = owner;
-        match (Schema.MigrationStage(owner, edge.definition))
-        {
-            Result::Error(errors) => {
-                return Result::Error(errors);
-            },
-            Result::Ok(selected) => {
-                stage = selected;
-            },
+        match Schema.MigrationStage(owner, edge.definition) {
+            Result::Error(errors) => { return Result::Error(errors); },
+            Result::Ok(selected) => { stage = selected; },
         };
-        match (PlanWithWork(current, stage, limits, work))
+        match PlanWithWork(current, stage, limits, work)
         {
             Result::Error(errors) => {
                 return Result::Error(errors);
             },
 
-            Result::Ok(plan) => match (ApplyWithWork(plan, limits, work))
+            Result::Ok(plan) => match ApplyWithWork(plan, limits, work)
             {
                 Result::Error(errors) => {
                     return Result::Error(errors);
@@ -1101,7 +1120,7 @@ pub Result<Schema.ValidatedDocument, Schema.Diagnostic[]> MigrateChain(Syntax.Do
         };
         i = i + 1_i64;
     }
-    return match (Schema.Validate(current, profiles[targetIndex], limits))
+    return match Schema.Validate(current, profiles[targetIndex], limits)
     {
         Result::Error(errors) => Result::Error(errors),
 

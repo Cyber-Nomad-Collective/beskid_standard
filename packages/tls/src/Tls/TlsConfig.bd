@@ -12,13 +12,9 @@ use Tls.Wire;
 // server name and a verification mode; skipping verification is a separate, loudly named
 // mode meant for tests only.
 
-pub type Blob
-{
-    pub u8[] data;
-}
+pub type Blob { pub u8[] data; }
 
-pub enum CertificateVerification
-{
+pub enum CertificateVerification {
     // Validate the chain (X.509, RFC 5280) to an anchor of this store and check the
     // server name (RFC 6125).
     Trust(TrustStore store),
@@ -27,8 +23,7 @@ pub enum CertificateVerification
     DangerousAcceptAnyCertificate,
 }
 
-pub type TlsClientConfig
-{
+pub type TlsClientConfig {
     // DNS name (sent as SNI and verified) or an IP literal (verified, not sent as SNI).
     pub string serverName;
     pub CertificateVerification verification;
@@ -48,8 +43,7 @@ pub type TlsClientConfig
     pub u8[] quicTransportParameters;
 }
 
-pub type TlsServerConfig
-{
+pub type TlsServerConfig {
     // End-entity certificate first, DER.
     pub Blob[] certificateChain;
     // P-256 private scalar (32 bytes); see PeerKeys.P256PrivateKeyFromDer.
@@ -67,72 +61,44 @@ pub type TlsServerConfig
 }
 
 /// Client defaults: all three suites (AES-128-GCM first), X25519 then P-256, no ALPN.
-pub TlsClientConfig Client(string serverName, CertificateVerification verification)
-{
+pub TlsClientConfig Client(string serverName, CertificateVerification verification) {
     mut string[] alpn = Array.Empty<string>();
-    return TlsClientConfig
-    {
-        serverName: serverName,
-        verification: verification,
-        alpn: alpn,
-        alpnRequired: false,
-        cipherSuites: Suites.All(),
-        groups: [Wire.GroupX25519(), Wire.GroupSecp256r1()],
-        minRsaBits: 2048_i64,
-        nowSeconds: 0_i64,
-        quic: false,
-        quicTransportParameters: Slice.New(0_i64),
+    return TlsClientConfig {
+        serverName: serverName, verification: verification, alpn: alpn, alpnRequired: false,
+        cipherSuites: Suites.All(), groups: [Wire.GroupX25519(), Wire.GroupSecp256r1()],
+        minRsaBits: 2048_i64, nowSeconds: 0_i64, quic: false, quicTransportParameters: Slice.New(0_i64),
     };
 }
 
 /// Server defaults: all three suites (AES-128-GCM first), X25519 then P-256, no ALPN, SNI optional.
-pub TlsServerConfig Server(Blob[] certificateChain, u8[] privateKey)
-{
+pub TlsServerConfig Server(Blob[] certificateChain, u8[] privateKey) {
     mut string[] alpn = Array.Empty<string>();
     mut string[] names = Array.Empty<string>();
-    return TlsServerConfig
-    {
-        certificateChain: certificateChain,
-        privateKey: privateKey,
-        alpn: alpn,
-        requireSni: false,
-        serverNames: names,
-        cipherSuites: Suites.All(),
-        groups: [Wire.GroupX25519(), Wire.GroupSecp256r1()],
-        quic: false,
-        quicTransportParameters: Slice.New(0_i64),
+    return TlsServerConfig {
+        certificateChain: certificateChain, privateKey: privateKey, alpn: alpn, requireSni: false,
+        serverNames: names, cipherSuites: Suites.All(), groups: [Wire.GroupX25519(), Wire.GroupSecp256r1()],
+        quic: false, quicTransportParameters: Slice.New(0_i64),
     };
 }
 
 /// A one-certificate chain over its own copy of `leaf`.
-pub Blob[] Chain1(u8[] leaf)
-{
+pub Blob[] Chain1(u8[] leaf) {
     mut Blob[] chain = Array.Empty<Blob>();
-    Array.Append<Blob>(chain, Blob
-    {
-        data: Slice.SubSlice(leaf, 0_i64, Slice.Len(leaf)),
-    });
+    Array.Append<Blob>(chain, Blob { data: Slice.SubSlice(leaf, 0_i64, Slice.Len(leaf)) });
     return chain;
 }
 
 /// Verification against explicit DER trust anchors. Unparseable anchors are an error.
-pub Result<CertificateVerification, X509Error> Anchors(Blob[] anchors)
-{
+pub Result<CertificateVerification, X509Error> Anchors(Blob[] anchors) {
     mut TrustStore store = TrustStore.Empty();
     i64 n = Array.Len<Blob>(anchors);
     mut i64 i = 0_i64;
-    while (i < n)
-    {
+    while i < n {
         Blob b = anchors[i];
         Result<Certificate, X509Error> parsed = Certificate.Parse(b.data);
-        match (parsed)
-        {
-            Result::Error(e) => {
-                return Result::Error(e);
-            },
-            Result::Ok(cert) => {
-                store = TrustStore.WithCertificate(store, cert);
-            },
+        match parsed {
+            Result::Error(e) => { return Result::Error(e); },
+            Result::Ok(cert) => { store = TrustStore.WithCertificate(store, cert); },
         };
         i = i + 1_i64;
     }
@@ -140,36 +106,19 @@ pub Result<CertificateVerification, X509Error> Anchors(Blob[] anchors)
 }
 
 /// Verification against a trust store (for example `TrustStore.FromFile(TrustStore.SystemBundlePath())`).
-pub CertificateVerification WithTrustStore(TrustStore store)
-{
-    return CertificateVerification::Trust(store);
-}
+pub CertificateVerification WithTrustStore(TrustStore store) { return CertificateVerification::Trust(store); }
 
-pub CertificateVerification AcceptAnyCertificateForTestsOnly()
-{
-    return CertificateVerification::DangerousAcceptAnyCertificate;
-}
+pub CertificateVerification AcceptAnyCertificateForTestsOnly() { return CertificateVerification::DangerousAcceptAnyCertificate; }
 
 /// True for an IPv4 dotted quad or an IPv6 literal (contains ':').
-pub bool IsIpLiteral(string name)
-{
-    if (String.Contains(name, ":"))
-    {
-        return true;
-    }
+pub bool IsIpLiteral(string name) {
+    if String.Contains(name, ":") { return true; }
     i64 n = String.Len(name);
-    if (n == 0_i64)
-    {
-        return false;
-    }
+    if n == 0_i64 { return false; }
     mut i64 i = 0_i64;
-    while (i < n)
-    {
+    while i < n {
         u8 c = String.ByteAt(name, i);
-        if (!(c == 46_u8 || (c >= 48_u8 && c <= 57_u8)))
-        {
-            return false;
-        }
+        if !(c == 46_u8 || (c >= 48_u8 && c <= 57_u8)) { return false; }
         i = i + 1_i64;
     }
     return true;

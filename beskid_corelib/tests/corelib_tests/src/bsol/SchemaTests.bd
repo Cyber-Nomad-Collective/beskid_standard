@@ -34,14 +34,14 @@ string FixtureProfile()
 
 Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ValidateFixture(string source)
 {
-    match (Schema.ParseProfile(FixtureProfile(), Limits.DefaultLimits()))
+    match Schema.ParseProfile(FixtureProfile(), Limits.DefaultLimits())
     {
         Result::Error(_) => {
             Assert.Fail("valid declared profile compiles natively");
             return Result::Error(Array.Empty<Schema.Diagnostic>());
         },
 
-        Result::Ok(profile) => match (Parser.Parse(source, Limits.DefaultLimits()))
+        Result::Ok(profile) => match Parser.Parse(source, Limits.DefaultLimits())
         {
             Result::Error(_) => {
                 Assert.Fail("validation fixture is syntactically valid");
@@ -72,7 +72,7 @@ Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ValidateFixture(string sou
                     }
                     ruleIndex = ruleIndex + 1_i64;
                 }
-                match (Schema.Validate(document, profile, Limits.DefaultLimits()))
+                match Schema.Validate(document, profile, Limits.DefaultLimits())
                 {
                     Result::Ok(validated) => {
                         Output.WriteLine("schema validation OK");
@@ -98,7 +98,7 @@ Result<Schema.ValidatedDocument, Schema.Diagnostic[]> ValidateFixture(string sou
 
 unit RequireDiagnostic(string source, string code, string field)
 {
-    match (ValidateFixture(source))
+    match ValidateFixture(source)
     {
         Result::Ok(_) => Assert.Fail("invalid profile input must reject"),
 
@@ -111,7 +111,7 @@ unit RequireDiagnostic(string source, string code, string field)
                 if (diagnostic.code == code && diagnostic.field == field)
                 {
                     found = true;
-                    Assert.True(match (diagnostic.stage)
+                    Assert.True(match diagnostic.stage
                     {
                         Schema.DiagnosticStage::Validation => true,
 
@@ -138,7 +138,7 @@ unit RequireDiagnostic(string source, string code, string field)
 
 test BsolNativeProfileV1AndV2DeclaredRuleLoad
 {
-    match (Schema.ParseProfile(FixtureProfile(), Limits.DefaultLimits()))
+    match Schema.ParseProfile(FixtureProfile(), Limits.DefaultLimits())
     {
         Result::Error(_) => Assert.Fail("v2 fixture profile loads"),
 
@@ -150,7 +150,7 @@ test BsolNativeProfileV1AndV2DeclaredRuleLoad
 
     string v1 = "profile \"fixture.v1\" { version = 1 rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one field \"name\" { type = quoted required = true } } }";
 
-    match (Schema.ParseProfile(v1, Limits.DefaultLimits()))
+    match Schema.ParseProfile(v1, Limits.DefaultLimits())
     {
         Result::Error(_) => Assert.Fail("v1 fixture profile loads using real rule grammar"),
 
@@ -160,7 +160,7 @@ test BsolNativeProfileV1AndV2DeclaredRuleLoad
 
 test BsolNativeSchemaValidPrimitivesReturnCheckedDocument
 {
-    match (ValidateFixture("config { name = \"native\" count = 4294967295 enabled = true }"))
+    match ValidateFixture("config { name = \"native\" count = 4294967295 enabled = true }")
     {
         Result::Error(_) => Assert.Fail("declared quoted u32 and bool validate"),
 
@@ -198,13 +198,13 @@ test BsolNativeSchemaInvalidProfileFailsAtProfileBoundary
 {
     string invalid = "profile \"broken.v2\" { version = 2 rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one field \"name\" { type = made_up_type required = true } } }";
 
-    match (Schema.ParseProfile(invalid, Limits.DefaultLimits()))
+    match Schema.ParseProfile(invalid, Limits.DefaultLimits())
     {
         Result::Ok(_) => Assert.Fail("unknown declared field type rejects profile"),
 
         Result::Error(diagnostics) => {
             Assert.True(Array.Len<Schema.Diagnostic>(diagnostics) > 0_i64, "profile diagnostic returned");
-            Assert.True(match (diagnostics[0].stage)
+            Assert.True(match diagnostics[0].stage
             {
                 Schema.DiagnosticStage::Profile => true,
 
@@ -219,35 +219,20 @@ test BsolNativeSchemaInvalidProfileFailsAtProfileBoundary
 /// Native profile loading uses the exact standalone bootstrap schema files.
 /// This verifies profile parsing/composition, not host materialization authority
 /// or generated typed adapter eligibility.
-unit CheckProfile(string directory, string name)
-{
-    match (FS.ReadAllText(directory + "/../schemas/" + name + ".bsol"))
-    {
-        Result::Error(_) => {
-            Assert.Fail("canonical embedded profile must be readable");
-        },
+unit CheckProfile(string directory, string name) {
+    match FS.ReadAllText(directory + "/../schemas/" + name + ".bsol") {
+        Result::Error(_) => { Assert.Fail("canonical embedded profile must be readable"); },
         Result::Ok(source) => {
-            match (Parser.Parse(source, Limits.DefaultLimits()))
-            {
-                Result::Error(_) => {
-                    Assert.Fail("canonical profile BSOL syntax must parse");
-                },
+            match Parser.Parse(source, Limits.DefaultLimits()) {
+                Result::Error(_) => { Assert.Fail("canonical profile BSOL syntax must parse"); },
                 Result::Ok(document) => {
-                    match (Schema.ParseProfile(source, Limits.DefaultLimits()))
-                    {
-                        Result::Error(_) => {
-                            Assert.Fail("canonical profile definitions must parse natively");
-                        },
+                    match Schema.ParseProfile(source, Limits.DefaultLimits()) {
+                        Result::Error(_) => { Assert.Fail("canonical profile definitions must parse natively"); },
                         Result::Ok(profile) => {
                             Assert.Equal(name, profile.name, "canonical profile identity preserved");
-                            match (Schema.Compose(profile, Limits.DefaultLimits()))
-                            {
-                                Result::Error(_) => {
-                                    Assert.Fail("canonical profile composition must validate");
-                                },
-                                Result::Ok(composed) => {
-                                    Assert.True(Array.Len<Schema.Rule>(composed.rules) > 0_i64, "canonical profile retains rules");
-                                },
+                            match Schema.Compose(profile, Limits.DefaultLimits()) {
+                                Result::Error(_) => { Assert.Fail("canonical profile composition must validate"); },
+                                Result::Ok(composed) => { Assert.True(Array.Len<Schema.Rule>(composed.rules) > 0_i64, "canonical profile retains rules"); },
                             };
                         },
                     };
@@ -258,13 +243,9 @@ unit CheckProfile(string directory, string name)
 }
 
 /// @native-only
-test BsolAllFourteenCanonicalProfilesParseAndCompose
-{
-    match (Environment.Get("BESKID_BSOL_CORPUS"))
-    {
-        Result::Error(_) => {
-            Assert.Fail("BESKID_BSOL_CORPUS must name the shared conformance root");
-        },
+test BsolAllFourteenCanonicalProfilesParseAndCompose {
+    match Environment.Get("BESKID_BSOL_CORPUS") {
+        Result::Error(_) => { Assert.Fail("BESKID_BSOL_CORPUS must name the shared conformance root"); },
         Result::Ok(directory) => {
             CheckProfile(directory, "schema.v1");
             CheckProfile(directory, "schema.v2");
@@ -284,21 +265,18 @@ test BsolAllFourteenCanonicalProfilesParseAndCompose
     };
 }
 
-unit CheckNumericBinding(Schema.ValidatedDocument document, string name, string expected, bool defaulted)
-{
+
+unit CheckNumericBinding(Schema.ValidatedDocument document, string name, string expected, bool defaulted) {
     mut bool found = false;
     mut i64 i = 0_i64;
-    while (i < Array.Len<Schema.FieldBinding>(document.fields))
-    {
+    while (i < Array.Len<Schema.FieldBinding>(document.fields)) {
         Schema.FieldBinding binding = document.fields[i];
         Schema.Field field = document.schema.rules[binding.rule].fields[binding.field];
-        if (field.name == name)
-        {
+        if (field.name == name) {
             found = true;
             Assert.Equal(binding.fromDefault, defaulted, "default provenance retained");
             Assert.Equal(binding.value.raw, expected, "exact numeric value retained");
-            Assert.True(match (binding.value.kind)
-            {
+            Assert.True(match binding.value.kind {
                 Syntax.NodeKind::Number => true,
                 _ => false,
             }, "numeric binding remains typed");
@@ -308,53 +286,32 @@ unit CheckNumericBinding(Schema.ValidatedDocument document, string name, string 
     Assert.True(found, "declared numeric binding available for typed mapping");
 }
 
-unit CheckProfileDocument(string directory, string name, bool accepted)
-{
+unit CheckProfileDocument(string directory, string name, bool accepted) {
     mut string suffix = "invalid";
-    if (accepted)
-    {
-        suffix = "valid";
-    }
-    match (FS.ReadAllText(directory + "/cases/builtin-profiles/" + name + "." + suffix + ".bsol"))
-    {
+    if (accepted) { suffix = "valid"; }
+    match FS.ReadAllText(directory + "/cases/builtin-profiles/" + name + "." + suffix + ".bsol") {
         Result::Error(_) => Assert.Fail("shared builtin document must be readable"),
-        Result::Ok(source) => match (Parser.Parse(source, Limits.DefaultLimits()))
-        {
+        Result::Ok(source) => match Parser.Parse(source, Limits.DefaultLimits()) {
             Result::Error(_) => Assert.Fail("builtin positive and negative documents have valid syntax"),
-            Result::Ok(document) => match (FS.ReadAllText(directory + "/../schemas/" + name + ".bsol"))
-            {
+            Result::Ok(document) => match FS.ReadAllText(directory + "/../schemas/" + name + ".bsol") {
                 Result::Error(_) => Assert.Fail("canonical profile must be readable"),
-                Result::Ok(profileSource) => match (Schema.ParseProfile(profileSource, Limits.DefaultLimits()))
-                {
+                Result::Ok(profileSource) => match Schema.ParseProfile(profileSource, Limits.DefaultLimits()) {
                     Result::Error(_) => Assert.Fail("canonical profile must parse"),
-                    Result::Ok(profile) => match (Schema.Validate(document, profile, Limits.DefaultLimits()))
-                    {
+                    Result::Ok(profile) => match Schema.Validate(document, profile, Limits.DefaultLimits()) {
                         Result::Ok(checked) => {
                             Assert.True(accepted, "missing required root must reject");
                             Assert.Equal(checked.schema.name, name, "validated document retains exact profile");
-                            if (name == "schema.v2")
-                            {
-                                CheckNumericBinding(checked, "version", "2", false);
-                            }
-                            if (name == "board.v3")
-                            {
-                                CheckNumericBinding(checked, "version", "3", true);
-                            }
-                            if (name == "runtime.v1" || name == "runtime.v2")
-                            {
-                                CheckNumericBinding(checked, "abi_version", "5", false);
-                            }
+                            if (name == "schema.v2") { CheckNumericBinding(checked, "version", "2", false); }
+                            if (name == "board.v3") { CheckNumericBinding(checked, "version", "3", true); }
+                            if (name == "runtime.v1" || name == "runtime.v2") { CheckNumericBinding(checked, "abi_version", "5", false); }
+
                         },
                         Result::Error(errors) => {
                             Assert.True(!accepted, "ordinary builtin document must validate");
                             mut bool cardinality = false;
                             mut i64 i = 0_i64;
-                            while (i < Array.Len<Schema.Diagnostic>(errors))
-                            {
-                                if (errors[i].code == "Cardinality")
-                                {
-                                    cardinality = true;
-                                }
+                            while (i < Array.Len<Schema.Diagnostic>(errors)) {
+                                if (errors[i].code == "Cardinality") { cardinality = true; }
                                 i = i + 1_i64;
                             }
                             Assert.True(cardinality, "missing required root reports cardinality");
@@ -367,10 +324,8 @@ unit CheckProfileDocument(string directory, string name, bool accepted)
 }
 
 /// @native-only
-test BsolAllFourteenBuiltinProfilesValidateRealDocuments
-{
-    match (Environment.Get("BESKID_BSOL_CORPUS"))
-    {
+test BsolAllFourteenBuiltinProfilesValidateRealDocuments {
+    match Environment.Get("BESKID_BSOL_CORPUS") {
         Result::Error(_) => Assert.Fail("shared conformance root required"),
         Result::Ok(directory) => {
             CheckProfileDocument(directory, "schema.v1", true);

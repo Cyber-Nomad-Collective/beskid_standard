@@ -11,57 +11,36 @@ use Quic.QuicProtection;
 use Quic.QuicWire;
 
 // Moves datagrams from `from` to `to`; drops the first `drop` of them. Returns how many moved.
-i64 Pump(Connection from, Connection to, i64 now, i64 drop)
-{
+i64 Pump(Connection from, Connection to, i64 now, i64 drop) {
     mut i64 moved = 0_i64;
     mut i64 length = QuicConnection.BuildDatagram(from, now);
-    while (length > 0_i64 && moved < 64_i64)
-    {
-        if (moved >= drop)
-        {
-            QuicConnection.OnDatagram(to, QuicWire.CopyOf(from.out, 0_i64, length), length, now);
-        }
+    while length > 0_i64 && moved < 64_i64 {
+        if moved >= drop { QuicConnection.OnDatagram(to, QuicWire.CopyOf(from.out, 0_i64, length), length, now); }
         moved = moved + 1_i64;
         length = QuicConnection.BuildDatagram(from, now);
     }
     return moved;
 }
 
-i64 Earliest(Connection a, Connection b, i64 now)
-{
+i64 Earliest(Connection a, Connection b, i64 now) {
     i64 x = QuicConnection.NextTimeout(a, now);
     i64 y = QuicConnection.NextTimeout(b, now);
-    if (x < 0_i64)
-    {
-        return y;
-    }
-    if (y < 0_i64 || x < y)
-    {
-        return x;
-    }
+    if x < 0_i64 { return y; }
+    if y < 0_i64 || x < y { return x; }
     return y;
 }
 
 // Exchanges until quiet, advancing the clock to the next timer when nothing moves.
 // Returns the final clock.
-i64 Settle(Connection a, Connection b, i64 start, i64 rounds)
-{
+i64 Settle(Connection a, Connection b, i64 start, i64 rounds) {
     mut i64 now = start;
     mut i64 r = 0_i64;
-    while (r < rounds)
-    {
+    while r < rounds {
         i64 moved = Pump(a, b, now, 0_i64) + Pump(b, a, now, 0_i64);
-        if (moved == 0_i64)
-        {
+        if moved == 0_i64 {
             i64 t = Earliest(a, b, now);
-            if (t < 0_i64 || t - now > 2000000000_i64)
-            {
-                return now;
-            }
-            if (t > now)
-            {
-                now = t;
-            }
+            if t < 0_i64 || t - now > 2000000000_i64 { return now; }
+            if t > now { now = t; }
             QuicConnection.OnTimeout(a, now);
             QuicConnection.OnTimeout(b, now);
         }
@@ -70,8 +49,7 @@ i64 Settle(Connection a, Connection b, i64 start, i64 rounds)
     return now;
 }
 
-test RetryLossFlowControlKeyUpdateAndTimeouts
-{
+test RetryLossFlowControlKeyUpdateAndTimeouts {
     QuicConfig cfg = QuicConfig.WithIdleTimeout(QuicConfig.InsecureLoopbackForTestsOnly(["h3"], 2_i64), 3000_i64);
     mut i64 now = 5000000000_i64;
     // Retry (RFC 9000 section 8.1): the client restarts with the token and the new ID.
@@ -104,49 +82,26 @@ test RetryLossFlowControlKeyUpdateAndTimeouts
     mut i64 sid = -1_i64;
     mut bool ok = true;
     mut i64 guard = 0_i64;
-    while ((written < 20000_i64 || received < 20000_i64) && guard < 400_i64)
-    {
-        if (written < 20000_i64)
-        {
+    while (written < 20000_i64 || received < 20000_i64) && guard < 400_i64 {
+        if written < 20000_i64 {
             mut i64 k = 0_i64;
-            while (k < 1000_i64)
-            {
-                chunk[k] = u8((written + k) & 255_i64);
-                k = k + 1_i64;
-            }
+            while k < 1000_i64 { chunk[k] = u8((written + k) & 255_i64); k = k + 1_i64; }
             i64 n = QuicConnection.StreamWrite(client, id, chunk, 0_i64, 1000_i64);
-            if (n > 0_i64)
-            {
-                written = written + n;
-            }
-            if (written == 20000_i64)
-            {
-                QuicConnection.StreamFinish(client, id);
-            }
+            if n > 0_i64 { written = written + n; }
+            if written == 20000_i64 { QuicConnection.StreamFinish(client, id); }
         }
         now = now + 1000000_i64;
         Pump(client, server, now, 0_i64);
         Pump(server, client, now, 0_i64);
-        if (sid < 0_i64)
-        {
-            sid = QuicConnection.AcceptStream(server);
-        }
-        if (sid >= 0_i64)
-        {
+        if sid < 0_i64 { sid = QuicConnection.AcceptStream(server); }
+        if sid >= 0_i64 {
             i64 got = QuicConnection.StreamRead(server, sid, sink, 0_i64, 4096_i64);
             mut i64 j = 0_i64;
-            while (j < got)
-            {
-                if (i64(sink[j]) != ((received + j) & 255_i64))
-                {
-                    ok = false;
-                }
+            while j < got {
+                if i64(sink[j]) != ((received + j) & 255_i64) { ok = false; }
                 j = j + 1_i64;
             }
-            if (got > 0_i64)
-            {
-                received = received + got;
-            }
+            if got > 0_i64 { received = received + got; }
         }
         guard = guard + 1_i64;
     }

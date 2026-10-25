@@ -23,28 +23,17 @@ use PestGrammar;
 use PestSyntax;
 
 /// Every rule of the regex grammar as one typed parser function.
-pub GeneratedSyntaxContribution BuildAll()
-{
-    NodeSpan origin = NodeSpan
-    {
-        start: 0_u64,
-        end: 0_u64,
-        lineStart: 0_u64,
-        columnStart: 0_u64,
-        lineEnd: 0_u64,
-        columnEnd: 0_u64,
-    };
+pub GeneratedSyntaxContribution BuildAll() {
+    NodeSpan origin = NodeSpan { start: 0_u64, end: 0_u64, lineStart: 0_u64, columnStart: 0_u64, lineEnd: 0_u64, columnEnd: 0_u64 };
     PestSyntax.Builder builder = PestSyntax.Create(origin);
     Result<GrammarRule[], string> parsed = ParseGrammarRules(PestGrammar.RegexGrammarSource());
-    GrammarRule[] rules = match (parsed)
-    {
+    GrammarRule[] rules = match parsed {
         Result::Ok(value) => value,
         Result::Error(_) => Array.Empty<GrammarRule>(),
     };
     mut SyntaxContributionItem[] items = [];
     mut i64 index = 0_i64;
-    while (index < Array.Len<GrammarRule>(rules))
-    {
+    while (index < Array.Len<GrammarRule>(rules)) {
         GrammarRule rule = rules[index];
         items = Array.Append<SyntaxContributionItem>(items, Items.FunctionItem(RuleFunction(builder, rule, rules)));
         index = index + 1_i64;
@@ -52,22 +41,18 @@ pub GeneratedSyntaxContribution BuildAll()
     return Contribution.From(items);
 }
 
-pub SpannedFunctionDefinition RuleFunction(PestSyntax.Builder builder, GrammarRule rule, GrammarRule[] rules)
-{
+pub SpannedFunctionDefinition RuleFunction(PestSyntax.Builder builder, GrammarRule rule, GrammarRule[] rules) {
     string callable = Casing.CallableFromSnake(rule.name, "Parse");
     return PestSyntax.Function(builder, callable, [PestSyntax.ParameterValue(builder, "c", CursorType(builder))], ResultType(builder), RuleBody(builder, rule.expression, rule.name, rules));
 }
 
-SpannedStatement[] RuleBody(PestSyntax.Builder builder, string expression, string rule, GrammarRule[] rules)
-{
+SpannedStatement[] RuleBody(PestSyntax.Builder builder, string expression, string rule, GrammarRule[] rules) {
     string builtin = BuiltinTerm(expression, rule);
-    if (String.Len(builtin) > 0_i64)
-    {
+    if (String.Len(builtin) > 0_i64) {
         SpannedExpression term = PestSyntax.Name(builder, PestSyntax.PathValue(builder, ["Core", "Text", "Parser", "Terms", builtin], []));
         return [PestSyntax.Return(builder, PestSyntax.Call(builder, term, [PestSyntax.Local(builder, "c"), PestSyntax.Text(builder, rule)]))];
     }
-    return match (ParseExpr(expression))
-    {
+    return match ParseExpr(expression) {
         Result::Ok(node) => NodeFromCursor(builder, "c", node, rule, rules),
         Result::Error(message) => One(PestSyntax.Return(builder, ParserFail(builder, "c", "ExpectedRule", rule + ": " + message))),
     };
@@ -75,113 +60,91 @@ SpannedStatement[] RuleBody(PestSyntax.Builder builder, string expression, strin
 
 // --- Canonical parser vocabulary -------------------------------------------------------
 
-SpannedType ResultType(PestSyntax.Builder builder)
-{
+SpannedType ResultType(PestSyntax.Builder builder) {
     return PestSyntax.Named(builder, ["Core", "Text", "Parser", "Result", "TextParseResult"], [PestSyntax.Primitive(builder, PrimitiveType::String)]);
 }
 
-SpannedType CursorType(PestSyntax.Builder builder)
-{
+SpannedType CursorType(PestSyntax.Builder builder) {
     return PestSyntax.Named(builder, ["Core", "Text", "Cursor", "TextCursor"], []);
 }
 
-SpannedType CountType(PestSyntax.Builder builder)
-{
+SpannedType CountType(PestSyntax.Builder builder) {
     return PestSyntax.Primitive(builder, PrimitiveType::I64);
 }
 
-SpannedExpression ParserCall(PestSyntax.Builder builder, string name, SpannedExpression[] arguments)
-{
+SpannedExpression ParserCall(PestSyntax.Builder builder, string name, SpannedExpression[] arguments) {
     return PestSyntax.Call(builder, PestSyntax.Name(builder, PestSyntax.PathValue(builder, ["Core", "Text", "Parser", name], [])), arguments);
 }
 
-SpannedExpression CursorPosition(PestSyntax.Builder builder, string cursor)
-{
+SpannedExpression CursorPosition(PestSyntax.Builder builder, string cursor) {
     SpannedExpression callee = PestSyntax.Name(builder, PestSyntax.PathValue(builder, ["Core", "Text", "Cursor", "Position"], []));
     return PestSyntax.Call(builder, callee, [PestSyntax.Local(builder, cursor)]);
 }
 
 /// `Fail(cursor, ParseErrorKind::<kind>(label), label)`.
-SpannedExpression ParserFail(PestSyntax.Builder builder, string cursor, string kind, string label)
-{
+SpannedExpression ParserFail(PestSyntax.Builder builder, string cursor, string kind, string label) {
     SpannedExpression error = PestSyntax.ConstructVariant(builder, PestSyntax.PathValue(builder, ["Core", "Text", "Parser", "Result", "ParseErrorKind"], []), kind, [PestSyntax.Text(builder, label)]);
     return ParserCall(builder, "Fail", [PestSyntax.Local(builder, cursor), error, PestSyntax.Text(builder, label)]);
 }
 
-SpannedExpression ParserPure(PestSyntax.Builder builder, string cursor)
-{
+SpannedExpression ParserPure(PestSyntax.Builder builder, string cursor) {
     return ParserCall(builder, "Pure", [PestSyntax.Text(builder, ""), PestSyntax.Local(builder, cursor)]);
 }
 
-SpannedExpression ResultIsOk(PestSyntax.Builder builder, string result)
-{
+SpannedExpression ResultIsOk(PestSyntax.Builder builder, string result) {
     return ParserCall(builder, "IsOk", [PestSyntax.Local(builder, result)]);
 }
 
-SpannedExpression ResultNotOk(PestSyntax.Builder builder, string result)
-{
+SpannedExpression ResultNotOk(PestSyntax.Builder builder, string result) {
     return PestSyntax.Not(builder, ResultIsOk(builder, result));
 }
 
-SpannedExpression RestOnOk(PestSyntax.Builder builder, string result, string cursor)
-{
+SpannedExpression RestOnOk(PestSyntax.Builder builder, string result, string cursor) {
     return ParserCall(builder, "RestOnOk", [PestSyntax.Local(builder, result), PestSyntax.Local(builder, cursor)]);
 }
 
-SpannedExpression ParserSatisfy(PestSyntax.Builder builder, string cursor, string rule)
-{
+SpannedExpression ParserSatisfy(PestSyntax.Builder builder, string cursor, string rule) {
     return ParserCall(builder, "Satisfy", [PestSyntax.Local(builder, cursor), PestSyntax.Text(builder, rule)]);
 }
 
 /// A literal outside the grammar's printable-ASCII policy compiles to a failing parser.
-SpannedExpression LiteralMatch(PestSyntax.Builder builder, string cursor, string value, string rule)
-{
-    if (!Representable(value))
-    {
+SpannedExpression LiteralMatch(PestSyntax.Builder builder, string cursor, string value, string rule) {
+    if (!Representable(value)) {
         return ParserFail(builder, cursor, "ExpectedLiteral", rule + ": unrepresentable literal");
     }
     return ParserCall(builder, "Literal", [PestSyntax.Local(builder, cursor), PestSyntax.Text(builder, value), PestSyntax.Text(builder, rule)]);
 }
 
-SpannedExpression RuleCall(PestSyntax.Builder builder, string name, string cursor)
-{
+SpannedExpression RuleCall(PestSyntax.Builder builder, string name, string cursor) {
     return PestSyntax.Call(builder, PestSyntax.Local(builder, Casing.CallableFromSnake(name, "Parse")), [PestSyntax.Local(builder, cursor)]);
 }
 
-SpannedExpression UnknownRule(PestSyntax.Builder builder, string cursor, string rule, string name)
-{
+SpannedExpression UnknownRule(PestSyntax.Builder builder, string cursor, string rule, string name) {
     return ParserFail(builder, cursor, "ExpectedRule", rule + ": unknown rule " + name);
 }
 
-SpannedStatement LetResult(PestSyntax.Builder builder, string name, SpannedExpression value)
-{
+SpannedStatement LetResult(PestSyntax.Builder builder, string name, SpannedExpression value) {
     return PestSyntax.Let(builder, name, ResultType(builder), false, value);
 }
 
-string DecimalText(i64 value)
-{
-    if (value < 10_i64)
-    {
+string DecimalText(i64 value) {
+    if (value < 10_i64) {
         return String.DigitChar(value);
     }
     return DecimalText(value / 10_i64) + String.DigitChar(value % 10_i64);
 }
 
-SpannedStatement[] One(SpannedStatement statement)
-{
+SpannedStatement[] One(SpannedStatement statement) {
     return [statement];
 }
 
 /// Grammar literals are limited to printable ASCII and space; anything else compiles to a
 /// failing parser instead of an unreviewed byte sequence.
-bool Representable(string value)
-{
+bool Representable(string value) {
     mut i64 index = 0_i64;
-    while (index < String.Len(value))
-    {
+    while (index < String.Len(value)) {
         u8 byte = String.ByteAt(value, index);
-        if (byte < 32_u8 || byte > 126_u8)
-        {
+        if (byte < 32_u8 || byte > 126_u8) {
             return false;
         }
         index = index + 1_i64;
@@ -190,18 +153,14 @@ bool Representable(string value)
 }
 
 /// Exact single-character alphabets map to the dedicated `Core.Text.Parser.Terms` matchers.
-string BuiltinTerm(string expression, string rule)
-{
-    if (rule == "digit" && expression == "\"0\" | \"1\" | \"2\" | \"3\" | \"4\" | \"5\" | \"6\" | \"7\" | \"8\" | \"9\"")
-    {
+string BuiltinTerm(string expression, string rule) {
+    if (rule == "digit" && expression == "\"0\" | \"1\" | \"2\" | \"3\" | \"4\" | \"5\" | \"6\" | \"7\" | \"8\" | \"9\"") {
         return "Digit";
     }
-    if (rule == "lower" && expression == "\"a\" | \"b\" | \"c\" | \"d\" | \"e\" | \"f\" | \"g\" | \"h\" | \"i\" | \"j\" | \"k\" | \"l\" | \"m\" | \"n\" | \"o\" | \"p\" | \"q\" | \"r\" | \"s\" | \"t\" | \"u\" | \"v\" | \"w\" | \"x\" | \"y\" | \"z\"")
-    {
+    if (rule == "lower" && expression == "\"a\" | \"b\" | \"c\" | \"d\" | \"e\" | \"f\" | \"g\" | \"h\" | \"i\" | \"j\" | \"k\" | \"l\" | \"m\" | \"n\" | \"o\" | \"p\" | \"q\" | \"r\" | \"s\" | \"t\" | \"u\" | \"v\" | \"w\" | \"x\" | \"y\" | \"z\"") {
         return "Lower";
     }
-    if (rule == "upper" && expression == "\"A\" | \"B\" | \"C\" | \"D\" | \"E\" | \"F\" | \"G\" | \"H\" | \"I\" | \"J\" | \"K\" | \"L\" | \"M\" | \"N\" | \"O\" | \"P\" | \"Q\" | \"R\" | \"S\" | \"T\" | \"U\" | \"V\" | \"W\" | \"X\" | \"Y\" | \"Z\"")
-    {
+    if (rule == "upper" && expression == "\"A\" | \"B\" | \"C\" | \"D\" | \"E\" | \"F\" | \"G\" | \"H\" | \"I\" | \"J\" | \"K\" | \"L\" | \"M\" | \"N\" | \"O\" | \"P\" | \"Q\" | \"R\" | \"S\" | \"T\" | \"U\" | \"V\" | \"W\" | \"X\" | \"Y\" | \"Z\"") {
         return "Upper";
     }
     return "";
@@ -210,10 +169,8 @@ string BuiltinTerm(string expression, string rule)
 // --- Result-variable steps --------------------------------------------------------------
 
 /// Declare `name` as the parse result of `node` at `cursor`.
-SpannedStatement[] ResultStep(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules, string name)
-{
-    return match (node)
-    {
+SpannedStatement[] ResultStep(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules, string name) {
+    return match node {
         PestExpr::Literal(value) => One(LetResult(builder, name, LiteralMatch(builder, cursor, value, rule))),
         PestExpr::RuleRef(reference) => StepRuleRef(builder, cursor, node, reference, rule, rules, name),
         PestExpr::Any => One(LetResult(builder, name, ParserSatisfy(builder, cursor, rule))),
@@ -222,54 +179,49 @@ SpannedStatement[] ResultStep(PestSyntax.Builder builder, string cursor, PestExp
     };
 }
 
-SpannedStatement[] StepRuleRef(PestSyntax.Builder builder, string cursor, PestExpr node, string reference, string rule, GrammarRule[] rules, string name)
-{
-    if (RuleExists(rules, reference))
-    {
+SpannedStatement[] StepRuleRef(PestSyntax.Builder builder, string cursor, PestExpr node, string reference, string rule, GrammarRule[] rules, string name) {
+    if (RuleExists(rules, reference)) {
         return [LetResult(builder, name, RuleCall(builder, reference, cursor))];
     }
     return MutableStep(builder, cursor, node, rule, rules, name);
 }
 
-SpannedStatement[] MutableStep(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules, string name)
-{
+SpannedStatement[] MutableStep(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules, string name) {
     SpannedStatement declaration = PestSyntax.Let(builder, name, ResultType(builder), true, ParserPure(builder, cursor));
     return PestSyntax.Concat([declaration], Assignment(builder, cursor, node, rule, rules, name));
 }
 
 /// Assign the parse result of `node` at `cursor` to the mutable `target`.
-SpannedStatement[] Assignment(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules, string target)
-{
-    return match (node)
-    {
+SpannedStatement[] Assignment(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules, string target) {
+    return match node {
         PestExpr::Literal(value) => One(PestSyntax.Assign(builder, target, LiteralMatch(builder, cursor, value, rule))),
         PestExpr::RuleRef(reference) => One(PestSyntax.Assign(builder, target, RuleReference(builder, cursor, reference, rule, rules))),
         PestExpr::Any => One(PestSyntax.Assign(builder, target, ParserSatisfy(builder, cursor, rule))),
         PestExpr::Group(inner) => Assignment(builder, cursor, inner, rule, rules, target),
-        PestExpr::Opt(inner) => PestSyntax.Concat(Assignment(builder, cursor, inner, rule, rules, target), [PestSyntax.If(builder, ResultNotOk(builder, target), [PestSyntax.Assign(builder, target, ParserPure(builder, cursor))])]),
-        PestExpr::Not(inner) => PestSyntax.Concat(Assignment(builder, cursor, inner, rule, rules, target), [PestSyntax.IfElse(builder, ResultIsOk(builder, target), [PestSyntax.Assign(builder, target, ParserFail(builder, cursor, "ExpectedRule", rule))], [PestSyntax.Assign(builder, target, ParserPure(builder, cursor))])]),
+        PestExpr::Opt(inner) => PestSyntax.Concat(Assignment(builder, cursor, inner, rule, rules, target),
+            [PestSyntax.If(builder, ResultNotOk(builder, target), [PestSyntax.Assign(builder, target, ParserPure(builder, cursor))])]),
+        PestExpr::Not(inner) => PestSyntax.Concat(Assignment(builder, cursor, inner, rule, rules, target),
+            [PestSyntax.IfElse(builder, ResultIsOk(builder, target),
+                [PestSyntax.Assign(builder, target, ParserFail(builder, cursor, "ExpectedRule", rule))],
+                [PestSyntax.Assign(builder, target, ParserPure(builder, cursor))])]),
         PestExpr::Repeat(inner, kind) => RepeatAssignment(builder, cursor, inner, rule, rules, target, kind == PestRepeatKind::OneOrMore),
         PestExpr::Seq(parts) => SeqAssignment(builder, cursor, parts, rule, rules, target),
         PestExpr::Choice(parts) => ChoiceAssignment(builder, cursor, parts, rule, rules, target),
     };
 }
 
-SpannedExpression RuleReference(PestSyntax.Builder builder, string cursor, string reference, string rule, GrammarRule[] rules)
-{
-    if (RuleExists(rules, reference))
-    {
+SpannedExpression RuleReference(PestSyntax.Builder builder, string cursor, string reference, string rule, GrammarRule[] rules) {
+    if (RuleExists(rules, reference)) {
         return RuleCall(builder, reference, cursor);
     }
     return UnknownRule(builder, cursor, rule, reference);
 }
 
-SpannedStatement[] SeqAssignment(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules, string target)
-{
+SpannedStatement[] SeqAssignment(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules, string target) {
     string sequenceCursor = target + "SeqCur";
     mut SpannedStatement[] statements = [PestSyntax.Let(builder, sequenceCursor, CursorType(builder), true, PestSyntax.Local(builder, cursor))];
     mut i64 index = 0_i64;
-    while (index < Array.Len<PestExpr>(parts))
-    {
+    while (index < Array.Len<PestExpr>(parts)) {
         SpannedStatement advance = PestSyntax.If(builder, ResultIsOk(builder, target), [PestSyntax.Assign(builder, sequenceCursor, RestOnOk(builder, target, sequenceCursor))]);
         SpannedStatement[] body = PestSyntax.Concat(Assignment(builder, sequenceCursor, parts[index], rule, rules, target), [advance]);
         statements = Array.Append<SpannedStatement>(statements, PestSyntax.If(builder, ResultIsOk(builder, target), body));
@@ -278,31 +230,39 @@ SpannedStatement[] SeqAssignment(PestSyntax.Builder builder, string cursor, Pest
     return statements;
 }
 
-SpannedStatement[] ChoiceAssignment(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules, string target)
-{
+SpannedStatement[] ChoiceAssignment(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules, string target) {
     mut SpannedStatement[] statements = [PestSyntax.Assign(builder, target, ParserFail(builder, cursor, "ChoiceFailed", rule))];
     mut i64 index = 0_i64;
-    while (index < Array.Len<PestExpr>(parts))
-    {
+    while (index < Array.Len<PestExpr>(parts)) {
         statements = Array.Append<SpannedStatement>(statements, PestSyntax.If(builder, ResultNotOk(builder, target), Assignment(builder, cursor, parts[index], rule, rules, target)));
         index = index + 1_i64;
     }
     return statements;
 }
 
-SpannedStatement[] RepeatAssignment(PestSyntax.Builder builder, string cursor, PestExpr inner, string rule, GrammarRule[] rules, string target, bool oneOrMore)
-{
+SpannedStatement[] RepeatAssignment(PestSyntax.Builder builder, string cursor, PestExpr inner, string rule, GrammarRule[] rules, string target, bool oneOrMore) {
     string repeatCursor = target + "ManyCur";
     string repeatCount = target + "ManyCount";
     string repeatPosition = target + "ManyPos";
     string repeatRest = target + "ManyRest";
     SpannedStatement[] head = [PestSyntax.Let(builder, repeatPosition, CountType(builder), false, CursorPosition(builder, repeatCursor))];
-    SpannedStatement[] tail = [PestSyntax.If(builder, ResultNotOk(builder, target), [PestSyntax.Assign(builder, target, ParserPure(builder, repeatCursor)), PestSyntax.Break(builder)]), PestSyntax.Let(builder, repeatRest, CursorType(builder), false, RestOnOk(builder, target, repeatCursor)), PestSyntax.If(builder, PestSyntax.Binary(builder, CursorPosition(builder, repeatRest), BinaryOp::Eq, PestSyntax.Local(builder, repeatPosition)), [PestSyntax.Assign(builder, target, ParserFail(builder, repeatCursor, "ZeroWidthRepeat", rule)), PestSyntax.Break(builder)]), PestSyntax.Assign(builder, repeatCursor, PestSyntax.Local(builder, repeatRest)), PestSyntax.Assign(builder, repeatCount, PestSyntax.Binary(builder, PestSyntax.Local(builder, repeatCount), BinaryOp::Add, PestSyntax.Integer(builder, "1")))];
+    SpannedStatement[] tail = [
+        PestSyntax.If(builder, ResultNotOk(builder, target), [PestSyntax.Assign(builder, target, ParserPure(builder, repeatCursor)), PestSyntax.Break(builder)]),
+        PestSyntax.Let(builder, repeatRest, CursorType(builder), false, RestOnOk(builder, target, repeatCursor)),
+        PestSyntax.If(builder, PestSyntax.Binary(builder, CursorPosition(builder, repeatRest), BinaryOp::Eq, PestSyntax.Local(builder, repeatPosition)),
+            [PestSyntax.Assign(builder, target, ParserFail(builder, repeatCursor, "ZeroWidthRepeat", rule)), PestSyntax.Break(builder)]),
+        PestSyntax.Assign(builder, repeatCursor, PestSyntax.Local(builder, repeatRest)),
+        PestSyntax.Assign(builder, repeatCount, PestSyntax.Binary(builder, PestSyntax.Local(builder, repeatCount), BinaryOp::Add, PestSyntax.Integer(builder, "1")))
+    ];
     SpannedStatement[] loopBody = PestSyntax.Concat(PestSyntax.Concat(head, Assignment(builder, repeatCursor, inner, rule, rules, target)), tail);
-    mut SpannedStatement[] statements = [PestSyntax.Let(builder, repeatCursor, CursorType(builder), true, PestSyntax.Local(builder, cursor)), PestSyntax.Let(builder, repeatCount, CountType(builder), true, PestSyntax.Integer(builder, "0")), PestSyntax.While(builder, ResultIsOk(builder, target), loopBody)];
-    if (oneOrMore)
-    {
-        SpannedExpression empty = PestSyntax.Binary(builder, ResultIsOk(builder, target), BinaryOp::And, PestSyntax.Binary(builder, PestSyntax.Local(builder, repeatCount), BinaryOp::Lt, PestSyntax.Integer(builder, "1")));
+    mut SpannedStatement[] statements = [
+        PestSyntax.Let(builder, repeatCursor, CursorType(builder), true, PestSyntax.Local(builder, cursor)),
+        PestSyntax.Let(builder, repeatCount, CountType(builder), true, PestSyntax.Integer(builder, "0")),
+        PestSyntax.While(builder, ResultIsOk(builder, target), loopBody)
+    ];
+    if (oneOrMore) {
+        SpannedExpression empty = PestSyntax.Binary(builder, ResultIsOk(builder, target), BinaryOp::And,
+            PestSyntax.Binary(builder, PestSyntax.Local(builder, repeatCount), BinaryOp::Lt, PestSyntax.Integer(builder, "1")));
         statements = Array.Append<SpannedStatement>(statements, PestSyntax.If(builder, empty, [PestSyntax.Assign(builder, target, ParserFail(builder, cursor, "ExpectedRule", rule))]));
     }
     return statements;
@@ -311,51 +271,60 @@ SpannedStatement[] RepeatAssignment(PestSyntax.Builder builder, string cursor, P
 // --- Returning rule bodies --------------------------------------------------------------
 
 /// Statements that return the parse result of `node` at `cursor`.
-SpannedStatement[] NodeFromCursor(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules)
-{
-    return match (node)
-    {
+SpannedStatement[] NodeFromCursor(PestSyntax.Builder builder, string cursor, PestExpr node, string rule, GrammarRule[] rules) {
+    return match node {
         PestExpr::Literal(value) => One(PestSyntax.Return(builder, LiteralMatch(builder, cursor, value, rule))),
         PestExpr::RuleRef(reference) => One(PestSyntax.Return(builder, RuleReference(builder, cursor, reference, rule, rules))),
         PestExpr::Any => One(PestSyntax.Return(builder, ParserSatisfy(builder, cursor, rule))),
         PestExpr::Group(inner) => NodeFromCursor(builder, cursor, inner, rule, rules),
-        PestExpr::Opt(inner) => PestSyntax.Concat(ResultStep(builder, cursor, inner, rule, rules, "optInner"), [PestSyntax.If(builder, ResultIsOk(builder, "optInner"), [PestSyntax.Return(builder, PestSyntax.Local(builder, "optInner"))]), PestSyntax.Return(builder, ParserPure(builder, cursor))]),
-        PestExpr::Not(inner) => PestSyntax.Concat(ResultStep(builder, cursor, inner, rule, rules, "notInner"), [PestSyntax.If(builder, ResultIsOk(builder, "notInner"), [PestSyntax.Return(builder, ParserFail(builder, cursor, "ExpectedRule", rule))]), PestSyntax.Return(builder, ParserPure(builder, cursor))]),
+        PestExpr::Opt(inner) => PestSyntax.Concat(ResultStep(builder, cursor, inner, rule, rules, "optInner"), [
+            PestSyntax.If(builder, ResultIsOk(builder, "optInner"), [PestSyntax.Return(builder, PestSyntax.Local(builder, "optInner"))]),
+            PestSyntax.Return(builder, ParserPure(builder, cursor))
+        ]),
+        PestExpr::Not(inner) => PestSyntax.Concat(ResultStep(builder, cursor, inner, rule, rules, "notInner"), [
+            PestSyntax.If(builder, ResultIsOk(builder, "notInner"), [PestSyntax.Return(builder, ParserFail(builder, cursor, "ExpectedRule", rule))]),
+            PestSyntax.Return(builder, ParserPure(builder, cursor))
+        ]),
         PestExpr::Repeat(inner, kind) => ReturnMany(builder, cursor, inner, rule, rules, kind == PestRepeatKind::OneOrMore),
         PestExpr::Seq(parts) => ReturnSequence(builder, cursor, parts, rule, rules),
         PestExpr::Choice(parts) => ReturnChoice(builder, cursor, parts, rule, rules),
     };
 }
 
-SpannedStatement[] ReturnMany(PestSyntax.Builder builder, string cursor, PestExpr inner, string rule, GrammarRule[] rules, bool oneOrMore)
-{
+SpannedStatement[] ReturnMany(PestSyntax.Builder builder, string cursor, PestExpr inner, string rule, GrammarRule[] rules, bool oneOrMore) {
     SpannedStatement[] head = [PestSyntax.Let(builder, "manyPos", CountType(builder), false, CursorPosition(builder, "manyCur"))];
-    SpannedStatement[] tail = [PestSyntax.If(builder, ResultNotOk(builder, "manyStep"), [PestSyntax.Break(builder)]), PestSyntax.Let(builder, "manyRest", CursorType(builder), false, RestOnOk(builder, "manyStep", "manyCur")), PestSyntax.If(builder, PestSyntax.Binary(builder, CursorPosition(builder, "manyRest"), BinaryOp::Eq, PestSyntax.Local(builder, "manyPos")), [PestSyntax.Return(builder, ParserFail(builder, "manyCur", "ZeroWidthRepeat", rule))]), PestSyntax.Assign(builder, "manyCur", PestSyntax.Local(builder, "manyRest")), PestSyntax.Assign(builder, "manyCount", PestSyntax.Binary(builder, PestSyntax.Local(builder, "manyCount"), BinaryOp::Add, PestSyntax.Integer(builder, "1")))];
+    SpannedStatement[] tail = [
+        PestSyntax.If(builder, ResultNotOk(builder, "manyStep"), [PestSyntax.Break(builder)]),
+        PestSyntax.Let(builder, "manyRest", CursorType(builder), false, RestOnOk(builder, "manyStep", "manyCur")),
+        PestSyntax.If(builder, PestSyntax.Binary(builder, CursorPosition(builder, "manyRest"), BinaryOp::Eq, PestSyntax.Local(builder, "manyPos")),
+            [PestSyntax.Return(builder, ParserFail(builder, "manyCur", "ZeroWidthRepeat", rule))]),
+        PestSyntax.Assign(builder, "manyCur", PestSyntax.Local(builder, "manyRest")),
+        PestSyntax.Assign(builder, "manyCount", PestSyntax.Binary(builder, PestSyntax.Local(builder, "manyCount"), BinaryOp::Add, PestSyntax.Integer(builder, "1")))
+    ];
     SpannedStatement[] loopBody = PestSyntax.Concat(PestSyntax.Concat(head, ResultStep(builder, "manyCur", inner, rule, rules, "manyStep")), tail);
-    mut SpannedStatement[] statements = [PestSyntax.Let(builder, "manyCur", CursorType(builder), true, PestSyntax.Local(builder, cursor)), PestSyntax.Let(builder, "manyCount", CountType(builder), true, PestSyntax.Integer(builder, "0")), PestSyntax.While(builder, PestSyntax.Boolean(builder, true), loopBody)];
-    if (oneOrMore)
-    {
+    mut SpannedStatement[] statements = [
+        PestSyntax.Let(builder, "manyCur", CursorType(builder), true, PestSyntax.Local(builder, cursor)),
+        PestSyntax.Let(builder, "manyCount", CountType(builder), true, PestSyntax.Integer(builder, "0")),
+        PestSyntax.While(builder, PestSyntax.Boolean(builder, true), loopBody)
+    ];
+    if (oneOrMore) {
         SpannedExpression empty = PestSyntax.Binary(builder, PestSyntax.Local(builder, "manyCount"), BinaryOp::Lt, PestSyntax.Integer(builder, "1"));
         statements = Array.Append<SpannedStatement>(statements, PestSyntax.If(builder, empty, [PestSyntax.Return(builder, ParserFail(builder, cursor, "ExpectedRule", rule))]));
     }
     return Array.Append<SpannedStatement>(statements, PestSyntax.Return(builder, ParserPure(builder, "manyCur")));
 }
 
-SpannedStatement[] ReturnSequence(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules)
-{
+SpannedStatement[] ReturnSequence(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules) {
     i64 count = Array.Len<PestExpr>(parts);
-    if (count < 1_i64)
-    {
+    if (count < 1_i64) {
         return [PestSyntax.Return(builder, ParserPure(builder, cursor))];
     }
-    if (count == 1_i64)
-    {
+    if (count == 1_i64) {
         return NodeFromCursor(builder, cursor, parts[0_i64], rule, rules);
     }
     mut SpannedStatement[] statements = [PestSyntax.Let(builder, "seqCur", CursorType(builder), true, PestSyntax.Local(builder, cursor))];
     mut i64 index = 0_i64;
-    while (index < count)
-    {
+    while (index < count) {
         string name = "seq" + DecimalText(index);
         statements = PestSyntax.Concat(statements, ResultStep(builder, "seqCur", parts[index], rule, rules, name));
         statements = Array.Append<SpannedStatement>(statements, PestSyntax.If(builder, ResultNotOk(builder, name), [PestSyntax.Return(builder, PestSyntax.Local(builder, name))]));
@@ -365,21 +334,17 @@ SpannedStatement[] ReturnSequence(PestSyntax.Builder builder, string cursor, Pes
     return Array.Append<SpannedStatement>(statements, PestSyntax.Return(builder, ParserPure(builder, "seqCur")));
 }
 
-SpannedStatement[] ReturnChoice(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules)
-{
+SpannedStatement[] ReturnChoice(PestSyntax.Builder builder, string cursor, PestExpr[] parts, string rule, GrammarRule[] rules) {
     i64 count = Array.Len<PestExpr>(parts);
-    if (count < 1_i64)
-    {
+    if (count < 1_i64) {
         return [PestSyntax.Return(builder, ParserFail(builder, cursor, "ChoiceFailed", rule))];
     }
-    if (count == 1_i64)
-    {
+    if (count == 1_i64) {
         return NodeFromCursor(builder, cursor, parts[0_i64], rule, rules);
     }
     mut SpannedStatement[] statements = [];
     mut i64 index = 0_i64;
-    while (index < count)
-    {
+    while (index < count) {
         string name = "choice" + DecimalText(index);
         statements = PestSyntax.Concat(statements, ResultStep(builder, cursor, parts[index], rule, rules, name));
         statements = Array.Append<SpannedStatement>(statements, PestSyntax.If(builder, ResultIsOk(builder, name), [PestSyntax.Return(builder, PestSyntax.Local(builder, name))]));

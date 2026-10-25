@@ -19,230 +19,118 @@ use Http2.Server;
 
 // Client and server over loopback TCP with prior-knowledge h2c (RFC 9113 section 3.3).
 
-pub SocketAddress Loopback(i64 port)
-{
-    Port value = match (NetworkTypes.PortNumber(port))
-    {
-        Result::Ok(p) => p,
-        Result::Error(_) => NetworkTypes.PortBytes(0_u8, 0_u8),
-    };
-    return SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: value,
-    };
+pub SocketAddress Loopback(i64 port) {
+    Port value = match NetworkTypes.PortNumber(port) { Result::Ok(p) => p, Result::Error(_) => NetworkTypes.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
 }
 
-pub Option<Deadline> Within(i64 millis)
-{
-    return match (Deadline.After(Time.FromMilliseconds(millis)))
-    {
+pub Option<Deadline> Within(i64 millis) {
+    return match Deadline.After(Time.FromMilliseconds(millis)) {
         Result::Ok(deadline) => Option.FromValue<Deadline>(deadline),
         Result::Error(_) => Option.Empty<Deadline>(),
     };
 }
 
-unit Guard(TcpStream stream)
-{
-    TransferDeadlines policy = TransferDeadlines
-    {
-        read: Within(20000_i64),
-        write: Within(20000_i64),
-    };
+unit Guard(TcpStream stream) {
+    TransferDeadlines policy = TransferDeadlines { read: Within(20000_i64), write: Within(20000_i64) };
     stream.SetDeadlines(policy);
     return;
 }
 
-u8[] Pattern(i64 count)
-{
+u8[] Pattern(i64 count) {
     u8[] out = Slice.New(count);
     mut i64 i = 0_i64;
-    while (i < count)
-    {
-        out[i] = u8((i * 7_i64) & 255_i64);
-        i = i + 1_i64;
-    }
+    while i < count { out[i] = u8((i * 7_i64) & 255_i64); i = i + 1_i64; }
     return out;
 }
 
-bool SameBytes(u8[] a, u8[] b)
-{
-    if (Slice.Len(a) != Slice.Len(b))
-    {
-        return false;
-    }
+bool SameBytes(u8[] a, u8[] b) {
+    if Slice.Len(a) != Slice.Len(b) { return false; }
     mut i64 i = 0_i64;
-    while (i < Slice.Len(a))
-    {
-        if (a[i] != b[i])
-        {
-            return false;
-        }
-        i = i + 1_i64;
-    }
+    while i < Slice.Len(a) { if a[i] != b[i] { return false; } i = i + 1_i64; }
     return true;
 }
 
-string HeaderValue(Header[] headers, string name)
-{
+string HeaderValue(Header[] headers, string name) {
     mut i64 i = 0_i64;
-    while (i < Array.Len<Header>(headers))
-    {
+    while i < Array.Len<Header>(headers) {
         Header header = Array.Get<Header>(headers, i);
-        if (header.name == name)
-        {
-            return header.value;
-        }
+        if header.name == name { return header.value; }
         i = i + 1_i64;
     }
     return "";
 }
 
 // GET answers "path=<target> host=<host>"; POST echoes the body.
-type Echo : RequestHandler
-{
+type Echo: RequestHandler {
     i64 tag;
-
-    pub Response Handle(Request request)
-    {
-        return EchoResponse(request);
-    }
+    pub Response Handle(Request request) { return EchoResponse(request); }
 }
 
-Response EchoResponse(Request request)
-{
+Response EchoResponse(Request request) {
     mut Header[] headers = Array.Empty<Header>();
-    Array.Append<Header>(headers, Header
-    {
-        name: "Content-Type",
-        value: "application/octet-stream",
-    });
-    Array.Append<Header>(headers, Header
-    {
-        name: "x-method",
-        value: request.method,
-    });
-    if (request.method == "POST")
-    {
-        return Response
-        {
-            status: 200_i64,
-            reason: "OK",
-            headers: headers,
-            body: request.body,
-        };
+    Array.Append<Header>(headers, Header { name: "Content-Type", value: "application/octet-stream" });
+    Array.Append<Header>(headers, Header { name: "x-method", value: request.method });
+    if request.method == "POST" {
+        return Response { status: 200_i64, reason: "OK", headers: headers, body: request.body };
     }
     string text = "path=" + request.target + " host=" + HeaderValue(request.headers, "host");
-    return Response
-    {
-        status: 200_i64,
-        reason: "OK",
-        headers: headers,
-        body: Convert.StringToBytes(text),
-    };
+    return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes(text) };
 }
 
-Config SmallWindows()
-{
+Config SmallWindows() {
     Config config = Connection.DefaultConfig();
     config.initialWindowSize = 16384_i64;
     config.timeoutMillis = 20000_i64;
     return config;
 }
 
-i64 ServeOne(TcpListener listener)
-{
-    Echo handler = Echo
-    {
-        tag: 1_i64,
-    };
-    Result<i64, Http2Error> served = Server.AcceptAndServe(listener, handler, SmallWindows(), Within(20000_i64));
-    return match (served)
-    {
+i64 ServeOne(TcpListener listener) {
+    Echo handler = Echo { tag: 1_i64 };
+    Result<i64,Http2Error> served = Server.AcceptAndServe(listener, handler, SmallWindows(), Within(20000_i64));
+    return match served {
         Result::Ok(count) => count,
         Result::Error(error) => -100_i64 - FrameErrors.CodeOf(error),
     };
 }
 
-Fiber<i64> StartServer(TcpListener listener)
-{
+Fiber<i64> StartServer(TcpListener listener) {
     return spawn (() => ServeOne(listener));
 }
 
-Request Get(string target)
-{
+Request Get(string target) {
     mut Header[] headers = Array.Empty<Header>();
-    Array.Append<Header>(headers, Header
-    {
-        name: "Host",
-        value: "example.test",
-    });
-    Array.Append<Header>(headers, Header
-    {
-        name: "Connection",
-        value: "keep-alive",
-    });
-    return Request
-    {
-        method: "GET",
-        target: target,
-        headers: headers,
-        body: Slice.New(0_i64),
-    };
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
+    Array.Append<Header>(headers, Header { name: "Connection", value: "keep-alive" });
+    return Request { method: "GET", target: target, headers: headers, body: Slice.New(0_i64) };
 }
 
-Request Post(string target, u8[] body)
-{
+Request Post(string target, u8[] body) {
     mut Header[] headers = Array.Empty<Header>();
-    Array.Append<Header>(headers, Header
-    {
-        name: "Host",
-        value: "example.test",
-    });
-    return Request
-    {
-        method: "POST",
-        target: target,
-        headers: headers,
-        body: body,
-    };
+    Array.Append<Header>(headers, Header { name: "Host", value: "example.test" });
+    return Request { method: "POST", target: target, headers: headers, body: body };
 }
 
-string BodyText(Response response)
-{
-    return match (Convert.BytesToString(response.body))
-    {
-        Result::Ok(text) => text,
-        Result::Error(_) => "<binary>",
-    };
+string BodyText(Response response) {
+    return match Convert.BytesToString(response.body) { Result::Ok(text) => text, Result::Error(_) => "<binary>", };
 }
 
-i64 JoinCount(Fiber<i64> server)
-{
-    return match (server.Join())
-    {
-        Result::Ok(count) => count,
-        Result::Error(_) => -1_i64,
-    };
+i64 JoinCount(Fiber<i64> server) {
+    return match server.Join() { Result::Ok(count) => count, Result::Error(_) => -1_i64, };
 }
 
 // Runs `scenario` against a fresh server; returns the server's handled count.
-Result<unit, NetworkError> GetThenPost()
-{
+Result<unit,NetworkError> GetThenPost() {
     TcpListener listener = TcpListener.Bind(Loopback(0_i64), 4_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<i64> server = StartServer(listener);
     TcpStream stream = TcpStream.Connect(address, NetworkTypes.DefaultSocketOptions(), Within(5000_i64))?;
     Guard(stream);
-    match (Client.Open(stream, SmallWindows()))
-    {
+    match Client.Open(stream, SmallWindows()) {
         Result::Error(_) => Assert.Fail("client preface"),
         Result::Ok(conn) => {
-            match (Client.Send(conn, stream, Get("/hello?x=1")))
-            {
-                Result::Error(error) => {
-                    Assert.Fail("GET failed: " + FrameErrors.KindOf(error));
-                },
+            match Client.Send(conn, stream, Get("/hello?x=1")) {
+                Result::Error(error) => { Assert.Fail("GET failed: " + FrameErrors.KindOf(error)); },
                 Result::Ok(response) => {
                     Assert.Equal<i64>(response.status, 200_i64, "GET status");
                     Assert.Equal<string>(BodyText(response), "path=/hello?x=1 host=example.test", "GET body");
@@ -253,11 +141,8 @@ Result<unit, NetworkError> GetThenPost()
             u8[] payload = Pattern(40000_i64);
             i64 updatesBefore = conn.windowUpdates;
             // The request owns its body; keep `payload` to compare the echo.
-            match (Client.Send(conn, stream, Post("/upload", Array.Copy<u8>(payload))))
-            {
-                Result::Error(error) => {
-                    Assert.Fail("POST failed: " + FrameErrors.KindOf(error));
-                },
+            match Client.Send(conn, stream, Post("/upload", Array.Copy<u8>(payload))) {
+                Result::Error(error) => { Assert.Fail("POST failed: " + FrameErrors.KindOf(error)); },
                 Result::Ok(response) => {
                     Assert.Equal<i64>(response.status, 200_i64, "POST status");
                     Assert.Equal<i64>(Slice.Len(response.body), 40000_i64, "echo length");
@@ -277,21 +162,11 @@ Result<unit, NetworkError> GetThenPost()
     return Result::Ok(());
 }
 
-unit RunGetThenPost()
-{
-    match (GetThenPost())
-    {
-        Result::Ok(_) => (),
-        Result::Error(_) => Assert.Fail("network setup"),
-    };
+unit RunGetThenPost() {
+    match GetThenPost() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("network setup"), };
 }
 
-test LoopbackGetThenLargePost
-{
+test LoopbackGetThenLargePost {
     Fiber<unit> scenario = spawn RunGetThenPost();
-    match (scenario.Join())
-    {
-        Result::Ok(_) => (),
-        Result::Error(_) => Assert.Fail("scenario"),
-    };
+    match scenario.Join() { Result::Ok(_) => (), Result::Error(_) => Assert.Fail("scenario"), };
 }

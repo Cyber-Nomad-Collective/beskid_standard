@@ -6,41 +6,29 @@ use Concurrency.TryResult;
 use Core.Results;
 
 [NeverTransferable]
-pub type Mutex
-{
+pub type Mutex {
     i64 handle;
 }
 
-pub Mutex Create()
-{
+pub Mutex Create() {
     i64 handle = __mutex_create();
-    return Mutex
-    {
-        handle: handle,
-    };
+    return Mutex { handle: handle };
 }
 
 /// Parks until the mutex is acquired or the fiber is cancelled.
-pub Core.Results.Result<MutexGuard, MutexError> Lock(Mutex mutex)
-{
+pub Core.Results.Result<MutexGuard, MutexError> Lock(Mutex mutex) {
     i64 raw = __mutex_lock(mutex.handle);
     Status status = Status.FromCode(raw);
-    return match (status)
-    {
-        Status::Ok => Results.Success<MutexGuard, MutexError>(MutexGuard
-        {
-            mutexHandle: mutex.handle,
-        }),
+    return match status {
+        Status::Ok => Results.Success<MutexGuard, MutexError>(MutexGuard { mutexHandle: mutex.handle }),
         _ => Results.Failure<MutexGuard, MutexError>(MapLockError(status)),
     };
 }
 
 /// Maps a failed `Lock` status. `mutex_lock` reports cancellation of the waiting fiber (or an
 /// unknown handle) as 1; any status outside that contract is `Unexpected` with its raw code.
-pub MutexError MapLockError(Status status)
-{
-    return match (status)
-    {
+pub MutexError MapLockError(Status status) {
+    return match status {
         Status::Cancelled(reason) => MutexError::Cancelled(reason),
         Status::Closed(_) => MutexError::Cancelled(0),
         _ => MutexError::Unexpected(Status.Discriminant(status)),
@@ -48,16 +36,11 @@ pub MutexError MapLockError(Status status)
 }
 
 /// Returns `WouldBlock` when contended, `Err` on cancel.
-pub TryResult<MutexGuard, MutexError> TryLock(Mutex mutex)
-{
+pub TryResult<MutexGuard, MutexError> TryLock(Mutex mutex) {
     i64 raw = __mutex_try_lock(mutex.handle);
     Status status = Status.FromCode(raw);
-    return match (status)
-    {
-        Status::Ok => TryResult::Ok(MutexGuard
-        {
-            mutexHandle: mutex.handle,
-        }),
+    return match status {
+        Status::Ok => TryResult::Ok(MutexGuard { mutexHandle: mutex.handle }),
         Status::Cancelled(reason) => TryResult::Err(MutexError::Cancelled(reason)),
         // mutex_try_lock reports a held mutex as 1 (MutexBusy).
         Status::Closed(_) => TryResult::WouldBlock,
@@ -65,8 +48,7 @@ pub TryResult<MutexGuard, MutexError> TryLock(Mutex mutex)
     };
 }
 
-pub unit Unlock(MutexGuard guard)
-{
+pub unit Unlock(MutexGuard guard) {
     __mutex_unlock(guard.mutexHandle);
     return;
 }

@@ -7,58 +7,44 @@ use Crypto.Scratch;
 /// i64 add wraps and `>>` is logical in Beskid 0.5.2, so i64 acts as a 64-bit unsigned word.
 /// `meta[0]` buffered bytes, `meta[1]` total length in bytes, `meta[2]` 1 after `Finish`,
 /// `meta[3]` digest length (48 or 64), `meta[4..6)` the compression cursor.
-pub type Sha512State
-{
+pub type Sha512State {
     i64[] h;
     u8[] buffer;
     i64[] meta;
 }
 
-pub i64 BlockLength()
-{
-    return 128_i64;
-}
+pub i64 BlockLength() { return 128_i64; }
 
 // Initial hash words (FIPS 180-4) are stored as i64. A word with the top bit set is
 // written as its two's-complement negative value, because the hex form is out of i64 range.
-Sha512State NewWith(i64[] iv, i64 digestLength)
-{
-    return Sha512State
-    {
-        h: iv,
-        buffer: Scratch.Bytes(128_i64),
-        meta: [0_i64, 0_i64, 0_i64, digestLength, 0_i64, 0_i64],
-    };
+Sha512State NewWith(i64[] iv, i64 digestLength) {
+    return Sha512State { h: iv, buffer: Scratch.Bytes(128_i64), meta: [0_i64, 0_i64, 0_i64, digestLength, 0_i64, 0_i64] };
 }
 
 /// Starts a new SHA-512 computation.
-pub Sha512State New512()
-{
-    return NewWith([0x6a09e667f3bcc908_i64, (-4942790177534073029_i64), 0x3c6ef372fe94f82b_i64, (-6534734903238641935_i64), 0x510e527fade682d1_i64, (-7276294671716946913_i64), 0x1f83d9abfb41bd6b_i64, 0x5be0cd19137e2179_i64], 64_i64);
+pub Sha512State New512() {
+    return NewWith([
+        0x6a09e667f3bcc908_i64, (-4942790177534073029_i64), 0x3c6ef372fe94f82b_i64, (-6534734903238641935_i64),
+        0x510e527fade682d1_i64, (-7276294671716946913_i64), 0x1f83d9abfb41bd6b_i64, 0x5be0cd19137e2179_i64
+    ], 64_i64);
 }
 
 /// Starts a new SHA-384 computation.
-pub Sha512State New384()
-{
-    return NewWith([(-3766243637369397544_i64), 0x629a292a367cd507_i64, (-7973340178411365097_i64), 0x152fecd8f70e5939_i64, 0x67332667ffc00b31_i64, (-8163818279084223215_i64), (-2662702644619276377_i64), 0x47b5481dbefa4fa4_i64], 48_i64);
+pub Sha512State New384() {
+    return NewWith([
+        (-3766243637369397544_i64), 0x629a292a367cd507_i64, (-7973340178411365097_i64), 0x152fecd8f70e5939_i64,
+        0x67332667ffc00b31_i64, (-8163818279084223215_i64), (-2662702644619276377_i64), 0x47b5481dbefa4fa4_i64
+    ], 48_i64);
 }
 
 /// Digest length in bytes of this state: 48 for SHA-384, 64 for SHA-512.
-pub i64 DigestLength(Sha512State state)
-{
-    return state.meta[3];
-}
+pub i64 DigestLength(Sha512State state) { return state.meta[3]; }
 
 /// Returns an independent copy of a running computation.
-pub Sha512State Clone(Sha512State state)
-{
+pub Sha512State Clone(Sha512State state) {
     Sha512State copy = NewWith([0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64], state.meta[3]);
     mut i64 i = 0_i64;
-    while (i < 8_i64)
-    {
-        copy.h[i] = state.h[i];
-        i = i + 1_i64;
-    }
+    while i < 8_i64 { copy.h[i] = state.h[i]; i = i + 1_i64; }
     Slice.Copy(copy.buffer, 0_i64, state.buffer, 0_i64, 128_i64);
     copy.meta[0] = state.meta[0];
     copy.meta[1] = state.meta[1];
@@ -68,8 +54,7 @@ pub Sha512State Clone(Sha512State state)
 
 /// Compresses the whole blocks of `data[offset, offset + length)`; `length` is a multiple
 /// of the block length.
-unit Compress(Sha512State state, u8[] data, i64 offset, i64 length)
-{
+unit Compress(Sha512State state, u8[] data, i64 offset, i64 length) {
     state.meta[4] = offset;
     state.meta[5] = offset + length;
     CompressBlocks(state.h, data, state.meta);
@@ -80,12 +65,11 @@ unit Compress(Sha512State state, u8[] data, i64 offset, i64 length)
 /// SHA-512 compressions (FIPS 180-4 6.4.2) of the 128-byte blocks of `data` from offset
 /// `meta[4]` up to `meta[5]`. Precondition: the range is in bounds, a multiple of 128
 /// long, and `h` has 8 words; the block does not check.
-i64 CompressBlocks(i64[] h, u8[] data, i64[] meta)
-{
+i64 CompressBlocks(i64[] h, u8[] data, i64[] meta) {
     mut i64 last = 0_i64;
-    while (meta[4] < meta[5])
-    {
-        last = clif { %hp1 = payload %0
+    while meta[4] < meta[5] {
+        last = clif {
+            %hp1 = payload %0
             %dp2 = payload %1
             %mp3 = payload %2
             %pos4 = load.i64 %mp3+32
@@ -2673,52 +2657,37 @@ i64 CompressBlocks(i64[] h, u8[] data, i64[] meta)
             %c2578 = iconst.i64 128
             %next2579 = iadd %pos4, %c2578
             store %next2579, %mp3+32
-            return %next2579 };
+            return %next2579
+        };
     }
     return last;
 }
-
 // END GENERATED Sha512Block
 
 /// Absorbs `count` bytes of `data` from `offset`. Returns false for an invalid range or a finished state.
-pub bool UpdateRange(Sha512State state, u8[] data, i64 offset, i64 count)
-{
-    if (state.meta[2] != 0_i64)
-    {
-        return false;
-    }
-    if (!Slice.IsValidRange(Slice.Len(data), offset, count))
-    {
-        return false;
-    }
+pub bool UpdateRange(Sha512State state, u8[] data, i64 offset, i64 count) {
+    if state.meta[2] != 0_i64 { return false; }
+    if !Slice.IsValidRange(Slice.Len(data), offset, count) { return false; }
     mut i64 pos = offset;
     i64 end = offset + count;
     mut i64 buffered = state.meta[0];
     state.meta[1] = state.meta[1] + count;
-    if (buffered > 0_i64)
-    {
-        while (buffered < 128_i64 && pos < end)
-        {
+    if buffered > 0_i64 {
+        while buffered < 128_i64 && pos < end {
             state.buffer[buffered] = data[pos];
             buffered = buffered + 1_i64;
             pos = pos + 1_i64;
         }
-        if (buffered < 128_i64)
-        {
-            state.meta[0] = buffered;
-            return true;
-        }
+        if buffered < 128_i64 { state.meta[0] = buffered; return true; }
         Compress(state, state.buffer, 0_i64, 128_i64);
         buffered = 0_i64;
     }
     i64 whole = ((end - pos) / 128_i64) * 128_i64;
-    if (whole > 0_i64)
-    {
+    if whole > 0_i64 {
         Compress(state, data, pos, whole);
         pos = pos + whole;
     }
-    while (pos < end)
-    {
+    while pos < end {
         state.buffer[buffered] = data[pos];
         buffered = buffered + 1_i64;
         pos = pos + 1_i64;
@@ -2727,43 +2696,30 @@ pub bool UpdateRange(Sha512State state, u8[] data, i64 offset, i64 count)
     return true;
 }
 
-pub bool Update(Sha512State state, u8[] data)
-{
+pub bool Update(Sha512State state, u8[] data) {
     return UpdateRange(state, data, 0_i64, Slice.Len(data));
 }
 
 /// Pads and returns the digest (48 or 64 bytes). The state cannot be updated afterwards.
 /// Message length is tracked in bytes as i64, so the high 64 bits of the 128-bit length field are zero.
-pub u8[] Finish(Sha512State state)
-{
+pub u8[] Finish(Sha512State state) {
     u8[] out = Scratch.Bytes(state.meta[3]);
-    if (state.meta[2] == 0_i64)
-    {
+    if state.meta[2] == 0_i64 {
         i64 byteLength = state.meta[1];
         mut i64 buffered = state.meta[0];
         state.buffer[buffered] = 0x80_u8;
         buffered = buffered + 1_i64;
-        if (buffered > 112_i64)
-        {
-            while (buffered < 128_i64)
-            {
-                state.buffer[buffered] = 0_u8;
-                buffered = buffered + 1_i64;
-            }
+        if buffered > 112_i64 {
+            while buffered < 128_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
             Compress(state, state.buffer, 0_i64, 128_i64);
             buffered = 0_i64;
         }
-        while (buffered < 128_i64)
-        {
-            state.buffer[buffered] = 0_u8;
-            buffered = buffered + 1_i64;
-        }
+        while buffered < 128_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
         // 128-bit big-endian bit length: high word carries the top 3 bits of the byte count.
         state.buffer[119] = u8((byteLength >> 61_i64) & 0xFF_i64);
         i64 bitLength = byteLength << 3_i64;
         mut i64 i = 0_i64;
-        while (i < 8_i64)
-        {
+        while i < 8_i64 {
             state.buffer[120_i64 + i] = u8((bitLength >> ((7_i64 - i) * 8_i64)) & 0xFF_i64);
             i = i + 1_i64;
         }
@@ -2772,8 +2728,7 @@ pub u8[] Finish(Sha512State state)
         state.meta[2] = 1_i64;
     }
     mut i64 i = 0_i64;
-    while (i < state.meta[3])
-    {
+    while i < state.meta[3] {
         i64 word = state.h[i / 8_i64];
         out[i] = u8((word >> ((7_i64 - (i % 8_i64)) * 8_i64)) & 0xFF_i64);
         i = i + 1_i64;
@@ -2782,10 +2737,8 @@ pub u8[] Finish(Sha512State state)
 }
 
 /// One-shot SHA-512 (OpenSSL when the native provider is selected, R27).
-pub u8[] Hash512(u8[] data)
-{
-    if (Slice.Len(data) < Native.MaxEvpLength() && Provider.IsNative())
-    {
+pub u8[] Hash512(u8[] data) {
+    if Slice.Len(data) < Native.MaxEvpLength() && Provider.IsNative() {
         u8[] digest = Scratch.Bytes(64_i64);
         Native.Sha512Into(data, digest);
         return digest;
@@ -2796,10 +2749,8 @@ pub u8[] Hash512(u8[] data)
 }
 
 /// One-shot SHA-384 (OpenSSL when the native provider is selected, R27).
-pub u8[] Hash384(u8[] data)
-{
-    if (Slice.Len(data) < Native.MaxEvpLength() && Provider.IsNative())
-    {
+pub u8[] Hash384(u8[] data) {
+    if Slice.Len(data) < Native.MaxEvpLength() && Provider.IsNative() {
         u8[] digest = Scratch.Bytes(48_i64);
         Native.Sha384Into(data, digest);
         return digest;

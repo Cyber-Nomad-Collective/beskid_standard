@@ -28,106 +28,56 @@ use Core.Collections.List;
 
 // ---- TypesTests.bd (formerly target `NetworkTypesTests`) ----
 
-test NetworkIpv4AndIpv6ValuesKeepBoundedPorts
-{
-    SocketAddress v4 = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
-    SocketAddress v6 = SocketAddress
-    {
-        address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32),
-        port: Network.Types.PortBytes(255_u8, 255_u8),
-    };
+test NetworkIpv4AndIpv6ValuesKeepBoundedPorts {
+    SocketAddress v4 = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    SocketAddress v6 = SocketAddress { address: IpAddress::V6(0_u32, 0_u32, 0_u32, 1_u32), port: Network.Types.PortBytes(255_u8, 255_u8) };
     Assert.Equal(v4.port.Value(), 0_i64, "bind permits an OS-selected port");
     Assert.Equal(v6.port.Value(), 65535_i64, "largest portable port");
-    bool loopback = match (v6.address)
-    {
-        IpAddress::V6(_, _, _, last) => last == 1_u32,
-        _ => false,
-    };
+    bool loopback = match v6.address { IpAddress::V6(_, _, _, last) => last == 1_u32, _ => false, };
     Assert.True(loopback, "IPv6 address groups survive the typed value");
 }
 
-test NetworkDatagramKeepsSourceAndTruncation
-{
-    SocketAddress source = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(1_u8, 187_u8),
-    };
-    Datagram value = Datagram
-    {
-        payload: [7_u8, 8_u8],
-        source: source,
-        truncated: true,
-    };
+test NetworkDatagramKeepsSourceAndTruncation {
+    SocketAddress source = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(1_u8, 187_u8) };
+    Datagram value = Datagram { payload: [7_u8, 8_u8], source: source, truncated: true };
     Assert.Equal(Slice.Len(value.payload), 2_i64, "one owned payload");
     Assert.Equal(value.source.port.Value(), 443_i64, "source metadata");
     Assert.True(value.truncated, "truncation remains visible");
 }
 
-test NetworkCleanupConversionIsExplicitAndPortable
-{
+test NetworkCleanupConversionIsExplicitAndPortable {
     NetworkError error = Network.Errors.FromDisposeError(DisposeError::Failed);
-    Assert.True(match (error)
-    {
-        NetworkError::CleanupFailed => true,
-        _ => false,
-    }, "cleanup maps only through the declared conversion");
+    Assert.True(match error { NetworkError::CleanupFailed => true, _ => false, }, "cleanup maps only through the declared conversion");
     SocketOptions options = Network.Types.DefaultSocketOptions();
     Assert.False(options.noDelay, "default option has no native flag");
     Assert.False(options.keepAlive, "default option is portable");
 }
 
 // Exhaustive matching makes additions to the closed error vocabulary reviewable.
-i64 ErrorOrdinal(NetworkError error)
-{
-    return match (error)
-    {
-        NetworkError::AddressInUse => 1_i64,
-        NetworkError::AddressNotAvailable => 2_i64,
-        NetworkError::ConnectionAborted => 3_i64,
-        NetworkError::ConnectionRefused => 4_i64,
-        NetworkError::ConnectionReset => 5_i64,
-        NetworkError::HostNotFound => 6_i64,
-        NetworkError::InvalidAddress => 7_i64,
-        NetworkError::MessageTooLarge => 8_i64,
-        NetworkError::NetworkDown => 9_i64,
-        NetworkError::NotConnected => 10_i64,
-        NetworkError::PermissionDenied => 11_i64,
-        NetworkError::TimedOut => 12_i64,
-        NetworkError::Cancelled => 13_i64,
-        NetworkError::Closed => 14_i64,
-        NetworkError::Busy => 15_i64,
-        NetworkError::CleanupFailed => 16_i64,
-        NetworkError::Unsupported => 17_i64,
-        NetworkError::ResourceExhausted => 18_i64,
+i64 ErrorOrdinal(NetworkError error) {
+    return match error {
+        NetworkError::AddressInUse => 1_i64, NetworkError::AddressNotAvailable => 2_i64,
+        NetworkError::ConnectionAborted => 3_i64, NetworkError::ConnectionRefused => 4_i64,
+        NetworkError::ConnectionReset => 5_i64, NetworkError::HostNotFound => 6_i64,
+        NetworkError::InvalidAddress => 7_i64, NetworkError::MessageTooLarge => 8_i64,
+        NetworkError::NetworkDown => 9_i64, NetworkError::NotConnected => 10_i64,
+        NetworkError::PermissionDenied => 11_i64, NetworkError::TimedOut => 12_i64,
+        NetworkError::Cancelled => 13_i64, NetworkError::Closed => 14_i64,
+        NetworkError::Busy => 15_i64, NetworkError::CleanupFailed => 16_i64,
+        NetworkError::Unsupported => 17_i64, NetworkError::ResourceExhausted => 18_i64,
     };
 }
 
-test NetworkErrorUnionHasNoNativePayload
-{
+test NetworkErrorUnionHasNoNativePayload {
     Assert.Equal(ErrorOrdinal(NetworkError::Busy), 15_i64, "portable admission failure");
     Assert.Equal(ErrorOrdinal(NetworkError::Unsupported), 17_i64, "closed error vocabulary");
     Assert.Equal(ErrorOrdinal(NetworkError::ResourceExhausted), 18_i64, "exhaustion is distinct from NetworkDown");
 }
 
-test NetworkPortsRejectOutOfRangeNumbers
-{
-    Assert.True(match (Network.Types.PortNumber(-1_i64))
-    {
-        Result::Error(NetworkError::InvalidAddress) => true,
-        _ => false,
-    }, "negative port has no value");
-    Assert.True(match (Network.Types.PortNumber(65536_i64))
-    {
-        Result::Error(NetworkError::InvalidAddress) => true,
-        _ => false,
-    }, "oversized port has no value");
-    match (Network.Types.PortNumber(65535_i64))
-    {
+test NetworkPortsRejectOutOfRangeNumbers {
+    Assert.True(match Network.Types.PortNumber(-1_i64) { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "negative port has no value");
+    Assert.True(match Network.Types.PortNumber(65536_i64) { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "oversized port has no value");
+    match Network.Types.PortNumber(65535_i64) {
         Result::Ok(port) => Assert.Equal(port.Value(), 65535_i64, "maximum port is representable"),
         Result::Error(_) => Assert.Fail("valid bounded port"),
     };
@@ -135,85 +85,62 @@ test NetworkPortsRejectOutOfRangeNumbers
 
 // ---- DnsTests.bd (formerly target `NetworkDnsTests`) ----
 
-unit ResolveIpv4()
-{
+unit ResolveIpv4() {
     Result<SocketAddress[], NetworkError> result = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 80_u8), Option::Some(AddressFamily::V4), Option.Empty<Deadline>());
-    match (result)
-    {
+    match result {
         Result::Error(_) => Assert.Fail("numeric IPv4 resolution must succeed"),
         Result::Ok(addresses) => {
             Assert.True(Array.Len<SocketAddress>(addresses) > 0_i64, "resolver returns all matching results");
             mut i64 index = 0_i64;
-            while (index < Array.Len<SocketAddress>(addresses))
-            {
+            while index < Array.Len<SocketAddress>(addresses) {
                 SocketAddress address = addresses[index];
                 Assert.Equal(address.port.Value(), 80_i64, "requested port survives resolution");
-                Assert.True(match (address.address)
-                {
-                    IpAddress::V4(_, _, _, _) => true,
-                    _ => false,
-                }, "family filter excludes IPv6");
+                Assert.True(match address.address { IpAddress::V4(_, _, _, _) => true, _ => false, }, "family filter excludes IPv6");
                 index = index + 1_i64;
             }
         },
     };
 }
 
-test NetworkDnsIpv4FilterPreservesTypedAddresses
-{
+test NetworkDnsIpv4FilterPreservesTypedAddresses {
     Fiber<unit> scenario = spawn ResolveIpv4();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "resolver scenario completes");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "resolver scenario completes");
 }
 
-test NetworkDnsPortZeroIsRejectedBeforeResolving
-{
+test NetworkDnsPortZeroIsRejectedBeforeResolving {
     Result<SocketAddress[], NetworkError> result = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 0_u8), Option::None, Option.Empty<Deadline>());
-    Assert.True(match (result)
-    {
-        Result::Error(NetworkError::InvalidAddress) => true,
-        _ => false,
-    }, "port zero is reserved for binding");
+    Assert.True(match result { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "port zero is reserved for binding");
 }
 
-unit ResolveTwice()
-{
+unit ResolveTwice() {
     Result<SocketAddress[], NetworkError> first = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 81_u8), Option::None, Option.Empty<Deadline>());
     Result<SocketAddress[], NetworkError> second = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 82_u8), Option::None, Option.Empty<Deadline>());
-    match (first)
-    {
+    match first {
         Result::Error(_) => Assert.Fail("first independent resolver call"),
         Result::Ok(addresses) => Assert.Equal(addresses[0].port.Value(), 81_i64, "first result retains its own port"),
     };
-    match (second)
-    {
+    match second {
         Result::Error(_) => Assert.Fail("second independent resolver call"),
         Result::Ok(addresses) => Assert.Equal(addresses[0].port.Value(), 82_i64, "second call has fresh results"),
     };
 }
 
-test NetworkDnsRepeatedCallsReturnIndependentlyOwnedResults
-{
+test NetworkDnsRepeatedCallsReturnIndependentlyOwnedResults {
     Fiber<unit> scenario = spawn ResolveTwice();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "independent resolver scenario completes");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "independent resolver scenario completes");
 }
 
-unit ResolveWithExpiredDeadline()
-{
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+unit ResolveWithExpiredDeadline() {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Error(_) => Assert.Fail("zero duration creates a typed deadline"),
         Result::Ok(deadline) => {
-            Result<SocketAddress[], NetworkError> result = Dns.Resolve("127.0.0.1", Network.Types.PortBytes(0_u8, 53_u8), Option::Some(AddressFamily::V4), Option.FromValue<Deadline>(deadline));
-            Assert.True(match (result)
-            {
+            Result<SocketAddress[], NetworkError> result = Dns.Resolve(
+                "127.0.0.1",
+                Network.Types.PortBytes(0_u8, 53_u8),
+                Option::Some(AddressFamily::V4),
+                Option.FromValue<Deadline>(deadline)
+            );
+            Assert.True(match result {
                 Result::Error(NetworkError::TimedOut) => true,
                 _ => false,
             }, "already expired DNS deadline wins before resolver submission");
@@ -221,63 +148,37 @@ unit ResolveWithExpiredDeadline()
     };
 }
 
-test NetworkDnsExpiredTypedDeadlineTimesOutBeforeSubmission
-{
+test NetworkDnsExpiredTypedDeadlineTimesOutBeforeSubmission {
     Fiber<unit> scenario = spawn ResolveWithExpiredDeadline();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "DNS deadline scenario completes");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "DNS deadline scenario completes");
 }
 
 // ---- TcpTests.bd (formerly target `NetworkTcpTests`) ----
 
-Result<unit, NetworkError> ServeResult(TcpListener listener)
-{
+Result<unit, NetworkError> ServeResult(TcpListener listener) {
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     u8[] bytes = [11_u8, 22_u8, 33_u8];
     Result<unit, IoError> written = IO.WriteAll(accepted, bytes, 0_i64, 3_i64);
-    Assert.True(match (written)
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "TCP reuses Foundation WriteAll");
+    Assert.True(match written { Result::Ok(_) => true, _ => false, }, "TCP reuses Foundation WriteAll");
     accepted.ShutdownWrite()?;
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "accepted close");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "accepted close");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit Serve(TcpListener listener)
-{
-    match (ServeResult(listener))
-    {
+unit Serve(TcpListener listener) {
+    match ServeResult(listener) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("TCP server completes without a NetworkError"),
     };
 }
 
-i64 ReadStream(Stream stream, u8[] bytes)
-{
-    return match (stream.Read(bytes, 0_i64, 1_i64))
-    {
-        Result::Ok(count) => count,
-        Result::Error(_) => -1_i64,
-    };
+i64 ReadStream(Stream stream, u8[] bytes) {
+    return match stream.Read(bytes, 0_i64, 1_i64) { Result::Ok(count) => count, Result::Error(_) => -1_i64, };
 }
 
-Result<unit, NetworkError> TcpLoopbackResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> TcpLoopbackResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Assert.True(address.port.Value() != 0_i64, "OS-selected port is reported");
@@ -285,69 +186,41 @@ Result<unit, NetworkError> TcpLoopbackResult()
     TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     u8[] bytes = Slice.New(3_i64);
     Result<unit, IoError> read = IO.ReadExact(client, bytes, 0_i64, 3_i64);
-    Assert.True(match (read)
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "TCP reuses Foundation ReadExact");
+    Assert.True(match read { Result::Ok(_) => true, _ => false, }, "TCP reuses Foundation ReadExact");
     Assert.Equal(bytes[2], 33_u8, "full transfer retained final byte");
     Assert.Equal(ReadStream(client, bytes), 0_i64, "half-close delivers Foundation EOF");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "first close succeeds");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "duplicate close is idempotent");
-    match (server.Join())
-    {
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "first close succeeds");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "duplicate close is idempotent");
+    match server.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server exits without a leak"),
     };
     return Result::Ok(());
 }
 
-unit TcpLoopback()
-{
-    match (TcpLoopbackResult())
-    {
+unit TcpLoopback() {
+    match TcpLoopbackResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("TCP loopback completes without a NetworkError"),
     };
 }
 
-test NetworkTcpReusesStreamTransferEofAndIdempotentClose
-{
+test NetworkTcpReusesStreamTransferEofAndIdempotentClose {
     Fiber<unit> scenario = spawn TcpLoopback();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("TCP loopback scenario completes"),
     };
 }
 
-test NetworkTcpInvalidBacklogHasTypedError
-{
-    SocketAddress address = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+test NetworkTcpInvalidBacklogHasTypedError {
+    SocketAddress address = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     Result<TcpListener, NetworkError> result = TcpListener.Bind(address, 0_i64);
-    Assert.True(match (result)
-    {
-        Result::Error(NetworkError::InvalidAddress) => true,
-        _ => false,
-    }, "invalid bind is rejected before effects");
+    Assert.True(match result { Result::Error(NetworkError::InvalidAddress) => true, _ => false, }, "invalid bind is rejected before effects");
 }
 
-i64 CauseCode(TransferFailure cause)
-{
-    return match (cause)
-    {
+i64 CauseCode(TransferFailure cause) {
+    return match cause {
         TransferFailure::Busy => -1_i64,
         TransferFailure::PeerReset => -2_i64,
         TransferFailure::TimedOut => -6_i64,
@@ -357,61 +230,41 @@ i64 CauseCode(TransferFailure cause)
 }
 
 // A non-negative code is a completed count; a negative code names the failure cause.
-i64 ReadCode(Result<i64, IoError> result)
-{
-    return match (result)
-    {
+i64 ReadCode(Result<i64, IoError> result) {
+    return match result {
         Result::Ok(count) => count,
         Result::Error(IoError::ReadFailed(cause)) => CauseCode(cause),
         Result::Error(_) => -4_i64,
     };
 }
 
-i64 ReadOne(TcpStream stream)
-{
+i64 ReadOne(TcpStream stream) {
     u8[] bytes = Slice.New(1_i64);
     return ReadCode(stream.Read(bytes, 0_i64, 1_i64));
 }
 
-Result<unit, NetworkError> DelayedServeResult(TcpListener listener)
-{
+Result<unit, NetworkError> DelayedServeResult(TcpListener listener) {
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
-    match (Time.Sleep(Time.FromMilliseconds(100_i64)))
-    {
+    match Time.Sleep(Time.FromMilliseconds(100_i64)) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server delay completes"),
     };
     Result<unit, IoError> written = IO.WriteAll(accepted, [7_u8], 0_i64, 1_i64);
-    Assert.True(match (written)
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "delayed server writes one byte");
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "delayed server closes");
+    Assert.True(match written { Result::Ok(_) => true, _ => false, }, "delayed server writes one byte");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "delayed server closes");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit DelayedServe(TcpListener listener)
-{
-    match (DelayedServeResult(listener))
-    {
+unit DelayedServe(TcpListener listener) {
+    match DelayedServeResult(listener) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("delayed server completes without a NetworkError"),
     };
 }
 
-Result<unit, NetworkError> SecondReadResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> SecondReadResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => DelayedServe(listener));
@@ -420,86 +273,49 @@ Result<unit, NetworkError> SecondReadResult()
     Concurrency.Yield();
     Concurrency.Yield();
     i64 second = ReadOne(client);
-    i64 firstCode = match (first.Join())
-    {
-        Result::Ok(code) => code,
-        Result::Error(_) => -5_i64,
-    };
+    i64 firstCode = match first.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
     Assert.True((firstCode == -1_i64 && second == 1_i64) || (firstCode == 1_i64 && second == -1_i64), "a second same-direction read reports ReadFailed(Busy)");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client closes");
-    match (server.Join())
-    {
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes");
+    match server.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("delayed server exits"),
     };
     return Result::Ok(());
 }
 
-unit SecondRead()
-{
-    match (SecondReadResult())
-    {
+unit SecondRead() {
+    match SecondReadResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("second-read scenario completes without a NetworkError"),
     };
 }
 
-test NetworkTcpSecondReadReportsBusyCause
-{
+test NetworkTcpSecondReadReportsBusyCause {
     Fiber<unit> scenario = spawn SecondRead();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("second-read scenario completes"),
     };
 }
 
-Result<unit, NetworkError> TypedDeadlineReadRecoversResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> TypedDeadlineReadRecoversResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => DelayedServe(listener));
     TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Ok(expired) => {
-            TransferDeadlines policy = TransferDeadlines
-            {
-                read: Option.FromValue<Deadline>(expired),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(policy))
-            {
-                Result::Ok(_) => true,
-                Result::Error(_) => false,
-            }, "typed read deadline is accepted");
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(expired), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, Result::Error(_) => false, }, "typed read deadline is accepted");
             u8[] bytes = [0_u8];
-            match (client.Read(bytes, 0_i64, 1_i64))
-            {
+            match client.Read(bytes, 0_i64, 1_i64) {
                 Result::Error(IoError::ReadFailed(TransferFailure::TimedOut)) => (),
                 _ => Assert.Fail("expired typed read returns TimedOut"),
             };
-            TransferDeadlines cleared = TransferDeadlines
-            {
-                read: Option.Empty<Deadline>(),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(cleared))
-            {
-                Result::Ok(_) => true,
-                Result::Error(_) => false,
-            }, "clearing typed policy succeeds");
-            match (client.Read(bytes, 0_i64, 1_i64))
-            {
+            TransferDeadlines cleared = TransferDeadlines { read: Option.Empty<Deadline>(), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(cleared) { Result::Ok(_) => true, Result::Error(_) => false, }, "clearing typed policy succeeds");
+            match client.Read(bytes, 0_i64, 1_i64) {
                 Result::Ok(count) => Assert.Equal(count, 1_i64, "read succeeds after deadline clear"),
                 Result::Error(_) => Assert.Fail("read remains usable after deadline clear"),
             };
@@ -507,76 +323,50 @@ Result<unit, NetworkError> TypedDeadlineReadRecoversResult()
         },
         Result::Error(_) => Assert.Fail("zero duration creates a checked deadline"),
     };
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "deadline client closes");
-    match (server.Join())
-    {
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "deadline client closes");
+    match server.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("deadline server completes"),
     };
     return Result::Ok(());
 }
 
-unit TypedDeadlineReadRecovers()
-{
-    match (TypedDeadlineReadRecoversResult())
-    {
+unit TypedDeadlineReadRecovers() {
+    match TypedDeadlineReadRecoversResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("typed deadline scenario completes without NetworkError"),
     };
 }
 
-test NetworkTcpTypedReadDeadlineTimesOutAndRecovers
-{
+test NetworkTcpTypedReadDeadlineTimesOutAndRecovers {
     Fiber<unit> scenario = spawn TypedDeadlineReadRecovers();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("typed deadline scenario completes"),
     };
 }
 
-Result<unit, NetworkError> ServeAfterClearResult(TcpListener listener, Channel<i64> release)
-{
+Result<unit, NetworkError> ServeAfterClearResult(TcpListener listener, Channel<i64> release) {
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
-    match (Channel<i64>.Receive(release))
-    {
+    match Channel<i64>.Receive(release) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server receives release after read deadline clear"),
     };
-    Assert.True(match (IO.WriteAll(accepted, [9_u8], 0_i64, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "released server writes one byte");
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "released server closes");
+    Assert.True(match IO.WriteAll(accepted, [9_u8], 0_i64, 1_i64) { Result::Ok(_) => true, _ => false, }, "released server writes one byte");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "released server closes");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit ServeAfterClear(TcpListener listener, Channel<i64> release)
-{
-    match (ServeAfterClearResult(listener, release))
-    {
+unit ServeAfterClear(TcpListener listener, Channel<i64> release) {
+    match ServeAfterClearResult(listener, release) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("released server completes"),
     };
 }
 
-Result<unit, NetworkError> PendingReadClearResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> PendingReadClearResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Channel<i64> release = Channel<i64>.Create();
@@ -586,55 +376,24 @@ Result<unit, NetworkError> PendingReadClearResult()
     Concurrency.Yield();
     Concurrency.Yield();
     Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
-    match (Deadline.After(Time.FromMilliseconds(20_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(20_i64)) {
         Result::Ok(deadline) => {
-            TransferDeadlines armed = TransferDeadlines
-            {
-                read: Option.FromValue<Deadline>(deadline),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(armed))
-            {
-                Result::Ok(_) => true,
-                _ => false,
-            }, "pending read accepts typed deadline");
-            TransferDeadlines cleared = TransferDeadlines
-            {
-                read: Option.Empty<Deadline>(),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(cleared))
-            {
-                Result::Ok(_) => true,
-                _ => false,
-            }, "pending read deadline clears");
+            TransferDeadlines armed = TransferDeadlines { read: Option.FromValue<Deadline>(deadline), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(armed) { Result::Ok(_) => true, _ => false, }, "pending read accepts typed deadline");
+            TransferDeadlines cleared = TransferDeadlines { read: Option.Empty<Deadline>(), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(cleared) { Result::Ok(_) => true, _ => false, }, "pending read deadline clears");
         },
         Result::Error(_) => Assert.Fail("positive duration creates a checked deadline"),
     };
-    match (Time.Sleep(Time.FromMilliseconds(50_i64)))
-    {
+    match Time.Sleep(Time.FromMilliseconds(50_i64)) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("wait past cleared deadline completes"),
     };
-    Assert.True(match (Channel<i64>.Send(release, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server is released after old deadline");
-    i64 pendingCode = match (pending.Join())
-    {
-        Result::Ok(code) => code,
-        Result::Error(_) => -5_i64,
-    };
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server is released after old deadline");
+    i64 pendingCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
     Assert.Equal(pendingCode, 1_i64, "pending read completes from peer readiness after deadline clear");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client closes after pending read");
-    match (server.Join())
-    {
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after pending read");
+    match server.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("released server exits"),
     };
@@ -642,58 +401,41 @@ Result<unit, NetworkError> PendingReadClearResult()
     return Result::Ok(());
 }
 
-unit PendingReadClear()
-{
-    match (PendingReadClearResult())
-    {
+unit PendingReadClear() {
+    match PendingReadClearResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending read deadline clear completes without NetworkError"),
     };
 }
 
-test NetworkTcpPendingTypedReadDeadlineClearPreservesReadiness
-{
+test NetworkTcpPendingTypedReadDeadlineClearPreservesReadiness {
     Fiber<unit> scenario = spawn PendingReadClear();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending read deadline clear scenario completes"),
     };
 }
 
-Result<unit, NetworkError> CloseServerOnReleaseResult(TcpListener listener, Channel<i64> release)
-{
+Result<unit, NetworkError> CloseServerOnReleaseResult(TcpListener listener, Channel<i64> release) {
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
-    match (Channel<i64>.Receive(release))
-    {
+    match Channel<i64>.Receive(release) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server receives release after client read settles"),
     };
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server closes accepted stream after release");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "server closes accepted stream after release");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit CloseServerOnRelease(TcpListener listener, Channel<i64> release)
-{
-    match (CloseServerOnReleaseResult(listener, release))
-    {
+unit CloseServerOnRelease(TcpListener listener, Channel<i64> release) {
+    match CloseServerOnReleaseResult(listener, release) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server closes after client read settles"),
     };
 }
 
-Result<unit, NetworkError> PendingReadTimeoutResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> PendingReadTimeoutResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Channel<i64> release = Channel<i64>.Create();
@@ -703,73 +445,36 @@ Result<unit, NetworkError> PendingReadTimeoutResult()
     Concurrency.Yield();
     Concurrency.Yield();
     Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Ok(expired) => {
-            TransferDeadlines policy = TransferDeadlines
-            {
-                read: Option.FromValue<Deadline>(expired),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(policy))
-            {
-                Result::Ok(_) => true,
-                _ => false,
-            }, "expired typed policy reaches the pending read");
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(expired), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "expired typed policy reaches the pending read");
         },
         Result::Error(_) => Assert.Fail("zero duration creates a typed read deadline"),
     };
-    i64 timedCode = match (pending.Join())
-    {
-        Result::Ok(code) => code,
-        Result::Error(_) => -5_i64,
-    };
+    i64 timedCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
     Assert.Equal(timedCode, -6_i64, "pending read reports exactly one TimedOut result");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client closes after timeout");
-    Assert.True(match (Channel<i64>.Send(release, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server is released after timeout");
-    Assert.True(match (server.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server exits after timeout");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after timeout");
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server is released after timeout");
+    Assert.True(match server.Join() { Result::Ok(_) => true, _ => false, }, "server exits after timeout");
     Channel<i64>.Close(release);
     return Result::Ok(());
 }
 
-unit PendingReadTimeout()
-{
-    match (PendingReadTimeoutResult())
-    {
+unit PendingReadTimeout() {
+    match PendingReadTimeoutResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending read timeout scenario completes"),
     };
 }
 
-test NetworkTcpPendingReadExpiredPolicyReportsTimedOut
-{
+test NetworkTcpPendingReadExpiredPolicyReportsTimedOut {
     Fiber<unit> scenario = spawn PendingReadTimeout();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "pending read timeout scenario joins");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read timeout scenario joins");
 }
 
-Result<unit, NetworkError> PendingReadCloseResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> PendingReadCloseResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Channel<i64> release = Channel<i64>.Create();
@@ -779,73 +484,36 @@ Result<unit, NetworkError> PendingReadCloseResult()
     Concurrency.Yield();
     Concurrency.Yield();
     Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
-    match (Deadline.After(Time.FromMilliseconds(30000_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(30000_i64)) {
         Result::Ok(future) => {
-            TransferDeadlines policy = TransferDeadlines
-            {
-                read: Option.FromValue<Deadline>(future),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(policy))
-            {
-                Result::Ok(_) => true,
-                _ => false,
-            }, "pending read has an armed typed deadline");
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(future), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "pending read has an armed typed deadline");
         },
         Result::Error(_) => Assert.Fail("future duration creates a typed read deadline"),
     };
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client closes while read is pending");
-    i64 closedCode = match (pending.Join())
-    {
-        Result::Ok(code) => code,
-        Result::Error(_) => -5_i64,
-    };
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes while read is pending");
+    i64 closedCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
     Assert.Equal(closedCode, -7_i64, "close wins the pending read before its deadline");
-    Assert.True(match (Channel<i64>.Send(release, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server is released after close");
-    Assert.True(match (server.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server exits after close");
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server is released after close");
+    Assert.True(match server.Join() { Result::Ok(_) => true, _ => false, }, "server exits after close");
     Channel<i64>.Close(release);
     return Result::Ok(());
 }
 
-unit PendingReadClose()
-{
-    match (PendingReadCloseResult())
-    {
+unit PendingReadClose() {
+    match PendingReadCloseResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending read close scenario completes"),
     };
 }
 
-test NetworkTcpPendingReadCloseReportsClosedWithArmedDeadline
-{
+test NetworkTcpPendingReadCloseReportsClosedWithArmedDeadline {
     Fiber<unit> scenario = spawn PendingReadClose();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "pending read close scenario joins");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read close scenario joins");
 }
 
-Result<unit, NetworkError> PendingReadReadyWithDeadlineResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> PendingReadReadyWithDeadlineResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Channel<i64> release = Channel<i64>.Create();
@@ -855,111 +523,58 @@ Result<unit, NetworkError> PendingReadReadyWithDeadlineResult()
     Concurrency.Yield();
     Concurrency.Yield();
     Assert.Equal(ReadOne(client), -1_i64, "second read proves the first read is pending");
-    match (Deadline.After(Time.FromMilliseconds(30000_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(30000_i64)) {
         Result::Ok(future) => {
-            TransferDeadlines policy = TransferDeadlines
-            {
-                read: Option.FromValue<Deadline>(future),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(policy))
-            {
-                Result::Ok(_) => true,
-                _ => false,
-            }, "pending read has an armed typed deadline");
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(future), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "pending read has an armed typed deadline");
         },
         Result::Error(_) => Assert.Fail("future duration creates a typed read deadline"),
     };
-    Assert.True(match (Channel<i64>.Send(release, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server sends while deadline is armed");
-    i64 readyCode = match (pending.Join())
-    {
-        Result::Ok(code) => code,
-        Result::Error(_) => -5_i64,
-    };
+    Assert.True(match Channel<i64>.Send(release, 1_i64) { Result::Ok(_) => true, _ => false, }, "server sends while deadline is armed");
+    i64 readyCode = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
     Assert.Equal(readyCode, 1_i64, "socket readiness wins the pending read before its deadline");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client closes after readiness");
-    Assert.True(match (server.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server exits after readiness");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after readiness");
+    Assert.True(match server.Join() { Result::Ok(_) => true, _ => false, }, "server exits after readiness");
     Channel<i64>.Close(release);
     return Result::Ok(());
 }
 
-unit PendingReadReadyWithDeadline()
-{
-    match (PendingReadReadyWithDeadlineResult())
-    {
+unit PendingReadReadyWithDeadline() {
+    match PendingReadReadyWithDeadlineResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending read readiness scenario completes"),
     };
 }
 
-test NetworkTcpPendingReadinessReportsByteWithArmedDeadline
-{
+test NetworkTcpPendingReadinessReportsByteWithArmedDeadline {
     Fiber<unit> scenario = spawn PendingReadReadyWithDeadline();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "pending read readiness scenario joins");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "pending read readiness scenario joins");
 }
 
-unit PhysicalRaceWrite(TcpStream peer, WaitGroup prepared, WaitGroup start)
-{
+unit PhysicalRaceWrite(TcpStream peer, WaitGroup prepared, WaitGroup start) {
     WaitGroup.Done(prepared);
     WaitGroup.Wait(start);
-    match (peer.Write([31_u8], 0_i64, 1_i64))
-    {
+    match peer.Write([31_u8], 0_i64, 1_i64) {
         Result::Ok(count) => Assert.Equal(count, 1_i64, "peer writes one byte if it wins the physical race"),
         Result::Error(IoError::WriteFailed(_)) => (),
         _ => Assert.Fail("physical race writer returns a transfer outcome"),
     };
 }
 
-unit PhysicalRaceClose(TcpStream client, WaitGroup prepared, WaitGroup start)
-{
+unit PhysicalRaceClose(TcpStream client, WaitGroup prepared, WaitGroup start) {
     WaitGroup.Done(prepared);
     WaitGroup.Wait(start);
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "independent closer finishes the physical race");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "independent closer finishes the physical race");
 }
 
-unit PhysicalRaceWatchdog(WaitGroup start, Channel<i64> released)
-{
-    Assert.True(match (Time.Sleep(Time.FromMilliseconds(200_i64)))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "physical race watchdog sleep completes");
-    Assert.True(match (Channel<i64>.Send(released, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "physical race watchdog records release first");
+unit PhysicalRaceWatchdog(WaitGroup start, Channel<i64> released) {
+    Assert.True(match Time.Sleep(Time.FromMilliseconds(200_i64)) { Result::Ok(_) => true, _ => false, }, "physical race watchdog sleep completes");
+    Assert.True(match Channel<i64>.Send(released, 1_i64) { Result::Ok(_) => true, _ => false, }, "physical race watchdog records release first");
     WaitGroup.Done(start);
 }
 
-Result<unit, NetworkError> PhysicalReadRaceRound(bool releaseAfterDeadline)
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> PhysicalReadRaceRound(bool releaseAfterDeadline) {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
@@ -976,100 +591,42 @@ Result<unit, NetworkError> PhysicalReadRaceRound(bool releaseAfterDeadline)
     Fiber<unit> writer = spawn (() => PhysicalRaceWrite(peer, prepared, start));
     Fiber<unit> closer = spawn (() => PhysicalRaceClose(client, prepared, start));
     WaitGroup.Wait(prepared);
-    match (Deadline.After(Time.FromMilliseconds(30_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(30_i64)) {
         Result::Ok(deadline) => {
-            TransferDeadlines policy = TransferDeadlines
-            {
-                read: Option.FromValue<Deadline>(deadline),
-                write: Option.Empty<Deadline>(),
-            };
-            Assert.True(match (client.SetDeadlines(policy))
-            {
-                Result::Ok(_) => true,
-                _ => false,
-            }, "physical race arms a real pending-read timer");
+            TransferDeadlines policy = TransferDeadlines { read: Option.FromValue<Deadline>(deadline), write: Option.Empty<Deadline>() };
+            Assert.True(match client.SetDeadlines(policy) { Result::Ok(_) => true, _ => false, }, "physical race arms a real pending-read timer");
         },
         Result::Error(_) => Assert.Fail("physical race creates a checked future deadline"),
     };
     mut i64 delay = 10_i64;
-    if (releaseAfterDeadline)
-    {
-        delay = 40_i64;
-    }
-    Assert.True(match (Time.Sleep(Time.FromMilliseconds(delay)))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "physical race reaches its release point");
-    if (releaseAfterDeadline)
-    {
+    if releaseAfterDeadline { delay = 40_i64; }
+    Assert.True(match Time.Sleep(Time.FromMilliseconds(delay)) { Result::Ok(_) => true, _ => false, }, "physical race reaches its release point");
+    if releaseAfterDeadline {
         Channel<i64> released = Channel<i64>.Create();
         Fiber<unit> watchdog = spawn (() => PhysicalRaceWatchdog(start, released));
-        i64 outcome = match (pending.Join())
-        {
-            Result::Ok(code) => code,
-            Result::Error(_) => -5_i64,
-        };
-        Assert.True(match (Channel<i64>.TryReceive(released))
-        {
-            TryResult::WouldBlock => true,
-            _ => false,
-        }, "read completes before watchdog releases the producers");
+        i64 outcome = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
+        Assert.True(match Channel<i64>.TryReceive(released) { TryResult::WouldBlock => true, _ => false, }, "read completes before watchdog releases the producers");
         Assert.Equal(outcome, -6_i64, "the real timer expires before either producer is released");
-        Assert.True(match (watchdog.Join())
-        {
-            Result::Ok(_) => true,
-            _ => false,
-        }, "physical race watchdog releases the producers");
-        Assert.True(match (Channel<i64>.TryReceive(released))
-        {
-            TryResult::Ok(value) => value == 1_i64,
-            _ => false,
-        }, "physical race watchdog marker is consumed once");
+        Assert.True(match watchdog.Join() { Result::Ok(_) => true, _ => false, }, "physical race watchdog releases the producers");
+        Assert.True(match Channel<i64>.TryReceive(released) { TryResult::Ok(value) => value == 1_i64, _ => false, }, "physical race watchdog marker is consumed once");
         Channel<i64>.Close(released);
-    }
-    else
-    {
+    } else {
         WaitGroup.Done(start);
-        i64 outcome = match (pending.Join())
-        {
-            Result::Ok(code) => code,
-            Result::Error(_) => -5_i64,
-        };
+        i64 outcome = match pending.Join() { Result::Ok(code) => code, Result::Error(_) => -5_i64, };
         Assert.True(outcome == 1_i64 || outcome == -6_i64 || outcome == -7_i64, "exactly one typed readiness, timeout, or close outcome wins");
     }
-    Assert.True(match (writer.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "independent readiness producer joins");
-    Assert.True(match (closer.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "independent close producer joins");
-    Assert.True(match (peer.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "peer closes after physical race");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client close remains idempotent after physical race");
+    Assert.True(match writer.Join() { Result::Ok(_) => true, _ => false, }, "independent readiness producer joins");
+    Assert.True(match closer.Join() { Result::Ok(_) => true, _ => false, }, "independent close producer joins");
+    Assert.True(match peer.Close() { Result::Ok(_) => true, _ => false, }, "peer closes after physical race");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client close remains idempotent after physical race");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit PhysicalReadRace()
-{
+unit PhysicalReadRace() {
     mut i64 round = 0_i64;
-    while (round < 7_i64)
-    {
-        match (PhysicalReadRaceRound(round == 6_i64))
-        {
+    while round < 7_i64 {
+        match PhysicalReadRaceRound(round == 6_i64) {
             Result::Ok(_) => (),
             Result::Error(_) => Assert.Fail("physical read race round closes all sockets"),
         };
@@ -1077,109 +634,68 @@ unit PhysicalReadRace()
     }
 }
 
-test NetworkTcpPhysicalReadinessCloseDeadlineHasOneTypedWinner
-{
+test NetworkTcpPhysicalReadinessCloseDeadlineHasOneTypedWinner {
     Fiber<unit> scenario = spawn PhysicalReadRace();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "bounded physical read race joins");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "bounded physical read race joins");
 }
 
 // Closing with unread received data makes the host abort the connection (RST).
-Result<unit, NetworkError> ResetServeResult(TcpListener listener)
-{
+Result<unit, NetworkError> ResetServeResult(TcpListener listener) {
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
     u8[] bytes = Slice.New(1_i64);
     Result<unit, IoError> read = IO.ReadExact(accepted, bytes, 0_i64, 1_i64);
-    Assert.True(match (read)
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server observes the first byte");
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server closes with unread data");
+    Assert.True(match read { Result::Ok(_) => true, _ => false, }, "server observes the first byte");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "server closes with unread data");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit ResetServe(TcpListener listener)
-{
-    match (ResetServeResult(listener))
-    {
+unit ResetServe(TcpListener listener) {
+    match ResetServeResult(listener) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("reset server completes without a NetworkError"),
     };
 }
 
-Result<unit, NetworkError> PeerResetResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> PeerResetResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => ResetServe(listener));
     TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Result<unit, IoError> written = IO.WriteAll(client, [1_u8, 2_u8], 0_i64, 2_i64);
-    Assert.True(match (written)
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client sends two bytes");
+    Assert.True(match written { Result::Ok(_) => true, _ => false, }, "client sends two bytes");
     Assert.Equal(ReadOne(client), -2_i64, "peer abort reports ReadFailed(PeerReset), not EOF");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client closes after reset");
-    match (server.Join())
-    {
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client closes after reset");
+    match server.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("reset server exits"),
     };
     return Result::Ok(());
 }
 
-unit PeerReset()
-{
-    match (PeerResetResult())
-    {
+unit PeerReset() {
+    match PeerResetResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("peer-reset scenario completes without a NetworkError"),
     };
 }
 
-test NetworkTcpPeerResetIsNotEof
-{
+test NetworkTcpPeerResetIsNotEof {
     Fiber<unit> scenario = spawn PeerReset();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("peer-reset scenario completes"),
     };
 }
 
-Result<unit, NetworkError> TypedLifecycleDeadlineResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> TypedLifecycleDeadlineResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Ok(expired) => {
-            match (listener.Accept(Option.FromValue<Deadline>(expired)))
-            {
+            match listener.Accept(Option.FromValue<Deadline>(expired)) {
                 Result::Error(NetworkError::TimedOut) => (),
                 _ => Assert.Fail("expired typed accept returns TimedOut"),
             };
@@ -1188,58 +704,35 @@ Result<unit, NetworkError> TypedLifecycleDeadlineResult()
     };
     TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "accepted stream closes after timeout recovery");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "client stream closes after timeout recovery");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "accepted stream closes after timeout recovery");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "client stream closes after timeout recovery");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit TypedLifecycleDeadline()
-{
-    match (TypedLifecycleDeadlineResult())
-    {
+unit TypedLifecycleDeadline() {
+    match TypedLifecycleDeadlineResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("typed TCP lifecycle deadline scenario completes"),
     };
 }
 
-test NetworkTcpTypedAcceptDeadlineTimesOutAndRecovers
-{
+test NetworkTcpTypedAcceptDeadlineTimesOutAndRecovers {
     Fiber<unit> scenario = spawn TypedLifecycleDeadline();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("typed TCP lifecycle deadline scenario joins"),
     };
 }
 
-Result<unit, NetworkError> ExpiredConnectOneWinnerResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> ExpiredConnectOneWinnerResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Ok(expired) => {
-            match (TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.FromValue<Deadline>(expired)))
-            {
-                Result::Ok(client) => Assert.True(match (client.Close())
-                {
-                    Result::Ok(_) => true,
-                    _ => false,
-                }, "ready connect closes its sole owned stream"),
+            match TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.FromValue<Deadline>(expired)) {
+                Result::Ok(client) => Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "ready connect closes its sole owned stream"),
                 Result::Error(NetworkError::TimedOut) => (),
                 Result::Error(_) => Assert.Fail("expired connect has only readiness or timeout outcome"),
             };
@@ -1250,20 +743,16 @@ Result<unit, NetworkError> ExpiredConnectOneWinnerResult()
     return Result::Ok(());
 }
 
-unit ExpiredConnectOneWinner()
-{
-    match (ExpiredConnectOneWinnerResult())
-    {
+unit ExpiredConnectOneWinner() {
+    match ExpiredConnectOneWinnerResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("expired connect one-winner scenario completes"),
     };
 }
 
-test NetworkTcpExpiredConnectHasOneOutcomeAndClosesOwnedStream
-{
+test NetworkTcpExpiredConnectHasOneOutcomeAndClosesOwnedStream {
     Fiber<unit> scenario = spawn ExpiredConnectOneWinner();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("expired connect scenario joins"),
     };
@@ -1271,58 +760,42 @@ test NetworkTcpExpiredConnectHasOneOutcomeAndClosesOwnedStream
 
 // ---- UdpTests.bd (formerly target `NetworkUdpTests`) ----
 
-unit PendingUdpReceive(UdpSocket receiver, Channel<i64> ready)
-{
-    Assert.True(match (Channel<i64>.Send(ready, 1_i64))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "receiver announces immediately before parking");
-    Assert.True(match (receiver.ReceiveFrom(1_i64, Option.Empty<Deadline>()))
-    {
+unit PendingUdpReceive(UdpSocket receiver, Channel<i64> ready) {
+    Assert.True(match Channel<i64>.Send(ready, 1_i64) { Result::Ok(_) => true, _ => false, }, "receiver announces immediately before parking");
+    Assert.True(match receiver.ReceiveFrom(1_i64, Option.Empty<Deadline>()) {
         Result::Ok(_) => true,
         _ => false,
     }, "opposite-direction send wakes the pending receive");
 }
 
-Result<unit, NetworkError> UdpContentionResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> UdpContentionResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     UdpSocket sender = UdpSocket.Bind(bindAddress)?;
     UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
     SocketAddress target = receiver.LocalAddress()?;
     Channel<i64> ready = Channel<i64>.Create();
     Fiber<unit> pending = spawn (() => PendingUdpReceive(receiver, ready));
-    match (Channel<i64>.Receive(ready))
-    {
+    match Channel<i64>.Receive(ready) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("pending UDP receive announces readiness"),
     };
 
     // An expired deadline bounds an incorrectly admitted second wait without
     // timing or sleeping: admission must reject it as Busy before timer setup.
-    bool sameDirectionBusy = match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    bool sameDirectionBusy = match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Error(_) => false,
-        Result::Ok(expired) => match (receiver.ReceiveFrom(1_i64, Option.FromValue<Deadline>(expired)))
-        {
+        Result::Ok(expired) => match receiver.ReceiveFrom(1_i64, Option.FromValue<Deadline>(expired)) {
             Result::Error(NetworkError::Busy) => true,
             _ => false,
         },
     };
 
     u8[] payload = [81_u8, 82_u8];
-    bool oppositeDirectionSendSucceeded = match (sender.SendTo(payload, target, Option.Empty<Deadline>()))
-    {
+    bool oppositeDirectionSendSucceeded = match sender.SendTo(payload, target, Option.Empty<Deadline>()) {
         Result::Ok(_) => true,
         _ => false,
     };
-    bool pendingReceiveSucceeded = match (pending.Join())
-    {
+    bool pendingReceiveSucceeded = match pending.Join() {
         Result::Ok(_) => true,
         _ => false,
     };
@@ -1337,32 +810,23 @@ Result<unit, NetworkError> UdpContentionResult()
     return Result::Ok(());
 }
 
-unit UdpContention()
-{
-    match (UdpContentionResult())
-    {
+unit UdpContention() {
+    match UdpContentionResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("UDP contention scenario completes without a NetworkError"),
     };
 }
 
-test NetworkUdpSameDirectionBusyAndOppositeDirectionSendReceive
-{
+test NetworkUdpSameDirectionBusyAndOppositeDirectionSendReceive {
     Fiber<unit> scenario = spawn UdpContention();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("UDP contention scenario joins"),
     };
 }
 
-Result<unit, NetworkError> UdpBoundariesResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> UdpBoundariesResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     UdpSocket sender = UdpSocket.Bind(bindAddress)?;
     UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
     SocketAddress target = receiver.LocalAddress()?;
@@ -1384,32 +848,23 @@ Result<unit, NetworkError> UdpBoundariesResult()
     return Result::Ok(());
 }
 
-unit UdpBoundaries()
-{
-    match (UdpBoundariesResult())
-    {
+unit UdpBoundaries() {
+    match UdpBoundariesResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("UDP boundaries complete without a NetworkError"),
     };
 }
 
-test NetworkUdpPreservesDatagramsSourcesAndTruncation
-{
+test NetworkUdpPreservesDatagramsSourcesAndTruncation {
     Fiber<unit> scenario = spawn UdpBoundaries();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("UDP boundaries scenario completes"),
     };
 }
 
-Result<unit, NetworkError> UdpConnectedResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> UdpConnectedResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     UdpSocket left = UdpSocket.Bind(bindAddress)?;
     UdpSocket right = UdpSocket.Bind(bindAddress)?;
     left.Connect(right.LocalAddress()?)?;
@@ -1418,49 +873,32 @@ Result<unit, NetworkError> UdpConnectedResult()
     Datagram received = right.Receive(1_i64, Option.Empty<Deadline>())?;
     Assert.Equal(received.payload[0], 99_u8, "connected receive preserves payload");
     right.Close()?;
-    Assert.True(match (right.Receive(1_i64, Option.Empty<Deadline>()))
-    {
-        Result::Error(NetworkError::Closed) => true,
-        _ => false,
-    }, "closed generation fails before native I/O");
+    Assert.True(match right.Receive(1_i64, Option.Empty<Deadline>()) { Result::Error(NetworkError::Closed) => true, _ => false, }, "closed generation fails before native I/O");
     left.Close()?;
     return Result::Ok(());
 }
 
-unit UdpConnected()
-{
-    match (UdpConnectedResult())
-    {
+unit UdpConnected() {
+    match UdpConnectedResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("connected UDP completes without a NetworkError"),
     };
 }
 
-test NetworkUdpConnectedOperationsAndClosedError
-{
+test NetworkUdpConnectedOperationsAndClosedError {
     Fiber<unit> scenario = spawn UdpConnected();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("connected UDP scenario completes"),
     };
 }
 
-Result<unit, NetworkError> SlotReuseResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> SlotReuseResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     UdpSocket previous = UdpSocket.Bind(bindAddress)?;
     previous.Close()?;
     UdpSocket current = UdpSocket.Bind(bindAddress)?;
-    Assert.True(match (previous.LocalAddress())
-    {
-        Result::Error(NetworkError::Closed) => true,
-        _ => false,
-    }, "stale generation cannot address replacement socket");
+    Assert.True(match previous.LocalAddress() { Result::Error(NetworkError::Closed) => true, _ => false, }, "stale generation cannot address replacement socket");
     previous.Close()?;
     SocketAddress address = current.LocalAddress()?;
     Assert.True(address.port.Value() > 0_i64, "stale close cannot release replacement socket");
@@ -1468,10 +906,8 @@ Result<unit, NetworkError> SlotReuseResult()
     return Result::Ok(());
 }
 
-test NetworkClosedResourceCannotReachAReusedSlot
-{
-    match (SlotReuseResult())
-    {
+test NetworkClosedResourceCannotReachAReusedSlot {
+    match SlotReuseResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("slot reuse completes without a NetworkError"),
     };
@@ -1479,34 +915,21 @@ test NetworkClosedResourceCannotReachAReusedSlot
 
 // Binds until the runtime reports exhaustion. state[0] records the live count,
 // state[1] the successful rebind after one close, state[2] the stop reason.
-Result<unit, NetworkError> ExhaustionResult(SocketAddress address, i64[] state)
-{
+Result<unit, NetworkError> ExhaustionResult(SocketAddress address, i64[] state) {
     List<UdpSocket> held = List.New<UdpSocket>();
     mut i64 stop = 0_i64;
-    while (stop == 0_i64 && held.Count() <= 256_i64)
-    {
-        match (UdpSocket.Bind(address))
-        {
-            Result::Ok(socket) => {
-                held.Push(socket);
-            },
-            Result::Error(NetworkError::ResourceExhausted) => {
-                stop = 1_i64;
-            },
-            Result::Error(_) => {
-                stop = 2_i64;
-            },
+    while stop == 0_i64 && held.Count() <= 256_i64 {
+        match UdpSocket.Bind(address) {
+            Result::Ok(socket) => { held.Push(socket); },
+            Result::Error(NetworkError::ResourceExhausted) => { stop = 1_i64; },
+            Result::Error(_) => { stop = 2_i64; },
         };
     }
     state[0] = held.Count();
     state[2] = stop;
-    if (stop == 1_i64 && held.Count() > 0_i64)
-    {
-        match (held.Get(held.Count() - 1_i64))
-        {
-            Result::Ok(last) => {
-                last.Close()?;
-            },
+    if stop == 1_i64 && held.Count() > 0_i64 {
+        match held.Get(held.Count() - 1_i64) {
+            Result::Ok(last) => { last.Close()?; },
             Result::Error(_) => Assert.Fail("the last live socket is held"),
         };
         held.Pop();
@@ -1515,13 +938,9 @@ Result<unit, NetworkError> ExhaustionResult(SocketAddress address, i64[] state)
         state[1] = 1_i64;
     }
     mut i64 index = 0_i64;
-    while (index < held.Count())
-    {
-        match (held.Get(index))
-        {
-            Result::Ok(socket) => {
-                socket.Close()?;
-            },
+    while index < held.Count() {
+        match held.Get(index) {
+            Result::Ok(socket) => { socket.Close()?; },
             Result::Error(_) => Assert.Fail("every live socket is held"),
         };
         index = index + 1_i64;
@@ -1529,49 +948,34 @@ Result<unit, NetworkError> ExhaustionResult(SocketAddress address, i64[] state)
     return Result::Ok(());
 }
 
-Result<unit, NetworkError> BindAndClose(SocketAddress address)
-{
+Result<unit, NetworkError> BindAndClose(SocketAddress address) {
     UdpSocket socket = UdpSocket.Bind(address)?;
     socket.Close()?;
     return Result::Ok(());
 }
 
-test NetworkUdpExhaustionIsTyped
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+test NetworkUdpExhaustionIsTyped {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     i64[] state = [0_i64, 0_i64, 0_i64];
-    match (ExhaustionResult(bindAddress, state))
-    {
+    match ExhaustionResult(bindAddress, state) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("exhaustion fixture releases every socket"),
     };
     Assert.Equal(state[2], 1_i64, "exhaustion is reported as ResourceExhausted");
     Assert.True(state[0] > 0_i64 && state[0] <= 256_i64, "exhaustion occurs at or before the slot count");
     Assert.Equal(state[1], 1_i64, "closing one live socket admits the next bind");
-    match (BindAndClose(bindAddress))
-    {
+    match BindAndClose(bindAddress) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("every exhausted socket was released"),
     };
 }
 
-Result<unit, NetworkError> UdpExpiredReceiveRecoversResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> UdpExpiredReceiveRecoversResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Error(_) => Assert.Fail("zero duration creates a typed deadline"),
-        Result::Ok(expired) => match (receiver.ReceiveFrom(1_i64, Option.FromValue<Deadline>(expired)))
-        {
+        Result::Ok(expired) => match receiver.ReceiveFrom(1_i64, Option.FromValue<Deadline>(expired)) {
             Result::Error(NetworkError::TimedOut) => (),
             _ => Assert.Fail("an empty UDP receive times out at its expired deadline"),
         },
@@ -1588,52 +992,36 @@ Result<unit, NetworkError> UdpExpiredReceiveRecoversResult()
     return Result::Ok(());
 }
 
-unit UdpExpiredReceiveRecovers()
-{
-    match (UdpExpiredReceiveRecoversResult())
-    {
+unit UdpExpiredReceiveRecovers() {
+    match UdpExpiredReceiveRecoversResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("UDP timeout recovery completes without a NetworkError"),
     };
 }
 
-test NetworkUdpExpiredReceiveDeadlineTimesOutAndSocketRecovers
-{
+test NetworkUdpExpiredReceiveDeadlineTimesOutAndSocketRecovers {
     Fiber<unit> scenario = spawn UdpExpiredReceiveRecovers();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "UDP timeout recovery scenario completes");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "UDP timeout recovery scenario completes");
 }
 
-Result<unit, NetworkError> UdpExpiredSendKeepsPayloadResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> UdpExpiredSendKeepsPayloadResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     UdpSocket sender = UdpSocket.Bind(bindAddress)?;
     UdpSocket receiver = UdpSocket.Bind(bindAddress)?;
     SocketAddress target = receiver.LocalAddress()?;
     u8[] payload = [41_u8, 42_u8];
-    match (Deadline.After(Time.FromMilliseconds(0_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(0_i64)) {
         Result::Error(_) => Assert.Fail("zero duration creates a typed deadline"),
-        Result::Ok(expired) => match (sender.SendTo(payload, target, Option.FromValue<Deadline>(expired)))
-        {
+        Result::Ok(expired) => match sender.SendTo(payload, target, Option.FromValue<Deadline>(expired)) {
             Result::Error(NetworkError::TimedOut) => (),
             _ => Assert.Fail("an expired UDP send returns TimedOut before submission"),
         },
     };
     Assert.Equal(payload[0], 41_u8, "timed-out send leaves caller payload intact");
     Assert.Equal(payload[1], 42_u8, "timed-out send retains the full caller payload");
-    match (Deadline.After(Time.FromMilliseconds(100_i64)))
-    {
+    match Deadline.After(Time.FromMilliseconds(100_i64)) {
         Result::Error(_) => Assert.Fail("short duration creates a typed receive deadline"),
-        Result::Ok(receiveDeadline) => match (receiver.ReceiveFrom(2_i64, Option.FromValue<Deadline>(receiveDeadline)))
-        {
+        Result::Ok(receiveDeadline) => match receiver.ReceiveFrom(2_i64, Option.FromValue<Deadline>(receiveDeadline)) {
             Result::Error(NetworkError::TimedOut) => (),
             _ => Assert.Fail("an expired send does not deliver a datagram"),
         },
@@ -1647,45 +1035,28 @@ Result<unit, NetworkError> UdpExpiredSendKeepsPayloadResult()
     return Result::Ok(());
 }
 
-unit UdpExpiredSendKeepsPayload()
-{
-    match (UdpExpiredSendKeepsPayloadResult())
-    {
+unit UdpExpiredSendKeepsPayload() {
+    match UdpExpiredSendKeepsPayloadResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("UDP send timeout scenario completes without another NetworkError"),
     };
 }
 
-test NetworkUdpExpiredSendKeepsUnsentPayloadAndSocket
-{
+test NetworkUdpExpiredSendKeepsUnsentPayloadAndSocket {
     Fiber<unit> scenario = spawn UdpExpiredSendKeepsPayload();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "UDP send timeout scenario completes");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "UDP send timeout scenario completes");
 }
 
 // ---- ScopeTests.bd (formerly target `NetworkScopeTests`) ----
 
-Result<unit, NetworkError> ScopedListener(SocketAddress address)
-{
+Result<unit, NetworkError> ScopedListener(SocketAddress address) {
     use TcpListener listener = TcpListener.Bind(address, 1_i64)?;
     return Result::Ok(());
 }
 
-test NetworkTcpDisposableUsesFoundationCleanupConversion
-{
-    SocketAddress address = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
-    Assert.True(match (ScopedListener(address))
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "scoped listener uses the explicit cleanup conversion");
+test NetworkTcpDisposableUsesFoundationCleanupConversion {
+    SocketAddress address = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+    Assert.True(match ScopedListener(address) { Result::Ok(_) => true, _ => false, }, "scoped listener uses the explicit cleanup conversion");
 }
 
 // ---- ShutdownLeakTests.bd (formerly target `NetworkShutdownLeakTests`) ----
@@ -1699,29 +1070,15 @@ test NetworkTcpDisposableUsesFoundationCleanupConversion
 // only observe typed Results and port numbers -- no descriptor, handle, or
 // platform constant is read or asserted on.
 
-Result<unit, NetworkError> ShutdownLeakAuditResult()
-{
+Result<unit, NetworkError> ShutdownLeakAuditResult() {
     i64 leakAuditCycles = 600_i64; // exceeds the runtime's fixed 256-slot socket table
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     mut i64 cycle = 0_i64;
-    while (cycle < leakAuditCycles)
-    {
+    while cycle < leakAuditCycles {
         UdpSocket socket = UdpSocket.Bind(bindAddress)?;
         Assert.True(socket.LocalAddress()?.port.Value() != 0_i64, "each cycle's socket is live before it closes");
-        Assert.True(match (socket.Close())
-        {
-            Result::Ok(_) => true,
-            _ => false,
-        }, "first close in the cycle succeeds and releases the slot");
-        Assert.True(match (socket.Close())
-        {
-            Result::Ok(_) => true,
-            _ => false,
-        }, "duplicate close in the cycle is safe: no double-close, no leak");
+        Assert.True(match socket.Close() { Result::Ok(_) => true, _ => false, }, "first close in the cycle succeeds and releases the slot");
+        Assert.True(match socket.Close() { Result::Ok(_) => true, _ => false, }, "duplicate close in the cycle is safe: no double-close, no leak");
         cycle = cycle + 1_i64;
     }
 
@@ -1730,18 +1087,12 @@ Result<unit, NetworkError> ShutdownLeakAuditResult()
     // open/close pairs even though that number exceeds the 256-slot table.
     UdpSocket fresh = UdpSocket.Bind(bindAddress)?;
     Assert.True(fresh.LocalAddress()?.port.Value() != 0_i64, "post-cycle bind still succeeds");
-    Assert.True(match (fresh.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "post-cycle socket closes cleanly");
+    Assert.True(match fresh.Close() { Result::Ok(_) => true, _ => false, }, "post-cycle socket closes cleanly");
     return Result::Ok(());
 }
 
-test NetworkShutdownIsIdempotentAndRepeatedCyclesDoNotLeakSlots
-{
-    match (ShutdownLeakAuditResult())
-    {
+test NetworkShutdownIsIdempotentAndRepeatedCyclesDoNotLeakSlots {
+    match ShutdownLeakAuditResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("shutdown leak audit completes without a NetworkError (a leak would surface as ResourceExhausted)"),
     };
@@ -1754,113 +1105,72 @@ test NetworkShutdownIsIdempotentAndRepeatedCyclesDoNotLeakSlots
 // existing typed IoError (not panic, not silently succeed); Dispose() itself
 // must be idempotent; and a fresh stream must still work afterward.
 
-Result<unit, NetworkError> ServeOnceResult(TcpListener listener)
-{
+Result<unit, NetworkError> ServeOnceResult(TcpListener listener) {
     TcpStream accepted = listener.Accept(Option.Empty<Deadline>())?;
-    Assert.True(match (accepted.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "server closes its side");
+    Assert.True(match accepted.Close() { Result::Ok(_) => true, _ => false, }, "server closes its side");
     listener.Close()?;
     return Result::Ok(());
 }
 
-unit ServeOnce(TcpListener listener)
-{
-    match (ServeOnceResult(listener))
-    {
+unit ServeOnce(TcpListener listener) {
+    match ServeOnceResult(listener) {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server completes without a NetworkError"),
     };
 }
 
-Result<unit, NetworkError> DisposedStreamFailsClosedResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> DisposedStreamFailsClosedResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener listener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress address = listener.LocalAddress()?;
     Fiber<unit> server = spawn (() => ServeOnce(listener));
     TcpStream client = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
 
-    Assert.True(match (client.Dispose())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "Dispose succeeds");
+    Assert.True(match client.Dispose() { Result::Ok(_) => true, _ => false, }, "Dispose succeeds");
 
     u8[] bytes = Slice.New(1_i64);
-    Assert.True(match (client.Read(bytes, 0_i64, 1_i64))
-    {
-        Result::Error(IoError::ReadFailed(TransferFailure::Closed)) => true,
-        _ => false,
-    }, "Read after Dispose fails closed with the typed Foundation IoError, not a panic");
-    Assert.True(match (client.Write(bytes, 0_i64, 1_i64))
-    {
-        Result::Error(IoError::WriteFailed(TransferFailure::Closed)) => true,
-        _ => false,
-    }, "Write after Dispose fails closed with the typed Foundation IoError, not a panic");
+    Assert.True(
+        match client.Read(bytes, 0_i64, 1_i64) { Result::Error(IoError::ReadFailed(TransferFailure::Closed)) => true, _ => false, },
+        "Read after Dispose fails closed with the typed Foundation IoError, not a panic"
+    );
+    Assert.True(
+        match client.Write(bytes, 0_i64, 1_i64) { Result::Error(IoError::WriteFailed(TransferFailure::Closed)) => true, _ => false, },
+        "Write after Dispose fails closed with the typed Foundation IoError, not a panic"
+    );
 
-    Assert.True(match (client.Dispose())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "Dispose is idempotent: a second call still succeeds");
-    Assert.True(match (client.Close())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "the Closer contract stays idempotent after Dispose too");
+    Assert.True(match client.Dispose() { Result::Ok(_) => true, _ => false, }, "Dispose is idempotent: a second call still succeeds");
+    Assert.True(match client.Close() { Result::Ok(_) => true, _ => false, }, "the Closer contract stays idempotent after Dispose too");
 
-    match (server.Join())
-    {
+    match server.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("server exits without a leak"),
     };
     return Result::Ok(());
 }
 
-unit DisposedStreamFailsClosed()
-{
-    match (DisposedStreamFailsClosedResult())
-    {
+unit DisposedStreamFailsClosed() {
+    match DisposedStreamFailsClosedResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("disposed-stream scenario completes without a NetworkError"),
     };
 }
 
-test NetworkTcpStreamAfterDisposeFailsClosedAndDisposeIsIdempotent
-{
+test NetworkTcpStreamAfterDisposeFailsClosedAndDisposeIsIdempotent {
     Fiber<unit> scenario = spawn DisposedStreamFailsClosed();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("disposed-stream scenario completes"),
     };
 }
 
-Result<unit, NetworkError> FreshStreamAfterDisposeResult()
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+Result<unit, NetworkError> FreshStreamAfterDisposeResult() {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     TcpListener firstListener = TcpListener.Bind(bindAddress, 8_i64)?;
     SocketAddress firstAddress = firstListener.LocalAddress()?;
     Fiber<unit> firstServer = spawn (() => ServeOnce(firstListener));
     TcpStream disposedClient = TcpStream.Connect(firstAddress, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
-    Assert.True(match (disposedClient.Dispose())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "first stream disposed");
-    match (firstServer.Join())
-    {
+    Assert.True(match disposedClient.Dispose() { Result::Ok(_) => true, _ => false, }, "first stream disposed");
+    match firstServer.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("first server exits"),
     };
@@ -1872,33 +1182,24 @@ Result<unit, NetworkError> FreshStreamAfterDisposeResult()
     Fiber<unit> secondServer = spawn (() => ServeOnce(secondListener));
     TcpStream freshClient = TcpStream.Connect(secondAddress, Network.Types.DefaultSocketOptions(), Option.Empty<Deadline>())?;
     Assert.True(freshClient.LocalAddress()?.port.Value() != 0_i64, "fresh stream after a prior Dispose is fully usable");
-    Assert.True(match (freshClient.Dispose())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "fresh stream disposes cleanly too");
-    match (secondServer.Join())
-    {
+    Assert.True(match freshClient.Dispose() { Result::Ok(_) => true, _ => false, }, "fresh stream disposes cleanly too");
+    match secondServer.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("second server exits"),
     };
     return Result::Ok(());
 }
 
-unit FreshStreamAfterDispose()
-{
-    match (FreshStreamAfterDisposeResult())
-    {
+unit FreshStreamAfterDispose() {
+    match FreshStreamAfterDisposeResult() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("fresh-stream-after-dispose scenario completes without a NetworkError"),
     };
 }
 
-test NetworkTcpFreshStreamWorksAfterAPriorDispose
-{
+test NetworkTcpFreshStreamWorksAfterAPriorDispose {
     Fiber<unit> scenario = spawn FreshStreamAfterDispose();
-    match (scenario.Join())
-    {
+    match scenario.Join() {
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("fresh-stream-after-dispose scenario completes"),
     };
@@ -1906,24 +1207,20 @@ test NetworkTcpFreshStreamWorksAfterAPriorDispose
 
 // ---- v0.6.7: network waits in the root fiber park like in any other fiber ----
 
-test ResolveInTheRootFiberParksInsteadOfFailing
-{
+test ResolveInTheRootFiberParksInsteadOfFailing {
     ResolveIpv4();
 }
 
-unit CountTicks(i64[] ticks)
-{
+unit CountTicks(i64[] ticks) {
     Concurrency.Yield();
     Array.Set<i64>(ticks, 0_i64, Array.Get<i64>(ticks, 0_i64) + 1_i64);
     return;
 }
 
-test SleepInTheRootFiberRunsOtherFibers
-{
+test SleepInTheRootFiberRunsOtherFibers {
     i64[] ticks = [0_i64];
     Fiber<unit> counter = spawn (() => CountTicks(ticks));
-    match (Time.Sleep(Time.FromMilliseconds(20_i64)))
-    {
+    match Time.Sleep(Time.FromMilliseconds(20_i64)) {
         Result::Ok(_) => Assert.True(true, "the root sleep ends at its deadline"),
         Result::Error(_) => Assert.Fail("Sleep in the root fiber must park, not fail"),
     };

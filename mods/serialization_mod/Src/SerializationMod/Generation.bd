@@ -11,8 +11,7 @@ use SerializationMod.Write;
 /// (`encoderMembers`); the decoder group is the bound Decoder impl with its adapter record type
 /// and field decoder factory (`decoderMembers`). The host attributes each group to the target's
 /// declaring unit.
-pub type GeneratedTarget
-{
+pub type GeneratedTarget {
     pub SyntaxContributionItem[] items;
     pub u32 encoderIndex;
     pub u32[] encoderMembers;
@@ -21,29 +20,24 @@ pub type GeneratedTarget
 }
 
 /// The encoder group of one target T<P...> before it is placed in the contribution list.
-type EncoderGroup
-{
+type EncoderGroup {
     SpannedImplBlock implementation;
     SpannedFunctionDefinition factory;
 }
 
-SpannedType Named(Syntax.Builder builder, string name)
-{
+SpannedType Named(Syntax.Builder builder, string name) {
     return Syntax.Named(builder, [name], []);
 }
 
-SpannedPath ResultPath(Syntax.Builder builder, SpannedType value)
-{
+SpannedPath ResultPath(Syntax.Builder builder, SpannedType value) {
     return Syntax.CorePath(builder, ["Results", "Result"], [value, Syntax.CoreType(builder, ["Serialization", "Errors", "SerializationError"], [])]);
 }
 
-SpannedType ResultType(Syntax.Builder builder, SpannedType value)
-{
+SpannedType ResultType(Syntax.Builder builder, SpannedType value) {
     return Syntax.CoreType(builder, ["Results", "Result"], [value, Syntax.CoreType(builder, ["Serialization", "Errors", "SerializationError"], [])]);
 }
 
-SpannedType TypePath(Syntax.Builder builder, SpannedPath path)
-{
+SpannedType TypePath(Syntax.Builder builder, SpannedPath path) {
     return Syntax.TypeFromPath(builder, path);
 }
 
@@ -52,8 +46,7 @@ SpannedType TypePath(Syntax.Builder builder, SpannedPath path)
 /// canonical `Serializable<E>` implementation whose WriteTyped forwards `this` to it. The factory
 /// is the correspondence target of `Contracts.WriteField<T<P...>, E>`; every nominal field site
 /// writes through `WriteField`, so no receiver parameter gets a Serializable bound.
-EncoderGroup EncoderFor(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, string encoderName, SpannedStatement[] body)
-{
+EncoderGroup EncoderFor(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, string encoderName, SpannedStatement[] body) {
     SpannedType encoder = Named(builder, encoderName);
     string writeName = Syntax.FreshTypeName(builder);
     SpannedType limits = Syntax.CoreType(builder, ["Serialization", "Limits", "SerializationLimits"], []);
@@ -62,8 +55,7 @@ EncoderGroup EncoderFor(Syntax.Builder builder, SpannedPath receiver, SpannedIde
     generics = Array.Append<SpannedIdentifier>(generics, Syntax.IdentifierValue(builder, encoderName));
     mut SpannedType[] arguments = [];
     mut i64 index = 0_i64;
-    while (index < Array.Len(parameters))
-    {
+    while (index < Array.Len(parameters)) {
         arguments = Array.Append<SpannedType>(arguments, Named(builder, parameters[index].node.name));
         index = index + 1_i64;
     }
@@ -73,117 +65,64 @@ EncoderGroup EncoderFor(Syntax.Builder builder, SpannedPath receiver, SpannedIde
     SpannedExpression forward = Syntax.Call(builder, Syntax.Name(builder, Syntax.PathValue(builder, [writeName], arguments)), [Syntax.Local(builder, "this"), Syntax.Local(builder, "encoder"), Syntax.Local(builder, "limits")]);
     SpannedMethodDefinition method = Syntax.Method(builder, TypePath(builder, receiver), "WriteTyped", [Syntax.ParameterValue(builder, "encoder", encoder), Syntax.ParameterValue(builder, "limits", limits)], ResultType(builder, unitType), [Syntax.Return(builder, forward)]);
     SpannedImplBlock implementation = Syntax.GenericImplementation(builder, generics, bounds, TypePath(builder, receiver), Syntax.CorePath(builder, ["Serialization", "Contracts", "Serializable"], [encoder]), [method]);
-    return EncoderGroup
-    {
-        implementation: implementation,
-        factory: factory,
-    };
+    return EncoderGroup { implementation: implementation, factory: factory };
 }
 
-Result<EncoderGroup, SemanticError> EncoderRecord(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers)
-{
+Result<EncoderGroup, SemanticError> EncoderRecord(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers) {
     string encoderName = Syntax.FreshTypeName(builder);
     SpannedType unitType = Syntax.Primitive(builder, PrimitiveType::Unit);
-    match (Write.Record(builder, Named(builder, encoderName), Syntax.CorePath(builder, ["Serialization", "Descriptors", "CompiledShape"], [TypePath(builder, receiver)]), ResultPath(builder, unitType), fields, policies, containers))
-    {
-        Result::Ok(body) => {
-            return Result::Ok(EncoderFor(builder, receiver, parameters, encoderName, body));
-        },
-        Result::Error(error) => {
-            return Result::Error(error);
-        },
+    match Write.Record(builder, Named(builder, encoderName), Syntax.CorePath(builder, ["Serialization", "Descriptors", "CompiledShape"], [TypePath(builder, receiver)]), ResultPath(builder, unitType), fields, policies, containers) {
+        Result::Ok(body) => { return Result::Ok(EncoderFor(builder, receiver, parameters, encoderName, body)); },
+        Result::Error(error) => { return Result::Error(error); },
     };
 }
 
 /// Decoded body kind. Record fields are read by wire name; payload-enum
 /// variant fields are read positionally, each with its own field policy.
-pub enum DecoderShape
-{
+pub enum DecoderShape {
     Record(SpannedField[] fields, Read.FieldPolicy[] policies),
     Enumeration(SpannedEnumVariant[] variants, Read.VariantPolicy[] policies),
 }
 
 /// Declared nominal sites read through the compiler-issued field decoder correspondence, in body order.
-pub Result<SpannedType[], SemanticError> FieldReadSites(DecoderShape shape, Read.ContainerSite[] containers)
-{
+pub Result<SpannedType[], SemanticError> FieldReadSites(DecoderShape shape, Read.ContainerSite[] containers) {
     mut SpannedType[] result = [];
-    match (shape)
-    {
+    match shape {
         DecoderShape::Record(fields, policies) => {
-            if (Array.Len(fields) != Array.Len(policies))
-            {
-                return Result::Error(SemanticError
-                {
-                    code: "SerializationFieldPolicy",
-                    message: "field policy count differs",
-                });
-            }
+            if (Array.Len(fields) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "field policy count differs" }); }
             mut i64 index = 0_i64;
-            while (index < Array.Len(fields))
-            {
+            while (index < Array.Len(fields)) {
                 Read.FieldPolicy policy = policies[index];
                 // A skip-read field the encoder still writes is read and discarded.
-                if (!policy.skipRead || !policy.skipWrite)
-                {
+                if (!policy.skipRead || !policy.skipWrite) {
                     SpannedType ty = fields[index].node.ty;
                     mut SpannedType[] needed = [];
-                    if (policy.catchall)
-                    {
+                    if (policy.catchall) {
                         // Unknown fields are read as the catchall value type V.
                         i64 site = Read.ContainerIndex(containers, ty);
-                        if (site >= 0_i64)
-                        {
-                            needed = Read.BindingTypes(containers[site].element, containers, false);
-                        }
-                    }
-                    else
-                    {
+                        if (site >= 0_i64) { needed = Read.BindingTypes(containers[site].element, containers, false); }
+                    } else {
                         needed = Read.BindingTypes(ty, containers, policy.bytes);
                     }
                     mut i64 item = 0_i64;
-                    while (item < Array.Len(needed))
-                    {
-                        result = Array.Append<SpannedType>(result, needed[item]);
-                        item = item + 1_i64;
-                    }
+                    while (item < Array.Len(needed)) { result = Array.Append<SpannedType>(result, needed[item]); item = item + 1_i64; }
                 }
                 index = index + 1_i64;
             }
         },
         DecoderShape::Enumeration(variants, policies) => {
-            if (Array.Len(variants) != Array.Len(policies))
-            {
-                return Result::Error(SemanticError
-                {
-                    code: "SerializationFieldPolicy",
-                    message: "variant policy count differs",
-                });
-            }
+            if (Array.Len(variants) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant policy count differs" }); }
             mut i64 variant = 0_i64;
-            while (variant < Array.Len(variants))
-            {
+            while (variant < Array.Len(variants)) {
                 SpannedField[] fields = variants[variant].node.fields.items;
                 Read.FieldPolicy[] fieldPolicies = policies[variant].fields;
-                if (Array.Len(fields) != Array.Len(fieldPolicies))
-                {
-                    return Result::Error(SemanticError
-                    {
-                        code: "SerializationFieldPolicy",
-                        message: "variant field policy count differs",
-                    });
-                }
+                if (Array.Len(fields) != Array.Len(fieldPolicies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant field policy count differs" }); }
                 mut i64 index = 0_i64;
-                while (index < Array.Len(fields))
-                {
-                    if (!fieldPolicies[index].skipRead)
-                    {
+                while (index < Array.Len(fields)) {
+                    if (!fieldPolicies[index].skipRead) {
                         SpannedType[] needed = Read.BindingTypes(fields[index].node.ty, containers, fieldPolicies[index].bytes);
                         mut i64 item = 0_i64;
-                        while (item < Array.Len(needed))
-                        {
-                            result = Array.Append<SpannedType>(result, needed[item]);
-                            item = item + 1_i64;
-                        }
+                        while (item < Array.Len(needed)) { result = Array.Append<SpannedType>(result, needed[item]); item = item + 1_i64; }
                     }
                     index = index + 1_i64;
                 }
@@ -201,17 +140,10 @@ pub Result<SpannedType[], SemanticError> FieldReadSites(DecoderShape shape, Read
 /// compiler issues per exact field application F; the factory itself is the correspondence
 /// target of `ReadField<T<P...>, R>`. No receiver parameter gets a decoding bound: each concrete
 /// application is revalidated by the compiler-issued correspondence.
-Result<GeneratedTarget, SemanticError> DecoderAdapter(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, DecoderShape shape, Read.ContainerSite[] containers)
-{
+Result<GeneratedTarget, SemanticError> DecoderAdapter(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, DecoderShape shape, Read.ContainerSite[] containers) {
     mut SpannedType[] bound = [];
-    match (FieldReadSites(shape, containers))
-    {
-        Result::Ok(value) => {
-            bound = value;
-        },
-        Result::Error(error) => {
-            return Result::Error(error);
-        },
+    match FieldReadSites(shape, containers) {
+        Result::Ok(value) => { bound = value; }, Result::Error(error) => { return Result::Error(error); },
     };
     string readerName = Syntax.FreshTypeName(builder);
     string decoderName = Syntax.FreshTypeName(builder);
@@ -222,8 +154,7 @@ Result<GeneratedTarget, SemanticError> DecoderAdapter(Syntax.Builder builder, Sp
     generics = Array.Append<SpannedIdentifier>(generics, Syntax.IdentifierValue(builder, readerName));
     mut SpannedType[] arguments = [];
     mut i64 index = 0_i64;
-    while (index < Array.Len(parameters))
-    {
+    while (index < Array.Len(parameters)) {
         arguments = Array.Append<SpannedType>(arguments, Named(builder, parameters[index].node.name));
         index = index + 1_i64;
     }
@@ -231,41 +162,23 @@ Result<GeneratedTarget, SemanticError> DecoderAdapter(Syntax.Builder builder, Sp
     WhereBound[] bounds = [Syntax.Bound(builder, readerName, Syntax.CorePath(builder, ["Serialization", "Reader", "Reader"], []))];
     mut Read.NominalBinding[] bindings = [];
     index = 0_i64;
-    while (index < Array.Len(bound))
-    {
+    while (index < Array.Len(bound)) {
         SpannedType ty = bound[index];
-        bindings = Array.Append<Read.NominalBinding>(bindings, Read.NominalBinding
-        {
-            ty: ty,
-            factory: Syntax.CorePath(builder, ["Serialization", "Reader", "ReadField"], [ty, reader]),
-        });
+        bindings = Array.Append<Read.NominalBinding>(bindings, Read.NominalBinding { ty: ty, factory: Syntax.CorePath(builder, ["Serialization", "Reader", "ReadField"], [ty, reader]) });
         index = index + 1_i64;
     }
     SpannedPath shapeGetter = Syntax.CorePath(builder, ["Serialization", "Descriptors", "CompiledShape"], [TypePath(builder, receiver)]);
     SpannedPath result = ResultPath(builder, TypePath(builder, receiver));
     mut SpannedStatement[] body = [];
-    match (shape)
-    {
+    match shape {
         DecoderShape::Record(fields, policies) => {
-            match (Read.RecordBody(builder, receiver, shapeGetter, result, fields, policies, bindings, containers))
-            {
-                Result::Ok(value) => {
-                    body = value;
-                },
-                Result::Error(error) => {
-                    return Result::Error(error);
-                },
+            match Read.RecordBody(builder, receiver, shapeGetter, result, fields, policies, bindings, containers) {
+                Result::Ok(value) => { body = value; }, Result::Error(error) => { return Result::Error(error); },
             };
         },
         DecoderShape::Enumeration(variants, policies) => {
-            match (Read.EnumBody(builder, receiver, shapeGetter, result, variants, policies, bindings, containers))
-            {
-                Result::Ok(value) => {
-                    body = value;
-                },
-                Result::Error(error) => {
-                    return Result::Error(error);
-                },
+            match Read.EnumBody(builder, receiver, shapeGetter, result, variants, policies, bindings, containers) {
+                Result::Ok(value) => { body = value; }, Result::Error(error) => { return Result::Error(error); },
             };
         },
     };
@@ -275,138 +188,65 @@ Result<GeneratedTarget, SemanticError> DecoderAdapter(Syntax.Builder builder, Sp
     // issued field read of T (this group's field decoder factory), then Finish.
     SpannedPath complete = Syntax.CorePath(builder, ["Serialization", "Reader", "ReadComplete"], [TypePath(builder, receiver), reader]);
     SpannedExpression held = Syntax.Member(builder, Syntax.Local(builder, "this"), "reader");
-    SpannedMethodDefinition method = Syntax.Method(builder, adapter, "ReadTyped", [Syntax.ParameterValue(builder, "limits", limits)], ResultType(builder, TypePath(builder, receiver)), [Syntax.Return(builder, Syntax.Call(builder, Syntax.Name(builder, complete), [held, Syntax.Local(builder, "limits")]))]);
+    SpannedMethodDefinition method = Syntax.Method(builder, adapter, "ReadTyped", [Syntax.ParameterValue(builder, "limits", limits)], ResultType(builder, TypePath(builder, receiver)), [
+        Syntax.Return(builder, Syntax.Call(builder, Syntax.Name(builder, complete), [held, Syntax.Local(builder, "limits")])),
+    ]);
     SpannedTypeDefinition definition = Syntax.RecordType(builder, decoderName, generics, [Syntax.DataField(builder, "reader", reader)]);
     SpannedImplBlock implementation = Syntax.GenericImplementation(builder, generics, bounds, adapter, Syntax.CorePath(builder, ["Serialization", "Contracts", "Decoder"], [TypePath(builder, receiver)]), [method]);
-    return Result::Ok(GeneratedTarget
-    {
-        items: [SyntaxContributionItem::TypeDefinition(definition), SyntaxContributionItem::FunctionDefinition(read), SyntaxContributionItem::ImplBlock(implementation)],
-        encoderIndex: 0_u32,
-        encoderMembers: [],
-        decoderIndex: 2_u32,
-        decoderMembers: [0_u32, 1_u32],
-    });
+    return Result::Ok(GeneratedTarget { items: [SyntaxContributionItem::TypeDefinition(definition), SyntaxContributionItem::FunctionDefinition(read), SyntaxContributionItem::ImplBlock(implementation)], encoderIndex: 0_u32, encoderMembers: [], decoderIndex: 2_u32, decoderMembers: [0_u32, 1_u32] });
 }
 
 /// Encoder impl first, then the three decoder items, then the field encoder factory. Any sticky
 /// builder failure (missing canonical path plan, node limit) is reported instead of the group.
-Result<GeneratedTarget, SemanticError> Group(Syntax.Builder builder, EncoderGroup encoder, GeneratedTarget decoder)
-{
-    match (Syntax.Status(builder))
-    {
-        Result::Error(error) => {
-            return Result::Error(error);
-        },
-        Result::Ok(_) => { },
-    };
+Result<GeneratedTarget, SemanticError> Group(Syntax.Builder builder, EncoderGroup encoder, GeneratedTarget decoder) {
+    match Syntax.Status(builder) { Result::Error(error) => { return Result::Error(error); }, Result::Ok(_) => { }, };
     mut SyntaxContributionItem[] items = [SyntaxContributionItem::ImplBlock(encoder.implementation)];
     mut i64 index = 0_i64;
-    while (index < Array.Len(decoder.items))
-    {
-        items = Array.Append<SyntaxContributionItem>(items, decoder.items[index]);
-        index = index + 1_i64;
-    }
+    while (index < Array.Len(decoder.items)) { items = Array.Append<SyntaxContributionItem>(items, decoder.items[index]); index = index + 1_i64; }
     u32 factory = u32(Array.Len(items));
     items = Array.Append<SyntaxContributionItem>(items, SyntaxContributionItem::FunctionDefinition(encoder.factory));
     mut u32[] members = [];
     index = 0_i64;
-    while (index < Array.Len(decoder.decoderMembers))
-    {
-        members = Array.Append<u32>(members, decoder.decoderMembers[index] + 1_u32);
-        index = index + 1_i64;
-    }
-    return Result::Ok(GeneratedTarget
-    {
-        items: items,
-        encoderIndex: 0_u32,
-        encoderMembers: [factory],
-        decoderIndex: decoder.decoderIndex + 1_u32,
-        decoderMembers: members,
-    });
+    while (index < Array.Len(decoder.decoderMembers)) { members = Array.Append<u32>(members, decoder.decoderMembers[index] + 1_u32); index = index + 1_i64; }
+    return Result::Ok(GeneratedTarget { items: items, encoderIndex: 0_u32, encoderMembers: [factory], decoderIndex: decoder.decoderIndex + 1_u32, decoderMembers: members });
 }
 
-pub Result<GeneratedTarget, SemanticError> Record(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers)
-{
-    if (Array.Len(fields) != Array.Len(policies))
-    {
-        return Result::Error(SemanticError
-        {
-            code: "SerializationFieldPolicy",
-            message: "field policy count differs",
-        });
-    }
-    match (EncoderRecord(builder, receiver, parameters, fields, policies, containers))
-    {
-        Result::Error(error) => {
-            return Result::Error(error);
-        },
+pub Result<GeneratedTarget, SemanticError> Record(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedField[] fields, Read.FieldPolicy[] policies, Read.ContainerSite[] containers) {
+    if (Array.Len(fields) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "field policy count differs" }); }
+    match EncoderRecord(builder, receiver, parameters, fields, policies, containers) {
+        Result::Error(error) => { return Result::Error(error); },
         Result::Ok(encoder) => {
-            match (DecoderAdapter(builder, receiver, parameters, DecoderShape::Record(fields, policies), containers))
-            {
-                Result::Error(error) => {
-                    return Result::Error(error);
-                },
-                Result::Ok(decoder) => {
-                    return Group(builder, encoder, decoder);
-                },
+            match DecoderAdapter(builder, receiver, parameters, DecoderShape::Record(fields, policies), containers) {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(decoder) => { return Group(builder, encoder, decoder); },
             };
         },
     };
 }
 
-Result<EncoderGroup, SemanticError> EncoderEnum(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers)
-{
+Result<EncoderGroup, SemanticError> EncoderEnum(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers) {
     string encoderName = Syntax.FreshTypeName(builder);
     SpannedType unitType = Syntax.Primitive(builder, PrimitiveType::Unit);
-    match (Write.Enumeration(builder, receiver, Named(builder, encoderName), Syntax.CorePath(builder, ["Serialization", "Descriptors", "CompiledShape"], [TypePath(builder, receiver)]), ResultPath(builder, unitType), variants, policies, containers))
-    {
-        Result::Ok(body) => {
-            return Result::Ok(EncoderFor(builder, receiver, parameters, encoderName, body));
-        },
-        Result::Error(error) => {
-            return Result::Error(error);
-        },
+    match Write.Enumeration(builder, receiver, Named(builder, encoderName), Syntax.CorePath(builder, ["Serialization", "Descriptors", "CompiledShape"], [TypePath(builder, receiver)]), ResultPath(builder, unitType), variants, policies, containers) {
+        Result::Ok(body) => { return Result::Ok(EncoderFor(builder, receiver, parameters, encoderName, body)); },
+        Result::Error(error) => { return Result::Error(error); },
     };
 }
 
-pub Result<GeneratedTarget, SemanticError> Enumeration(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers)
-{
-    if (Array.Len(variants) != Array.Len(policies))
-    {
-        return Result::Error(SemanticError
-        {
-            code: "SerializationFieldPolicy",
-            message: "variant policy count differs",
-        });
-    }
+pub Result<GeneratedTarget, SemanticError> Enumeration(Syntax.Builder builder, SpannedPath receiver, SpannedIdentifier[] parameters, SpannedEnumVariant[] variants, Read.VariantPolicy[] policies, Read.ContainerSite[] containers) {
+    if (Array.Len(variants) != Array.Len(policies)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant policy count differs" }); }
     // Validate cardinality before the encoder indexes per-variant policies.
     mut i64 variant = 0_i64;
-    while (variant < Array.Len(variants))
-    {
-        if (Array.Len(variants[variant].node.fields.items) != Array.Len(policies[variant].fields))
-        {
-            return Result::Error(SemanticError
-            {
-                code: "SerializationFieldPolicy",
-                message: "variant field policy count differs",
-            });
-        }
+    while (variant < Array.Len(variants)) {
+        if (Array.Len(variants[variant].node.fields.items) != Array.Len(policies[variant].fields)) { return Result::Error(SemanticError { code: "SerializationFieldPolicy", message: "variant field policy count differs" }); }
         variant = variant + 1_i64;
     }
-    match (EncoderEnum(builder, receiver, parameters, variants, policies, containers))
-    {
-        Result::Error(error) => {
-            return Result::Error(error);
-        },
+    match EncoderEnum(builder, receiver, parameters, variants, policies, containers) {
+        Result::Error(error) => { return Result::Error(error); },
         Result::Ok(encoder) => {
-            match (DecoderAdapter(builder, receiver, parameters, DecoderShape::Enumeration(variants, policies), containers))
-            {
-                Result::Error(error) => {
-                    return Result::Error(error);
-                },
-                Result::Ok(decoder) => {
-                    return Group(builder, encoder, decoder);
-                },
+            match DecoderAdapter(builder, receiver, parameters, DecoderShape::Enumeration(variants, policies), containers) {
+                Result::Error(error) => { return Result::Error(error); },
+                Result::Ok(decoder) => { return Group(builder, encoder, decoder); },
             };
         },
     };

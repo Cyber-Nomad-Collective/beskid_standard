@@ -6,118 +6,89 @@ use Connect.Order;
 use Connect.Policy;
 use Testing.Assert;
 
-SocketAddress A4(u8 last)
-{
-    return SocketAddress
-    {
-        address: IpAddress::V4(192_u8, 0_u8, 2_u8, last),
-        port: Network.Types.PortBytes(0_u8, 80_u8),
-    };
+SocketAddress A4(u8 last) {
+    return SocketAddress { address: IpAddress::V4(192_u8, 0_u8, 2_u8, last), port: Network.Types.PortBytes(0_u8, 80_u8) };
 }
 
-SocketAddress A6(u32 last)
-{
-    return SocketAddress
-    {
-        address: IpAddress::V6(0x20010db8_u32, 0_u32, 0_u32, last),
-        port: Network.Types.PortBytes(0_u8, 80_u8),
-    };
+SocketAddress A6(u32 last) {
+    return SocketAddress { address: IpAddress::V6(0x20010db8_u32, 0_u32, 0_u32, last), port: Network.Types.PortBytes(0_u8, 80_u8) };
 }
 
 // A compact signature: 4xx for IPv4 hosts, 6xx for IPv6 hosts, one digit pair each.
-i64 Code(SocketAddress address)
-{
-    return match (address.address)
-    {
+i64 Code(SocketAddress address) {
+    return match address.address {
         IpAddress::V4(_, _, _, d) => 400_i64 + i64(d),
         IpAddress::V6(_, _, _, d) => 600_i64 + i64(d),
     };
 }
 
-i64 Signature(SocketAddress[] values)
-{
+i64 Signature(SocketAddress[] values) {
     mut i64 result = 0_i64;
     mut i64 index = 0_i64;
-    while (index < Array.Len<SocketAddress>(values))
-    {
+    while index < Array.Len<SocketAddress>(values) {
         result = result * 1000_i64 + Code(values[index]);
         index = index + 1_i64;
     }
     return result;
 }
 
-SocketAddress[] Mixed()
-{
+SocketAddress[] Mixed() {
     // Resolver order as getaddrinfo might return it: IPv4 first.
     return [A4(1_u8), A4(2_u8), A4(3_u8), A6(1_u32), A6(2_u32)];
 }
 
-test OrderInterleavesPreferredV6First
-{
-    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V6, 1_i64, Option.Empty<AddressFamily>());
+test OrderInterleavesPreferredV6First {
+    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V6(), 1_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Array.Len<SocketAddress>(ordered), 5_i64, "all addresses kept");
     Assert.Equal<i64>(Signature(ordered), 601401602402403_i64, "v6, v4, v6, v4, then remaining v4");
 }
 
-test OrderInterleavesPreferredV4First
-{
-    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V4, 1_i64, Option.Empty<AddressFamily>());
+test OrderInterleavesPreferredV4First {
+    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V4(), 1_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Signature(ordered), 401601402602403_i64, "v4, v6, v4, v6, v4");
 }
 
-test OrderFirstAddressFamilyCountLeadsWithTwo
-{
-    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V4, 2_i64, Option.Empty<AddressFamily>());
+test OrderFirstAddressFamilyCountLeadsWithTwo {
+    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V4(), 2_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Signature(ordered), 401402601403602_i64, "two v4 before the first v6");
 }
 
-test OrderFirstAddressFamilyCountBelowOneIsOne
-{
-    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V6, 0_i64, Option.Empty<AddressFamily>());
+test OrderFirstAddressFamilyCountBelowOneIsOne {
+    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V6(), 0_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Signature(ordered), 601401602402403_i64, "count zero behaves like one");
 }
 
-test OrderFamilyFilterDropsOtherFamily
-{
-    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V6, 1_i64, Option.FromValue<AddressFamily>(AddressFamily::V4));
+test OrderFamilyFilterDropsOtherFamily {
+    SocketAddress[] ordered = Order.Interleave(Mixed(), AddressFamily::V6(), 1_i64, Option.FromValue<AddressFamily>(AddressFamily::V4()));
     Assert.Equal<i64>(Signature(ordered), 401402403_i64, "only v4 remains, in resolver order");
 }
 
-test OrderMissingPreferredFamilyUsesOther
-{
+test OrderMissingPreferredFamilyUsesOther {
     SocketAddress[] only4 = [A4(7_u8), A4(8_u8)];
-    SocketAddress[] ordered = Order.Interleave(only4, AddressFamily::V6, 1_i64, Option.Empty<AddressFamily>());
+    SocketAddress[] ordered = Order.Interleave(only4, AddressFamily::V6(), 1_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Signature(ordered), 407408_i64, "v4 list unchanged without v6");
 }
 
-test OrderRemovesDuplicates
-{
+test OrderRemovesDuplicates {
     SocketAddress[] values = [A6(1_u32), A4(1_u8), A6(1_u32), A4(1_u8), A4(2_u8)];
-    SocketAddress[] ordered = Order.Interleave(values, AddressFamily::V6, 1_i64, Option.Empty<AddressFamily>());
+    SocketAddress[] ordered = Order.Interleave(values, AddressFamily::V6(), 1_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Signature(ordered), 601401402_i64, "duplicates dropped, first occurrence kept");
 }
 
-test OrderEmptyInputIsEmpty
-{
-    SocketAddress[] ordered = Order.Interleave(Array.Empty<SocketAddress>(), AddressFamily::V6, 1_i64, Option.Empty<AddressFamily>());
+test OrderEmptyInputIsEmpty {
+    SocketAddress[] ordered = Order.Interleave(Array.Empty<SocketAddress>(), AddressFamily::V6(), 1_i64, Option.Empty<AddressFamily>());
     Assert.Equal<i64>(Array.Len<SocketAddress>(ordered), 0_i64, "nothing to order");
 }
 
-test OrderSameAddressComparesPort
-{
+test OrderSameAddressComparesPort {
     SocketAddress a = A4(1_u8);
-    SocketAddress b = SocketAddress
-    {
-        address: IpAddress::V4(192_u8, 0_u8, 2_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 81_u8),
-    };
+    SocketAddress b = SocketAddress { address: IpAddress::V4(192_u8, 0_u8, 2_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 81_u8) };
     Assert.True(Order.SameAddress(a, a), "address equals itself");
     Assert.False(Order.SameAddress(a, b), "different port differs");
     Assert.False(Order.SameAddress(A4(1_u8), A6(1_u32)), "different family differs");
 }
 
-test PolicyDefaultsFollowRfc8305
-{
+test PolicyDefaultsFollowRfc8305 {
     ConnectPolicy p = Policy.Default();
     Assert.Equal<i64>(Policy.AttemptDelayMillis(p), 250_i64, "default attempt delay");
     Assert.Equal<i64>(Policy.ResolutionDelayMillis(p), 50_i64, "default resolution delay");
@@ -125,16 +96,14 @@ test PolicyDefaultsFollowRfc8305
     Assert.True(Policy.IsValid(p), "default policy is valid");
 }
 
-test PolicyAttemptDelayIsClamped
-{
+test PolicyAttemptDelayIsClamped {
     ConnectPolicy low = Policy.WithAttemptDelay(Policy.Default(), Time.FromMilliseconds(10_i64));
     ConnectPolicy high = Policy.WithAttemptDelay(Policy.Default(), Time.FromMilliseconds(9000_i64));
     Assert.Equal<i64>(Policy.AttemptDelayMillis(low), 100_i64, "lower clamp 100 ms");
     Assert.Equal<i64>(Policy.AttemptDelayMillis(high), 2000_i64, "upper clamp 2 s");
 }
 
-test PolicyRejectsInvalidValues
-{
+test PolicyRejectsInvalidValues {
     Assert.False(Policy.IsValid(Policy.WithMaxAttempts(Policy.Default(), 0_i64)), "max attempts must be positive");
     Assert.False(Policy.IsValid(Policy.WithFirstAddressFamilyCount(Policy.Default(), 0_i64)), "family count must be positive");
     Assert.False(Policy.IsValid(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(-1_i64))), "negative timeout is invalid");

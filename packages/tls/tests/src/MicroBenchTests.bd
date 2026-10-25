@@ -30,87 +30,51 @@ use Tls.TlsConfig;
 use Tls.TlsErrors;
 use Tls.TlsStream;
 
-i64 NowNanos()
-{
-    Core.Time.Instant now = Time.MonotonicNow();
-    return now.nanos;
-}
+i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
 
-string Dec(i64 v)
-{
-    if (v < 0_i64)
-    {
-        return "-" + Dec(0_i64 - v);
-    }
-    if (v < 10_i64)
-    {
-        return String.DigitChar(v);
-    }
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
     return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
 }
 
-unit Throughput(string name, i64 bytes, i64 nanos)
-{
+unit Throughput(string name, i64 bytes, i64 nanos) {
     i64 safe = nanos + 1_i64;
     i64 centi = bytes * 100000_i64 / safe;
     i64 frac = centi % 100_i64;
     mut string pad = "";
-    if (frac < 10_i64)
-    {
-        pad = "0";
-    }
+    if frac < 10_i64 { pad = "0"; }
     Output.WriteLine("BENCH " + name + ": " + Dec(centi / 100_i64) + "." + pad + Dec(frac) + " MB/s (" + Dec(safe / 1000_i64) + " us total)");
     return;
 }
 
-unit Latency(string name, i64 ops, i64 nanos)
-{
+unit Latency(string name, i64 ops, i64 nanos) {
     i64 safe = nanos + 1_i64;
     Output.WriteLine("BENCH " + name + ": " + Dec(safe / ops / 1000_i64) + " us/op over " + Dec(ops));
     return;
 }
 
-Option<Deadline> Soon()
-{
+Option<Deadline> Soon() {
     Result<Deadline, TimerError> d = Deadline.After(Time.FromMilliseconds(120000_i64));
-    return match (d)
-    {
-        Result::Ok(v) => Option.FromValue<Deadline>(v),
-        Result::Error(_) => Option.Empty<Deadline>(),
-    };
+    return match d { Result::Ok(v) => Option.FromValue<Deadline>(v), Result::Error(_) => Option.Empty<Deadline>(), };
 }
 
-i64 Chunk()
-{
-    return 16384_i64;
-}
+i64 Chunk() { return 16384_i64; }
+i64 Total() { return 8388608_i64; }
 
-i64 Total()
-{
-    return 8388608_i64;
-}
 
-unit RecordLoop(string label, RecordKeys w, RecordKeys r)
-{
+
+unit RecordLoop(string label, RecordKeys w, RecordKeys r) {
     u8[] buf = Slice.New(Record.BufferLength());
     i64 records = 128_i64;
     mut i64 sealNanos = 0_i64;
     mut i64 openNanos = 0_i64;
     mut i64 i = 0_i64;
-    while (i < records)
-    {
+    while i < records {
         i64 t0 = NowNanos();
-        i64 total = match (Record.Seal(w, buf, 23_i64, Chunk(), 0_i64))
-        {
-            Result::Ok(n) => n,
-            Result::Error(_) => -1_i64,
-        };
+        i64 total = match Record.Seal(w, buf, 23_i64, Chunk(), 0_i64) { Result::Ok(n) => n, Result::Error(_) => -1_i64, };
         i64 t1 = NowNanos();
-        bool ok = match (Record.Open(r, buf, total))
-        {
-            Result::Ok(_) => true,
-            Result::Error(_) => false,
-        };
+        bool ok = match Record.Open(r, buf, total) { Result::Ok(_) => true, Result::Error(_) => false, };
         i64 t2 = NowNanos();
         Assert.True(ok, "record opens");
         sealNanos = sealNanos + (t1 - t0);
@@ -124,26 +88,17 @@ unit RecordLoop(string label, RecordKeys w, RecordKeys r)
 
 // In-memory record layer breakdown: Record.Seal + Record.Open of 16 KiB records in one
 // reused buffer, without sockets, per provider.
-unit RecordBreakdown(string label, CipherSuite suite, bool pure)
-{
+unit RecordBreakdown(string label, CipherSuite suite, bool pure) {
     Provider.ForcePure(pure);
     u8[] secret = Slice.New(Suites.HashLength(suite));
     Result<RecordKeys, TlsError> wr = Record.FromSecret(suite, secret);
     Result<RecordKeys, TlsError> rr = Record.FromSecret(suite, secret);
-    match (wr)
-    {
-        Result::Error(_) => {
-            Assert.Fail("write keys");
-        },
+    match wr {
+        Result::Error(_) => { Assert.Fail("write keys"); },
         Result::Ok(w) => {
-            match (rr)
-            {
-                Result::Error(_) => {
-                    Assert.Fail("read keys");
-                },
-                Result::Ok(r) => {
-                    RecordLoop(label, w, r);
-                },
+            match rr {
+                Result::Error(_) => { Assert.Fail("read keys"); },
+                Result::Ok(r) => { RecordLoop(label, w, r); },
             };
         },
     };
@@ -151,13 +106,8 @@ unit RecordBreakdown(string label, CipherSuite suite, bool pure)
     return;
 }
 
-test BenchTlsRecordLayerInMemory
-{
-    meta
-    {
-        tags = "bench";
-    }
-
+test BenchTlsRecordLayerInMemory {
+    meta { tags = "bench"; }
     RecordBreakdown("aes128gcm pure", Suites.Aes128(), true);
     RecordBreakdown("aes128gcm native", Suites.Aes128(), false);
     RecordBreakdown("chacha20poly1305 pure", Suites.ChaCha(), true);
@@ -166,11 +116,7 @@ test BenchTlsRecordLayerInMemory
     u8[] b = Slice.New(Chunk());
     i64 t0 = NowNanos();
     mut i64 i = 0_i64;
-    while (i < 64_i64)
-    {
-        Slice.Copy(a, 0_i64, b, 0_i64, Chunk());
-        i = i + 1_i64;
-    }
+    while i < 64_i64 { Slice.Copy(a, 0_i64, b, 0_i64, Chunk()); i = i + 1_i64; }
     Throughput("Slice.Copy 16KiB", 64_i64 * Chunk(), NowNanos() - t0);
     i64 t1 = NowNanos();
     u8[] fresh = Slice.New(Chunk());
@@ -179,44 +125,23 @@ test BenchTlsRecordLayerInMemory
 }
 
 // Plain TCP floor: the same 8 MiB in 16 KiB writes without TLS.
-unit PlainSink(TcpListener listener, i64 bytes, i64[] result)
-{
+unit PlainSink(TcpListener listener, i64 bytes, i64[] result) {
     Result<TcpStream, NetworkError> accepted = listener.Accept(Soon());
-    match (accepted)
-    {
-        Result::Error(_) => {
-            result[0] = 1_i64;
-        },
+    match accepted {
+        Result::Error(_) => { result[0] = 1_i64; },
         Result::Ok(tcp) => {
             u8[] buf = Slice.New(Chunk());
             mut i64 got = 0_i64;
             mut bool ok = true;
-            while (ok && got < bytes)
-            {
+            while ok && got < bytes {
                 Result<i64, IoError> n = tcp.Read(buf, 0_i64, Chunk());
-                i64 k = match (n)
-                {
-                    Result::Ok(v) => v,
-                    Result::Error(_) => -1_i64,
-                };
-                if (k <= 0_i64)
-                {
-                    ok = false;
-                }
-                else
-                {
-                    got = got + k;
-                }
+                i64 k = match n { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+                if k <= 0_i64 { ok = false; } else { got = got + k; }
             }
-            if (ok)
-            {
+            if ok {
                 Result<unit, IoError> w = IO.WriteAll(tcp, buf, 0_i64, 1_i64);
                 result[0] = 0_i64;
-            }
-            else
-            {
-                result[0] = 2_i64;
-            }
+            } else { result[0] = 2_i64; }
             tcp.Close();
         },
     };
@@ -224,40 +149,24 @@ unit PlainSink(TcpListener listener, i64 bytes, i64[] result)
     return;
 }
 
-unit PlainRun(u8[] payload, i64[] info)
-{
-    SocketAddress bindAddress = SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: Network.Types.PortBytes(0_u8, 0_u8),
-    };
+unit PlainRun(u8[] payload, i64[] info) {
+    SocketAddress bindAddress = SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
     Result<TcpListener, NetworkError> bound = TcpListener.Bind(bindAddress, 4_i64);
-    match (bound)
-    {
-        Result::Error(_) => {
-            info[0] = 99_i64;
-        },
+    match bound {
+        Result::Error(_) => { info[0] = 99_i64; },
         Result::Ok(listener) => {
-            SocketAddress address = match (listener.LocalAddress())
-            {
-                Result::Ok(a) => a,
-                Result::Error(_) => bindAddress,
-            };
+            SocketAddress address = match listener.LocalAddress() { Result::Ok(a) => a, Result::Error(_) => bindAddress, };
             i64[] result = [-1_i64];
             TcpListener l = listener;
             i64 total = Total();
             Fiber<unit> worker = spawn (() => PlainSink(l, total, result));
             Result<TcpStream, NetworkError> connected = TcpStream.Connect(address, Network.Types.DefaultSocketOptions(), Soon());
-            match (connected)
-            {
-                Result::Error(_) => {
-                    info[0] = 97_i64;
-                },
+            match connected {
+                Result::Error(_) => { info[0] = 97_i64; },
                 Result::Ok(tcp) => {
                     i64 t1 = NowNanos();
                     mut i64 sent = 0_i64;
-                    while (sent < Total())
-                    {
+                    while sent < Total() {
                         IO.WriteAll(tcp, payload, 0_i64, Chunk());
                         sent = sent + Chunk();
                     }
@@ -268,22 +177,14 @@ unit PlainRun(u8[] payload, i64[] info)
                 },
             };
             worker.Join();
-            if (result[0] != 0_i64)
-            {
-                info[0] = 50_i64 + result[0];
-            }
+            if result[0] != 0_i64 { info[0] = 50_i64 + result[0]; }
         },
     };
     return;
 }
 
-test BenchPlainTcpLoopbackFloor
-{
-    meta
-    {
-        tags = "bench";
-    }
-
+test BenchPlainTcpLoopbackFloor {
+    meta { tags = "bench"; }
     u8[] payload = Slice.New(Chunk());
     i64[] info = [-1_i64, 0_i64];
     Fiber<unit> run = spawn (() => PlainRun(payload, info));
@@ -291,3 +192,4 @@ test BenchPlainTcpLoopbackFloor
     Assert.Equal<i64>(info[0], 0_i64, "plain tcp");
     Throughput("plain tcp 8MiB in 16KiB writes", Total(), info[1]);
 }
+

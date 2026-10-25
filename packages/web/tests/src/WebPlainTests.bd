@@ -17,203 +17,100 @@ use Web.WebConfig;
 use Web.WebErrors;
 
 // GET answers "hello <target>"; POST answers "received <length>".
-type Hello : RequestHandler
-{
+type Hello: RequestHandler {
     i64 tag;
-
-    pub Response Handle(Request request)
-    {
-        return Answer(request);
-    }
+    pub Response Handle(Request request) { return Answer(request); }
 }
 
-Response Answer(Request request)
-{
+Response Answer(Request request) {
     mut Header[] headers = Array.Empty<Header>();
-    Array.Append<Header>(headers, Header
-    {
-        name: "content-type",
-        value: "text/plain",
-    });
-    if (request.method == "POST")
-    {
-        return Response
-        {
-            status: 200_i64,
-            reason: "OK",
-            headers: headers,
-            body: Convert.StringToBytes("received " + Dec(Slice.Len(request.body))),
-        };
+    Array.Append<Header>(headers, Header { name: "content-type", value: "text/plain" });
+    if request.method == "POST" {
+        return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("received " + Dec(Slice.Len(request.body))) };
     }
-    return Response
-    {
-        status: 200_i64,
-        reason: "OK",
-        headers: headers,
-        body: Convert.StringToBytes("hello " + request.target),
-    };
+    return Response { status: 200_i64, reason: "OK", headers: headers, body: Convert.StringToBytes("hello " + request.target) };
 }
 
-string Dec(i64 v)
-{
-    if (v < 0_i64)
-    {
-        return "-" + Dec(0_i64 - v);
-    }
-    if (v < 10_i64)
-    {
-        return String.DigitChar(v);
-    }
+string Dec(i64 v) {
+    if v < 0_i64 { return "-" + Dec(0_i64 - v); }
+    if v < 10_i64 { return String.DigitChar(v); }
     return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
 }
 
-SocketAddress Loopback4()
-{
-    Port value = match (NetTypes.PortNumber(0_i64))
-    {
-        Result::Ok(p) => p,
-        Result::Error(_) => NetTypes.PortBytes(0_u8, 0_u8),
-    };
-    return SocketAddress
-    {
-        address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8),
-        port: value,
-    };
+SocketAddress Loopback4() {
+    Port value = match NetTypes.PortNumber(0_i64) { Result::Ok(p) => p, Result::Error(_) => NetTypes.PortBytes(0_u8, 0_u8), };
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: value };
 }
 
-string BaseUrl(TcpListener listener, string scheme, string hostName)
-{
-    return match (listener.LocalAddress())
-    {
+string BaseUrl(TcpListener listener, string scheme, string hostName) {
+    return match listener.LocalAddress() {
         Result::Ok(address) => scheme + "://" + hostName + ":" + Dec(address.port.Value()),
         Result::Error(_) => "",
     };
 }
 
 // Records [kind, detail] of a failure, or [0, 0], at codes[at], codes[at + 1].
-unit Record(i64[] codes, i64 at, Result<WebResponse, WebError> r)
-{
-    match (r)
-    {
-        Result::Ok(_) => {
-            codes[at] = 0_i64;
-            codes[at + 1_i64] = 0_i64;
-        },
-        Result::Error(e) => {
-            codes[at] = WebErrors.Code(e);
-            codes[at + 1_i64] = WebErrors.Detail(e);
-        },
+unit Record(i64[] codes, i64 at, Result<WebResponse, WebError> r) {
+    match r {
+        Result::Ok(_) => { codes[at] = 0_i64; codes[at + 1_i64] = 0_i64; },
+        Result::Error(e) => { codes[at] = WebErrors.Code(e); codes[at + 1_i64] = WebErrors.Detail(e); },
     };
     return;
 }
 
-string TextOf(u8[] body)
-{
-    return match (Convert.BytesToString(body))
-    {
-        Result::Ok(t) => t,
-        Result::Error(_) => "<binary>",
-    };
+string TextOf(u8[] body) {
+    return match Convert.BytesToString(body) { Result::Ok(t) => t, Result::Error(_) => "<binary>", };
 }
 
-string BodyOf(WebResponse w)
-{
-    Response r = w.response;
-    return TextOf(r.body);
-}
+string BodyOf(WebResponse w) { Response r = w.response; return TextOf(r.body); }
+i64 StatusIn(WebResponse w) { Response r = w.response; return r.status; }
 
-i64 StatusIn(WebResponse w)
-{
-    Response r = w.response;
-    return r.status;
-}
-
-string BodyText(Result<WebResponse, WebError> r)
-{
-    return match (r)
-    {
+string BodyText(Result<WebResponse, WebError> r) {
+    return match r {
         Result::Ok(w) => BodyOf(w),
         Result::Error(e) => "<error " + WebErrors.KindOf(e) + ">",
     };
 }
 
-string ProtocolOf(Result<WebResponse, WebError> r)
-{
-    return match (r)
-    {
-        Result::Ok(w) => w.protocol,
-        Result::Error(_) => "<error>",
-    };
+string ProtocolOf(Result<WebResponse, WebError> r) {
+    return match r { Result::Ok(w) => w.protocol, Result::Error(_) => "<error>", };
 }
 
-i64 StatusOf(Result<WebResponse, WebError> r)
-{
-    return match (r)
-    {
-        Result::Ok(w) => StatusIn(w),
-        Result::Error(_) => -1_i64,
-    };
+i64 StatusOf(Result<WebResponse, WebError> r) {
+    return match r { Result::Ok(w) => StatusIn(w), Result::Error(_) => -1_i64, };
 }
 
-unit Expect(i64 actual, i64 expected, string what)
-{
-    if (actual != expected)
-    {
-        Assert.Fail(what + ": got " + Dec(actual) + ", expected " + Dec(expected));
-    }
+unit Expect(i64 actual, i64 expected, string what) {
+    if actual != expected { Assert.Fail(what + ": got " + Dec(actual) + ", expected " + Dec(expected)); }
     return;
 }
 
-unit ExpectText(string actual, string expected, string what)
-{
-    if (actual != expected)
-    {
-        Assert.Fail(what + ": got [" + actual + "], expected [" + expected + "]");
-    }
+unit ExpectText(string actual, string expected, string what) {
+    if actual != expected { Assert.Fail(what + ": got [" + actual + "], expected [" + expected + "]"); }
     return;
 }
 
-Request Get(string url)
-{
-    return Request
-    {
-        method: "GET",
-        target: url,
-        headers: Array.Empty<Header>(),
-        body: Slice.New(0_i64),
-    };
+Request Get(string url) {
+    return Request { method: "GET", target: url, headers: Array.Empty<Header>(), body: Slice.New(0_i64) };
 }
 
-unit ServePlainN(TcpListener l, i64 connections, i64[] served)
-{
-    Hello handler = Hello
-    {
-        tag: 0_i64,
-    };
+unit ServePlainN(TcpListener l, i64 connections, i64[] served) {
+    Hello handler = Hello { tag: 0_i64 };
     mut WebServerConfig c = WebConfig.DefaultServer();
     c.maxConnections = connections;
     c.acceptTimeoutMillis = 120000_i64;
     Result<i64, WebError> r = Web.ServePlain(l, handler, c);
-    match (r)
-    {
-        Result::Ok(n) => {
-            served[0] = n;
-        },
-        Result::Error(e) => {
-            served[0] = 100_i64 + WebErrors.Code(e);
-        },
+    match r {
+        Result::Ok(n) => { served[0] = n; },
+        Result::Error(e) => { served[0] = 100_i64 + WebErrors.Code(e); },
     };
     return;
 }
 
 // codes: [0] server, [1..2] h1 error, [3] h1 status, [4..5] h2c error, [6] h2c status.
-unit PlainScenario(i64[] codes, string[] texts)
-{
-    match (TcpListener.Bind(Loopback4(), 4_i64))
-    {
-        Result::Error(_) => {
-            codes[0] = -1_i64;
-        },
+unit PlainScenario(i64[] codes, string[] texts) {
+    match TcpListener.Bind(Loopback4(), 4_i64) {
+        Result::Error(_) => { codes[0] = -1_i64; },
         Result::Ok(listener) => {
             TcpListener l = listener;
             i64[] served = [0_i64];
@@ -240,16 +137,11 @@ unit PlainScenario(i64[] codes, string[] texts)
 }
 
 // http:// GET against ServePlain (HTTP/1.1), then h2c with prior knowledge.
-test WebPlain
-{
+test WebPlain {
     i64[] codes = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
     string[] texts = ["", "", "", ""];
     Fiber<unit> scenario = spawn (() => PlainScenario(codes, texts));
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "scenario joins");
+    Assert.True(match scenario.Join() { Result::Ok(_) => true, _ => false, }, "scenario joins");
     Expect(codes[1] * 1000_i64 + codes[2], 0_i64, "h1 error kind*1000+detail");
     Expect(codes[3], 200_i64, "h1 status");
     ExpectText(texts[0], "hello /plain", "h1 body");

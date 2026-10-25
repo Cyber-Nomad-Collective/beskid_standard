@@ -9,8 +9,7 @@ use Crypto.Scratch;
 /// `r` holds r0, r1, r1 + (r1 >> 2); `h` the accumulator; `pad` the two s words;
 /// `meta[0]` buffered bytes, `meta[1]` 1 after `Finish`, `meta[2..5)` the kernel cursor
 /// (offset, end, pad bit).
-pub type Poly1305State
-{
+pub type Poly1305State {
     i64[] r;
     i64[] h;
     i64[] pad;
@@ -18,30 +17,20 @@ pub type Poly1305State
     i64[] meta;
 }
 
-i64 Le64(u8[] data, i64 offset)
-{
+i64 Le64(u8[] data, i64 offset) {
     mut i64 v = 0_i64;
     mut i64 i = 7_i64;
-    while (i >= 0_i64)
-    {
-        v = (v << 8_i64) | i64(data[offset + i]);
-        i = i - 1_i64;
-    }
+    while i >= 0_i64 { v = (v << 8_i64) | i64(data[offset + i]); i = i - 1_i64; }
     return v;
 }
 
 /// Starts a one-time authenticator from a 32-byte key (r || s).
-pub Result<Poly1305State, CryptoError> New(u8[] key)
-{
-    if (Slice.Len(key) != 32_i64)
-    {
-        return Result::Error(CryptoError::InvalidKeyLength);
-    }
+pub Result<Poly1305State, CryptoError> New(u8[] key) {
+    if Slice.Len(key) != 32_i64 { return Result::Error(CryptoError::InvalidKeyLength); }
     // Clamp r (RFC 8439 2.5.1).
     i64 r0 = Le64(key, 0_i64) & 0x0ffffffc0fffffff_i64;
     i64 r1 = Le64(key, 8_i64) & 0x0ffffffc0ffffffc_i64;
-    return Result::Ok(Poly1305State
-    {
+    return Result::Ok(Poly1305State {
         r: [r0, r1, r1 + (r1 >> 2_i64)],
         h: [0_i64, 0_i64, 0_i64],
         pad: [Le64(key, 16_i64), Le64(key, 24_i64)],
@@ -51,14 +40,10 @@ pub Result<Poly1305State, CryptoError> New(u8[] key)
 }
 
 /// Pad bit (2^128 at h2 scale) for a full 16-byte block.
-i64 FullBlockBit()
-{
-    return 1_i64;
-}
+i64 FullBlockBit() { return 1_i64; }
 
 /// Absorbs the whole blocks of `m[offset, offset + length)`; `length` is a multiple of 16.
-unit Absorb(Poly1305State state, u8[] m, i64 offset, i64 length, i64 hibit)
-{
+unit Absorb(Poly1305State state, u8[] m, i64 offset, i64 length, i64 hibit) {
     state.meta[2] = offset;
     state.meta[3] = offset + length;
     state.meta[4] = hibit;
@@ -69,12 +54,11 @@ unit Absorb(Poly1305State state, u8[] m, i64 offset, i64 length, i64 hibit)
 // BEGIN GENERATED Poly1305Blocks (tools/clifgen.py)
 /// Absorbs the 16-byte blocks of `data` from offset `meta[2]` up to `meta[3]` with pad
 /// bit `meta[4]` (radix 2^64). Precondition: the range is in bounds.
-i64 Blocks(i64[] r, i64[] h, u8[] data, i64[] meta)
-{
+i64 Blocks(i64[] r, i64[] h, u8[] data, i64[] meta) {
     mut i64 last = 0_i64;
-    while (meta[2] < meta[3])
-    {
-        last = clif { %rp1 = payload %0
+    while meta[2] < meta[3] {
+        last = clif {
+            %rp1 = payload %0
             %hp2 = payload %1
             %dp3 = payload %2
             %mp4 = payload %3
@@ -143,113 +127,69 @@ i64 Blocks(i64[] r, i64[] h, u8[] data, i64[] meta)
             %c74 = iconst.i64 16
             %next75 = iadd %pos5, %c74
             store %next75, %mp4+16
-            return %next75 };
+            return %next75
+        };
     }
     return last;
 }
-
 // END GENERATED Poly1305Blocks
 
 /// Absorbs `count` bytes of `data` at `offset`. Returns false for an invalid range or a finished state.
-pub bool UpdateRange(Poly1305State state, u8[] data, i64 offset, i64 count)
-{
-    if (state.meta[1] != 0_i64)
-    {
-        return false;
-    }
-    if (!Slice.IsValidRange(Slice.Len(data), offset, count))
-    {
-        return false;
-    }
+pub bool UpdateRange(Poly1305State state, u8[] data, i64 offset, i64 count) {
+    if state.meta[1] != 0_i64 { return false; }
+    if !Slice.IsValidRange(Slice.Len(data), offset, count) { return false; }
     mut i64 pos = offset;
     i64 end = offset + count;
     mut i64 buffered = state.meta[0];
-    if (buffered > 0_i64)
-    {
-        while (buffered < 16_i64 && pos < end)
-        {
-            state.buffer[buffered] = data[pos];
-            buffered = buffered + 1_i64;
-            pos = pos + 1_i64;
-        }
-        if (buffered < 16_i64)
-        {
-            state.meta[0] = buffered;
-            return true;
-        }
+    if buffered > 0_i64 {
+        while buffered < 16_i64 && pos < end { state.buffer[buffered] = data[pos]; buffered = buffered + 1_i64; pos = pos + 1_i64; }
+        if buffered < 16_i64 { state.meta[0] = buffered; return true; }
         Absorb(state, state.buffer, 0_i64, 16_i64, FullBlockBit());
         buffered = 0_i64;
     }
     i64 whole = ((end - pos) / 16_i64) * 16_i64;
-    if (whole > 0_i64)
-    {
+    if whole > 0_i64 {
         Absorb(state, data, pos, whole, FullBlockBit());
         pos = pos + whole;
     }
-    while (pos < end)
-    {
-        state.buffer[buffered] = data[pos];
-        buffered = buffered + 1_i64;
-        pos = pos + 1_i64;
-    }
+    while pos < end { state.buffer[buffered] = data[pos]; buffered = buffered + 1_i64; pos = pos + 1_i64; }
     state.meta[0] = buffered;
     return true;
 }
 
-pub bool Update(Poly1305State state, u8[] data)
-{
+pub bool Update(Poly1305State state, u8[] data) {
     return UpdateRange(state, data, 0_i64, Slice.Len(data));
 }
 
 /// Zero-pads the buffered input to a 16-byte boundary (the AEAD pad16 construction).
-pub unit PadToBlock(Poly1305State state)
-{
+pub unit PadToBlock(Poly1305State state) {
     mut i64 buffered = state.meta[0];
-    if (buffered == 0_i64 || state.meta[1] != 0_i64)
-    {
-        return;
-    }
-    while (buffered < 16_i64)
-    {
-        state.buffer[buffered] = 0_u8;
-        buffered = buffered + 1_i64;
-    }
+    if buffered == 0_i64 || state.meta[1] != 0_i64 { return; }
+    while buffered < 16_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
     Absorb(state, state.buffer, 0_i64, 16_i64, FullBlockBit());
     state.meta[0] = 0_i64;
     return;
 }
 
 /// Carry of the unsigned 64-bit sum `a + b = sum`, as 0 or 1.
-i64 CarryOut(i64 a, i64 b, i64 sum)
-{
+i64 CarryOut(i64 a, i64 b, i64 sum) {
     return (((a & b) | ((a | b) & (-1_i64 - sum))) >> 63_i64) & 1_i64;
 }
 
 /// Returns the 16-byte tag.
-pub u8[] Finish(Poly1305State state)
-{
+pub u8[] Finish(Poly1305State state) {
     u8[] tag = Scratch.Bytes(16_i64);
-    if (state.meta[1] != 0_i64)
-    {
-        return tag;
-    }
+    if state.meta[1] != 0_i64 { return tag; }
     mut i64 buffered = state.meta[0];
-    if (buffered > 0_i64)
-    {
+    if buffered > 0_i64 {
         state.buffer[buffered] = 1_u8;
         buffered = buffered + 1_i64;
-        while (buffered < 16_i64)
-        {
-            state.buffer[buffered] = 0_u8;
-            buffered = buffered + 1_i64;
-        }
+        while buffered < 16_i64 { state.buffer[buffered] = 0_u8; buffered = buffered + 1_i64; }
         Absorb(state, state.buffer, 0_i64, 16_i64, 0_i64);
     }
     state.meta[1] = 1_i64;
     i64[] h = state.h;
-    mut i64 h0 = h[0];
-    mut i64 h1 = h[1];
-    i64 h2 = h[2];
+    mut i64 h0 = h[0]; mut i64 h1 = h[1]; i64 h2 = h[2];
     // g = h + 5; when g reaches 2^130 (bit 2 of g2), h >= p and g - 2^130 is h mod p.
     i64 g0 = h0 + 5_i64;
     i64 c0 = CarryOut(h0, 5_i64, g0);
@@ -268,11 +208,9 @@ pub u8[] Finish(Poly1305State state)
     return tag;
 }
 
-unit WriteLe64(u8[] out, i64 offset, i64 value)
-{
+unit WriteLe64(u8[] out, i64 offset, i64 value) {
     mut i64 i = 0_i64;
-    while (i < 8_i64)
-    {
+    while i < 8_i64 {
         out[offset + i] = u8((value >> (i * 8_i64)) & 0xFF_i64);
         i = i + 1_i64;
     }
@@ -280,10 +218,8 @@ unit WriteLe64(u8[] out, i64 offset, i64 value)
 }
 
 /// One-shot Poly1305 tag of `message` under a 32-byte one-time key.
-pub Result<u8[], CryptoError> Mac(u8[] key, u8[] message)
-{
-    return match (New(key))
-    {
+pub Result<u8[], CryptoError> Mac(u8[] key, u8[] message) {
+    return match New(key) {
         Result::Error(error) => Result::Error(error),
         Result::Ok(state) => {
             Update(state, message);

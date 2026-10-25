@@ -6,516 +6,295 @@ use Core.Text.Parser;
 use Core.Text.Regex.Generated;
 use Core.Text.Regex.Types;
 
-pub MatchStep MatchPat(string pattern, i64 patPos, string text, i64 textPos)
-{
+pub MatchStep MatchPat(string pattern, i64 patPos, string text, i64 textPos) {
     mut i64 branchStart = patPos;
-    while (branchStart < PatLen(pattern))
-    {
+    while branchStart < PatLen(pattern) {
         MatchStep branch = MatchBranch(pattern, branchStart, text, textPos);
-        if (branch.ok)
-        {
+        if branch.ok {
             return branch;
         }
         i64 nextBranch = NextPatBranch(pattern, branchStart);
-        if (nextBranch < 0)
-        {
+        if nextBranch < 0 {
             break;
         }
         branchStart = nextBranch;
     }
-    return MatchStep
-    {
-        patPos: patPos,
-        textPos: textPos,
-        ok: false,
-    };
+    return MatchStep { patPos: patPos, textPos: textPos, ok: false };
 }
 
-MatchStep MatchBranch(string pattern, i64 patPos, string text, i64 textPos)
-{
+MatchStep MatchBranch(string pattern, i64 patPos, string text, i64 textPos) {
     mut i64 pos = patPos;
     mut i64 curText = textPos;
-    while (pos < PatLen(pattern))
-    {
-        if (IsBranchTerminator(PatAt(pattern, pos)))
-        {
+    while pos < PatLen(pattern) {
+        if IsBranchTerminator(PatAt(pattern, pos)) {
             break;
         }
         MatchStep piece = MatchPiece(pattern, pos, text, curText);
-        if (!piece.ok)
-        {
-            return MatchStep
-            {
-                patPos: patPos,
-                textPos: textPos,
-                ok: false,
-            };
+        if !piece.ok {
+            return MatchStep { patPos: patPos, textPos: textPos, ok: false };
         }
         pos = piece.patPos;
         curText = piece.textPos;
     }
-    return MatchStep
-    {
-        patPos: pos,
-        textPos: curText,
-        ok: true,
-    };
+    return MatchStep { patPos: pos, textPos: curText, ok: true };
 }
 
-bool IsBranchTerminator(string ch)
-{
+bool IsBranchTerminator(string ch) {
     return ch == "|" || ch == ")";
 }
 
-MatchStep MatchPiece(string pattern, i64 patPos, string text, i64 textPos)
-{
-    if (patPos >= PatLen(pattern))
-    {
-        return MatchStep
-        {
-            patPos: patPos,
-            textPos: textPos,
-            ok: false,
-        };
+MatchStep MatchPiece(string pattern, i64 patPos, string text, i64 textPos) {
+    if patPos >= PatLen(pattern) {
+        return MatchStep { patPos: patPos, textPos: textPos, ok: false };
     }
     mut i64 pieceEnd = 0;
     mut string quant = "";
     MatchStep one = MatchPieceCore(pattern, patPos, text, textPos);
-    if (!one.ok)
-    {
+    if !one.ok {
         return one;
     }
     pieceEnd = one.patPos;
-    if (pieceEnd < PatLen(pattern))
-    {
+    if pieceEnd < PatLen(pattern) {
         string q = PatAt(pattern, pieceEnd);
-        if (q == "*" || q == "+" || q == "?")
-        {
+        if q == "*" || q == "+" || q == "?" {
             quant = q;
             pieceEnd = pieceEnd + 1;
         }
     }
-    if (quant == "")
-    {
-        return MatchStep
-        {
-            patPos: pieceEnd,
-            textPos: one.textPos,
-            ok: true,
-        };
+    if quant == "" {
+        return MatchStep { patPos: pieceEnd, textPos: one.textPos, ok: true };
     }
     return MatchQuant(pattern, patPos, pieceEnd, text, textPos, quant);
 }
 
-MatchStep MatchPieceCore(string pattern, i64 patPos, string text, i64 textPos)
-{
+MatchStep MatchPieceCore(string pattern, i64 patPos, string text, i64 textPos) {
     string ch = PatAt(pattern, patPos);
-    if (ch == "^")
-    {
-        if (textPos != 0)
-        {
-            return MatchStep
-            {
-                patPos: patPos,
-                textPos: textPos,
-                ok: false,
-            };
+    if ch == "^" {
+        if textPos != 0 {
+            return MatchStep { patPos: patPos, textPos: textPos, ok: false };
         }
-        return MatchStep
-        {
-            patPos: patPos + 1,
-            textPos: textPos,
-            ok: true,
-        };
+        return MatchStep { patPos: patPos + 1, textPos: textPos, ok: true };
     }
-    if (ch == "$")
-    {
-        if (textPos != PatLen(text))
-        {
-            return MatchStep
-            {
-                patPos: patPos,
-                textPos: textPos,
-                ok: false,
-            };
+    if ch == "$" {
+        if textPos != PatLen(text) {
+            return MatchStep { patPos: patPos, textPos: textPos, ok: false };
         }
-        return MatchStep
-        {
-            patPos: patPos + 1,
-            textPos: textPos,
-            ok: true,
-        };
+        return MatchStep { patPos: patPos + 1, textPos: textPos, ok: true };
     }
-    if (ch == "(")
-    {
+    if ch == "(" {
         i64 close = FindClosingParen(pattern, patPos);
-        if (close < 0)
-        {
-            return MatchStep
-            {
-                patPos: patPos,
-                textPos: textPos,
-                ok: false,
-            };
+        if close < 0 {
+            return MatchStep { patPos: patPos, textPos: textPos, ok: false };
         }
         MatchStep inner = MatchPat(pattern, patPos + 1, text, textPos);
-        if (!inner.ok)
-        {
+        if !inner.ok {
             return inner;
         }
-        return MatchStep
-        {
-            patPos: close + 1,
-            textPos: inner.textPos,
-            ok: true,
-        };
+        return MatchStep { patPos: close + 1, textPos: inner.textPos, ok: true };
     }
-    if (ch == "[")
-    {
+    if ch == "[" {
         i64 close = FindClosingBracket(pattern, patPos);
-        if (close < 0)
-        {
-            return MatchStep
-            {
-                patPos: patPos,
-                textPos: textPos,
-                ok: false,
-            };
+        if close < 0 {
+            return MatchStep { patPos: patPos, textPos: textPos, ok: false };
         }
         return MatchClass(pattern, patPos + 1, close, text, textPos);
     }
-    if (ch == "\\")
-    {
+    if ch == "\\" {
         return MatchEscape(pattern, patPos, text, textPos);
     }
-    if (ch == ".")
-    {
+    if ch == "." {
         return MatchDot(text, textPos, patPos + 1);
     }
     return MatchLiteral(pattern, patPos, text, textPos);
 }
 
-MatchStep MatchQuant(string pattern, i64 pieceStart, i64 patAfter, string text, i64 textPos, string quant)
-{
+MatchStep MatchQuant(string pattern, i64 pieceStart, i64 patAfter, string text, i64 textPos, string quant) {
     mut i64 min = 1;
     mut i64 max = 1000000;
-    if (quant == "*")
-    {
+    if quant == "*" {
         min = 0;
     }
-    if (quant == "?")
-    {
+    if quant == "?" {
         min = 0;
         max = 1;
     }
     mut i64 count = 0;
     mut i64 curText = textPos;
     mut i64 lastGood = textPos;
-    while (count < max)
-    {
+    while count < max {
         MatchStep one = MatchPieceCore(pattern, pieceStart, text, curText);
-        if (!one.ok)
-        {
+        if !one.ok {
             break;
         }
-        if (one.textPos == curText)
-        {
-            return MatchStep
-            {
-                patPos: pieceStart,
-                textPos: textPos,
-                ok: false,
-            };
+        if one.textPos == curText {
+            return MatchStep { patPos: pieceStart, textPos: textPos, ok: false };
         }
         count = count + 1;
         curText = one.textPos;
-        if (count >= min)
-        {
+        if count >= min {
             lastGood = curText;
         }
     }
-    if (count < min)
-    {
-        return MatchStep
-        {
-            patPos: pieceStart,
-            textPos: textPos,
-            ok: false,
-        };
+    if count < min {
+        return MatchStep { patPos: pieceStart, textPos: textPos, ok: false };
     }
-    return MatchStep
-    {
-        patPos: patAfter,
-        textPos: lastGood,
-        ok: true,
-    };
+    return MatchStep { patPos: patAfter, textPos: lastGood, ok: true };
 }
 
-pub MatchStep MatchDot(string text, i64 textPos, i64 patAfter)
-{
+pub MatchStep MatchDot(string text, i64 textPos, i64 patAfter) {
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), textPos);
     Parser.Result.TextParseResult<string> parsed = Generated.ParseAnyUnit(c);
-    if (!Parser.IsOk(parsed))
-    {
-        return MatchStep
-        {
-            patPos: patAfter,
-            textPos: textPos,
-            ok: false,
-        };
+    if !Parser.IsOk(parsed) {
+        return MatchStep { patPos: patAfter, textPos: textPos, ok: false };
     }
     Cursor.TextCursor rest = Parser.RestOnOk(parsed, c);
-    return MatchStep
-    {
-        patPos: patAfter,
-        textPos: Cursor.Position(rest),
-        ok: true,
-    };
+    return MatchStep { patPos: patAfter, textPos: Cursor.Position(rest), ok: true };
 }
 
-MatchStep MatchEscape(string pattern, i64 patPos, string text, i64 textPos)
-{
-    if (patPos + 1 >= PatLen(pattern))
-    {
-        return MatchStep
-        {
-            patPos: patPos,
-            textPos: textPos,
-            ok: false,
-        };
+MatchStep MatchEscape(string pattern, i64 patPos, string text, i64 textPos) {
+    if patPos + 1 >= PatLen(pattern) {
+        return MatchStep { patPos: patPos, textPos: textPos, ok: false };
     }
     string esc = PatAt(pattern, patPos + 1);
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), textPos);
     mut Parser.Result.TextParseResult<string> parsed = Generated.ParseDigit(c);
-    if (esc == "d")
-    {
+    if esc == "d" {
         parsed = Generated.ParseDigit(c);
-    }
-    else if (esc == "D")
-    {
+    } else if esc == "D" {
         parsed = MatchNotDigit(c);
-    }
-    else if (esc == "w")
-    {
+    } else if esc == "w" {
         parsed = Generated.ParseWordTail(c);
-    }
-    else if (esc == "W")
-    {
+    } else if esc == "W" {
         parsed = MatchNotWord(c);
-    }
-    else if (esc == "s")
-    {
+    } else if esc == "s" {
         parsed = Generated.ParseSpace(c);
-    }
-    else if (esc == "S")
-    {
+    } else if esc == "S" {
         parsed = MatchNotSpace(c);
-    }
-    else if (esc == "." || esc == "\\" || esc == "/" || esc == "-" || esc == "+" || esc == "|" || esc == "(" || esc == ")" || esc == "[" || esc == "]")
-    {
+    } else if esc == "." || esc == "\\" || esc == "/" || esc == "-" || esc == "+" || esc == "|" || esc == "(" || esc == ")" || esc == "[" || esc == "]" {
         string lit = PatAt(pattern, patPos + 1);
         parsed = Parser.Literal(c, lit, "escape");
+    } else {
+        return MatchStep { patPos: patPos, textPos: textPos, ok: false };
     }
-    else
-    {
-        return MatchStep
-        {
-            patPos: patPos,
-            textPos: textPos,
-            ok: false,
-        };
-    }
-    if (!Parser.IsOk(parsed))
-    {
-        return MatchStep
-        {
-            patPos: patPos,
-            textPos: textPos,
-            ok: false,
-        };
+    if !Parser.IsOk(parsed) {
+        return MatchStep { patPos: patPos, textPos: textPos, ok: false };
     }
     Cursor.TextCursor rest = Parser.RestOnOk(parsed, c);
-    return MatchStep
-    {
-        patPos: patPos + 2,
-        textPos: Cursor.Position(rest),
-        ok: true,
-    };
+    return MatchStep { patPos: patPos + 2, textPos: Cursor.Position(rest), ok: true };
 }
 
-pub Parser.Result.TextParseResult<string> MatchNotDigit(Cursor.TextCursor c)
-{
+pub Parser.Result.TextParseResult<string> MatchNotDigit(Cursor.TextCursor c) {
     Parser.Result.TextParseResult<string> digit = Generated.ParseDigit(c);
-    if (Parser.IsOk(digit))
-    {
+    if Parser.IsOk(digit) {
         return Parser.Fail(c, ParseErrorKind::ExpectedRule("not_digit"), "not_digit");
     }
     return Generated.ParseAnyUnit(c);
 }
 
-pub Parser.Result.TextParseResult<string> MatchNotWord(Cursor.TextCursor c)
-{
+pub Parser.Result.TextParseResult<string> MatchNotWord(Cursor.TextCursor c) {
     Parser.Result.TextParseResult<string> word = Generated.ParseWordTail(c);
-    if (Parser.IsOk(word))
-    {
+    if Parser.IsOk(word) {
         return Parser.Fail(c, ParseErrorKind::ExpectedRule("not_word"), "not_word");
     }
     return Generated.ParseAnyUnit(c);
 }
 
-pub Parser.Result.TextParseResult<string> MatchNotSpace(Cursor.TextCursor c)
-{
+pub Parser.Result.TextParseResult<string> MatchNotSpace(Cursor.TextCursor c) {
     Parser.Result.TextParseResult<string> space = Generated.ParseSpace(c);
-    if (Parser.IsOk(space))
-    {
+    if Parser.IsOk(space) {
         return Parser.Fail(c, ParseErrorKind::ExpectedRule("not_space"), "not_space");
     }
     return Generated.ParseAnyUnit(c);
 }
 
-MatchStep MatchClass(string pattern, i64 start, i64 close, string text, i64 textPos)
-{
+MatchStep MatchClass(string pattern, i64 start, i64 close, string text, i64 textPos) {
     mut bool neg = false;
     mut i64 pos = start;
-    if (pos < close && PatAt(pattern, pos) == "^")
-    {
+    if pos < close && PatAt(pattern, pos) == "^" {
         neg = true;
         pos = pos + 1;
     }
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), textPos);
-    if (Cursor.AtEnd(c))
-    {
-        return MatchStep
-        {
-            patPos: close + 1,
-            textPos: textPos,
-            ok: false,
-        };
+    if Cursor.AtEnd(c) {
+        return MatchStep { patPos: close + 1, textPos: textPos, ok: false };
     }
     string ch = Cursor.Slice(c, c.pos, 1);
     bool matched = ClassMatches(pattern, pos, close, ch, neg);
-    if (!matched)
-    {
-        return MatchStep
-        {
-            patPos: close + 1,
-            textPos: textPos,
-            ok: false,
-        };
+    if !matched {
+        return MatchStep { patPos: close + 1, textPos: textPos, ok: false };
     }
-    return MatchStep
-    {
-        patPos: close + 1,
-        textPos: textPos + 1,
-        ok: true,
-    };
+    return MatchStep { patPos: close + 1, textPos: textPos + 1, ok: true };
 }
 
-bool ClassMatches(string pattern, i64 start, i64 close, string ch, bool neg)
-{
+bool ClassMatches(string pattern, i64 start, i64 close, string ch, bool neg) {
     mut i64 pos = start;
     mut bool found = false;
-    while (pos < close)
-    {
+    while pos < close {
         string first = PatAt(pattern, pos);
-        if (pos + 2 < close && PatAt(pattern, pos + 1) == "-")
-        {
+        if pos + 2 < close && PatAt(pattern, pos + 1) == "-" {
             string last = PatAt(pattern, pos + 2);
-            if (CharInRange(ch, first, last))
-            {
+            if CharInRange(ch, first, last) {
                 found = true;
             }
             pos = pos + 3;
             continue;
         }
-        if (first == ch)
-        {
+        if first == ch {
             found = true;
         }
         pos = pos + 1;
     }
-    if (neg)
-    {
+    if neg {
         return !found;
     }
     return found;
 }
 
-bool CharInRange(string ch, string lo, string hi)
-{
+bool CharInRange(string ch, string lo, string hi) {
     u8 cb = Core.String.ByteAt(ch, 0);
     u8 lb = Core.String.ByteAt(lo, 0);
     u8 hb = Core.String.ByteAt(hi, 0);
-    if (cb >= lb && cb <= hb)
-    {
+    if cb >= lb && cb <= hb {
         return true;
     }
     return false;
 }
 
-MatchStep MatchLiteral(string pattern, i64 patPos, string text, i64 textPos)
-{
+MatchStep MatchLiteral(string pattern, i64 patPos, string text, i64 textPos) {
     mut i64 end = patPos;
-    while (end < PatLen(pattern))
-    {
+    while end < PatLen(pattern) {
         string ch = PatAt(pattern, end);
-        if (ch == "|" || ch == "(" || ch == ")" || ch == "[" || ch == "]" || ch == "*" || ch == "+" || ch == "?" || ch == "^" || ch == "$" || ch == "." || ch == "\\")
-        {
+        if ch == "|" || ch == "(" || ch == ")" || ch == "[" || ch == "]" || ch == "*" || ch == "+" || ch == "?" || ch == "^" || ch == "$" || ch == "." || ch == "\\" {
             break;
         }
         end = end + 1;
     }
-    if (end == patPos)
-    {
-        return MatchStep
-        {
-            patPos: patPos,
-            textPos: textPos,
-            ok: false,
-        };
+    if end == patPos {
+        return MatchStep { patPos: patPos, textPos: textPos, ok: false };
     }
     string lit = Cursor.Slice(Cursor.From(pattern), patPos, end - patPos);
     Cursor.TextCursor c = Cursor.Advance(Cursor.From(text), textPos);
     Parser.Result.TextParseResult<string> parsed = Parser.Literal(c, lit, "literal");
-    if (!Parser.IsOk(parsed))
-    {
-        return MatchStep
-        {
-            patPos: patPos,
-            textPos: textPos,
-            ok: false,
-        };
+    if !Parser.IsOk(parsed) {
+        return MatchStep { patPos: patPos, textPos: textPos, ok: false };
     }
     Cursor.TextCursor rest = Parser.RestOnOk(parsed, c);
-    return MatchStep
-    {
-        patPos: end,
-        textPos: Cursor.Position(rest),
-        ok: true,
-    };
+    return MatchStep { patPos: end, textPos: Cursor.Position(rest), ok: true };
 }
 
-pub i64 NextPatBranch(string pattern, i64 patPos)
-{
+pub i64 NextPatBranch(string pattern, i64 patPos) {
     mut i64 pos = patPos;
     mut i64 depth = 0;
-    while (pos < PatLen(pattern))
-    {
+    while pos < PatLen(pattern) {
         string ch = PatAt(pattern, pos);
-        if (ch == "(")
-        {
+        if ch == "(" {
             depth = depth + 1;
-        }
-        else if (ch == ")")
-        {
-            if (depth < 1)
-            {
+        } else if ch == ")" {
+            if depth < 1 {
                 return -1;
             }
             depth = depth - 1;
-        }
-        else if (ch == "|" && depth == 0)
-        {
+        } else if ch == "|" && depth == 0 {
             return pos + 1;
         }
         pos = pos + 1;
@@ -523,22 +302,16 @@ pub i64 NextPatBranch(string pattern, i64 patPos)
     return -1;
 }
 
-pub i64 FindClosingParen(string pattern, i64 openPos)
-{
+pub i64 FindClosingParen(string pattern, i64 openPos) {
     mut i64 pos = openPos + 1;
     mut i64 depth = 1;
-    while (pos < PatLen(pattern))
-    {
+    while pos < PatLen(pattern) {
         string ch = PatAt(pattern, pos);
-        if (ch == "(")
-        {
+        if ch == "(" {
             depth = depth + 1;
-        }
-        else if (ch == ")")
-        {
+        } else if ch == ")" {
             depth = depth - 1;
-            if (depth == 0)
-            {
+            if depth == 0 {
                 return pos;
             }
         }
@@ -547,13 +320,10 @@ pub i64 FindClosingParen(string pattern, i64 openPos)
     return -1;
 }
 
-pub i64 FindClosingBracket(string pattern, i64 openPos)
-{
+pub i64 FindClosingBracket(string pattern, i64 openPos) {
     mut i64 pos = openPos + 1;
-    while (pos < PatLen(pattern))
-    {
-        if (PatAt(pattern, pos) == "]")
-        {
+    while pos < PatLen(pattern) {
+        if PatAt(pattern, pos) == "]" {
             return pos;
         }
         pos = pos + 1;
@@ -561,12 +331,10 @@ pub i64 FindClosingBracket(string pattern, i64 openPos)
     return -1;
 }
 
-pub i64 PatLen(string pattern)
-{
+pub i64 PatLen(string pattern) {
     return Core.String.Len(pattern);
 }
 
-pub string PatAt(string pattern, i64 index)
-{
+pub string PatAt(string pattern, i64 index) {
     return Cursor.Slice(Cursor.From(pattern), index, 1);
 }

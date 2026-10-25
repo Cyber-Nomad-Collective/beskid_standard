@@ -579,3 +579,34 @@ test WaitReceiveOnAnEmptyHubIsEmpty {
         _ => Assert.Fail("an unknown hub reports Empty"),
     };
 }
+
+// ---- v0.6.7 review 2: a Main local survives collections while Main parks ----
+
+unit ChurnThenSend(Channel<i64> done) {
+    mut i64 round = 0_i64;
+    mut i64 empty = 0_i64;
+    while round < 20000_i64 {
+        string text = "churn ${round}";
+        if text == "" {
+            empty = empty + 1_i64;
+        }
+        round = round + 1_i64;
+    }
+    let sent = Channel.Send<i64>(done, empty);
+    return;
+}
+
+test AFreshObjectHeldOnlyByMainSurvivesCollectionsDuringARootPark {
+    string kept = "kept ${41_i64}";
+    Channel<i64> done = Channel<i64>.Create();
+    Fiber<unit> churn = spawn (() => ChurnThenSend(done));
+    match Channel.Receive<i64>(done) {
+        Result::Ok(empty) => Assert.Equal(empty, 0_i64, "the churning fiber finished while Main waited"),
+        Result::Error(_) => Assert.Fail("Receive in the root fiber must park, not fail"),
+    };
+    Assert.Equal(kept, "kept 41", "Main's fresh string survived the collections the fiber caused");
+    match churn.Join() {
+        Result::Ok(_) => Assert.True(true, "the churning fiber finished"),
+        Result::Error(_) => Assert.Fail("the churning fiber must finish"),
+    };
+}

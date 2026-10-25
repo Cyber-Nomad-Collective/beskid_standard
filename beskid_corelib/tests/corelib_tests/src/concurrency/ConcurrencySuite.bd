@@ -532,11 +532,40 @@ test MapRegisterErrorNamesTheMemberIndex {
 }
 
 test MapWaitReceiveErrorTurnsAnUnknownStatusIntoUnexpected {
-    i64 code = match Hub.MapWaitReceiveError(Status.FromCode(1)) {
+    i64 code = match Hub.MapWaitReceiveError(Status.FromCode(3), 0_i64) {
         HubError::Unexpected(raw) => raw,
         _ => -1_i64,
     };
-    Assert.Equal(code, 1_i64, "a status outside the wait contract is Unexpected, not Closed(0)");
+    Assert.Equal(code, 3_i64, "a status outside the wait contract is Unexpected, not Closed(0)");
+}
+
+test MapWaitReceiveErrorNamesTheClosedMember {
+    i64 member = match Hub.MapWaitReceiveError(Status.FromCode(1), 4_i64) {
+        HubError::Closed(index) => index,
+        _ => -1_i64,
+    };
+    Assert.Equal(member, 4_i64, "a closed wait names the member the runtime reports");
+}
+
+test WaitReceiveInMainOverClosedMembersIsClosed {
+    Hub<i64> hub = Hub<i64>.Create();
+    Channel<i64> first = Hub.CreateMemberChannel();
+    Channel<i64> second = Hub.CreateMemberChannel();
+    match Hub.Register<i64>(hub, 5_i64, first) {
+        Result::Ok(_) => Assert.True(true, "first member registered"),
+        Result::Error(_) => Assert.Fail("first member registers"),
+    };
+    match Hub.Register<i64>(hub, 9_i64, second) {
+        Result::Ok(_) => Assert.True(true, "second member registered"),
+        Result::Error(_) => Assert.Fail("second member registers"),
+    };
+    Channel.Close<i64>(first);
+    Channel.Close<i64>(second);
+    i64 member = match Hub.WaitReceive<i64>(hub) {
+        Result::Error(HubError::Closed(index)) => index,
+        _ => -1_i64,
+    };
+    Assert.Equal(member, 5_i64, "a wait over closed members returns Closed with the first member, not a deadlock trap");
 }
 
 test WaitReceiveOnAnEmptyHubIsEmpty {

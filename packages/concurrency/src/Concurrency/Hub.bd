@@ -50,20 +50,24 @@ pub unit Unregister<T>(Hub<T> self, i64 index) {
     return;
 }
 
-/// Blocks until a member can satisfy `Receive` (round-robin among ready channels).
+/// Blocks until a member can satisfy `Receive` (round-robin among ready channels). When every
+/// member is closed and drained, nothing can arrive any more: the result is
+/// `HubError::Closed` naming the first closed member, also in `Main`.
 pub Core.Results.Result<HubReceiveResult<T>, HubError> WaitReceive<T>(Hub<T> self) {
     i64 raw = __hub_wait_receive_status(self.handle);
     Status status = Status.FromCode(raw);
     return match status {
         Status::Ok => Results.Success<HubReceiveResult<T>, HubError>(HubReceiveResult<T> { index: __hub_wait_receive_index(self.handle), value: __hub_wait_receive_value<T>(self.handle) }),
-        _ => Results.Failure<HubReceiveResult<T>, HubError>(MapWaitReceiveError(status)),
+        _ => Results.Failure<HubReceiveResult<T>, HubError>(MapWaitReceiveError(status, __hub_wait_receive_index(self.handle))),
     };
 }
 
-/// Maps a failed `WaitReceive` status. An empty or unknown hub is `Empty` (it names no
-/// member); any status outside the contract is `Unexpected` with its raw code.
-pub HubError MapWaitReceiveError(Status status) {
+/// Maps a failed `WaitReceive` status. `Closed` (every member closed) names `closedMember`, the
+/// member index the runtime reports for the wait. An empty or unknown hub is `Empty` (it names
+/// no member); any status outside the contract is `Unexpected` with its raw code.
+pub HubError MapWaitReceiveError(Status status, i64 closedMember) {
     return match status {
+        Status::Closed(_) => HubError::Closed(closedMember),
         Status::Cancelled(reason) => HubError::Cancelled(reason),
         Status::HubEmpty => HubError::Empty,
         Status::HubNotFound(_) => HubError::Empty,

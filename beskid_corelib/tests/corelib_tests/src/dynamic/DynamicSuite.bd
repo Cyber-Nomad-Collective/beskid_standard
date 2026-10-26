@@ -7,36 +7,75 @@ use Core.Dynamic;
 use Core.Results;
 use Testing.Assert;
 
-pub type DynamicSource { pub i64 value; }
-pub type DynamicOther { pub i64 value; pub i64 extra; }
-pub type DynamicNested { pub string label; pub i64[] values; }
-pub type DynamicBox<T> { pub T item; }
+pub type DynamicSource
+{
+    pub i64 value;
+}
+
+pub type DynamicOther
+{
+    pub i64 value;
+    pub i64 extra;
+}
+
+pub type DynamicNested
+{
+    pub string label;
+    pub i64[] values;
+}
+
+pub type DynamicBox<T>
+{
+    pub T item;
+}
 
 /// A token no registration issued in this process: registered tags are small process-local counters.
-u64 ForeignToken() { return 0xdeadbeef00000001_u64; }
+u64 ForeignToken()
+{
+    return 0xdeadbeef00000001_u64;
+}
 
-DynamicPayloadV1 PackSource(i64 value) {
-    return match Pack<DynamicSource>(DynamicSource { value: value }) {
+DynamicPayloadV1 PackSource(i64 value)
+{
+    return match (Pack<DynamicSource>(DynamicSource
+    {
+        value: value,
+    }))
+    {
         Result::Ok(payload) => payload,
-        Result::Error(_) => { Assert.Fail("canonical Pack of a registered source"); return PackSource(value); },
+        Result::Error(_) => {
+            Assert.Fail("canonical Pack of a registered source");
+            return PackSource(value);
+        },
     };
 }
 
-DynamicValueV1 CreateSource(i64 value) {
-    return match Create(PackSource(value), Shape<DynamicSource>()) {
+DynamicValueV1 CreateSource(i64 value)
+{
+    return match (Create(PackSource(value), Shape<DynamicSource>()))
+    {
         Result::Ok(cell) => cell,
-        Result::Error(_) => { Assert.Fail("registered Create succeeds"); return CreateSource(value); },
+        Result::Error(_) => {
+            Assert.Fail("registered Create succeeds");
+            return CreateSource(value);
+        },
     };
 }
 
-i64 UnpackSource(DynamicPayloadV1 payload) {
-    return match Unpack<DynamicSource>(payload) {
+i64 UnpackSource(DynamicPayloadV1 payload)
+{
+    return match (Unpack<DynamicSource>(payload))
+    {
         Result::Ok(source) => source.value,
-        Result::Error(_) => { Assert.Fail("typed extraction of the packed source"); return 0_i64; },
+        Result::Error(_) => {
+            Assert.Fail("typed extraction of the packed source");
+            return 0_i64;
+        },
     };
 }
 
-test DynamicZeroShapeAndMappingTokensRejectWithoutPublishing {
+test DynamicZeroShapeAndMappingTokensRejectWithoutPublishing
+{
     u64 shape = Shape<DynamicSource>();
     Assert.True(shape != 0_u64, "a registered shape tag is nonzero");
     DynamicPayloadV1 payload = PackSource(101_i64);
@@ -45,13 +84,15 @@ test DynamicZeroShapeAndMappingTokensRejectWithoutPublishing {
     Assert.True(Results.IsError(Cast(cell, 0_u64)), "zero cast target rejects");
     Assert.True(Results.IsError(Dynamic.Map(cell, 0_u64)), "zero mapping token rejects instead of returning the source");
     Assert.Equal(UnpackSource(payload), 101_i64, "rejected operations leave the source payload unchanged");
-    match Cast(cell, shape) {
+    match (Cast(cell, shape))
+    {
         Result::Error(_) => Assert.Fail("the cell is still castable after rejected operations"),
         Result::Ok(recovered) => Assert.Equal(UnpackSource(recovered), 101_i64, "rejections published nothing into the cell"),
     };
 }
 
-test DynamicUnregisteredTokensFailClosedForCreateCastAndMap {
+test DynamicUnregisteredTokensFailClosedForCreateCastAndMap
+{
     DynamicPayloadV1 payload = PackSource(83_i64);
     Assert.True(Results.IsError(Create(payload, ForeignToken())), "unregistered shape token rejects Create");
     DynamicValueV1 cell = CreateSource(83_i64);
@@ -60,51 +101,78 @@ test DynamicUnregisteredTokensFailClosedForCreateCastAndMap {
     Assert.Equal(UnpackSource(payload), 83_i64, "the source payload is unchanged");
 }
 
-test DynamicCastToWrongRegisteredShapeRejectsAndExactShapeSucceeds {
+test DynamicCastToWrongRegisteredShapeRejectsAndExactShapeSucceeds
+{
     u64 source = Shape<DynamicSource>();
     u64 other = Shape<DynamicOther>();
     Assert.True(source != 0_u64 && other != 0_u64, "both shapes are registered with nonzero tags");
     Assert.True(source != other, "distinct shapes receive distinct tags");
     DynamicValueV1 cell = CreateSource(71_i64);
     Assert.True(Results.IsError(Cast(cell, other)), "a cell of one registered shape does not cast to another");
-    match Cast(cell, source) {
+    match (Cast(cell, source))
+    {
         Result::Error(_) => Assert.Fail("the exact registered shape casts"),
         Result::Ok(payload) => {
             Assert.Equal(UnpackSource(payload), 71_i64, "checked cast returns the original contents");
             Assert.True(Results.IsError(Unpack<DynamicOther>(payload)), "extraction with a different complete type rejects before loading a field");
         },
     };
-    DynamicPayloadV1 otherPayload = match Pack<DynamicOther>(DynamicOther { value: 1_i64, extra: 2_i64 }) {
+    DynamicPayloadV1 otherPayload = match (Pack<DynamicOther>(DynamicOther
+    {
+        value: 1_i64,
+        extra: 2_i64,
+    }))
+    {
         Result::Ok(value) => value,
-        Result::Error(_) => { Assert.Fail("second shape packs"); return; },
+        Result::Error(_) => {
+            Assert.Fail("second shape packs");
+            return;
+        },
     };
     Assert.True(Results.IsError(Create(otherPayload, source)), "Create rejects a payload whose packed type differs from the shape");
 }
 
-DynamicValueV1 ScopedNested(string label, i64 count) {
+DynamicValueV1 ScopedNested(string label, i64 count)
+{
     mut i64[] values = [];
     mut i64 index = 0_i64;
-    while (index < count) {
+    while (index < count)
+    {
         Array.Append<i64>(values, index * 3_i64);
         index = index + 1_i64;
     }
-    DynamicPayloadV1 payload = match Pack<DynamicNested>(DynamicNested { label: label + " payload", values: values }) {
+    DynamicPayloadV1 payload = match (Pack<DynamicNested>(DynamicNested
+    {
+        label: label + " payload",
+        values: values,
+    }))
+    {
         Result::Ok(value) => value,
-        Result::Error(_) => { Assert.Fail("nested record packs"); return ScopedNested(label, count); },
+        Result::Error(_) => {
+            Assert.Fail("nested record packs");
+            return ScopedNested(label, count);
+        },
     };
-    return match Create(payload, Shape<DynamicNested>()) {
+    return match (Create(payload, Shape<DynamicNested>()))
+    {
         Result::Ok(cell) => cell,
-        Result::Error(_) => { Assert.Fail("nested record cell is created"); return ScopedNested(label, count); },
+        Result::Error(_) => {
+            Assert.Fail("nested record cell is created");
+            return ScopedNested(label, count);
+        },
     };
 }
 
-test DynamicCellOnlyRootKeepsNestedPayloadAcrossForcedCollection {
+test DynamicCellOnlyRootKeepsNestedPayloadAcrossForcedCollection
+{
     DynamicValueV1 cell = ScopedNested("rooted", 16_i64);
     Assert.CollectGarbage();
     Assert.CollectGarbage();
-    match Cast(cell, Shape<DynamicNested>()) {
+    match (Cast(cell, Shape<DynamicNested>()))
+    {
         Result::Error(_) => Assert.Fail("cell reachable only through its root casts after collection"),
-        Result::Ok(payload) => match Unpack<DynamicNested>(payload) {
+        Result::Ok(payload) => match (Unpack<DynamicNested>(payload))
+        {
             Result::Error(_) => Assert.Fail("payload reachable only through the cell is extracted after collection"),
             Result::Ok(nested) => {
                 Assert.Equal(nested.label, "rooted payload", "managed string survives collection");
@@ -115,37 +183,67 @@ test DynamicCellOnlyRootKeepsNestedPayloadAcrossForcedCollection {
     };
 }
 
-test DynamicGenericInstantiationsKeepDistinctIdentitiesThroughRepeatedCreationAndCollection {
+test DynamicGenericInstantiationsKeepDistinctIdentitiesThroughRepeatedCreationAndCollection
+{
     u64 numbers = Shape<DynamicBox<i64>>();
     u64 words = Shape<DynamicBox<string>>();
     Assert.True(numbers != 0_u64 && words != 0_u64, "both instantiations are registered");
     Assert.True(numbers != words, "two instantiations of one generic declaration have distinct tags");
     mut i64 round = 0_i64;
     mut i64 survivors = 0_i64;
-    while (round < 200_i64) {
-        DynamicPayloadV1 payload = match Pack<DynamicBox<string>>(DynamicBox<string> { item: "round " + round }) {
+    while (round < 200_i64)
+    {
+        DynamicPayloadV1 payload = match (Pack<DynamicBox<string>>(DynamicBox<string>
+        {
+            item: "round " + round,
+        }))
+        {
             Result::Ok(value) => value,
-            Result::Error(_) => { Assert.Fail("generic string box packs"); return; },
+            Result::Error(_) => {
+                Assert.Fail("generic string box packs");
+                return;
+            },
         };
-        DynamicValueV1 cell = match Create(payload, words) {
+        DynamicValueV1 cell = match (Create(payload, words))
+        {
             Result::Ok(value) => value,
-            Result::Error(_) => { Assert.Fail("generic string box cell is created"); return; },
+            Result::Error(_) => {
+                Assert.Fail("generic string box cell is created");
+                return;
+            },
         };
         Assert.True(Results.IsError(Cast(cell, numbers)), "a string instantiation never casts to the i64 instantiation");
-        if (round % 50_i64 == 0_i64) { Assert.CollectGarbage(); }
-        match Cast(cell, words) {
+        if (round % 50_i64 == 0_i64)
+        {
+            Assert.CollectGarbage();
+        }
+        match (Cast(cell, words))
+        {
             Result::Error(_) => Assert.Fail("live cell casts to its own instantiation"),
-            Result::Ok(recovered) => match Unpack<DynamicBox<string>>(recovered) {
+            Result::Ok(recovered) => match (Unpack<DynamicBox<string>>(recovered))
+            {
                 Result::Error(_) => Assert.Fail("live generic payload is extracted"),
-                Result::Ok(boxed) => { if (boxed.item == "round " + round) { survivors = survivors + 1_i64; } },
+                Result::Ok(boxed) => {
+                    if (boxed.item == "round " + round)
+                    {
+                        survivors = survivors + 1_i64;
+                    }
+                },
             },
         };
         round = round + 1_i64;
     }
     Assert.Equal(survivors, 200_i64, "every live value keeps its own contents through repeated creation and collection");
-    DynamicPayloadV1 number = match Pack<DynamicBox<i64>>(DynamicBox<i64> { item: 9007199254740993_i64 }) {
+    DynamicPayloadV1 number = match (Pack<DynamicBox<i64>>(DynamicBox<i64>
+    {
+        item: 9007199254740993_i64,
+    }))
+    {
         Result::Ok(value) => value,
-        Result::Error(_) => { Assert.Fail("generic i64 box packs"); return; },
+        Result::Error(_) => {
+            Assert.Fail("generic i64 box packs");
+            return;
+        },
     };
     Assert.True(Results.IsError(Unpack<DynamicBox<string>>(number)), "extraction with the other instantiation rejects");
 }

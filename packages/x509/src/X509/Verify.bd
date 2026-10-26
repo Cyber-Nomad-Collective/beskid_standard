@@ -27,7 +27,8 @@ use X509.Signature;
 use X509.TrustStore;
 use X509.X509Errors;
 
-pub type VerifyOptions {
+pub type VerifyOptions
+{
     /// Validation time in seconds since the Unix epoch.
     pub i64 time;
     /// DNS name or IP literal to match against the leaf; empty skips the check.
@@ -39,21 +40,37 @@ pub type VerifyOptions {
 }
 
 /// Server-certificate defaults: at most 6 intermediates, serverAuth required.
-pub VerifyOptions ServerOptions(i64 time, string serverName) {
-    return VerifyOptions { time: time, serverName: serverName, maxIntermediates: 6_i64, requireServerAuth: true };
+pub VerifyOptions ServerOptions(i64 time, string serverName)
+{
+    return VerifyOptions
+    {
+        time: time,
+        serverName: serverName,
+        maxIntermediates: 6_i64,
+        requireServerAuth: true,
+    };
 }
 
-pub VerifyOptions WithMaxIntermediates(VerifyOptions o, i64 value) {
-    return VerifyOptions { time: o.time, serverName: o.serverName, maxIntermediates: value, requireServerAuth: o.requireServerAuth };
+pub VerifyOptions WithMaxIntermediates(VerifyOptions o, i64 value)
+{
+    return VerifyOptions
+    {
+        time: o.time,
+        serverName: o.serverName,
+        maxIntermediates: value,
+        requireServerAuth: o.requireServerAuth,
+    };
 }
 
 /// A validated path: the leaf followed by the intermediates used, and the anchor.
-pub type VerifiedChain {
+pub type VerifiedChain
+{
     pub Certificate[] certificates;
     pub TrustAnchor anchor;
 }
 
-type Search {
+type Search
+{
     Certificate leaf;
     Certificate[] intermediates;
     TrustStore store;
@@ -68,8 +85,10 @@ type Search {
     X509Error[] best;
 }
 
-i64 Rank(X509Error e) {
-    return match e {
+i64 Rank(X509Error e)
+{
+    return match (e)
+    {
         X509Error::None => 0_i64,
         X509Error::UnknownIssuer => 1_i64,
         X509Error::ChainTooLong => 2_i64,
@@ -77,94 +96,154 @@ i64 Rank(X509Error e) {
     };
 }
 
-unit Record(Search s, X509Error e) {
+unit Record(Search s, X509Error e)
+{
     X509Error current = s.best[0];
-    if Rank(e) > Rank(current) { s.best[0] = e; }
+    if (Rank(e) > Rank(current))
+    {
+        s.best[0] = e;
+    }
     return;
 }
 
-bool IsNone(X509Error e) {
-    return match e { X509Error::None => true, _ => false, };
+bool IsNone(X509Error e)
+{
+    return match (e)
+    {
+        X509Error::None => true,
+        _ => false,
+    };
 }
 
 /// Certificate `k` of the current path: 0 is the leaf.
-Certificate At(Search s, i64 k) {
-    if k == 0_i64 { return s.leaf; }
+Certificate At(Search s, i64 k)
+{
+    if (k == 0_i64)
+    {
+        return s.leaf;
+    }
     return s.intermediates[s.path[k - 1_i64]];
 }
 
 /// True unless both key identifiers are present and differ.
-bool KeyIdsAgree(u8[] authorityKeyId, u8[] subjectKeyId) {
-    if Slice.Len(authorityKeyId) == 0_i64 || Slice.Len(subjectKeyId) == 0_i64 { return true; }
+bool KeyIdsAgree(u8[] authorityKeyId, u8[] subjectKeyId)
+{
+    if (Slice.Len(authorityKeyId) == 0_i64 || Slice.Len(subjectKeyId) == 0_i64)
+    {
+        return true;
+    }
     return Der.BytesEqual(authorityKeyId, subjectKeyId);
 }
 
 /// Number of non-self-issued certificates among path positions 1..k-1.
-i64 IntermediatesBelow(Search s, i64 k) {
+i64 IntermediatesBelow(Search s, i64 k)
+{
     mut i64 count = 0_i64;
     mut i64 j = 1_i64;
-    while j < k {
-        if !Certificate.IsSelfIssued(At(s, j)) { count = count + 1_i64; }
+    while (j < k)
+    {
+        if (!Certificate.IsSelfIssued(At(s, j)))
+        {
+            count = count + 1_i64;
+        }
         j = j + 1_i64;
     }
     return count;
 }
 
-bool DnsWithin(string name, string constraint) {
-    if constraint == "" { return true; }
-    if String.ByteAt(constraint, 0_i64) == 46_u8 {
+bool DnsWithin(string name, string constraint)
+{
+    if (constraint == "")
+    {
+        return true;
+    }
+    if (String.ByteAt(constraint, 0_i64) == 46_u8)
+    {
         i64 n = String.Len(name);
         i64 c = String.Len(constraint);
         return n > c && String.SubSlice(name, n - c, c) == constraint;
     }
-    if name == constraint { return true; }
+    if (name == constraint)
+    {
+        return true;
+    }
     i64 n2 = String.Len(name);
     i64 c2 = String.Len(constraint);
     return n2 > c2 + 1_i64 && String.SubSlice(name, n2 - c2 - 1_i64, c2 + 1_i64) == "." + constraint;
 }
 
-bool DnsAllowed(NameConstraints nc, string rawName) {
+bool DnsAllowed(NameConstraints nc, string rawName)
+{
     string name = Hostname.Normalize(rawName);
     mut i64 i = 0_i64;
-    while i < Array.Len<string>(nc.excludedDns) {
-        if DnsWithin(name, nc.excludedDns[i]) { return false; }
+    while (i < Array.Len<string>(nc.excludedDns))
+    {
+        if (DnsWithin(name, nc.excludedDns[i]))
+        {
+            return false;
+        }
         i = i + 1_i64;
     }
-    if Array.Len<string>(nc.permittedDns) == 0_i64 { return true; }
+    if (Array.Len<string>(nc.permittedDns) == 0_i64)
+    {
+        return true;
+    }
     i = 0_i64;
-    while i < Array.Len<string>(nc.permittedDns) {
-        if DnsWithin(name, nc.permittedDns[i]) { return true; }
+    while (i < Array.Len<string>(nc.permittedDns))
+    {
+        if (DnsWithin(name, nc.permittedDns[i]))
+        {
+            return true;
+        }
         i = i + 1_i64;
     }
     return false;
 }
 
-bool IpWithin(u8[] ip, u8[] block) {
+bool IpWithin(u8[] ip, u8[] block)
+{
     i64 n = Slice.Len(ip);
-    if Slice.Len(block) != n * 2_i64 { return false; }
+    if (Slice.Len(block) != n * 2_i64)
+    {
+        return false;
+    }
     mut i64 i = 0_i64;
-    while i < n {
+    while (i < n)
+    {
         u8 mask = block[n + i];
-        if (ip[i] & mask) != (block[i] & mask) { return false; }
+        if ((ip[i] & mask) != (block[i] & mask))
+        {
+            return false;
+        }
         i = i + 1_i64;
     }
     return true;
 }
 
-bool IpAllowed(NameConstraints nc, u8[] ip) {
+bool IpAllowed(NameConstraints nc, u8[] ip)
+{
     mut i64 i = 0_i64;
-    while i < Array.Len<IpBytes>(nc.excludedIp) {
+    while (i < Array.Len<IpBytes>(nc.excludedIp))
+    {
         IpBytes r = nc.excludedIp[i];
-        if IpWithin(ip, r.bytes) { return false; }
+        if (IpWithin(ip, r.bytes))
+        {
+            return false;
+        }
         i = i + 1_i64;
     }
     mut bool sameFamily = false;
     i = 0_i64;
-    while i < Array.Len<IpBytes>(nc.permittedIp) {
+    while (i < Array.Len<IpBytes>(nc.permittedIp))
+    {
         IpBytes p = nc.permittedIp[i];
-        if Slice.Len(p.bytes) == Slice.Len(ip) * 2_i64 {
+        if (Slice.Len(p.bytes) == Slice.Len(ip) * 2_i64)
+        {
             sameFamily = true;
-            if IpWithin(ip, p.bytes) { return true; }
+            if (IpWithin(ip, p.bytes))
+            {
+                return true;
+            }
         }
         i = i + 1_i64;
     }
@@ -172,108 +251,181 @@ bool IpAllowed(NameConstraints nc, u8[] ip) {
 }
 
 /// Applies one nameConstraints extension to one certificate's names.
-pub X509Error CheckNameConstraints(NameConstraints nc, Certificate cert, bool isLeaf) {
-    if !nc.present { return X509Error::None; }
-    if nc.hasUnsupportedForm { return X509Error::UnsupportedNameConstraint; }
+pub X509Error CheckNameConstraints(NameConstraints nc, Certificate cert, bool isLeaf)
+{
+    if (!nc.present)
+    {
+        return X509Error::None;
+    }
+    if (nc.hasUnsupportedForm)
+    {
+        return X509Error::UnsupportedNameConstraint;
+    }
     Extensions ext = cert.extensions;
     mut i64 i = 0_i64;
-    while i < Array.Len<string>(ext.dnsNames) {
-        if !DnsAllowed(nc, ext.dnsNames[i]) { return X509Error::NameConstraintViolation; }
+    while (i < Array.Len<string>(ext.dnsNames))
+    {
+        if (!DnsAllowed(nc, ext.dnsNames[i]))
+        {
+            return X509Error::NameConstraintViolation;
+        }
         i = i + 1_i64;
     }
     i = 0_i64;
-    while i < Array.Len<IpBytes>(ext.ipAddresses) {
+    while (i < Array.Len<IpBytes>(ext.ipAddresses))
+    {
         IpBytes ip = ext.ipAddresses[i];
-        if !IpAllowed(nc, ip.bytes) { return X509Error::NameConstraintViolation; }
+        if (!IpAllowed(nc, ip.bytes))
+        {
+            return X509Error::NameConstraintViolation;
+        }
         i = i + 1_i64;
     }
     // A leaf without subjectAltName may be matched by its common name, so constrain it too.
     DistinguishedName subject = cert.subject;
     string cn = subject.commonName;
-    if isLeaf && !ext.hasSubjectAltName && Hostname.IsValidDnsName(Hostname.Normalize(cn)) {
-        if !DnsAllowed(nc, cn) { return X509Error::NameConstraintViolation; }
+    if (isLeaf && !ext.hasSubjectAltName && Hostname.IsValidDnsName(Hostname.Normalize(cn)))
+    {
+        if (!DnsAllowed(nc, cn))
+        {
+            return X509Error::NameConstraintViolation;
+        }
     }
     return X509Error::None;
 }
 
 /// Name constraints of the certificate at `issuerPos` (or the anchor when it is
 /// `depth + 1`) applied to every certificate below it.
-X509Error ConstraintsBelow(Search s, NameConstraints nc, i64 issuerPos) {
-    if !nc.present { return X509Error::None; }
+X509Error ConstraintsBelow(Search s, NameConstraints nc, i64 issuerPos)
+{
+    if (!nc.present)
+    {
+        return X509Error::None;
+    }
     mut i64 j = 0_i64;
-    while j < issuerPos {
+    while (j < issuerPos)
+    {
         Certificate c = At(s, j);
-        if j == 0_i64 || !Certificate.IsSelfIssued(c) {
+        if (j == 0_i64 || !Certificate.IsSelfIssued(c))
+        {
             X509Error e = CheckNameConstraints(nc, c, j == 0_i64);
-            if !IsNone(e) { return e; }
+            if (!IsNone(e))
+            {
+                return e;
+            }
         }
         j = j + 1_i64;
     }
     return X509Error::None;
 }
 
-bool AllowsServerAuth(Extensions ext) {
+bool AllowsServerAuth(Extensions ext)
+{
     return !ext.hasExtKeyUsage || ext.ekuServerAuth || ext.ekuAny;
 }
 
 /// Validates the path leaf, intermediates path[0..depth), anchor `anchorIndex`.
-X509Error ValidatePath(Search s, i64 depth, i64 anchorIndex) {
+X509Error ValidatePath(Search s, i64 depth, i64 anchorIndex)
+{
     VerifyOptions o = s.options;
     i64 t = o.time;
     mut i64 k = 0_i64;
-    while k <= depth {
+    while (k <= depth)
+    {
         Certificate c = At(s, k);
-        if t < c.notBefore || t > c.notAfter { return X509Error::Expired; }
+        if (t < c.notBefore || t > c.notAfter)
+        {
+            return X509Error::Expired;
+        }
         k = k + 1_i64;
     }
     k = 1_i64;
-    while k <= depth {
+    while (k <= depth)
+    {
         Certificate ca = At(s, k);
         Extensions ext = ca.extensions;
-        if !ext.hasBasicConstraints || !ext.isCa { return X509Error::NotCa; }
-        if ext.hasKeyUsage && (ext.keyUsage & Certificate.KeyUsageKeyCertSign()) == 0_i64 { return X509Error::BadKeyUsage; }
-        if ext.pathLen >= 0_i64 && IntermediatesBelow(s, k) > ext.pathLen { return X509Error::PathLengthExceeded; }
-        if o.requireServerAuth && !AllowsServerAuth(ext) { return X509Error::BadExtendedKeyUsage; }
+        if (!ext.hasBasicConstraints || !ext.isCa)
+        {
+            return X509Error::NotCa;
+        }
+        if (ext.hasKeyUsage && (ext.keyUsage & Certificate.KeyUsageKeyCertSign()) == 0_i64)
+        {
+            return X509Error::BadKeyUsage;
+        }
+        if (ext.pathLen >= 0_i64 && IntermediatesBelow(s, k) > ext.pathLen)
+        {
+            return X509Error::PathLengthExceeded;
+        }
+        if (o.requireServerAuth && !AllowsServerAuth(ext))
+        {
+            return X509Error::BadExtendedKeyUsage;
+        }
         X509Error ncError = ConstraintsBelow(s, ext.nameConstraints, k);
-        if !IsNone(ncError) { return ncError; }
+        if (!IsNone(ncError))
+        {
+            return ncError;
+        }
         k = k + 1_i64;
     }
     TrustStore store = s.store;
     TrustAnchor anchor = store.anchors[anchorIndex];
-    if anchor.pathLen >= 0_i64 && IntermediatesBelow(s, depth + 1_i64) > anchor.pathLen { return X509Error::PathLengthExceeded; }
+    if (anchor.pathLen >= 0_i64 && IntermediatesBelow(s, depth + 1_i64) > anchor.pathLen)
+    {
+        return X509Error::PathLengthExceeded;
+    }
     X509Error anchorNc = ConstraintsBelow(s, anchor.nameConstraints, depth + 1_i64);
-    if !IsNone(anchorNc) { return anchorNc; }
+    if (!IsNone(anchorNc))
+    {
+        return anchorNc;
+    }
     Certificate leaf = s.leaf;
     Extensions leafExt = leaf.extensions;
-    if o.requireServerAuth {
-        if !AllowsServerAuth(leafExt) { return X509Error::BadExtendedKeyUsage; }
-        if leafExt.hasKeyUsage && (leafExt.keyUsage & Certificate.KeyUsageDigitalSignature()) == 0_i64 { return X509Error::BadKeyUsage; }
+    if (o.requireServerAuth)
+    {
+        if (!AllowsServerAuth(leafExt))
+        {
+            return X509Error::BadExtendedKeyUsage;
+        }
+        if (leafExt.hasKeyUsage && (leafExt.keyUsage & Certificate.KeyUsageDigitalSignature()) == 0_i64)
+        {
+            return X509Error::BadKeyUsage;
+        }
     }
-    if o.serverName != "" { return Hostname.VerifyHostname(leaf, o.serverName); }
+    if (o.serverName != "")
+    {
+        return Hostname.VerifyHostname(leaf, o.serverName);
+    }
     return X509Error::None;
 }
 
 /// Depth-first search for an issuer of `current`, which sits at path position `depth`.
-bool Extend(Search s, Certificate current, i64 depth) {
+bool Extend(Search s, Certificate current, i64 depth)
+{
     DistinguishedName issuer = current.issuer;
     Extensions ext = current.extensions;
     TrustStore store = s.store;
     i64 anchors = TrustStore.Count(store);
     mut i64 i = 0_i64;
-    while i < anchors {
+    while (i < anchors)
+    {
         TrustAnchor a = store.anchors[i];
-        if Names.Equal(a.subject, issuer) && KeyIdsAgree(ext.authorityKeyId, a.subjectKeyId) {
+        if (Names.Equal(a.subject, issuer) && KeyIdsAgree(ext.authorityKeyId, a.subjectKeyId))
+        {
             X509Error sig = Signature.VerifySignature(current, a.publicKey);
-            if IsNone(sig) {
+            if (IsNone(sig))
+            {
                 X509Error v = ValidatePath(s, depth, i);
-                if IsNone(v) {
+                if (IsNone(v))
+                {
                     s.found[0] = depth;
                     s.found[1] = i;
                     s.found[2] = 1_i64;
                     return true;
                 }
                 Record(s, v);
-            } else {
+            }
+            else
+            {
                 Record(s, sig);
             }
         }
@@ -282,20 +434,31 @@ bool Extend(Search s, Certificate current, i64 depth) {
     VerifyOptions o = s.options;
     i64 count = Array.Len<Certificate>(s.intermediates);
     mut i64 j = 0_i64;
-    while j < count {
+    while (j < count)
+    {
         Certificate candidate = s.intermediates[j];
         Extensions cext = candidate.extensions;
-        if s.used[j] == 0_i64 && Names.Equal(candidate.subject, issuer) && KeyIdsAgree(ext.authorityKeyId, cext.subjectKeyId) {
-            if depth >= o.maxIntermediates {
+        if (s.used[j] == 0_i64 && Names.Equal(candidate.subject, issuer) && KeyIdsAgree(ext.authorityKeyId, cext.subjectKeyId))
+        {
+            if (depth >= o.maxIntermediates)
+            {
                 Record(s, X509Error::ChainTooLong);
-            } else {
+            }
+            else
+            {
                 X509Error sig2 = Signature.VerifySignature(current, candidate.publicKey);
-                if IsNone(sig2) {
+                if (IsNone(sig2))
+                {
                     s.used[j] = 1_i64;
                     s.path[depth] = j;
-                    if Extend(s, candidate, depth + 1_i64) { return true; }
+                    if (Extend(s, candidate, depth + 1_i64))
+                    {
+                        return true;
+                    }
                     s.used[j] = 0_i64;
-                } else {
+                }
+                else
+                {
                     Record(s, sig2);
                 }
             }
@@ -305,36 +468,65 @@ bool Extend(Search s, Certificate current, i64 depth) {
     return false;
 }
 
-i64[] Zeros(i64 n) {
+i64[] Zeros(i64 n)
+{
     mut i64[] out = Array.Empty<i64>();
     mut i64 i = 0_i64;
-    while i < n { Array.Append<i64>(out, 0_i64); i = i + 1_i64; }
+    while (i < n)
+    {
+        Array.Append<i64>(out, 0_i64);
+        i = i + 1_i64;
+    }
     return out;
 }
 
-Search NewSearch(Certificate leaf, Certificate[] intermediates, TrustStore store, VerifyOptions options) {
+Search NewSearch(Certificate leaf, Certificate[] intermediates, TrustStore store, VerifyOptions options)
+{
     i64 n = Array.Len<Certificate>(intermediates);
     mut X509Error[] best = Array.Empty<X509Error>();
     Array.Append<X509Error>(best, X509Error::UnknownIssuer);
-    return Search { leaf: leaf, intermediates: intermediates, store: store, options: options, path: Zeros(n + 1_i64), used: Zeros(n + 1_i64), found: [0_i64, 0_i64, 0_i64], best: best };
+    return Search
+    {
+        leaf: leaf,
+        intermediates: intermediates,
+        store: store,
+        options: options,
+        path: Zeros(n + 1_i64),
+        used: Zeros(n + 1_i64),
+        found: [0_i64, 0_i64, 0_i64],
+        best: best,
+    };
 }
 
 /// Validates `leaf` and returns X509Error::None, or the most specific failure.
-pub X509Error Check(Certificate leaf, Certificate[] intermediates, TrustStore store, VerifyOptions options) {
+pub X509Error Check(Certificate leaf, Certificate[] intermediates, TrustStore store, VerifyOptions options)
+{
     Search s = NewSearch(leaf, intermediates, store, options);
-    if Extend(s, leaf, 0_i64) { return X509Error::None; }
+    if (Extend(s, leaf, 0_i64))
+    {
+        return X509Error::None;
+    }
     return s.best[0];
 }
 
 /// Validates `leaf` and returns the path that was accepted.
-pub Result<VerifiedChain, X509Error> Verify(Certificate leaf, Certificate[] intermediates, TrustStore store, VerifyOptions options) {
+pub Result<VerifiedChain, X509Error> Verify(Certificate leaf, Certificate[] intermediates, TrustStore store, VerifyOptions options)
+{
     Search s = NewSearch(leaf, intermediates, store, options);
-    if !Extend(s, leaf, 0_i64) { return Result::Error(s.best[0]); }
+    if (!Extend(s, leaf, 0_i64))
+    {
+        return Result::Error(s.best[0]);
+    }
     mut Certificate[] chain = Array.Empty<Certificate>();
     mut i64 k = 0_i64;
-    while k <= s.found[0] {
+    while (k <= s.found[0])
+    {
         Array.Append<Certificate>(chain, At(s, k));
         k = k + 1_i64;
     }
-    return Result::Ok(VerifiedChain { certificates: chain, anchor: store.anchors[s.found[1]] });
+    return Result::Ok(VerifiedChain
+    {
+        certificates: chain,
+        anchor: store.anchors[s.found[1]],
+    });
 }

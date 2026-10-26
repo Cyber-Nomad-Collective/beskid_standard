@@ -8,32 +8,56 @@ use Crypto.Scratch;
 /// (pshufb) lookups in registers, so no memory access depends on key or data and the
 /// running time is constant. The round keys are kept in the vpaes basis. The kernels are
 /// generated from the checked model in tools/vpaes.py by tools/clifgen.py.
-pub type AesKey {
+pub type AesKey
+{
     u8[] keys;
     i64 rounds;
     u8[] tables;
 }
 
 /// Expands a 16-, 24-, or 32-byte key. Other lengths fail with InvalidKeyLength.
-pub Result<AesKey, CryptoError> NewKey(u8[] key) {
+pub Result<AesKey, CryptoError> NewKey(u8[] key)
+{
     i64 keyLength = Slice.Len(key);
-    if keyLength != 16_i64 && keyLength != 24_i64 && keyLength != 32_i64 {
+    if (keyLength != 16_i64 && keyLength != 24_i64 && keyLength != 32_i64)
+    {
         return Result::Error(CryptoError::InvalidKeyLength);
     }
     i64 rounds = keyLength / 4_i64 + 6_i64;
     u8[] tables = Tables();
     u8[] keys = Scratch.Bytes(16_i64 * (rounds + 1_i64));
-    if keyLength == 16_i64 { Schedule128(key, tables, keys); }
-    if keyLength == 24_i64 { Schedule192(key, tables, keys); }
-    if keyLength == 32_i64 { Schedule256(key, tables, keys); }
-    return Result::Ok(AesKey { keys: keys, rounds: rounds, tables: tables });
+    if (keyLength == 16_i64)
+    {
+        Schedule128(key, tables, keys);
+    }
+    if (keyLength == 24_i64)
+    {
+        Schedule192(key, tables, keys);
+    }
+    if (keyLength == 32_i64)
+    {
+        Schedule256(key, tables, keys);
+    }
+    return Result::Ok(AesKey
+    {
+        keys: keys,
+        rounds: rounds,
+        tables: tables,
+    });
 }
 
 /// Encrypts one 16-byte block from `input[inputOffset..]` into `output[outputOffset..]`.
 /// Returns false for out-of-range offsets. Input and output may alias.
-pub bool EncryptBlock(AesKey key, u8[] input, i64 inputOffset, u8[] output, i64 outputOffset) {
-    if !Slice.IsValidRange(Slice.Len(input), inputOffset, 16_i64) { return false; }
-    if !Slice.IsValidRange(Slice.Len(output), outputOffset, 16_i64) { return false; }
+pub bool EncryptBlock(AesKey key, u8[] input, i64 inputOffset, u8[] output, i64 outputOffset)
+{
+    if (!Slice.IsValidRange(Slice.Len(input), inputOffset, 16_i64))
+    {
+        return false;
+    }
+    if (!Slice.IsValidRange(Slice.Len(output), outputOffset, 16_i64))
+    {
+        return false;
+    }
     i64 rounds = key.rounds;
     i64[] meta = [inputOffset, outputOffset, inputOffset + 1_i64, 0_i64, 0_i64, rounds];
     Block1(key.keys, key.tables, input, input, output, Scratch.Bytes(16_i64), meta);
@@ -45,12 +69,23 @@ pub bool EncryptBlock(AesKey key, u8[] input, i64 inputOffset, u8[] output, i64 
 /// `inputOffset` with the keystream of the counter blocks `prefix[0, 12) || counter`,
 /// `counter + 1`, ... into `output` at `outputOffset`. Returns false for invalid ranges or
 /// a prefix shorter than 16 bytes. Input and output may be the same range.
-pub bool CtrXorInto(AesKey key, u8[] prefix, i64 counter, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
-    if Slice.Len(prefix) < 16_i64 { return false; }
-    if !Slice.IsValidRange(Slice.Len(input), inputOffset, count) { return false; }
-    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count) { return false; }
+pub bool CtrXorInto(AesKey key, u8[] prefix, i64 counter, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset)
+{
+    if (Slice.Len(prefix) < 16_i64)
+    {
+        return false;
+    }
+    if (!Slice.IsValidRange(Slice.Len(input), inputOffset, count))
+    {
+        return false;
+    }
+    if (!Slice.IsValidRange(Slice.Len(output), outputOffset, count))
+    {
+        return false;
+    }
     i64 grouped = (count / 64_i64) * 64_i64;
-    if grouped > 0_i64 {
+    if (grouped > 0_i64)
+    {
         i64 rounds = key.rounds;
         i64[] meta = [inputOffset, outputOffset - inputOffset, inputOffset + grouped, counter & 4294967295_i64, 0_i64, rounds];
         Blocks4(key.keys, key.tables, prefix, input, output, Scratch.Bytes(64_i64), meta);
@@ -58,10 +93,15 @@ pub bool CtrXorInto(AesKey key, u8[] prefix, i64 counter, u8[] input, i64 inputO
     mut i64 next = (counter + grouped / 16_i64) & 4294967295_i64;
     u8[] block = Scratch.Bytes(16_i64);
     mut i64 i = 0_i64;
-    while i < 12_i64 { block[i] = prefix[i]; i = i + 1_i64; }
+    while (i < 12_i64)
+    {
+        block[i] = prefix[i];
+        i = i + 1_i64;
+    }
     u8[] stream = Scratch.Bytes(16_i64);
     mut i64 done = grouped;
-    while done < count {
+    while (done < count)
+    {
         block[12] = u8((next >> 24_i64) & 255_i64);
         block[13] = u8((next >> 16_i64) & 255_i64);
         block[14] = u8((next >> 8_i64) & 255_i64);
@@ -69,9 +109,13 @@ pub bool CtrXorInto(AesKey key, u8[] prefix, i64 counter, u8[] input, i64 inputO
         EncryptBlock(key, block, 0_i64, stream, 0_i64);
         next = (next + 1_i64) & 4294967295_i64;
         mut i64 take = 16_i64;
-        if count - done < take { take = count - done; }
+        if (count - done < take)
+        {
+            take = count - done;
+        }
         mut i64 j = 0_i64;
-        while j < take {
+        while (j < take)
+        {
             u8 a = input[inputOffset + done + j];
             u8 b = stream[j];
             output[outputOffset + done + j] = (a | b) - (a & b);
@@ -83,9 +127,14 @@ pub bool CtrXorInto(AesKey key, u8[] prefix, i64 counter, u8[] input, i64 inputO
 }
 
 /// One-shot encryption of a single 16-byte block (also the QUIC AES header-protection sample cipher).
-pub Result<u8[], CryptoError> Encrypt(u8[] key, u8[] block) {
-    if Slice.Len(block) != 16_i64 { return Result::Error(CryptoError::InvalidLength); }
-    return match NewKey(key) {
+pub Result<u8[], CryptoError> Encrypt(u8[] key, u8[] block)
+{
+    if (Slice.Len(block) != 16_i64)
+    {
+        return Result::Error(CryptoError::InvalidLength);
+    }
+    return match (NewKey(key))
+    {
         Result::Error(error) => Result::Error(error),
         Result::Ok(expanded) => {
             u8[] out = Scratch.Bytes(16_i64);
@@ -97,7 +146,8 @@ pub Result<u8[], CryptoError> Encrypt(u8[] key, u8[] block) {
 
 // BEGIN GENERATED AesKernels (tools/clifgen.py)
 /// vpaes encryption key schedule for a 128-bit key into `out` (176 bytes).
-i64 Schedule128(u8[] key, u8[] tables, u8[] out) {
+i64 Schedule128(u8[] key, u8[] tables, u8[] out)
+{
     return clif {
         %kp1 = payload %0
         %tp2 = payload %1
@@ -619,7 +669,8 @@ i64 Schedule128(u8[] key, u8[] tables, u8[] out) {
 }
 
 /// vpaes encryption key schedule for a 192-bit key into `out` (208 bytes).
-i64 Schedule192(u8[] key, u8[] tables, u8[] out) {
+i64 Schedule192(u8[] key, u8[] tables, u8[] out)
+{
     return clif {
         %kp1 = payload %0
         %tp2 = payload %1
@@ -1147,7 +1198,8 @@ i64 Schedule192(u8[] key, u8[] tables, u8[] out) {
 }
 
 /// vpaes encryption key schedule for a 256-bit key into `out` (240 bytes).
-i64 Schedule256(u8[] key, u8[] tables, u8[] out) {
+i64 Schedule256(u8[] key, u8[] tables, u8[] out)
+{
     return clif {
         %kp1 = payload %0
         %tp2 = payload %1
@@ -1811,9 +1863,11 @@ i64 Schedule256(u8[] key, u8[] tables, u8[] out) {
 /// AES-CTR over 64-byte groups (four blocks interleaved) from input offset `meta[0]` up
 /// to `meta[2]`; `meta[1]` is the output minus input offset, `meta[3]` the 32-bit block
 /// counter, `meta[5]` the round count. Precondition: all ranges are in bounds.
-i64 Blocks4(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u8[] state, i64[] meta) {
+i64 Blocks4(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u8[] state, i64[] meta)
+{
     mut i64 last = 0_i64;
-    while meta[0] < meta[2] {
+    while (meta[0] < meta[2])
+    {
         last = clif {
             %kp1 = payload %0
             %tp2 = payload %1
@@ -1890,7 +1944,8 @@ i64 Blocks4(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, 
             store %c68, %mp4+32
             return %c68
         };
-        while meta[4] < meta[5] {
+        while (meta[4] < meta[5])
+        {
             last = clif {
                 %kp1 = payload %0
                 %tp2 = payload %1
@@ -2181,9 +2236,11 @@ i64 Blocks4(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, 
 }
 
 /// One AES block from `input[meta[0]]` to `output[meta[1]]` (run with `meta[2] = meta[0] + 1`).
-i64 Block1(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u8[] state, i64[] meta) {
+i64 Block1(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u8[] state, i64[] meta)
+{
     mut i64 last = 0_i64;
-    while meta[0] < meta[2] {
+    while (meta[0] < meta[2])
+    {
         last = clif {
             %kp1 = payload %0
             %tp2 = payload %1
@@ -2212,7 +2269,8 @@ i64 Block1(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u
             store %c23, %mp4+32
             return %c23
         };
-        while meta[4] < meta[5] {
+        while (meta[4] < meta[5])
+        {
             last = clif {
                 %kp1 = payload %0
                 %tp2 = payload %1
@@ -2334,7 +2392,8 @@ i64 Block1(u8[] keys, u8[] tables, u8[] counterBlock, u8[] input, u8[] output, u
 }
 
 /// The vpaes constant vectors in `tools/vpaes.py` order.
-u8[] Tables() {
+u8[] Tables()
+{
     return [0x80_u8, 0x01_u8, 0x08_u8, 0x0d_u8, 0x0f_u8, 0x06_u8, 0x05_u8, 0x0e_u8, 0x02_u8, 0x0c_u8, 0x0b_u8, 0x0a_u8, 0x09_u8, 0x03_u8, 0x07_u8, 0x04_u8, 0x80_u8, 0x07_u8, 0x0b_u8, 0x0f_u8, 0x06_u8, 0x0a_u8, 0x04_u8, 0x01_u8, 0x09_u8, 0x08_u8, 0x05_u8, 0x02_u8, 0x0c_u8, 0x0e_u8, 0x0d_u8, 0x03_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x0f_u8, 0x00_u8, 0x70_u8, 0x2a_u8, 0x5a_u8, 0x98_u8, 0xe8_u8, 0xb2_u8, 0xc2_u8, 0x08_u8, 0x78_u8, 0x22_u8, 0x52_u8, 0x90_u8, 0xe0_u8, 0xba_u8, 0xca_u8, 0x00_u8, 0x4d_u8, 0x7c_u8, 0x31_u8, 0x7d_u8, 0x30_u8, 0x01_u8, 0x4c_u8, 0x81_u8, 0xcc_u8, 0xfd_u8, 0xb0_u8, 0xfc_u8, 0xb1_u8, 0x80_u8, 0xcd_u8, 0x00_u8, 0x3e_u8, 0x50_u8, 0xcb_u8, 0x8f_u8, 0xe1_u8, 0x9b_u8, 0xb1_u8, 0x44_u8, 0xf5_u8, 0x2a_u8, 0x14_u8, 0x6e_u8, 0x7a_u8, 0xdf_u8, 0xa5_u8, 0x00_u8, 0x23_u8, 0xe2_u8, 0xfa_u8, 0x15_u8, 0xd4_u8, 0x18_u8, 0x36_u8, 0xef_u8, 0xd9_u8, 0x2e_u8, 0x0d_u8, 0xc1_u8, 0xcc_u8, 0xf7_u8, 0x3b_u8, 0x00_u8, 0x24_u8, 0x71_u8, 0x0b_u8, 0xc6_u8, 0x93_u8, 0x7a_u8, 0xe2_u8, 0xcd_u8, 0x2f_u8, 0x98_u8, 0xbc_u8, 0x55_u8, 0xe9_u8, 0xb7_u8, 0x5e_u8, 0x00_u8, 0x29_u8, 0xe1_u8, 0x0a_u8, 0x40_u8, 0x88_u8, 0xeb_u8, 0x69_u8, 0x4a_u8, 0x23_u8, 0x82_u8, 0xab_u8, 0xc8_u8, 0x63_u8, 0xa1_u8, 0xc2_u8, 0x00_u8, 0xc7_u8, 0xbd_u8, 0x6f_u8, 0x17_u8, 0x6d_u8, 0xd2_u8, 0xd0_u8, 0x78_u8, 0xa8_u8, 0x02_u8, 0xc5_u8, 0x7a_u8, 0xbf_u8, 0xaa_u8, 0x15_u8, 0x00_u8, 0x6a_u8, 0xbb_u8, 0x5f_u8, 0xa5_u8, 0x74_u8, 0xe4_u8, 0xcf_u8, 0xfa_u8, 0x35_u8, 0x2b_u8, 0x41_u8, 0xd1_u8, 0x90_u8, 0x1e_u8, 0x8e_u8, 0x01_u8, 0x02_u8, 0x03_u8, 0x00_u8, 0x05_u8, 0x06_u8, 0x07_u8, 0x04_u8, 0x09_u8, 0x0a_u8, 0x0b_u8, 0x08_u8, 0x0d_u8, 0x0e_u8, 0x0f_u8, 0x0c_u8, 0x05_u8, 0x06_u8, 0x07_u8, 0x04_u8, 0x09_u8, 0x0a_u8, 0x0b_u8, 0x08_u8, 0x0d_u8, 0x0e_u8, 0x0f_u8, 0x0c_u8, 0x01_u8, 0x02_u8, 0x03_u8, 0x00_u8, 0x09_u8, 0x0a_u8, 0x0b_u8, 0x08_u8, 0x0d_u8, 0x0e_u8, 0x0f_u8, 0x0c_u8, 0x01_u8, 0x02_u8, 0x03_u8, 0x00_u8, 0x05_u8, 0x06_u8, 0x07_u8, 0x04_u8, 0x0d_u8, 0x0e_u8, 0x0f_u8, 0x0c_u8, 0x01_u8, 0x02_u8, 0x03_u8, 0x00_u8, 0x05_u8, 0x06_u8, 0x07_u8, 0x04_u8, 0x09_u8, 0x0a_u8, 0x0b_u8, 0x08_u8, 0x03_u8, 0x00_u8, 0x01_u8, 0x02_u8, 0x07_u8, 0x04_u8, 0x05_u8, 0x06_u8, 0x0b_u8, 0x08_u8, 0x09_u8, 0x0a_u8, 0x0f_u8, 0x0c_u8, 0x0d_u8, 0x0e_u8, 0x0f_u8, 0x0c_u8, 0x0d_u8, 0x0e_u8, 0x03_u8, 0x00_u8, 0x01_u8, 0x02_u8, 0x07_u8, 0x04_u8, 0x05_u8, 0x06_u8, 0x0b_u8, 0x08_u8, 0x09_u8, 0x0a_u8, 0x0b_u8, 0x08_u8, 0x09_u8, 0x0a_u8, 0x0f_u8, 0x0c_u8, 0x0d_u8, 0x0e_u8, 0x03_u8, 0x00_u8, 0x01_u8, 0x02_u8, 0x07_u8, 0x04_u8, 0x05_u8, 0x06_u8, 0x07_u8, 0x04_u8, 0x05_u8, 0x06_u8, 0x0b_u8, 0x08_u8, 0x09_u8, 0x0a_u8, 0x0f_u8, 0x0c_u8, 0x0d_u8, 0x0e_u8, 0x03_u8, 0x00_u8, 0x01_u8, 0x02_u8, 0x00_u8, 0x01_u8, 0x02_u8, 0x03_u8, 0x04_u8, 0x05_u8, 0x06_u8, 0x07_u8, 0x08_u8, 0x09_u8, 0x0a_u8, 0x0b_u8, 0x0c_u8, 0x0d_u8, 0x0e_u8, 0x0f_u8, 0x00_u8, 0x05_u8, 0x0a_u8, 0x0f_u8, 0x04_u8, 0x09_u8, 0x0e_u8, 0x03_u8, 0x08_u8, 0x0d_u8, 0x02_u8, 0x07_u8, 0x0c_u8, 0x01_u8, 0x06_u8, 0x0b_u8, 0x00_u8, 0x09_u8, 0x02_u8, 0x0b_u8, 0x04_u8, 0x0d_u8, 0x06_u8, 0x0f_u8, 0x08_u8, 0x01_u8, 0x0a_u8, 0x03_u8, 0x0c_u8, 0x05_u8, 0x0e_u8, 0x07_u8, 0x00_u8, 0x0d_u8, 0x0a_u8, 0x07_u8, 0x04_u8, 0x01_u8, 0x0e_u8, 0x0b_u8, 0x08_u8, 0x05_u8, 0x02_u8, 0x0f_u8, 0x0c_u8, 0x09_u8, 0x06_u8, 0x03_u8, 0xb6_u8, 0xee_u8, 0x9d_u8, 0xaf_u8, 0xb9_u8, 0x91_u8, 0x83_u8, 0x1f_u8, 0x81_u8, 0x7d_u8, 0x7c_u8, 0x4d_u8, 0x08_u8, 0x98_u8, 0x2a_u8, 0x70_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x5b_u8, 0x00_u8, 0x60_u8, 0xb6_u8, 0xd6_u8, 0x29_u8, 0x49_u8, 0x9f_u8, 0xff_u8, 0x08_u8, 0x68_u8, 0xbe_u8, 0xde_u8, 0x21_u8, 0x41_u8, 0x97_u8, 0xf7_u8, 0x00_u8, 0xec_u8, 0xbc_u8, 0x50_u8, 0x51_u8, 0xbd_u8, 0xed_u8, 0x01_u8, 0xe0_u8, 0x0c_u8, 0x5c_u8, 0xb0_u8, 0xb1_u8, 0x5d_u8, 0x0d_u8, 0xe1_u8];
 }
 // END GENERATED AesKernels

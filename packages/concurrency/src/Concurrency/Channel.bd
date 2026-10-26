@@ -6,66 +6,87 @@ use Concurrency.TryResult;
 use Core.Results;
 
 /// Success marker for [`Send`] / [`TrySend`] (`Result<SendOk, ChannelError>` per platform spec `Result<(), _>`).
-pub type SendOk {
-}
+pub type SendOk { }
 
 // Ordinary descriptor-backed box shared by every typed channel send. The native
 // boundary transports its traced ABI owner slot, never the payload's scalar bits.
-type ChannelValue<T> { T value; }
+type ChannelValue<T>
+{
+    T value;
+}
 
 /// Opaque channel handle (move-only at language layer).
 [NeverTransferable]
-pub type Channel<T> {
+pub type Channel<T>
+{
     i64 handle;
 }
 
 /// Runtime queue id for `Hub.Register` and builtins.
-pub i64 Handle<T>(Channel<T> self) {
+pub i64 Handle<T>(Channel<T> self)
+{
     return self.handle;
 }
 
 /// Creates an unbounded channel (default per platform spec).
-pub Channel<T> Create<T>() {
+pub Channel<T> Create<T>()
+{
     return CreateWithOptions<T>(ChannelOptions.Default());
 }
 
 /// Creates a channel with explicit options.
-pub Channel<T> CreateWithOptions<T>(ChannelOptions options) {
+pub Channel<T> CreateWithOptions<T>(ChannelOptions options)
+{
     i64 capacity = ChannelOptions.EncodeCapacity(options);
     i64 flags = ChannelOptions.EncodeFlags(options);
     i64 handle = __channel_create(capacity, flags);
-    return Channel<T> { handle: handle };
+    return Channel<T>
+    {
+        handle: handle,
+    };
 }
 
 /// Sender owns before commit; cancellation before commit retains that ownership.
 /// At commit the queue owns the value. Cancellation after commit reports Cancelled
 /// without retracting it; exactly one successful receiver becomes its owner.
-pub Core.Results.Result<SendOk, ChannelError> Send<T>(Channel<T> self, T value) {
-    i64 raw = __channel_send(self.handle, ChannelValue<T> { value: value });
+pub Core.Results.Result<SendOk, ChannelError> Send<T>(Channel<T> self, T value)
+{
+    i64 raw = __channel_send(self.handle, ChannelValue<T>
+    {
+        value: value,
+    });
     return MapSendStatus(Status.FromCode(raw), self.handle);
 }
 
 /// Receives a value; parks when empty and open. In `Main` it parks like in any other fiber.
-pub Core.Results.Result<T, ChannelError> Receive<T>(Channel<T> self) {
+pub Core.Results.Result<T, ChannelError> Receive<T>(Channel<T> self)
+{
     i64 raw = __channel_receive_status(self.handle);
     Status status = Status.FromCode(raw);
-    return match status {
+    return match (status)
+    {
         Status::Ok => Results.Success<T, ChannelError>(__channel_receive_value<T>(self.handle)),
         _ => Results.Failure<T, ChannelError>(MapChannelError(status, self.handle)),
     };
 }
 
 /// Non-blocking send; `WouldBlock` when full, `Err` on close or cancel.
-pub TryResult<SendOk, ChannelError> TrySend<T>(Channel<T> self, T value) {
-    i64 raw = __channel_try_send(self.handle, ChannelValue<T> { value: value });
+pub TryResult<SendOk, ChannelError> TrySend<T>(Channel<T> self, T value)
+{
+    i64 raw = __channel_try_send(self.handle, ChannelValue<T>
+    {
+        value: value,
+    });
     return MapTrySendStatus(Status.FromCode(raw), self.handle);
 }
 
 /// Non-blocking receive; `WouldBlock` when empty, `Err` on close or cancel.
-pub TryResult<T, ChannelError> TryReceive<T>(Channel<T> self) {
+pub TryResult<T, ChannelError> TryReceive<T>(Channel<T> self)
+{
     i64 raw = __channel_try_receive(self.handle);
     Status status = Status.FromCode(raw);
-    return match status {
+    return match (status)
+    {
         Status::Ok => TryResult::Ok(__channel_receive_value<T>(self.handle)),
         Status::WouldBlock => TryResult::WouldBlock,
         Status::Cancelled(reason) => TryResult::Err(ChannelError::Cancelled(reason)),
@@ -76,14 +97,17 @@ pub TryResult<T, ChannelError> TryReceive<T>(Channel<T> self) {
 
 /// Idempotent writer shutdown. Queued values drain in FIFO order; close never
 /// disposes resources. A closed, empty queue reports Closed.
-pub unit Close<T>(Channel<T> self) {
+pub unit Close<T>(Channel<T> self)
+{
     __channel_close(self.handle);
     return;
 }
 
 /// Maps a blocking-send status. `endpoint` is the channel handle that a `Closed` error names.
-pub Core.Results.Result<SendOk, ChannelError> MapSendStatus(Status status, i64 endpoint) {
-    return match status {
+pub Core.Results.Result<SendOk, ChannelError> MapSendStatus(Status status, i64 endpoint)
+{
+    return match (status)
+    {
         Status::Ok => Results.Success<SendOk, ChannelError>(SendOk { }),
         _ => Results.Failure<SendOk, ChannelError>(MapChannelError(status, endpoint)),
     };
@@ -92,8 +116,10 @@ pub Core.Results.Result<SendOk, ChannelError> MapSendStatus(Status status, i64 e
 /// Maps a failed channel status (from a send or a receive) to its error. `Closed` names `endpoint` (the channel handle);
 /// a status outside the channel contract (including `WouldBlock` from a blocking call) is
 /// `Unexpected` with its raw code, never a close.
-pub ChannelError MapChannelError(Status status, i64 endpoint) {
-    return match status {
+pub ChannelError MapChannelError(Status status, i64 endpoint)
+{
+    return match (status)
+    {
         Status::Cancelled(reason) => ChannelError::Cancelled(reason),
         Status::Closed(_) => ChannelError::Closed(endpoint),
         _ => ChannelError::Unexpected(Status.Discriminant(status)),
@@ -101,8 +127,10 @@ pub ChannelError MapChannelError(Status status, i64 endpoint) {
 }
 
 /// Maps a non-blocking send status. `endpoint` is the channel handle that a `Closed` error names.
-pub TryResult<SendOk, ChannelError> MapTrySendStatus(Status status, i64 endpoint) {
-    return match status {
+pub TryResult<SendOk, ChannelError> MapTrySendStatus(Status status, i64 endpoint)
+{
+    return match (status)
+    {
         Status::Ok => TryResult::Ok(SendOk { }),
         Status::WouldBlock => TryResult::WouldBlock,
         _ => TryResult::Err(MapChannelError(status, endpoint)),

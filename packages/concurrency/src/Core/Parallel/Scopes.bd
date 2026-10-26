@@ -24,19 +24,26 @@ use Core.Parallel.Port;
 /// `BESKID_ISOLATES_MAX`, and the cap never exceeds that bound.
 /// `serial` runs every body on the calling isolate in program order (serial elision).
 [Immutable]
-pub type ScopeOptions {
+pub type ScopeOptions
+{
     pub i64 workers;
     pub bool serial;
 }
 
 /// Options of `Parallel.Scope`: the process bound, parallel execution.
-pub ScopeOptions DefaultOptions() {
-    return ScopeOptions { workers: 0_i64, serial: false };
+pub ScopeOptions DefaultOptions()
+{
+    return ScopeOptions
+    {
+        workers: 0_i64,
+        serial: false,
+    };
 }
 
 /// One failed task: its zero-based spawn index inside its scope and its failure message.
 [Immutable]
-pub type TaskFailure {
+pub type TaskFailure
+{
     pub i64 index;
     pub string message;
 }
@@ -45,7 +52,8 @@ pub type TaskFailure {
 /// @variant(Failed) The body panicked, or a `SpawnTry` body returned `Error`.
 /// @variant(Cancelled) The task was cancelled before it completed.
 /// @variant(Joined) The task was already joined, or its scope has returned.
-pub enum TaskError {
+pub enum TaskError
+{
     Failed(TaskFailure failure),
     Cancelled,
     Joined,
@@ -54,7 +62,8 @@ pub enum TaskError {
 /// Failure of a whole scope.
 /// @variant(Failed) Every failed task of the scope, ordered by spawn index.
 /// @variant(Cancelled) The scope was cancelled (`Scope.Cancel`, or the body returned `Cancelled`).
-pub enum ParallelError {
+pub enum ParallelError
+{
     Failed(List<TaskFailure> failures),
     Cancelled,
 }
@@ -63,30 +72,50 @@ pub enum ParallelError {
 
 // Runtime task status codes (`__isolate_join`, `__isolate_task_status`). 3 also answers a
 // handle that names no task; `__isolate_task_status` answers 4 while the task runs.
-i64 StatusCompleted() { return 0_i64; }
-i64 StatusCancelled() { return 1_i64; }
-i64 StatusPanicked() { return 2_i64; }
-i64 StatusJoined() { return 3_i64; }
+i64 StatusCompleted()
+{
+    return 0_i64;
+}
+
+i64 StatusCancelled()
+{
+    return 1_i64;
+}
+
+i64 StatusPanicked()
+{
+    return 2_i64;
+}
+
+i64 StatusJoined()
+{
+    return 3_i64;
+}
 
 /// Handle of one task: an `[Immutable]` record over a process-wide task id.
 [Immutable]
-pub type Task<T> {
+pub type Task<T>
+{
     i64 id;
 
     /// Waits for the task, parking the calling fiber (not its thread), and takes its result.
     /// A second `Join`, or a `Join` after the scope returned, is `Error(TaskError::Joined)`.
-    pub Result<T, TaskError> Join() {
+    pub Result<T, TaskError> Join()
+    {
         i64 status = __isolate_join(this.id);
-        if status == StatusCompleted() {
+        if (status == StatusCompleted())
+        {
             T value = __isolate_join_value<T>(this.id);
             __isolate_join_finish(this.id);
             return Result::Ok(value);
         }
-        if status == StatusCancelled() {
+        if (status == StatusCancelled())
+        {
             __isolate_join_finish(this.id);
             return Result::Error(TaskError::Cancelled);
         }
-        if status == StatusPanicked() {
+        if (status == StatusPanicked())
+        {
             TaskFailure failure = FailureOf(this.id);
             __isolate_join_finish(this.id);
             return Result::Error(TaskError::Failed(failure));
@@ -95,13 +124,20 @@ pub type Task<T> {
     }
 }
 
-TaskFailure FailureOf(i64 handle) {
-    return TaskFailure { index: __isolate_task_index(handle), message: __isolate_join_message(handle) };
+TaskFailure FailureOf(i64 handle)
+{
+    return TaskFailure
+    {
+        index: __isolate_task_index(handle),
+        message: __isolate_join_message(handle),
+    };
 }
 
 // `SpawnTry` turns an `Error` result into a task failure carrying the message.
-T Unwrap<T>(Result<T, string> result) {
-    return match result {
+T Unwrap<T>(Result<T, string> result)
+{
+    return match (result)
+    {
         Result::Ok(value) => value,
         Result::Error(message) => __panic_str(message),
     };
@@ -112,7 +148,8 @@ T Unwrap<T>(Result<T, string> result) {
 /// A fork-join scope. `Scope` is isolate-local: a task body cannot capture it (E1236), so no
 /// task outlives or detaches from the scope that started it.
 [NeverTransferable]
-pub type Scope {
+pub type Scope
+{
     i64 id;
     bool serial;
     i64[] tasks;
@@ -125,35 +162,45 @@ pub type Scope {
     /// yields, parks on a full or empty port, and observes cancellation at its safepoints.
     /// Shared captures are passed by pointer, Copied captures are copied once, Moved captures are
     /// consumed here.
-    pub Task<T> Spawn<T>([Captures(Bound: Transferable)] () => T body) where T: Core.Parallel.Transferable {
+    pub Task<T> Spawn<T>([Captures(Bound: Transferable)] () => T body) where T: Core.Parallel.Transferable
+    {
         this.EnsureOpen("Scope.Spawn");
         mut i64 handle = -1_i64;
-        if !this.serial {
+        if (!this.serial)
+        {
             handle = __isolate_spawn<T>(body, this.id);
         }
-        if handle < 0_i64 {
+        if (handle < 0_i64)
+        {
             handle = __isolate_spawn_local<T>(body, this.id);
         }
         this.tasks = Array.Append<i64>(this.tasks, handle);
-        return Task<T> { id: handle };
+        return Task<T>
+        {
+            id: handle,
+        };
     }
 
     /// `Spawn` for a fallible body: a body that returns `Result::Error(message)` fails the task
     /// with `message`. Write the type argument when the body only returns `Error`.
-    pub Task<T> SpawnTry<T>([Captures(Bound: Transferable)] () => Result<T, string> body) where T: Core.Parallel.Transferable {
+    pub Task<T> SpawnTry<T>([Captures(Bound: Transferable)] () => Result<T, string> body) where T: Core.Parallel.Transferable
+    {
         return this.Spawn<T>(() => Unwrap<T>(body()));
     }
 
     /// Starts a long-lived isolate owned by this scope and returns its handle. The body takes its
     /// work from ports it captured and ends when its inbox reports `Closed`. Without a free pool
     /// isolate the body runs as a fiber of the calling isolate, concurrently with the caller.
-    pub Isolate Isolate([Captures(Bound: Transferable)] () => unit body) {
+    pub Isolate Isolate([Captures(Bound: Transferable)] () => unit body)
+    {
         this.EnsureOpen("Scope.Isolate");
         mut i64 handle = -1_i64;
-        if !this.serial {
+        if (!this.serial)
+        {
             handle = __isolate_spawn<unit>(body, this.id);
         }
-        if handle < 0_i64 {
+        if (handle < 0_i64)
+        {
             handle = __isolate_spawn_local<unit>(body, this.id);
         }
         this.tasks = Array.Append<i64>(this.tasks, handle);
@@ -161,67 +208,81 @@ pub type Scope {
     }
 
     /// A port of capacity 64 owned by this scope and closed when the scope returns.
-    pub Port<T> Port<T>() where T: Core.Parallel.Transferable {
+    pub Port<T> Port<T>() where T: Core.Parallel.Transferable
+    {
         return this.PortWith<T>(64_i64);
     }
 
     /// A port of `capacity` owned by this scope. Panics when `capacity < 1`.
-    pub Port<T> PortWith<T>(i64 capacity) where T: Core.Parallel.Transferable {
+    pub Port<T> PortWith<T>(i64 capacity) where T: Core.Parallel.Transferable
+    {
         this.EnsureOpen("Scope.PortWith");
         return Core.Parallel.Port.Open<T>(this.id, capacity);
     }
 
     /// Starts a pipeline: one isolate runs `source` with a fresh output port, which is closed
     /// when `source` returns.
-    pub PipelineStage<T> Source<T>([Captures(Bound: Transferable)] (Port<T>) => unit source) where T: Core.Parallel.Transferable {
+    pub PipelineStage<T> Source<T>([Captures(Bound: Transferable)] (Port<T>) => unit source) where T: Core.Parallel.Transferable
+    {
         return StartSource<T>(this, source);
     }
 
     /// Requests cancellation of every task of this scope. The scope then returns
     /// `Error(ParallelError::Cancelled)` unless a task failed.
-    pub unit Cancel() {
+    pub unit Cancel()
+    {
         this.cancelled = true;
         __isolate_scope_cancel(this.id);
         return;
     }
 
-    unit EnsureOpen(string operation) {
-        if this.closed {
+    unit EnsureOpen(string operation)
+    {
+        if (this.closed)
+        {
             __panic_str(operation + ": the scope has returned");
         }
         return;
     }
-
     // Ends the scope: cancels it when required, closes its ports so that inbox loops and parked
     // senders end, joins every task in spawn order and collects the failures.
-    Result<T, ParallelError> Finish<T>(Result<T, ParallelError> outcome) {
-        bool bodyCancelled = match outcome {
+
+    Result<T, ParallelError> Finish<T>(Result<T, ParallelError> outcome)
+    {
+        bool bodyCancelled = match (outcome)
+        {
             Result::Error(ParallelError::Cancelled) => true,
             _ => false,
         };
-        if bodyCancelled {
+        if (bodyCancelled)
+        {
             this.Cancel();
         }
         __isolate_scope_close_ports(this.id);
         List<TaskFailure> failures = List.New<TaskFailure>();
         mut i64 i = 0_i64;
-        while i < Array.Len<i64>(this.tasks) {
+        while (i < Array.Len<i64>(this.tasks))
+        {
             i64 handle = this.tasks[i];
             i64 joined = __isolate_join(handle);
-            if joined != StatusJoined() {
+            if (joined != StatusJoined())
+            {
                 __isolate_join_finish(handle);
             }
-            if __isolate_task_status(handle) == StatusPanicked() {
+            if (__isolate_task_status(handle) == StatusPanicked())
+            {
                 failures.Push(FailureOf(handle));
             }
             i = i + 1_i64;
         }
         __isolate_scope_close(this.id);
         this.closed = true;
-        if failures.Count() > 0_i64 {
+        if (failures.Count() > 0_i64)
+        {
             return Result::Error(ParallelError::Failed(failures));
         }
-        if this.cancelled {
+        if (this.cancelled)
+        {
             return Result::Error(ParallelError::Cancelled);
         }
         return outcome;
@@ -230,12 +291,15 @@ pub type Scope {
 
 /// Runs `body` in a fresh scope with `options`. `Parallel.Scope` and `Parallel.ScopeWith` call
 /// this; it is the only way to open a scope.
-pub Result<T, ParallelError> Run<T>(ScopeOptions options, (Scope) => Result<T, ParallelError> body) {
-    if options.workers < 0_i64 {
+pub Result<T, ParallelError> Run<T>(ScopeOptions options, (Scope) => Result<T, ParallelError> body)
+{
+    if (options.workers < 0_i64)
+    {
         __panic_str("ScopeOptions.workers must not be negative");
     }
     i64 id = __isolate_scope_open(options.workers);
-    Scope owner = Scope {
+    Scope owner = Scope
+    {
         id: id,
         serial: options.serial,
         tasks: Array.Empty<i64>(),
@@ -249,37 +313,43 @@ pub Result<T, ParallelError> Run<T>(ScopeOptions options, (Scope) => Result<T, P
 // ---- Pipelines ----
 
 // A record with its input sequence number. An enum, so its transfer class follows `T`.
-enum Sequenced<T> {
+enum Sequenced<T>
+{
     Item(i64 sequence, T value),
 }
 
 /// One stage of a pipeline: the output port of the previous stage, handed to the next stage.
 /// Stages never join and resend.
 [NeverTransferable]
-pub type PipelineStage<T> {
+pub type PipelineStage<T>
+{
     Scope owner;
     Port<Sequenced<T>> output;
 
     /// Starts `workers` isolates (at least 1) that apply `step` to every record of this stage and
     /// send the results to a fresh port. With `workers > 1` the results may be reordered; apply
     /// `Ordered` to restore input order.
-    pub PipelineStage<U> Stage<U>(i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
+    pub PipelineStage<U> Stage<U>(i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable
+    {
         return StartStage<T, U>(this.owner, this.output, workers, step);
     }
 
     /// Delivers this stage's records in input order, buffering by input sequence number.
-    pub PipelineStage<T> Ordered() where T: Core.Parallel.Transferable {
+    pub PipelineStage<T> Ordered() where T: Core.Parallel.Transferable
+    {
         return StartOrdered<T>(this.owner, this.output);
     }
 
     /// Runs `sink` on the calling isolate for every record and returns the number of records
     /// once the pipeline is closed and drained.
-    pub Result<i64, ParallelError> Sink([Captures(Bound: Transferable)] (T) => unit sink) where T: Core.Parallel.Transferable {
+    pub Result<i64, ParallelError> Sink([Captures(Bound: Transferable)] (T) => unit sink) where T: Core.Parallel.Transferable
+    {
         return RunSink<T>(this.output, sink);
     }
 }
 
-PipelineStage<T> StartSource<T>(Scope owner, [Captures(Bound: Transferable)] (Port<T>) => unit source) where T: Core.Parallel.Transferable {
+PipelineStage<T> StartSource<T>(Scope owner, [Captures(Bound: Transferable)] (Port<T>) => unit source) where T: Core.Parallel.Transferable
+{
     Port<T> raw = owner.Port<T>();
     Port<Sequenced<T>> numbered = owner.Port<Sequenced<T>>();
     Isolate producer = owner.Isolate(() => {
@@ -291,36 +361,53 @@ PipelineStage<T> StartSource<T>(Scope owner, [Captures(Bound: Transferable)] (Po
         Number<T>(raw, numbered);
         return;
     });
-    return PipelineStage<T> { owner: owner, output: numbered };
+    return PipelineStage<T>
+    {
+        owner: owner,
+        output: numbered,
+    };
 }
 
-unit Number<T>(Port<T> input, Port<Sequenced<T>> output) where T: Core.Parallel.Transferable {
+unit Number<T>(Port<T> input, Port<Sequenced<T>> output) where T: Core.Parallel.Transferable
+{
     mut i64 sequence = 0_i64;
     mut bool open = true;
-    while open {
-        match input.Receive() {
+    while (open)
+    {
+        match (input.Receive())
+        {
             Result::Ok(value) => {
-                match output.Send(Sequenced::Item(sequence, value)) {
-                    Result::Ok(_) => { sequence = sequence + 1_i64; },
-                    Result::Error(_) => { open = false; },
+                match (output.Send(Sequenced::Item(sequence, value)))
+                {
+                    Result::Ok(_) => {
+                        sequence = sequence + 1_i64;
+                    },
+                    Result::Error(_) => {
+                        open = false;
+                    },
                 };
             },
-            Result::Error(_) => { open = false; },
+            Result::Error(_) => {
+                open = false;
+            },
         };
     }
     output.Close();
     return;
 }
 
-PipelineStage<U> StartStage<T, U>(Scope owner, Port<Sequenced<T>> input, i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
+PipelineStage<U> StartStage<T, U>(Scope owner, Port<Sequenced<T>> input, i64 workers, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable
+{
     mut i64 count = workers;
-    if count < 1_i64 {
+    if (count < 1_i64)
+    {
         count = 1_i64;
     }
     Port<Sequenced<U>> output = owner.Port<Sequenced<U>>();
     Port<i64> finished = owner.Port<i64>();
     mut i64 w = 0_i64;
-    while w < count {
+    while (w < count)
+    {
         Isolate worker = owner.Isolate(() => {
             Work<T, U>(input, output, finished, step);
             return;
@@ -332,23 +419,36 @@ PipelineStage<U> StartStage<T, U>(Scope owner, Port<Sequenced<T>> input, i64 wor
         CloseAfter<U>(finished, expected, output);
         return;
     });
-    return PipelineStage<U> { owner: owner, output: output };
+    return PipelineStage<U>
+    {
+        owner: owner,
+        output: output,
+    };
 }
 
-unit Work<T, U>(Port<Sequenced<T>> input, Port<Sequenced<U>> output, Port<i64> finished, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable {
+unit Work<T, U>(Port<Sequenced<T>> input, Port<Sequenced<U>> output, Port<i64> finished, [Captures(Bound: Transferable)] (T) => U step) where T: Core.Parallel.Transferable, U: Core.Parallel.Transferable
+{
     mut bool open = true;
-    while open {
-        match input.Receive() {
+    while (open)
+    {
+        match (input.Receive())
+        {
             Result::Ok(Sequenced::Item(sequence, value)) => {
-                match output.Send(Sequenced::Item(sequence, step(value))) {
+                match (output.Send(Sequenced::Item(sequence, step(value))))
+                {
                     Result::Ok(_) => { },
-                    Result::Error(_) => { open = false; },
+                    Result::Error(_) => {
+                        open = false;
+                    },
                 };
             },
-            Result::Error(_) => { open = false; },
+            Result::Error(_) => {
+                open = false;
+            },
         };
     }
-    match finished.Send(1_i64) {
+    match (finished.Send(1_i64))
+    {
         Result::Ok(_) => { },
         Result::Error(_) => { },
     };
@@ -356,66 +456,99 @@ unit Work<T, U>(Port<Sequenced<T>> input, Port<Sequenced<U>> output, Port<i64> f
 }
 
 // Closes `output` once every worker of the stage observed its input closed.
-unit CloseAfter<U>(Port<i64> finished, i64 workers, Port<Sequenced<U>> output) where U: Core.Parallel.Transferable {
+unit CloseAfter<U>(Port<i64> finished, i64 workers, Port<Sequenced<U>> output) where U: Core.Parallel.Transferable
+{
     mut i64 seen = 0_i64;
-    while seen < workers {
-        match finished.Receive() {
-            Result::Ok(_) => { seen = seen + 1_i64; },
-            Result::Error(_) => { seen = workers; },
+    while (seen < workers)
+    {
+        match (finished.Receive())
+        {
+            Result::Ok(_) => {
+                seen = seen + 1_i64;
+            },
+            Result::Error(_) => {
+                seen = workers;
+            },
         };
     }
     output.Close();
     return;
 }
 
-PipelineStage<T> StartOrdered<T>(Scope owner, Port<Sequenced<T>> input) where T: Core.Parallel.Transferable {
+PipelineStage<T> StartOrdered<T>(Scope owner, Port<Sequenced<T>> input) where T: Core.Parallel.Transferable
+{
     Port<Sequenced<T>> output = owner.Port<Sequenced<T>>();
     Isolate reorder = owner.Isolate(() => {
         Reorder<T>(input, output);
         return;
     });
-    return PipelineStage<T> { owner: owner, output: output };
+    return PipelineStage<T>
+    {
+        owner: owner,
+        output: output,
+    };
 }
 
-unit Reorder<T>(Port<Sequenced<T>> input, Port<Sequenced<T>> output) where T: Core.Parallel.Transferable {
+unit Reorder<T>(Port<Sequenced<T>> input, Port<Sequenced<T>> output) where T: Core.Parallel.Transferable
+{
     I64Map<T> pending = I64Map.New<T>();
     mut i64 next = 0_i64;
     mut bool open = true;
-    while open {
-        match input.Receive() {
+    while (open)
+    {
+        match (input.Receive())
+        {
             Result::Ok(Sequenced::Item(sequence, value)) => {
                 pending.Insert(sequence, value);
                 mut bool ready = true;
-                while ready && open {
-                    match pending.Get(next) {
+                while (ready && open)
+                {
+                    match (pending.Get(next))
+                    {
                         Option::Some(item) => {
                             pending.Remove(next);
-                            match output.Send(Sequenced::Item(next, item)) {
-                                Result::Ok(_) => { next = next + 1_i64; },
-                                Result::Error(_) => { open = false; },
+                            match (output.Send(Sequenced::Item(next, item)))
+                            {
+                                Result::Ok(_) => {
+                                    next = next + 1_i64;
+                                },
+                                Result::Error(_) => {
+                                    open = false;
+                                },
                             };
                         },
-                        Option::None => { ready = false; },
+                        Option::None => {
+                            ready = false;
+                        },
                     };
                 }
             },
-            Result::Error(_) => { open = false; },
+            Result::Error(_) => {
+                open = false;
+            },
         };
     }
     output.Close();
     return;
 }
 
-Result<i64, ParallelError> RunSink<T>(Port<Sequenced<T>> input, [Captures(Bound: Transferable)] (T) => unit sink) where T: Core.Parallel.Transferable {
+Result<i64, ParallelError> RunSink<T>(Port<Sequenced<T>> input, [Captures(Bound: Transferable)] (T) => unit sink) where T: Core.Parallel.Transferable
+{
     mut i64 consumed = 0_i64;
-    while true {
-        match input.Receive() {
+    while (true)
+    {
+        match (input.Receive())
+        {
             Result::Ok(Sequenced::Item(_, value)) => {
                 sink(value);
                 consumed = consumed + 1_i64;
             },
-            Result::Error(PortError::Closed) => { return Result::Ok(consumed); },
-            Result::Error(PortError::Cancelled) => { return Result::Error(ParallelError::Cancelled); },
+            Result::Error(PortError::Closed) => {
+                return Result::Ok(consumed);
+            },
+            Result::Error(PortError::Cancelled) => {
+                return Result::Error(ParallelError::Cancelled);
+            },
         };
     }
     return Result::Ok(consumed);

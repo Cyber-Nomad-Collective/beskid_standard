@@ -13,6 +13,16 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   implementations are `[Isolated]`. Compile-fail fixtures
   `PortOfUnmarkedContract` (E1610) and `LaunderedContractValue` (E1206) cover
   the rule.
+- `List<T>` lends a view to a call that only borrows it (`Borrow`): the
+  callee copies before it writes, and the caller's list stays the sole owner
+  of its array, so a list built by a function or read by helpers in a loop
+  writes in place. A list sent through a port is `Detached` first and leaves
+  with an array of its own when another list shares it.
+- Functions that keep a Moved parameter (store it, build a value with it or
+  return it) declare it `move` (codec, compiler-sdk, crypto, foundation Bytes,
+  Json, Process and Pest, glue, http, http2, http3, quic, tls, web,
+  websocket). `Connect` engine helpers that spawn fibers capturing the
+  shared `done` flags declare them `move`.
 - `Core.IO.Stream` embeds `Reader`, `Writer` and `Closer`; a `Stream` value
   passes to `IO.Read`, `IO.ReadExact` and `IO.WriteAll` directly.
 - `Testing.Assert.FailureRecord` fields are public.

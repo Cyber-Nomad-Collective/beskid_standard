@@ -16,7 +16,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Functions that keep a Moved parameter (store it, build a value with it or
   return it) declare it `move` (codec, compiler-sdk, crypto, foundation Bytes,
   Json, Process and Pest, glue, http, http2, http3, quic, tls, web,
-  websocket).
+  websocket). `Connect` engine helpers that spawn fibers capturing the
+  shared `done` flags declare them `move`.
 - `Core.IO.Stream` embeds `Reader`, `Writer` and `Closer`; a `Stream` value
   passes to `IO.Read`, `IO.ReadExact` and `IO.WriteAll` directly.
 - `Testing.Assert.FailureRecord` fields are public.

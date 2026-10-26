@@ -14,32 +14,52 @@ use Crypto.Scratch;
 /// A key created while the native provider is selected (`Crypto.Provider`, ruling R27)
 /// seals and opens through OpenSSL EVP for its whole life; `cipher` is then the EVP cipher
 /// and `raw` the key bytes. `cipher` = 0 marks a pure key.
-pub type AesGcmKey {
+pub type AesGcmKey
+{
     AesKey aes;
     i64[] hash;
     u8[] raw;
     i64 cipher;
 }
 
-pub i64 TagLength() { return 16_i64; }
-pub i64 NonceLength() { return 12_i64; }
+pub i64 TagLength()
+{
+    return 16_i64;
+}
 
-i64 Be64(u8[] data, i64 offset) {
+pub i64 NonceLength()
+{
+    return 12_i64;
+}
+
+i64 Be64(u8[] data, i64 offset)
+{
     mut i64 v = 0_i64;
     mut i64 i = 0_i64;
-    while i < 8_i64 { v = (v << 8_i64) | i64(data[offset + i]); i = i + 1_i64; }
+    while (i < 8_i64)
+    {
+        v = (v << 8_i64) | i64(data[offset + i]);
+        i = i + 1_i64;
+    }
     return v;
 }
 
-unit PutBe64(u8[] out, i64 offset, i64 value) {
+unit PutBe64(u8[] out, i64 offset, i64 value)
+{
     mut i64 i = 0_i64;
-    while i < 8_i64 { out[offset + i] = u8((value >> ((7_i64 - i) * 8_i64)) & 0xFF_i64); i = i + 1_i64; }
+    while (i < 8_i64)
+    {
+        out[offset + i] = u8((value >> ((7_i64 - i) * 8_i64)) & 0xFF_i64);
+        i = i + 1_i64;
+    }
     return;
 }
 
 /// Expands the AES key (16, 24, or 32 bytes) and derives the GHASH key H = E(K, 0^128).
-pub Result<AesGcmKey, CryptoError> New(u8[] key) {
-    return match Aes.NewKey(key) {
+pub Result<AesGcmKey, CryptoError> New(u8[] key)
+{
+    return match (Aes.NewKey(key))
+    {
         Result::Error(error) => Result::Error(error),
         Result::Ok(aes) => {
             u8[] h = Scratch.Bytes(16_i64);
@@ -50,36 +70,57 @@ pub Result<AesGcmKey, CryptoError> New(u8[] key) {
             GhashPrepare(g);
             i64 n = Slice.Len(key);
             mut i64 cipher = 0_i64;
-            if Provider.IsNative() { cipher = Native.AesGcmCipher(n); }
+            if (Provider.IsNative())
+            {
+                cipher = Native.AesGcmCipher(n);
+            }
             u8[] raw = Scratch.Bytes(n);
             Slice.Copy(raw, 0_i64, key, 0_i64, n);
-            return Result::Ok(AesGcmKey { aes: aes, hash: g, raw: raw, cipher: cipher });
+            return Result::Ok(AesGcmKey
+            {
+                aes: aes,
+                hash: g,
+                raw: raw,
+                cipher: cipher,
+            });
         },
     };
 }
 
 /// A fresh GHASH state (Y = 0) for `key`.
-i64[] Start(AesGcmKey key) {
+i64[] Start(AesGcmKey key)
+{
     i64[] t = key.hash;
     i64[] g = [0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64, 0_i64];
     mut i64 i = 2_i64;
-    while i < 8_i64 { g[i] = t[i]; i = i + 1_i64; }
+    while (i < 8_i64)
+    {
+        g[i] = t[i];
+        i = i + 1_i64;
+    }
     return g;
 }
 
 /// Absorbs `count` bytes zero-padded to whole blocks into the GHASH state `g`.
-unit Absorb(i64[] g, u8[] data, i64 offset, i64 count) {
+unit Absorb(i64[] g, u8[] data, i64 offset, i64 count)
+{
     i64 whole = (count / 16_i64) * 16_i64;
-    if whole > 0_i64 {
+    if (whole > 0_i64)
+    {
         g[8] = offset;
         g[9] = offset + whole;
         GhashBlocks(g, data);
     }
     i64 rest = count - whole;
-    if rest > 0_i64 {
+    if (rest > 0_i64)
+    {
         u8[] last = Scratch.Bytes(16_i64);
         mut i64 i = 0_i64;
-        while i < rest { last[i] = data[offset + whole + i]; i = i + 1_i64; }
+        while (i < rest)
+        {
+            last[i] = data[offset + whole + i];
+            i = i + 1_i64;
+        }
         g[8] = 0_i64;
         g[9] = 16_i64;
         GhashBlocks(g, last);
@@ -88,7 +129,8 @@ unit Absorb(i64[] g, u8[] data, i64 offset, i64 count) {
 }
 
 /// The tag E(K, J0) xor GHASH(aad || pad || ciphertext || pad || lengths).
-u8[] ComputeTag(AesGcmKey key, u8[] j0, u8[] aad, u8[] ciphertext, i64 offset, i64 count) {
+u8[] ComputeTag(AesGcmKey key, u8[] j0, u8[] aad, u8[] ciphertext, i64 offset, i64 count)
+{
     i64[] g = Start(key);
     Absorb(g, aad, 0_i64, Slice.Len(aad));
     Absorb(g, ciphertext, offset, count);
@@ -102,17 +144,25 @@ u8[] ComputeTag(AesGcmKey key, u8[] j0, u8[] aad, u8[] ciphertext, i64 offset, i
     u8[] mask = Scratch.Bytes(16_i64);
     Aes.EncryptBlock(key.aes, j0, 0_i64, mask, 0_i64);
     mut i64 i = 0_i64;
-    while i < 16_i64 { u8 a = y[i]; u8 b = mask[i]; y[i] = (a | b) - (a & b); i = i + 1_i64; }
+    while (i < 16_i64)
+    {
+        u8 a = y[i];
+        u8 b = mask[i];
+        y[i] = (a | b) - (a & b);
+        i = i + 1_i64;
+    }
     return y;
 }
 
 /// GCTR from counter block inc32(J0): XORs `count` bytes of `input` into `output`.
-unit Ctr(AesGcmKey key, u8[] j0, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
+unit Ctr(AesGcmKey key, u8[] j0, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset)
+{
     Aes.CtrXorInto(key.aes, j0, 2_i64, input, inputOffset, count, output, outputOffset);
     return;
 }
 
-u8[] InitialCounter(u8[] nonce) {
+u8[] InitialCounter(u8[] nonce)
+{
     u8[] j0 = Scratch.Bytes(16_i64);
     Slice.Copy(j0, 0_i64, nonce, 0_i64, 12_i64);
     j0[15] = 1_u8;
@@ -122,9 +172,11 @@ u8[] InitialCounter(u8[] nonce) {
 // BEGIN GENERATED GhashKernels (tools/clifgen.py)
 /// GHASH over the 16-byte blocks of `data` from offset `g[8]` up to `g[9]`.
 /// Precondition: the range is in bounds.
-i64 GhashBlocks(i64[] g, u8[] data) {
+i64 GhashBlocks(i64[] g, u8[] data)
+{
     mut i64 last = 0_i64;
-    while g[8] < g[9] {
+    while (g[8] < g[9])
+    {
         last = clif {
             %gp1 = payload %0
             %dp2 = payload %1
@@ -476,7 +528,8 @@ i64 GhashBlocks(i64[] g, u8[] data) {
 }
 
 /// Fills the bit-reversed and Karatsuba middle hash-key words of `g`.
-i64 GhashPrepare(i64[] g) {
+i64 GhashPrepare(i64[] g)
+{
     return clif {
         %gp1 = payload %0
         %v2 = load.i64 %gp1+16
@@ -493,28 +546,50 @@ i64 GhashPrepare(i64[] g) {
         return %c8
     };
 }
+
 // END GENERATED GhashKernels
 
 /// Maximum plaintext per invocation: 2^32 - 2 blocks (SP 800-38D section 5.2.1.1).
-i64 MaxPlaintext() { return 68719476704_i64; }
+i64 MaxPlaintext()
+{
+    return 68719476704_i64;
+}
 
 /// True when `key` was created while the native provider was selected (ruling R27).
-pub bool UsesNative(AesGcmKey key) { return key.cipher != 0_i64; }
+pub bool UsesNative(AesGcmKey key)
+{
+    return key.cipher != 0_i64;
+}
 
 /// True when the native provider serves this call (native key, EVP-sized lengths).
-bool UseNative(AesGcmKey key, u8[] aad, i64 count) {
+bool UseNative(AesGcmKey key, u8[] aad, i64 count)
+{
     return key.cipher != 0_i64 && count < Native.MaxEvpLength() && Slice.Len(aad) < Native.MaxEvpLength();
 }
 
 /// Encrypts `count` bytes of `input` at `inputOffset` and writes ciphertext || tag
 /// (`count` + 16 bytes) to `output` at `outputOffset`. Input and output must be the same
 /// range (in place) or disjoint. Prefer this with a reused record buffer.
-pub Result<unit, CryptoError> SealInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
-    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength); }
-    if count > MaxPlaintext() || !Slice.IsValidRange(Slice.Len(input), inputOffset, count) { return Result::Error(CryptoError::InvalidLength); }
-    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count + 16_i64) { return Result::Error(CryptoError::InvalidLength); }
-    if UseNative(key, aad, count) {
-        if Native.AeadSeal(key.cipher, key.raw, nonce, aad, input, inputOffset, count, output, outputOffset) { return Result::Ok(()); }
+pub Result<unit, CryptoError> SealInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset)
+{
+    if (Slice.Len(nonce) != 12_i64)
+    {
+        return Result::Error(CryptoError::InvalidNonceLength);
+    }
+    if (count > MaxPlaintext() || !Slice.IsValidRange(Slice.Len(input), inputOffset, count))
+    {
+        return Result::Error(CryptoError::InvalidLength);
+    }
+    if (!Slice.IsValidRange(Slice.Len(output), outputOffset, count + 16_i64))
+    {
+        return Result::Error(CryptoError::InvalidLength);
+    }
+    if (UseNative(key, aad, count))
+    {
+        if (Native.AeadSeal(key.cipher, key.raw, nonce, aad, input, inputOffset, count, output, outputOffset))
+        {
+            return Result::Ok(());
+        }
         Native.Wipe(output, outputOffset, count + 16_i64);
         return Result::Error(CryptoError::ProviderFailed);
     }
@@ -530,21 +605,42 @@ pub Result<unit, CryptoError> SealInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[]
 /// A wrong tag returns AuthenticationFailed and leaves no plaintext: the pure provider
 /// writes nothing, the native provider (which decrypts before it verifies) zeroes the
 /// output range.
-pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset) {
-    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength); }
-    if !Slice.IsValidRange(Slice.Len(sealed), sealedOffset, sealedCount) { return Result::Error(CryptoError::InvalidLength); }
-    if sealedCount < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed); }
+pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset)
+{
+    if (Slice.Len(nonce) != 12_i64)
+    {
+        return Result::Error(CryptoError::InvalidNonceLength);
+    }
+    if (!Slice.IsValidRange(Slice.Len(sealed), sealedOffset, sealedCount))
+    {
+        return Result::Error(CryptoError::InvalidLength);
+    }
+    if (sealedCount < 16_i64)
+    {
+        return Result::Error(CryptoError::AuthenticationFailed);
+    }
     i64 count = sealedCount - 16_i64;
-    if !Slice.IsValidRange(Slice.Len(output), outputOffset, count) { return Result::Error(CryptoError::InvalidLength); }
-    if UseNative(key, aad, count) {
+    if (!Slice.IsValidRange(Slice.Len(output), outputOffset, count))
+    {
+        return Result::Error(CryptoError::InvalidLength);
+    }
+    if (UseNative(key, aad, count))
+    {
         i64 result = Native.AeadOpen(key.cipher, key.raw, nonce, aad, sealed, sealedOffset, count, output, outputOffset);
-        if result == 1_i64 { return Result::Ok(count); }
-        if result == 0_i64 { return Result::Error(CryptoError::ProviderFailed); }
+        if (result == 1_i64)
+        {
+            return Result::Ok(count);
+        }
+        if (result == 0_i64)
+        {
+            return Result::Error(CryptoError::ProviderFailed);
+        }
         return Result::Error(CryptoError::AuthenticationFailed);
     }
     u8[] j0 = InitialCounter(nonce);
     u8[] expected = ComputeTag(key, j0, aad, sealed, sealedOffset, count);
-    if !ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64) {
+    if (!ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64))
+    {
         return Result::Error(CryptoError::AuthenticationFailed);
     }
     Ctr(key, j0, sealed, sealedOffset, count, output, outputOffset);
@@ -552,11 +648,16 @@ pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] 
 }
 
 /// Encrypts `plaintext` and returns ciphertext || tag. The nonce must be 12 bytes and unique per key.
-pub Result<u8[], CryptoError> Seal(AesGcmKey key, u8[] nonce, u8[] aad, u8[] plaintext) {
+pub Result<u8[], CryptoError> Seal(AesGcmKey key, u8[] nonce, u8[] aad, u8[] plaintext)
+{
     i64 count = Slice.Len(plaintext);
-    if count > MaxPlaintext() { return Result::Error(CryptoError::InvalidLength); }
+    if (count > MaxPlaintext())
+    {
+        return Result::Error(CryptoError::InvalidLength);
+    }
     u8[] out = Scratch.Bytes(count + 16_i64);
-    return match SealInto(key, nonce, aad, plaintext, 0_i64, count, out, 0_i64) {
+    return match (SealInto(key, nonce, aad, plaintext, 0_i64, count, out, 0_i64))
+    {
         Result::Ok(_) => Result::Ok(out),
         Result::Error(error) => Result::Error(error),
     };
@@ -564,12 +665,20 @@ pub Result<u8[], CryptoError> Seal(AesGcmKey key, u8[] nonce, u8[] aad, u8[] pla
 
 /// Verifies the tag of ciphertext || tag, then decrypts.
 /// A wrong tag returns AuthenticationFailed and no plaintext.
-pub Result<u8[], CryptoError> Open(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed) {
-    if Slice.Len(nonce) != 12_i64 { return Result::Error(CryptoError::InvalidNonceLength); }
+pub Result<u8[], CryptoError> Open(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed)
+{
+    if (Slice.Len(nonce) != 12_i64)
+    {
+        return Result::Error(CryptoError::InvalidNonceLength);
+    }
     i64 total = Slice.Len(sealed);
-    if total < 16_i64 { return Result::Error(CryptoError::AuthenticationFailed); }
+    if (total < 16_i64)
+    {
+        return Result::Error(CryptoError::AuthenticationFailed);
+    }
     u8[] out = Scratch.Bytes(total - 16_i64);
-    return match OpenInto(key, nonce, aad, sealed, 0_i64, total, out, 0_i64) {
+    return match (OpenInto(key, nonce, aad, sealed, 0_i64, total, out, 0_i64))
+    {
         Result::Ok(_) => Result::Ok(out),
         Result::Error(error) => Result::Error(error),
     };

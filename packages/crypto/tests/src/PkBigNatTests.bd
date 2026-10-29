@@ -2,106 +2,100 @@
 /// random.seed(7); a=getrandbits(1000); b=getrandbits(700); m=getrandbits(2048)|1|2^2047;
 /// x=getrandbits(2040); y=getrandbits(2040).
 use Testing.Assert;
-use Core.Bytes.Slice;
 use Core.Results;
-use Core.String;
-use Core.Time;
 use Crypto.BigNat;
 use Crypto.ModArith;
 use Crypto.PkErrors;
+use TestSupport;
 
-pub u8 PkNibble(u8 c) {
-    if c >= u8(48) && c <= u8(57) { return c - u8(48); }
-    if c >= u8(97) && c <= u8(102) { return c - u8(87); }
-    if c >= u8(65) && c <= u8(70) { return c - u8(55); }
-    return u8(0);
-}
-
-/// Test-only hex decoder; an odd-length string gets an implicit leading zero nibble.
-pub u8[] Hex(string text) {
-    i64 len = String.Len(text);
-    i64 odd = len % 2_i64;
-    u8[] out = Slice.New((len + 1_i64) / 2_i64);
-    mut i64 i = 0_i64;
-    while i < len {
-        i64 pos = i + odd;
-        u8 nib = PkNibble(String.ByteAt(text, i));
-        i64 index = pos / 2_i64;
-        if pos % 2_i64 == 0_i64 { out[index] = nib << u8(4); } else { out[index] = out[index] | nib; }
-        i = i + 1_i64;
-    }
-    return out;
-}
-
-pub string HexDigit(u8 v) {
-    if v < u8(10) { return String.CodeUnitChar(v + u8(48)); }
-    return String.CodeUnitChar(v + u8(87));
-}
-
-pub string ToHex(u8[] bytes) {
-    mut string out = "";
-    mut i64 i = 0_i64;
-    while i < Slice.Len(bytes) {
-        out = out + HexDigit(bytes[i] >> u8(4)) + HexDigit(bytes[i] & u8(15));
-        i = i + 1_i64;
-    }
-    return out;
-}
-
-pub string Dec(i64 v) {
-    if v < 10_i64 { return String.DigitChar(v); }
-    return Dec(v / 10_i64) + String.DigitChar(v % 10_i64);
-}
-
-pub i64 NowNanos() { Core.Time.Instant now = Time.MonotonicNow(); return now.nanos; }
-
-u32[] Nat(string hex) {
+u32[] Nat(string hex)
+{
     Result<u32[], PkError> r = BigNat.FromBytes(Hex(hex));
-    return match r { Result::Ok(v) => v, Result::Error(_) => BigNat.Zeros(1_i64), };
+    return match (r)
+    {
+        Result::Ok(v) => v,
+        Result::Error(_) => BigNat.Zeros(1_i64),
+    };
 }
 
-string NatHex(u32[] a) {
+string NatHex(u32[] a)
+{
     Result<u8[], PkError> r = BigNat.ToBytes(a, (BigNat.BitLength(a) + 7_i64) / 8_i64);
-    return match r { Result::Ok(v) => ToHex(v), Result::Error(_) => "error", };
+    return match (r)
+    {
+        Result::Ok(v) => ToHex(v),
+        Result::Error(_) => "error",
+    };
 }
 
-test PkBignatRoundtrip {
+test PkBignatBytesRoundTrip
+{
     Assert.Equal<string>(NatHex(Nat("a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d836f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902bd23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438")), "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d836f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902bd23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438", "bytes roundtrip");
     Assert.Equal<string>(NatHex(Nat("0000ff")), "ff", "leading zeros dropped");
     Assert.Equal<i64>(BigNat.BitLength(Nat("0100")), 9_i64, "bit length");
     Assert.True(BigNat.IsZero(Nat("")), "empty is zero");
 }
 
-test PkBignatFixedWidth {
+test PkBignatEncodesAtAFixedWidth
+{
     Result<u32[], PkError> ok = BigNat.FromBytesFixed(Hex("00000000ffffffff"), 1_i64);
-    Assert.True(match ok { Result::Ok(_) => true, Result::Error(_) => false, }, "leading zeros fit");
+    Assert.True(match (ok)
+    {
+        Result::Ok(_) => true,
+        Result::Error(_) => false,
+    }, "leading zeros fit");
     Result<u32[], PkError> big = BigNat.FromBytesFixed(Hex("01ffffffff"), 1_i64);
-    Assert.True(match big { Result::Ok(_) => false, Result::Error(_) => true, }, "too wide rejected");
+    Assert.True(match (big)
+    {
+        Result::Ok(_) => false,
+        Result::Error(_) => true,
+    }, "too wide rejected");
     Result<u8[], PkError> narrow = BigNat.ToBytes(Nat("0100"), 1_i64);
-    Assert.True(match narrow { Result::Ok(_) => false, Result::Error(_) => true, }, "ToBytes too narrow");
+    Assert.True(match (narrow)
+    {
+        Result::Ok(_) => false,
+        Result::Error(_) => true,
+    }, "ToBytes too narrow");
 }
 
-test PkBignatArith {
+test PkBignatArithmeticMatchesPythonBigIntegers
+{
     u32[] a = Nat("a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d93d9c172411e20b8f6b0d549b6f03675a1600a35a099950d836f675cc81e74ef5e8e25d940ed904759531985d5d9dc9f81818e811892f902bd23f0824128b2f330c5c7fd0a6a3a4506513270e269e0d37f2a74de452e6b438");
     u32[] b = Nat("08f6d0554ef8aa38922766581e27a1c08a6a63ec24ede6a46b4cb2424a23d5962217beaddbc496cb8e81973e0becd7b03898d190f9ebdacc0cb1e29c658cda1495e60af593bd04cf0fd630f1f29d0da9953f48f1a09f76b5");
     Assert.Equal<string>(NatHex(BigNat.Add(a, b)), "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d94692e77960dab5c7fd34baf38d2b091aa06b07462e87377ca243280ecc0b248c0afa1c41ea9d9b4123b32f9b698aa1a850b1b9a2831b6af7def0eac078180947a2428ac63a60a91f74e95800193b1ae187e696d5f3862aed", "add");
     Result<u32[], PkError> d = BigNat.Sub(a, b);
-    Assert.Equal<string>(match d { Result::Ok(v) => NatHex(v), Result::Error(_) => "error", }, "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d934a546cec2e96156d8e5ee4350dbc5998b963f6de4ab6a33cba9c38a37c3795fc6ca9ee633146daa06b0011f51b0f247df8016808f43b55fc58d2587acfe551e767674db12e69f81553cf61c3400ff8e5d6804f2b2473d83", "sub");
+    Assert.Equal<string>(match (d)
+    {
+        Result::Ok(v) => NatHex(v),
+        Result::Error(_) => "error",
+    }, "a139263059f28c105d1fb17c2390c192cfd3ac94af0f21ddb66cad4a268d116ece1738f7d934a546cec2e96156d8e5ee4350dbc5998b963f6de4ab6a33cba9c38a37c3795fc6ca9ee633146daa06b0011f51b0f247df8016808f43b55fc58d2587acfe551e767674db12e69f81553cf61c3400ff8e5d6804f2b2473d83", "sub");
     Result<u32[], PkError> neg = BigNat.Sub(b, a);
-    Assert.True(match neg { Result::Ok(_) => false, Result::Error(_) => true, }, "sub underflow rejected");
+    Assert.True(match (neg)
+    {
+        Result::Ok(_) => false,
+        Result::Error(_) => true,
+    }, "sub underflow rejected");
     Assert.Equal<string>(NatHex(BigNat.Mul(a, b)), "05a539505e02fec9581f2efd2cf0f2ce1d8b9d8b1108e88d787951b4bc5eac61352d0911b7609bd3051621071d3a99e34a2cd69f29178c4b559bf24dd10a118a9a3b0dcee65106bd642fd44c726ba4618b4554240876e1be2d9a40ba3491b4aed74711938460f958d0faea81a569325f7c1393e8e27db96d8dc95df9a596d96d905d238fdb57976978d9edd7e29e1cacb16b9761cafea37c0413c4a93d904f3e0a1d2eca8bd1180161900934adbe0d29891af1ce086cc6385524f00838efd0b3db97c1502f8a904729c9e472e5a2786749e2f73b98", "mul");
     Result<u32[], PkError> r = BigNat.Mod(a, b);
-    Assert.Equal<string>(match r { Result::Ok(v) => NatHex(v), Result::Error(_) => "error", }, "402276c3a3dd2051cc03e8bc18edf47cb0d5f4c37f2af0e7f2546c89c3f10526da3344f45a3c8b63cac55b9312dd2358efda538825c94472982b8506fd731b83a1c92f4161842d020b49e73068492b515b54c026046b4b", "mod");
+    Assert.Equal<string>(match (r)
+    {
+        Result::Ok(v) => NatHex(v),
+        Result::Error(_) => "error",
+    }, "402276c3a3dd2051cc03e8bc18edf47cb0d5f4c37f2af0e7f2546c89c3f10526da3344f45a3c8b63cac55b9312dd2358efda538825c94472982b8506fd731b83a1c92f4161842d020b49e73068492b515b54c026046b4b", "mod");
     Assert.Equal<i64>(BigNat.Compare(a, b), 1_i64, "compare");
     Assert.Equal<i64>(BigNat.Compare(b, a), -1_i64, "compare reversed");
     Assert.Equal<i64>(BigNat.Compare(a, BigNat.Resize(a, 60_i64)), 0_i64, "compare ignores zero limbs");
 }
 
-test PkModarithMontgomery {
+test PkModarithMontgomeryMultiplicationMatchesPython
+{
     u32[] m = Nat("8ede0d7ac3baea9e13deef86ab1031d0f646e1f40a097c976bf46c697d2caf82eeeacbe226e875555790f82ec1d3fcff2a3af4d46b0a18e8830e07bc1e398f1012bd4acefaecbd389be4bcfc49b64a0872e6cc3ababced2057ee05cde00902c77ebff206867347214cdd2055930d6eaf14f4733f3e7d1bfbc7a2ea20b2f14c942e05319acb5c74273f98e2774cbd87ad5c90a9587403e430ec66a78795e761d17731af10506bf2efc6f877186d76b07e881ed162ae2eb1547f15052434b9b5df9e7769b10f4205b4907a70c31012f037b64ce4228c38fb2918f135d25f557203301850c5a38fd547923a736994e3bf911a61dbe22e44158bae97ba94d0eda82f");
     Result<u32[], PkError> created = ModArith.NewWorkspace(m, 4_i64);
-    match created {
-        Result::Error(_) => { Assert.Fail("workspace"); },
+    match (created)
+    {
+        Result::Error(_) => {
+            Assert.Fail("workspace");
+        },
         Result::Ok(w) => {
             i64 n = 64_i64;
             i64 x = ModArith.WSlot(n, 0_i64);
@@ -127,10 +121,15 @@ test PkModarithMontgomery {
         },
     };
     Result<u32[], PkError> even = ModArith.NewWorkspace(Nat("10"), 1_i64);
-    Assert.True(match even { Result::Ok(_) => false, Result::Error(_) => true, }, "even modulus rejected");
+    Assert.True(match (even)
+    {
+        Result::Ok(_) => false,
+        Result::Error(_) => true,
+    }, "even modulus rejected");
 }
 
-test PkModarithConstantTimeHelpers {
+test PkModarithConstantTimeHelpers
+{
     u32[] a = [1_u32, 2_u32];
     u32[] b = [3_u32, 4_u32];
     ModArith.CondSwap(a, b, 0_u32);

@@ -88,6 +88,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ToolchainProbe`, `StdioBridge`), the unused `[Glue]`, `[GlueImport]` and
   `[GlueExport]` attributes and the `GlueBackendKind` enum from `corelib_glue`.
   The package now holds only the provisional stdio bridge protocol.
+- Remove `PackageVersion()` from the codec, crypto, http2, http3, quic, tls,
+  uri and x509 packages, and the smoke test targets that only called it.
+- Crypto, TLS, QUIC and HTTP/2 benchmarks move from the package test projects
+  to the `beskid_corelib/bench` project, which is not part of the test matrix.
 
 ### Fixed
 

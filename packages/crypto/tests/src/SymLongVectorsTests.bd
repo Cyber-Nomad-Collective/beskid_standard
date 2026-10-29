@@ -1,73 +1,41 @@
 /// Long-message AEAD known answers that cover the multi-block CLIF kernels (four-block
-/// ChaCha20 groups, AES-CTR/GHASH batches) plus their tails. Expected values are SHA-256
-/// digests of ciphertext || tag from Python cryptography 49 (OpenSSL 3) with
-/// key = 00 01 .. (16 or 32 bytes), nonce = 000000090000004a00000000, aad = 00 .. 0c and
-/// message byte i = (7 i + 3) mod 256.
+/// ChaCha20 groups, AES-CTR/GHASH batches) plus their tails. The vectors and their inputs are
+/// in `Vectors.bd`.
 use Testing.Assert;
-use Core.Bytes.Slice;
 use Core.Results;
-use Core.String;
 use Crypto.AesGcm;
 use Crypto.ChaCha20Poly1305;
 use Crypto.Sha256;
+use TestSupport;
+use Vectors;
 
-u8 Nibble(u8 c) {
-    if c >= 48_u8 && c <= 57_u8 { return c - 48_u8; }
-    return c - 87_u8;
+test ChaCha20Poly1305SealsLongMessagesToTheKnownDigests
+{
+    for v in LongChaCha20Poly1305Vectors()
+    {
+        u8[] key = LongKey(v.keyLength);
+        u8[] message = LongMessage(v.length);
+        u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(key, LongNonce(), LongAad(), message));
+        Assert.True(Same(Sha256.Hash(sealed), Hex(v.sealedDigest)), "sealed digest " + v.label);
+        Assert.True(Same(Unwrap(ChaCha20Poly1305.Open(key, LongNonce(), LongAad(), sealed)), message), "round trip " + v.label);
+    }
 }
 
-u8[] Hex(string text) {
-    i64 n = String.Len(text) / 2_i64;
-    u8[] out = Slice.New(n);
-    mut i64 i = 0_i64;
-    while i < n { out[i] = Nibble(String.ByteAt(text, 2_i64 * i)) * 16_u8 + Nibble(String.ByteAt(text, 2_i64 * i + 1_i64)); i = i + 1_i64; }
-    return out;
+test AesGcmSealsLongMessagesToTheKnownDigests
+{
+    for v in LongAesGcmVectors()
+    {
+        match (AesGcm.New(LongKey(v.keyLength)))
+        {
+            Result::Error(_) => {
+                Assert.Fail("key " + v.label);
+            },
+            Result::Ok(key) => {
+                u8[] message = LongMessage(v.length);
+                u8[] sealed = Unwrap(AesGcm.Seal(key, LongNonce(), LongAad(), message));
+                Assert.True(Same(Sha256.Hash(sealed), Hex(v.sealedDigest)), "sealed digest " + v.label);
+                Assert.True(Same(Unwrap(AesGcm.Open(key, LongNonce(), LongAad(), sealed)), message), "round trip " + v.label);
+            },
+        };
+    }
 }
-
-u8[] Counting(i64 n) {
-    u8[] out = Slice.New(n);
-    mut i64 i = 0_i64;
-    while i < n { out[i] = u8(i & 255_i64); i = i + 1_i64; }
-    return out;
-}
-
-u8[] Message(i64 n) {
-    u8[] out = Slice.New(n);
-    mut i64 i = 0_i64;
-    while i < n { out[i] = u8((i * 7_i64 + 3_i64) & 255_i64); i = i + 1_i64; }
-    return out;
-}
-
-u8[] Nonce() { return Hex("000000090000004a00000000"); }
-
-bool Same(u8[] a, u8[] b) { return Slice.Compare(a, b) == 0_i64; }
-
-unit CheckChaCha(i64 n, string expected) {
-    u8[] message = Message(n);
-    u8[] sealed = match ChaCha20Poly1305.Seal(Counting(32_i64), Nonce(), Counting(13_i64), message) { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
-    Assert.True(Same(Sha256.Hash(sealed), Hex(expected)), "chacha20-poly1305 sealed digest");
-    u8[] opened = match ChaCha20Poly1305.Open(Counting(32_i64), Nonce(), Counting(13_i64), sealed) { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
-    Assert.True(Same(opened, message), "chacha20-poly1305 round trip");
-    return;
-}
-
-unit CheckAes(i64 keyLength, i64 n, string expected) {
-    match AesGcm.New(Counting(keyLength)) {
-        Result::Error(_) => { Assert.Fail("key"); },
-        Result::Ok(key) => {
-            u8[] message = Message(n);
-            u8[] sealed = match AesGcm.Seal(key, Nonce(), Counting(13_i64), message) { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
-            Assert.True(Same(Sha256.Hash(sealed), Hex(expected)), "aes-gcm sealed digest");
-            u8[] opened = match AesGcm.Open(key, Nonce(), Counting(13_i64), sealed) { Result::Ok(v) => v, Result::Error(_) => Slice.New(0_i64), };
-            Assert.True(Same(opened, message), "aes-gcm round trip");
-        },
-    };
-    return;
-}
-
-test LongChacha20poly13051000 { CheckChaCha(1000_i64, "6fd7dbdd4ed19f5c49bcc8101f937a571b23dd77e0a5508a1f1c210c6c99e6c0"); }
-test LongChacha20poly13054109 { CheckChaCha(4109_i64, "7af36d463a1fa9e9023062cf632cbf25930a378edccd8fb448d0155ed763e479"); }
-test LongAes128gcm1000 { CheckAes(16_i64, 1000_i64, "fa4a80f1f6af61dcaada5747a1783d44f5fc4a1ff9265d940a69dc295fc848a7"); }
-test LongAes128gcm4109 { CheckAes(16_i64, 4109_i64, "5fb9b60f8dfcf08ea27e712dc74ec131cb0f220dee9a1ecdd21ba0db015259df"); }
-test LongAes256gcm1000 { CheckAes(32_i64, 1000_i64, "688bd10e4d7c68fee1194e385c1c743fd3dcb1728a724e92ae6617b916093a97"); }
-test LongAes256gcm4109 { CheckAes(32_i64, 4109_i64, "e60f2974413eb4551722ad646ff090c9fdf59beaf2084ebf133e93beb2bec7a1"); }

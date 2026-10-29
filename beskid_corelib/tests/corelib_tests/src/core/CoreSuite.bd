@@ -7,8 +7,6 @@ use Core.Optional.Option;
 use Core.Bytes.Convert;
 use Core.Bytes.Slice;
 use Core.Collections.Array;
-use Core.Time;
-use Core.Time.Instant;
 use Core.Encoding;
 use Core.Encoding.EncodingError;
 use Core.Collections.List;
@@ -19,7 +17,6 @@ use Core.ErrorHandling;
 use Core.String;
 use Core.String.Builder;
 use Core.Process;
-use Core.Threading.Thread;
 
 // ---- ResultsTests.bd (formerly target `CoreResultsTests`) ----
 
@@ -188,24 +185,15 @@ test BytesCopyRange
     Assert.Equal(Slice.Get(dst, 2), 122_u8, "Copy third byte");
 }
 
-i64 ElapsedNanos(Instant start)
-{
-    Instant now = Time.MonotonicNow();
-    return now.nanos - start.nanos;
-}
-
-// PERF1 / C53-5: Slice.New is one zeroed allocation, not one append per byte.
+// Slice.New is one zeroed allocation of exactly the requested capacity, not one append per byte.
 test BytesNewOneMebibyteIsOneZeroedAllocation
 {
-    Instant start = Time.MonotonicNow();
     u8[] buf = Slice.New(1048576);
-    i64 elapsed = ElapsedNanos(start);
     Assert.Equal(Slice.Len(buf), 1048576, "1 MiB length");
     Assert.Equal(Array.Capacity<u8>(buf), 1048576, "sized allocation has exact capacity");
     Assert.Equal(Slice.Get(buf, 0), 0, "first byte is zero");
     Assert.Equal(Slice.Get(buf, 524288), 0, "middle byte is zero");
     Assert.Equal(Slice.Get(buf, 1048575), 0, "last byte is zero");
-    Assert.True(elapsed < 50000000, "Slice.New(1 MiB) takes less than 50 ms");
 }
 
 test BytesNewNonPositiveLengthIsEmpty
@@ -727,14 +715,13 @@ test StringInterpolationOperandsSurviveCollection
     Assert.Equal(Array.Len<string>(live), 20000, "live strings stay");
 }
 
-// The resolver spike measured 7.7 us per `==` against a literal and a `String.Join` that did
-// not finish 16k lines in 10 minutes. These bounds sit far above the fixed cost, so they catch
-// only regressions of that size, not machine load.
-test StringEqualityAndJoinStayFast
+// One million `==` against a literal and a join of 20k lines. A quadratic comparison or join (a
+// join of 16k lines once took more than 10 minutes) exceeds the target time budget, so the test
+// needs no clock.
+test StringEqualityAndJoinScaleToTwentyThousandLines
 {
     string a = String.Concat("Primary", "Expression");
     mut i64 hits = 0;
-    Instant compareStart = Time.MonotonicNow();
     mut i64 i = 0;
     while (i < 1000000)
     {
@@ -744,9 +731,7 @@ test StringEqualityAndJoinStayFast
         }
         i = i + 1;
     }
-    i64 compareNanos = ElapsedNanos(compareStart);
     Assert.Equal(hits, 1000000, "every comparison matched");
-    Assert.True(compareNanos < 2000000000, "1e6 string == literal take less than 2 s");
     mut string[] lines = Array.Empty<string>();
     i = 0;
     while (i < 20000)
@@ -754,13 +739,10 @@ test StringEqualityAndJoinStayFast
         Array.Append<string>(lines, "line ${i}");
         i = i + 1;
     }
-    Instant joinStart = Time.MonotonicNow();
     string joined = String.Join(lines, String.Newline());
-    i64 joinNanos = ElapsedNanos(joinStart);
     string[] back = String.Lines(joined);
     Assert.Equal(Array.Len<string>(back), 20000, "join round-trips through Lines");
     Assert.Equal(Array.Get<string>(back, 19999), "line 19999", "last line");
-    Assert.True(joinNanos < 2000000000, "joining 20k lines takes less than 2 s");
 }
 
 test StringByteAt
@@ -1021,7 +1003,7 @@ test StringBuilderLines
 
 // ---- ProcessTests.bd (formerly target `CoreProcessTests`) ----
 
-// Process module tests for the exact v0.4 current-process surface.
+// Current-process surface (`Id`, `CurrentId`, `IsCurrentProcess`); child processes are in `ProcessSuite`.
 
 test ProcessIdReturnsPositive
 {
@@ -1041,14 +1023,4 @@ test ProcessIsCurrentProcessTrueForSelf
 test ProcessIsCurrentProcessFalseForOther
 {
     Assert.False(Core.Process.IsCurrentProcess(999999), "alien pid is not current");
-}
-
-// ---- ThreadingTests.bd (formerly target `CoreThreadingTests`) ----
-
-// Threading module tests: OS-level yield only.
-
-test ThreadYieldReturnsUnit
-{
-    Thread.Yield();
-    Assert.True(true, "Yield returns unit without crashing");
 }

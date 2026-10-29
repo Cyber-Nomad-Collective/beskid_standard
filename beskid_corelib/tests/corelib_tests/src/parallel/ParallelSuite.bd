@@ -495,9 +495,9 @@ test PortHandleCrossesAPort
     Assert.Equal<i64>(ScopeValue(result), 42_i64, "the reply arrives through the sent port");
 }
 
-// A list sent through a port leaves with a backing array of its own when another list shares
-// it (`kept = shared`), so no copy-on-write state is reachable from two isolates; a list that is
-// the sole owner of its array is handed over without a copy.
+// A list sent through a port is `Detached`: when another list shares its backing array
+// (`kept = shared`) it leaves with an array of its own, so no sharing state is reachable from two
+// isolates; a list that is the sole owner of its array is handed over without a copy.
 test SentListLeavesWithStorageOfItsOwn
 {
     Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
@@ -939,4 +939,38 @@ test ShippedCombiners
     Assert.Equal<i64>(values.Parallel().Reduce(0_i64, MaxI64 { }), 9_i64, "MaxI64");
     Assert.Equal<i64>(values.Parallel().Reduce(100_i64, MinI64 { }), 0_i64, "MinI64");
     Assert.Equal<i64>(values.Parallel().Map(x => 1_i64).Reduce(0_i64, Count { }), 10_i64, "Count");
+}
+
+// ---- Sources and isolate handles ----
+
+test OfListBorrowsTheListForASequence
+{
+    List<i64> values = List.FromArray<i64>([1_i64, 2_i64, 3_i64, 4_i64]);
+    Assert.Equal<i64>(ParallelSeq.OfList<i64>(values).Reduce(0_i64, SumI64 { }), 10_i64, "OfList sums every element");
+    Assert.Equal<i64>(Parallel.Of<i64>(values).Map(x => x * 2_i64).Reduce(0_i64, SumI64 { }), 20_i64, "Parallel.Of is OfList");
+    Assert.Equal<i64>(values.Count(), 4_i64, "the borrowed list keeps its elements");
+    Assert.Equal<i64>(ParallelSeq.OfList<i64>(List.New<i64>()).Reduce(7_i64, SumI64 { }), 7_i64, "an empty list reduces to the seed");
+}
+
+test ScopeIsolateHandleNamesTheIsolateThatRunsTheBody
+{
+    Result<i64, ParallelError> result = Parallel.Scope<i64>((Core.Parallel.Scopes.Scope s) => {
+        Port<Isolate> seen = s.Port<Isolate>();
+        Isolate worker = s.Isolate(() => {
+            seen.Send(Isolate.Current());
+            return;
+        });
+        return match (seen.Receive())
+        {
+            Result::Ok(running) => {
+                if (running.Equals(worker))
+                {
+                    return Result::Ok(1_i64);
+                }
+                return Result::Ok(0_i64);
+            },
+            Result::Error(_) => Result::Ok(-1_i64),
+        };
+    });
+    Assert.Equal<i64>(ScopeValue(result), 1_i64, "Isolate.OfTask of the body's task is the isolate the body reports as current");
 }

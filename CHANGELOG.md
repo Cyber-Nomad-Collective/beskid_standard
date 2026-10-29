@@ -12,6 +12,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   tag returns `AuthenticationFailed` and zeroes the whole output range, so no unverified plaintext
   stays in the buffer. The pure provider now zeroes the range as the native one does. The crypto
   tests check the zeroed output under both providers.
+- `Core.Collections.Array.Append` documents that growth of a `mut` parameter
+  changes only the callee's copy: the first growth through the caller's handle
+  copies the array, so the caller's array never changes, whatever its capacity.
+- `Platform.Terminal.PollResize` stores a new size in the fields of
+  `lastSize` (`lastSize = now;` changed only its own by-value parameter, so
+  `Console.RunTick` sent the same `Resize` on every later tick; the 0.6.7
+  compiler rejects that assignment as E1259).
 - A contract value crosses a port only when its contract embeds a transfer
   marker: `ParallelSuite`'s `Scored` embeds `Transferable` and its
   implementations are `[Isolated]`. Compile-fail fixtures

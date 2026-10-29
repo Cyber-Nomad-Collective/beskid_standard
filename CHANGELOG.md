@@ -79,6 +79,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
+- `beskid_corelib/tests/corelib_tests/Project.lock` is no longer tracked: a
+  generated lock is never committed (`.gitignore` covers it).
 - Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`
   handle type, the `LinuxPthread`/`DarwinPthread` contracts and `ThreadError`.
   `Spawn` passed `0` as the `pthread_t*` out-parameter and had no callers. Fibers

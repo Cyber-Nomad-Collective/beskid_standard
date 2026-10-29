@@ -25,7 +25,7 @@ the packages were first developed under `protocols/` against an unmodified
 0.5.2 corelib copy. Compiler 0.5.3 grants authority per canonical service file,
 so the packages now live in `packages/<pkg>/` of the corelib repository and are
 registered in the `beskid_corelib/corelib.bproj` aggregate (ruling R21).
-The program notes, gap log, and repros are in `docs/networking/`.
+The program notes and gap log are in `docs/networking/`.
 
 ## Environment (mandatory)
 

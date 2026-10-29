@@ -747,11 +747,11 @@ callers.
 ## 2026-10-06, crypto native provider slice
 
 ### NATIVE1. An extern from a missing library fails the whole program, even when it is never called
-- Symptom: `docs/networking/repros/missing-extern-library` declares
+- Symptom: the repro `missing-extern-library` (since removed) declares
   `[Extern(Abi:"C", Library:"libbeskid-not-installed.so.1")]` and calls it only behind
   `if false`. The 0.5.3 JIT fails before any test runs:
   `JIT compile failed: extern resolve: dlopen(libbeskid-not-installed.so.1) for
-  beskid_missing_symbol: ... cannot open shared object file` (`actual-0.5.3-linux.txt`).
+  beskid_missing_symbol: ... cannot open shared object file`.
   The JIT resolves every referenced `[Extern]` symbol at load time
   (`beskid_engine/src/engine.rs` `resolve_process_extern_symbols`), and an AOT link needs
   the library too. CLIF blocks admit no `call_indirect`, so `dlopen`/`dlsym` at run time
@@ -883,7 +883,7 @@ limits, and `H3Quic.ForH3` uses it (R25).
   full of freed 2-3 page array spans could not serve a 1-page request, so the heap grew region
   by region to the 1 GiB cap with `live=0`. The collector now splits larger free spans,
   merges adjacent free spans during sweep, and searches every region before it grows.
-  `docs/networking/repros/array_oom` variants A-C pass.
+  The `array_oom` repro variants A-C (since removed) passed.
 - WEB7 runtime gap: `NetworkFinish` now delivers a transfer that the reactor completed after
   the deadline won the wait (UDP datagram, TCP bytes, accepted socket, connection). Runtime
   tests `native_network_*_deadline_race_*` force that order 20 times each.

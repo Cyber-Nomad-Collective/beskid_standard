@@ -9,7 +9,6 @@ All paths are local; nothing is pushed.
 | --- | --- | --- | --- |
 | Integrated protocol stack (uri, codec, connect, crypto (pure), x509, tls, http2 HPACK, websocket + wss, quic, http3 + QPACK) | corelib (`compiler/corelib`, `beskid_standard`) | `claude/net-protocols` @ `bde3c41` | worktree `.worktrees/corelib-net-protocols/protocols/` |
 | Main gap report | same | same | `docs/networking/COMPILER-GAPS.md` (C*, W*, X*, H*, Q*, tls/codec/uri sections) |
-| Runnable repros (8 cases, outputs on both toolchains) | same | same (merged from `claude/net-repros` @ `68a726d`) | `docs/networking/repros/` (README.md per-case table) |
 | Rulings | same | same | `docs/networking/RULINGS.md` |
 | CLIF-optimized crypto + 0.5.3 gaps C53-1..6 + benchmarks | corelib | `claude/net-crypto-opt` @ `3c8dc4b` (not merged: needs 0.5.3) | `.worktrees/net-crypto-opt/protocols/{COMPILER-GAPS.md,crypto/BENCHMARKS.md}` |
 | HTTP/2 connection layer + its gaps | corelib | `claude/net-h2` (in progress, last `51922a7`) | `.worktrees/net-h2/protocols/` |
@@ -32,15 +31,12 @@ authority — `88522d60`.
 
 Command shape (both): `BESKID_RUNTIME_PREFIX=<kit> beskid test --project protocols/<pkg>/tests [--target <T> | --all-targets] --plain --target-timeout <s>` with `BESKID_CORELIB_ROOT` unset. Packages depend on an unmodified 0.5.2 corelib copy at `.worktrees/corelib-0.5.2-pristine` (builder: `/workspace/corelib-0.5.2-pristine`).
 
-Rechecked with 0.5.3: the 8 repro cases (identical results to 0.5.2, outputs in
-`docs/networking/repros/<case>/actual-0.5.3-linux.txt`) and the whole crypto suite (21/21 green, where
+Rechecked with 0.5.3: the 8 repro cases (identical results to 0.5.2) and the whole crypto suite (21/21 green, where
 C53-1..6 were found). The other gap entries were observed on 0.5.2 only.
 
 ## 3. Complete repros
 
-`docs/networking/repros/<case>/` each with `<case>.bproj`, `src/Main.bd` (+ variant files), `run.sh`
-(one `beskid test --target` per variant; set `BESKID_RUNTIME_PREFIX`, optional `BESKID=<cli>`),
-`actual-0.5.2-macos.txt`, `actual-0.5.3-linux.txt`.
+The `docs/networking/repros/` cases were removed in 0.6.7: they needed a 0.5.2 Corelib copy that is not in the tree, and no gate ran them. The results are kept here as a record.
 
 | Case | Actual error (both toolchains) | Correction to COMPILER-GAPS |
 | --- | --- | --- |
@@ -72,7 +68,7 @@ Interop scripts: `packages/tls/tests/interop/run.sh` (OpenSSL 6/6), `packages/we
 
 ## 5. Runtime regressions
 
-Runnable cases: `docs/networking/repros/{channel_exhaustion,array_oom,cancelled_parent_orphan}`, run on
+Cases `channel_exhaustion`, `array_oom` and `cancelled_parent_orphan` (since removed), run on
 0.5.2 (macOS) and 0.5.3 (Linux; the 0.5.3 runtime kit is the newest runtime built from the 0.5.3
 branch). Results identical on both:
 

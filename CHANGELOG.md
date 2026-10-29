@@ -8,6 +8,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Core.Collections.Array.Append` documents that growth of a `mut` parameter
+  changes only the callee's copy: the first growth through the caller's handle
+  copies the array, so the caller's array never changes, whatever its capacity.
 - `Platform.Terminal.PollResize` stores a new size in the fields of
   `lastSize` (`lastSize = now;` changed only its own by-value parameter, so
   `Console.RunTick` sent the same `Resize` on every later tick; the 0.6.7

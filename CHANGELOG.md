@@ -60,6 +60,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   regex parsers), `TextRegexBoundsTests` (subject cap, limits, depth and work budget of
   `Core.Text.Regex.Bounded`) and `TextCasingTests` (ASCII byte classes and case
   conversion edges).
+- `mods/corelib_pest_gen/Tests`: tests for the Pest Generator (grammar copy, collected
+  target, one public cursor parser per rule, failing bodies for unknown rules, parse
+  errors and unrepresentable literals).
 - `Process.Message(error)` returns one readable line for a `ProcessError`.
 - `Console.Hosting`: the `ConsoleHost` base host for console programs
   (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service

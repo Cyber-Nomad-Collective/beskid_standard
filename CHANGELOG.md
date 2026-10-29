@@ -100,6 +100,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
+- `Core.Text.Pest` `Expr.StripParens` skips string literals, so a group with a
+  parenthesis inside a literal, such as `( ")" )`, parses; it failed with
+  `invalid group`.
 - `Channel.Receive`, `Channel.Send`, `WaitGroup.Wait`, `Mutex.Lock` and
   `Hub.WaitReceive` in `Main` park like in any other fiber (Main runs as the
   root fiber); `Receive` on an empty channel in `Main` returned `Closed(0)`.

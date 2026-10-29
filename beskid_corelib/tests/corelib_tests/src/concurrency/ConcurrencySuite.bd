@@ -16,6 +16,7 @@ use Concurrency.Fiber;
 use Concurrency.FiberError;
 use Concurrency.ChannelOptions;
 use Core.Threading.Thread;
+use Core.Collections.Array;
 
 // ---- StatusAbiTests.bd (formerly target `ConcurrencyStatusAbiTests`) ----
 
@@ -279,12 +280,6 @@ test ChannelCloseDrainsCommittedValue
 // ---- MutexTryLockTests.bd (formerly target `ConcurrencyMutexTryLockTests`) ----
 
 // Mutex wrapper surface tests.
-
-test MutexCreateReturnsHandle
-{
-    Mutex mutex = Mutex.Create();
-    Assert.True(true, "Mutex.Create returns a handle");
-}
 
 test MutexTryLockIsExclusiveUntilUnlock
 {
@@ -579,6 +574,7 @@ test OneThousandMutexesLockAndUnlock
 
 test OneThousandWaitGroupsComplete
 {
+    mut i64 completed = 0_i64;
     mut i64 index = 0_i64;
     while (index < 1000_i64)
     {
@@ -586,9 +582,10 @@ test OneThousandWaitGroupsComplete
         WaitGroup.Add(group, 1_i64);
         WaitGroup.Done(group);
         WaitGroup.Wait(group);
+        completed = completed + 1_i64;
         index = index + 1_i64;
     }
-    Assert.True(true, "1,000 wait groups beyond the old 16-slot table complete");
+    Assert.Equal(completed, 1000_i64, "1,000 wait groups beyond the old 16-slot table each return from Wait");
 }
 
 test OneHubRegistersOneThousandChannelsAndReceivesFromTheLast
@@ -683,21 +680,24 @@ test ReceiveInTheRootFiberParksUntilAFiberSends
     };
 }
 
-unit DoneAfterYields(WaitGroup group)
+unit DoneAfterYields(WaitGroup group, i64[] state)
 {
     Concurrency.Yield();
+    Array.Set<i64>(state, 0_i64, 1_i64);
     WaitGroup.Done(group);
     return;
 }
 
 test WaitInTheRootFiberParksUntilAFiberCallsDone
 {
+    // state[0] is set by the fiber just before Done.
+    i64[] state = [0_i64];
     WaitGroup group = WaitGroup.Create();
     WaitGroup.Add(group, 1_i64);
-    Fiber<unit> finisher = spawn (() => DoneAfterYields(group));
+    Fiber<unit> finisher = spawn (() => DoneAfterYields(group, state));
     WaitGroup.Wait(group);
+    Assert.Equal(Array.Get<i64>(state, 0_i64), 1_i64, "Wait returned only after the fiber ran up to Done");
     finisher.Detach();
-    Assert.True(true, "the root fiber waited for Done");
 }
 
 // ---- v0.6.7: Hub and Mutex statuses outside their contract are Unexpected ----

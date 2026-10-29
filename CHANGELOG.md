@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `ChaCha20Poly1305.OpenInto` and `AesGcm.OpenInto` follow one contract on every provider: a wrong
+  tag returns `AuthenticationFailed` and zeroes the whole output range, so no unverified plaintext
+  stays in the buffer. The pure provider now zeroes the range as the native one does. The crypto
+  tests check the zeroed output under both providers.
 - A contract value crosses a port only when its contract embeds a transfer
   marker: `ParallelSuite`'s `Scored` embeds `Transferable` and its
   implementations are `[Isolated]`. Compile-fail fixtures

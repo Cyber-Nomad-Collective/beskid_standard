@@ -602,9 +602,10 @@ pub Result<unit, CryptoError> SealInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[]
 
 /// Verifies ciphertext || tag (`sealedCount` bytes at `sealedOffset`) in constant time, then
 /// writes the plaintext to `output` at `outputOffset` and returns its length.
-/// A wrong tag returns AuthenticationFailed and leaves no plaintext: the pure provider
-/// writes nothing, the native provider (which decrypts before it verifies) zeroes the
-/// output range.
+/// Every provider follows one contract: a wrong tag returns AuthenticationFailed and zeroes
+/// the whole output range `[outputOffset, outputOffset + sealedCount - 16)`, so no
+/// unverified plaintext stays in the buffer. The native provider decrypts before it
+/// verifies and wipes the range; the pure provider verifies first and writes zeros.
 pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset)
 {
     if (Slice.Len(nonce) != 12_i64)
@@ -641,6 +642,7 @@ pub Result<i64, CryptoError> OpenInto(AesGcmKey key, u8[] nonce, u8[] aad, u8[] 
     u8[] expected = ComputeTag(key, j0, aad, sealed, sealedOffset, count);
     if (!ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64))
     {
+        Slice.Copy(output, outputOffset, Slice.New(count), 0_i64, count);
         return Result::Error(CryptoError::AuthenticationFailed);
     }
     Ctr(key, j0, sealed, sealedOffset, count, output, outputOffset);

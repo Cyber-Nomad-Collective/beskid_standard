@@ -1,14 +1,14 @@
 #!/bin/bash
 # Interop between the Beskid TLS 1.3 implementation and OpenSSL 3 (s_server / s_client).
 # Usage: packages/tls/tests/interop/run.sh [quick]
-# Requires: beskid 0.5.3 (BESKID=<cli>) with BESKID_RUNTIME_PREFIX set (see docs/networking/PLAN.md), OpenSSL 3.
+# Requires: a beskid CLI (BESKID=<cli>) with BESKID_RUNTIME_PREFIX set (see docs/networking/PLAN.md), OpenSSL 3.
 set -u
 HERE="$(cd "$(dirname "$0")" && pwd)"
 CERTS="$HERE/certs"
 PROJECT="$HERE/project"
 OPENSSL="${OPENSSL:-/opt/homebrew/bin/openssl}"
 LOG="${TLS_INTEROP_LOG:-$(mktemp -d)}"
-export BESKID_RUNTIME_PREFIX="${BESKID_RUNTIME_PREFIX:?set BESKID_RUNTIME_PREFIX to a beskid 0.5.3 runtime kit}"
+export BESKID_RUNTIME_PREFIX="${BESKID_RUNTIME_PREFIX:?set BESKID_RUNTIME_PREFIX to a beskid runtime kit}"
 BESKID="${BESKID:-beskid}"
 unset BESKID_CORELIB_ROOT
 export RUST_LOG=error

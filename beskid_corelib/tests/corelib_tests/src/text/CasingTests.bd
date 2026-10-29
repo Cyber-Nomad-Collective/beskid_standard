@@ -1,0 +1,88 @@
+//! `TextCasingTests`: the ASCII byte classes of `Core.Text.Casing` and the identifier case
+//! conversions at their edges (empty input, leading and doubled underscores, digits).
+
+use Core.Text.Casing;
+use Testing.Assert;
+
+// ---- Byte classes ----
+
+test IsAsciiLowerAcceptsExactlyATillZ
+{
+    Assert.True(Casing.IsAsciiLower(97_u8), "a");
+    Assert.True(Casing.IsAsciiLower(122_u8), "z");
+    Assert.False(Casing.IsAsciiLower(96_u8), "backtick before a");
+    Assert.False(Casing.IsAsciiLower(123_u8), "brace after z");
+    Assert.False(Casing.IsAsciiLower(65_u8), "A");
+    Assert.False(Casing.IsAsciiLower(195_u8), "UTF-8 lead byte");
+}
+
+test IsAsciiUpperAcceptsExactlyATillZ
+{
+    Assert.True(Casing.IsAsciiUpper(65_u8), "A");
+    Assert.True(Casing.IsAsciiUpper(90_u8), "Z");
+    Assert.False(Casing.IsAsciiUpper(64_u8), "at sign before A");
+    Assert.False(Casing.IsAsciiUpper(91_u8), "bracket after Z");
+    Assert.False(Casing.IsAsciiUpper(97_u8), "a");
+}
+
+test IsAsciiDigitAcceptsExactlyZeroTillNine
+{
+    Assert.True(Casing.IsAsciiDigit(48_u8), "0");
+    Assert.True(Casing.IsAsciiDigit(57_u8), "9");
+    Assert.False(Casing.IsAsciiDigit(47_u8), "slash before 0");
+    Assert.False(Casing.IsAsciiDigit(58_u8), "colon after 9");
+}
+
+test IsSnakePartCharAllowsDigitsOnlyAfterTheFirstByte
+{
+    Assert.True(Casing.IsSnakePartChar(95_u8, true), "underscore may start");
+    Assert.True(Casing.IsSnakePartChar(120_u8, true), "letter may start");
+    Assert.True(Casing.IsSnakePartChar(88_u8, true), "upper letter may start");
+    Assert.False(Casing.IsSnakePartChar(49_u8, true), "digit may not start");
+    Assert.True(Casing.IsSnakePartChar(49_u8, false), "digit may follow");
+    Assert.False(Casing.IsSnakePartChar(45_u8, false), "hyphen is never a part");
+    Assert.False(Casing.IsSnakePartChar(32_u8, false), "space is never a part");
+}
+
+// ---- Conversions ----
+
+test SnakeToPascalDropsEveryUnderscore
+{
+    Assert.Equal(Casing.SnakeToPascal(""), "", "empty");
+    Assert.Equal(Casing.SnakeToPascal("_lead"), "Lead", "leading underscore");
+    Assert.Equal(Casing.SnakeToPascal("a__b"), "AB", "doubled underscore");
+    Assert.Equal(Casing.SnakeToPascal("tail_"), "Tail", "trailing underscore");
+}
+
+test SnakeToPascalKeepsDigitsAndUpperCaseBytes
+{
+    Assert.Equal(Casing.SnakeToPascal("utf8_text"), "Utf8Text", "digit inside a part");
+    Assert.Equal(Casing.SnakeToPascal("x_1"), "X1", "part that starts with a digit");
+    Assert.Equal(Casing.SnakeToPascal("http_URL"), "HttpURL", "upper case kept");
+}
+
+test PascalToSnakeSplitsBeforeEveryUpperCaseByte
+{
+    Assert.Equal(Casing.PascalToSnake(""), "", "empty");
+    Assert.Equal(Casing.PascalToSnake("A"), "a", "one letter");
+    Assert.Equal(Casing.PascalToSnake("Utf8Text"), "utf8_text", "digit stays in its part");
+}
+
+test SnakeToCamelLowersOnlyTheFirstLetter
+{
+    Assert.Equal(Casing.SnakeToCamel(""), "", "empty");
+    Assert.Equal(Casing.SnakeToCamel("x"), "x", "one letter");
+    Assert.Equal(Casing.SnakeToCamel("_lead_run"), "leadRun", "leading underscore");
+}
+
+test CamelAndSnakeRoundTripForLowerSnakeNames
+{
+    Assert.Equal(Casing.CamelToSnake(Casing.SnakeToCamel("word_tail_run")), "word_tail_run", "camel round trip");
+    Assert.Equal(Casing.PascalToSnake(Casing.SnakeToPascal("pat_class_item")), "pat_class_item", "pascal round trip");
+}
+
+test CallableFromSnakeWithAnEmptyPrefixIsPascal
+{
+    Assert.Equal(Casing.CallableFromSnake("digit_run", ""), "DigitRun", "empty prefix");
+    Assert.Equal(Casing.CallableFromSnake("", "Parse"), "Parse", "empty rule name");
+}

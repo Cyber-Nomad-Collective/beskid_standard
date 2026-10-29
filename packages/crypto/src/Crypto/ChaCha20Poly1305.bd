@@ -106,10 +106,12 @@ pub Result<unit, CryptoError> SealInto(u8[] key, u8[] nonce, u8[] aad, u8[] inpu
 }
 
 /// Verifies `sealedCount` bytes of ciphertext || tag at `sealedOffset` in constant time
-/// and only then writes `sealedCount - 16` plaintext bytes to `output` at `outputOffset`.
-/// Returns the plaintext length. A wrong tag returns AuthenticationFailed and leaves no
-/// plaintext: the pure provider writes nothing, the native provider (which decrypts before
-/// it verifies) zeroes the output range.
+/// and writes `sealedCount - 16` plaintext bytes to `output` at `outputOffset`.
+/// Returns the plaintext length. Every provider follows one contract: a wrong tag returns
+/// AuthenticationFailed and zeroes the whole output range `[outputOffset, outputOffset +
+/// sealedCount - 16)`, so no unverified plaintext stays in the buffer. The native provider
+/// decrypts before it verifies and wipes the range; the pure provider verifies first and
+/// writes zeros.
 pub Result<i64, CryptoError> OpenInto(u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 sealedCount, u8[] output, i64 outputOffset)
 {
     if (!Slice.IsValidRange(Slice.Len(sealed), sealedOffset, sealedCount))
@@ -145,6 +147,7 @@ pub Result<i64, CryptoError> OpenInto(u8[] key, u8[] nonce, u8[] aad, u8[] seale
             u8[] expected = Tag(mac, aad, sealed, sealedOffset, count);
             if (!ConstantTime.EqualRange(expected, 0_i64, sealed, sealedOffset + count, 16_i64))
             {
+                Slice.Copy(output, outputOffset, Slice.New(count), 0_i64, count);
                 return Result::Error(CryptoError::AuthenticationFailed);
             }
             if (!ChaCha20.XorInto(key, 1_u32, nonce, sealed, sealedOffset, count, output, outputOffset))

@@ -1,0 +1,241 @@
+//! `corelib_pest_gen` Generator: the regex grammar copy it carries, the target it collects
+//! and the typed parser functions it contributes. The tests inspect the contributed syntax
+//! trees; they do not run the host materialization.
+
+use Beskid.Compiler.Collect;
+use Beskid.Syntax.Nodes;
+use Core.Collections.Array;
+use Core.Results;
+use Core.Text.Casing;
+// The Mod also runs over this project and contributes its parsers here; they name
+// `Core.Text.Parser` and `Core.Text.Cursor` by full path, so both must be in the import closure.
+use Core.Text.Cursor;
+use Core.Text.Parser;
+use Core.Text.Pest.Grammar;
+use Emit;
+use PestGrammar;
+use PestSyntax;
+use Targets;
+use Testing.Assert;
+
+// ---- Helpers ----
+
+GrammarRule[] RegexRules()
+{
+    return match (Grammar.ParseGrammarRules(PestGrammar.RegexGrammarSource()))
+    {
+        Result::Ok(rules) => rules,
+        Result::Error(_) => Array.Empty<GrammarRule>(),
+    };
+}
+
+PestSyntax.Builder NewBuilder()
+{
+    return PestSyntax.Create(NodeSpan
+    {
+        start: 0_u64,
+        end: 0_u64,
+        lineStart: 0_u64,
+        columnStart: 0_u64,
+        lineEnd: 0_u64,
+        columnEnd: 0_u64,
+    });
+}
+
+/// The function definition of a contribution item; an item of another kind fails the test.
+SpannedFunctionDefinition FunctionOf(SyntaxContributionItem item)
+{
+    return match (item)
+    {
+        SyntaxContributionItem::FunctionDefinition(definition) => definition,
+        _ => Emit.RuleFunction(NewBuilder(), Grammar.NewRule("not_a_function", "ANY"), Array.Empty<GrammarRule>()),
+    };
+}
+
+bool IsFunction(SyntaxContributionItem item)
+{
+    return match (item)
+    {
+        SyntaxContributionItem::FunctionDefinition(_) => true,
+        _ => false,
+    };
+}
+
+string NameOf(SpannedFunctionDefinition definition)
+{
+    return definition.node.name.node.name;
+}
+
+SpannedStatement[] BodyOf(SpannedFunctionDefinition definition)
+{
+    return definition.node.body.node.statements.items;
+}
+
+/// The source spelling of the last string argument of the call that the first statement
+/// returns, or `<none>` when the first statement is not `return <call>(..., "...")`.
+string ReturnedLabel(SpannedFunctionDefinition definition)
+{
+    SpannedStatement[] body = BodyOf(definition);
+    if (Array.Len<SpannedStatement>(body) < 1)
+    {
+        return "<none>";
+    }
+    return match (body[0].node)
+    {
+        Statement::Return(statement) => match (statement.node.value)
+        {
+            OptionalSpannedExpression::Some(value) => LastTextArgument(value),
+            _ => "<none>",
+        },
+        _ => "<none>",
+    };
+}
+
+string LastTextArgument(SpannedExpression expression)
+{
+    return match (expression.node)
+    {
+        Expression::Call(call) => TextOf(call.node.args.items[Array.Len<SpannedExpression>(call.node.args.items) - 1]),
+        _ => "<none>",
+    };
+}
+
+string TextOf(SpannedExpression expression)
+{
+    return match (expression.node)
+    {
+        Expression::Literal(literal) => match (literal.node.literal.node)
+        {
+            Beskid.Syntax.Nodes.Literal::String(raw) => raw,
+            _ => "<none>",
+        },
+        _ => "<none>",
+    };
+}
+
+bool IsPublic(SpannedFunctionDefinition definition)
+{
+    return match (definition.node.visibility.node)
+    {
+        Visibility::Public => true,
+        _ => false,
+    };
+}
+
+bool HasReturnType(SpannedFunctionDefinition definition)
+{
+    return match (definition.node.returnType)
+    {
+        OptionalSpannedType::Some(_) => true,
+        _ => false,
+    };
+}
+
+// ---- Grammar and targets ----
+
+test RegexGrammarCopyParsesIntoThirtyRules
+{
+    GrammarRule[] rules = RegexRules();
+    Assert.Equal(Grammar.RuleCount(rules), 30, "rule count");
+    Assert.Equal(Grammar.RuleAt(rules, 0).name, "digit", "first rule");
+    Assert.Equal(Grammar.RuleAt(rules, 29).name, "sym_safe", "last rule");
+    Assert.True(Grammar.RuleExists(rules, "pat"), "pattern root");
+    Assert.Equal(Grammar.RuleAt(rules, 7).expression, "lower+", "lower_run body");
+}
+
+test CollectorTargetsTheMaterializedRegexModule
+{
+    string[] ids = Targets.GrammarTargetIds();
+    Assert.Equal(Array.Len<string>(ids), 1, "one target");
+    Assert.Equal(ids[0], Targets.RegexGeneratedTargetId(), "the regex module");
+    Assert.Equal(ids[0], "packages/foundation/.generated/Core/Text/Regex/Generated.g.bd", "materialized path");
+}
+
+// ---- Contribution ----
+
+test BuildAllContributesOneParserPerRuleInGrammarOrder
+{
+    GrammarRule[] rules = RegexRules();
+    GeneratedSyntaxContribution contribution = Emit.BuildAll();
+    Assert.Equal(Array.Len<SyntaxContributionItem>(contribution.items), Grammar.RuleCount(rules), "one item per rule");
+    Assert.Equal(Array.Len<SerializationTargetBinding>(contribution.targetBindings), 0, "no target bindings");
+    Assert.Equal(Array.Len<SerializationTemplateBinding>(contribution.templateBindings), 0, "no template bindings");
+    mut i64 i = 0;
+    while (i < Array.Len<SyntaxContributionItem>(contribution.items))
+    {
+        SyntaxContributionItem item = contribution.items[i];
+        Assert.True(IsFunction(item), "item is a function");
+        Assert.Equal(NameOf(FunctionOf(item)), Casing.CallableFromSnake(Grammar.RuleAt(rules, i).name, "Parse"), "callable name");
+        i = i + 1;
+    }
+}
+
+test EveryParserIsPublicAndTakesOneCursor
+{
+    GeneratedSyntaxContribution contribution = Emit.BuildAll();
+    mut i64 i = 0;
+    while (i < Array.Len<SyntaxContributionItem>(contribution.items))
+    {
+        SpannedFunctionDefinition definition = FunctionOf(contribution.items[i]);
+        Assert.True(IsPublic(definition), "public");
+        Assert.True(HasReturnType(definition), "returns a parse result");
+        SpannedParameter[] parameters = definition.node.parameters.items;
+        Assert.Equal(Array.Len<SpannedParameter>(parameters), 1, "one parameter");
+        Assert.Equal(parameters[0].node.name.node.name, "c", "cursor parameter");
+        Assert.True(Array.Len<SpannedStatement>(BodyOf(definition)) > 0, "body has statements");
+        i = i + 1;
+    }
+}
+
+// ---- Rule bodies ----
+
+test BuiltinAlphabetRuleIsOneTermsCall
+{
+    GrammarRule[] rules = RegexRules();
+    GrammarRule digit = Grammar.RuleAt(rules, 0);
+    SpannedFunctionDefinition builtin = Emit.RuleFunction(NewBuilder(), digit, rules);
+    Assert.Equal(Array.Len<SpannedStatement>(BodyOf(builtin)), 1, "one return");
+    Assert.Equal(ReturnedLabel(builtin), "\"digit\"", "the call names the rule");
+    SpannedFunctionDefinition spelled = Emit.RuleFunction(NewBuilder(), Grammar.NewRule("digits", digit.expression), rules);
+    Assert.True(Array.Len<SpannedStatement>(BodyOf(spelled)) > 1, "another rule name spells the choice out");
+}
+
+test UnknownRuleReferenceReturnsAFailure
+{
+    GrammarRule start = Grammar.NewRule("start", "missing");
+    SpannedFunctionDefinition definition = Emit.RuleFunction(NewBuilder(), start, [start]);
+    Assert.Equal(NameOf(definition), "ParseStart", "name");
+    Assert.Equal(Array.Len<SpannedStatement>(BodyOf(definition)), 1, "one return");
+    Assert.Equal(ReturnedLabel(definition), "\"start: unknown rule missing\"", "failure label");
+}
+
+test UnparsableExpressionReturnsAFailure
+{
+    GrammarRule start = Grammar.NewRule("start", "1abc");
+    SpannedFunctionDefinition definition = Emit.RuleFunction(NewBuilder(), start, [start]);
+    Assert.Equal(ReturnedLabel(definition), "\"start: unsupported primary\"", "failure label");
+}
+
+test UnrepresentableLiteralReturnsAFailure
+{
+    GrammarRule tab = Grammar.NewRule("tab", "\"\\t\"");
+    SpannedFunctionDefinition definition = Emit.RuleFunction(NewBuilder(), tab, [tab]);
+    Assert.Equal(ReturnedLabel(definition), "\"tab: unrepresentable literal\"", "failure label");
+}
+
+test RepresentableLiteralIsMatchedByText
+{
+    GrammarRule quote = Grammar.NewRule("quote", "\"\\\"\"");
+    SpannedFunctionDefinition definition = Emit.RuleFunction(NewBuilder(), quote, [quote]);
+    Assert.Equal(ReturnedLabel(definition), "\"quote\"", "literal call names the rule");
+}
+
+test BuilderGivesEveryNodeItsOwnLabel
+{
+    PestSyntax.Builder builder = NewBuilder();
+    GrammarRule rule = Grammar.NewRule("any_unit", "ANY");
+    SpannedFunctionDefinition first = Emit.RuleFunction(builder, rule, [rule]);
+    SpannedFunctionDefinition second = Emit.RuleFunction(builder, rule, [rule]);
+    Assert.True(first.id != second.id, "function labels differ");
+    Assert.True(first.node.name.id != second.node.name.id, "name labels differ");
+}

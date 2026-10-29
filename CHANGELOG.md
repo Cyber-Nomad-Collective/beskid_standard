@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `ChaCha20Poly1305.OpenInto` and `AesGcm.OpenInto` follow one contract on every provider: a wrong
+  tag returns `AuthenticationFailed` and zeroes the whole output range, so no unverified plaintext
+  stays in the buffer. The pure provider now zeroes the range as the native one does. The crypto
+  tests check the zeroed output under both providers.
 - A contract value crosses a port only when its contract embeds a transfer
   marker: `ParallelSuite`'s `Scored` embeds `Transferable` and its
   implementations are `[Isolated]`. Compile-fail fixtures
@@ -51,6 +55,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Corelib test targets `TextParserTests` (every `Core.Text.Parser` combinator and
+  term), `TextPestTests` (Pest grammar, expression and emit stages and the generated
+  regex parsers), `TextRegexBoundsTests` (subject cap, limits, depth and work budget of
+  `Core.Text.Regex.Bounded`) and `TextCasingTests` (ASCII byte classes and case
+  conversion edges).
+- `mods/corelib_pest_gen/Tests`: tests for the Pest Generator (grammar copy, collected
+  target, one public cursor parser per rule, failing bodies for unknown rules, parse
+  errors and unrepresentable literals).
 - `Process.Message(error)` returns one readable line for a `ProcessError`.
 - `Console.Hosting`: the `ConsoleHost` base host for console programs
   (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service
@@ -90,9 +102,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   `ToolchainProbe`, `StdioBridge`), the unused `[Glue]`, `[GlueImport]` and
   `[GlueExport]` attributes and the `GlueBackendKind` enum from `corelib_glue`.
   The package now holds only the provisional stdio bridge protocol.
+- Remove `PackageVersion()` from the codec, connect, crypto, http2, http3,
+  quic, tls, uri, web, websocket and x509 packages, and the smoke test targets
+  that only called it.
+- Crypto, TLS, QUIC and HTTP/2 benchmarks move from the package test projects
+  to the `beskid_corelib/bench` project, which is not part of the test matrix.
 
 ### Fixed
 
+- `Core.Text.Pest` `Expr.StripParens` skips string literals, so a group with a
+  parenthesis inside a literal, such as `( ")" )`, parses; it failed with
+  `invalid group`.
 - `Channel.Receive`, `Channel.Send`, `WaitGroup.Wait`, `Mutex.Lock` and
   `Hub.WaitReceive` in `Main` park like in any other fiber (Main runs as the
   root fiber); `Receive` on an empty channel in `Main` returned `Closed(0)`.

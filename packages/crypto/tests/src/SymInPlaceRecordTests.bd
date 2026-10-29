@@ -1,0 +1,209 @@
+use Testing.Assert;
+use Core.Bytes.Slice;
+use Core.Results;
+use Crypto.AesGcm;
+use Crypto.ChaCha20Poly1305;
+use Crypto.Errors;
+use Crypto.Provider;
+use Crypto.Sha256;
+
+/// 16 in-place seal/open round trips of one 16 KiB record (the TLS maximum) per AEAD in one
+/// reused record buffer, as the TLS record layer uses them.
+i64 RecordLength()
+{
+    return 16384_i64;
+}
+
+u8[] Record()
+{
+    u8[] d = Slice.New(RecordLength() + 16_i64);
+    Reset(d);
+    return d;
+}
+
+unit Reset(u8[] d)
+{
+    mut i64 i = 0_i64;
+    while (i < RecordLength())
+    {
+        d[i] = u8(i & 255_i64);
+        i = i + 1_i64;
+    }
+    return;
+}
+
+bool Intact(u8[] d)
+{
+    mut i64 i = 0_i64;
+    while (i < RecordLength())
+    {
+        if (d[i] != u8(i & 255_i64))
+        {
+            return false;
+        }
+        i = i + 1_i64;
+    }
+    return true;
+}
+
+test ChaCha20Poly1305SealsAndOpens16KiBRecordsInPlace
+{
+    u8[] key = Slice.New(32_i64);
+    u8[] nonce = Slice.New(12_i64);
+    u8[] aad = Slice.New(5_i64);
+    u8[] record = Record();
+    mut i64 round = 0_i64;
+    while (round < 16_i64)
+    {
+        nonce[11] = u8(round);
+        bool sealed = match (ChaCha20Poly1305.SealInto(key, nonce, aad, record, 0_i64, RecordLength(), record, 0_i64))
+        {
+            Result::Ok(_) => true,
+            Result::Error(_) => false,
+        };
+        Assert.True(sealed, "sealed");
+        Assert.False(Intact(record), "encrypted in place");
+        i64 opened = match (ChaCha20Poly1305.OpenInto(key, nonce, aad, record, 0_i64, RecordLength() + 16_i64, record, 0_i64))
+        {
+            Result::Ok(n) => n,
+            Result::Error(_) => -1_i64,
+        };
+        Assert.Equal<i64>(opened, RecordLength(), "opened");
+        Assert.True(Intact(record), "round trip");
+        round = round + 1_i64;
+    }
+}
+
+test AesGcmSealsAndOpens16KiBRecordsInPlace
+{
+    match (AesGcm.New(Slice.New(16_i64)))
+    {
+        Result::Error(_) => {
+            Assert.Fail("key");
+        },
+        Result::Ok(key) => {
+            u8[] nonce = Slice.New(12_i64);
+            u8[] aad = Slice.New(5_i64);
+            u8[] record = Record();
+            mut i64 round = 0_i64;
+            while (round < 16_i64)
+            {
+                nonce[11] = u8(round);
+                bool sealed = match (AesGcm.SealInto(key, nonce, aad, record, 0_i64, RecordLength(), record, 0_i64))
+                {
+                    Result::Ok(_) => true,
+                    Result::Error(_) => false,
+                };
+                Assert.True(sealed, "sealed");
+                i64 opened = match (AesGcm.OpenInto(key, nonce, aad, record, 0_i64, RecordLength() + 16_i64, record, 0_i64))
+                {
+                    Result::Ok(n) => n,
+                    Result::Error(_) => -1_i64,
+                };
+                Assert.Equal<i64>(opened, RecordLength(), "opened");
+                Assert.True(Intact(record), "round trip");
+                round = round + 1_i64;
+            }
+        },
+    };
+}
+
+/// A bad tag zeroes the whole output range under the host-selected provider and under the
+/// pure kernels.
+test ChaCha20Poly1305OpenIntoZeroesTheOutputOnABadTag
+{
+    CheckBadTagZeroes("host provider");
+    Provider.ForcePure(true);
+    CheckBadTagZeroes("pure provider");
+    Provider.ForcePure(false);
+}
+
+/// AES-GCM keys keep the provider they were created with, so each pass creates its own key.
+test AesGcmOpenIntoZeroesTheOutputOnABadTag
+{
+    CheckAesBadTagZeroes("host provider");
+    Provider.ForcePure(true);
+    CheckAesBadTagZeroes("pure provider");
+    Provider.ForcePure(false);
+}
+
+unit CheckAesBadTagZeroes(string label)
+{
+    match (AesGcm.New(Slice.New(16_i64)))
+    {
+        Result::Error(_) => {
+            Assert.Fail(label + " key");
+        },
+        Result::Ok(key) => {
+            u8[] nonce = Slice.New(12_i64);
+            u8[] aad = Slice.New(5_i64);
+            u8[] record = Record();
+            AesGcm.SealInto(key, nonce, aad, record, 0_i64, RecordLength(), record, 0_i64);
+            record[RecordLength() + 3_i64] = record[RecordLength() + 3_i64] + 1_u8;
+            u8[] full = Record();
+            full[0] = 0xAA_u8;
+            bool rejected = match (AesGcm.OpenInto(key, nonce, aad, record, 0_i64, RecordLength() + 16_i64, full, 0_i64))
+            {
+                Result::Ok(_) => false,
+                Result::Error(e) => match (e)
+                {
+                    CryptoError::AuthenticationFailed => true,
+                    _ => false,
+                },
+            };
+            Assert.True(rejected, label + " bad tag");
+            Assert.True(Slice.Compare(Slice.SubSlice(full, 0_i64, RecordLength()), Slice.New(RecordLength())) == 0, label + " output range zeroed");
+        },
+    };
+}
+
+unit CheckBadTagZeroes(string label)
+{
+    u8[] key = Slice.New(32_i64);
+    u8[] nonce = Slice.New(12_i64);
+    u8[] record = Record();
+    ChaCha20Poly1305.SealInto(key, nonce, Slice.New(0_i64), record, 0_i64, RecordLength(), record, 0_i64);
+    record[RecordLength() + 3_i64] = record[RecordLength() + 3_i64] + 1_u8;
+    u8[] out = Slice.New(64_i64);
+    out[0] = 0xAA_u8;
+    // Output too small is rejected before any work; a bad tag never writes plaintext.
+    bool small = match (ChaCha20Poly1305.OpenInto(key, nonce, Slice.New(0_i64), record, 0_i64, RecordLength() + 16_i64, out, 0_i64))
+    {
+        Result::Ok(_) => false,
+        Result::Error(e) => match (e)
+        {
+            CryptoError::InvalidLength => true,
+            _ => false,
+        },
+    };
+    Assert.True(small, label + " short output");
+    u8[] full = Record();
+    full[0] = 0xAA_u8;
+    bool rejected = match (ChaCha20Poly1305.OpenInto(key, nonce, Slice.New(0_i64), record, 0_i64, RecordLength() + 16_i64, full, 0_i64))
+    {
+        Result::Ok(_) => false,
+        Result::Error(e) => match (e)
+        {
+            CryptoError::AuthenticationFailed => true,
+            _ => false,
+        },
+    };
+    Assert.True(rejected, label + " bad tag");
+    Assert.Equal<u8>(full[0], 0_u8, label + " output zeroed");
+    Assert.True(Slice.Compare(Slice.SubSlice(full, 0_i64, RecordLength()), Slice.New(RecordLength())) == 0, label + " whole output range zeroed");
+}
+
+test Sha256IncrementalUpdatesOf16KiBRecordsMatchTheOneShotDigest
+{
+    u8[] data = Record();
+    u8[] whole = Slice.New(16 * RecordLength());
+    Sha256State state = Sha256.New();
+    mut i64 round = 0;
+    while (round < 16)
+    {
+        Sha256.UpdateRange(state, data, 0, RecordLength());
+        Slice.Copy(whole, round * RecordLength(), data, 0, RecordLength());
+        round = round + 1;
+    }
+    Assert.True(Slice.Compare(Sha256.Finish(state), Sha256.Hash(whole)) == 0, "incremental digest equals one-shot digest");
+}

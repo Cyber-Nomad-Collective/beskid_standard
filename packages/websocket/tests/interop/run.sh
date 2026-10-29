@@ -3,7 +3,7 @@
 # Beskid echo server. Needs node >= 22 and the environment from docs/networking/PLAN.md.
 set -u
 here="$(cd "$(dirname "$0")" && pwd)"
-export BESKID_RUNTIME_PREFIX="${BESKID_RUNTIME_PREFIX:?set BESKID_RUNTIME_PREFIX to a beskid 0.5.3 runtime kit}"
+export BESKID_RUNTIME_PREFIX="${BESKID_RUNTIME_PREFIX:?set BESKID_RUNTIME_PREFIX to a beskid runtime kit}"
 BESKID="${BESKID:-beskid}"
 unset BESKID_CORELIB_ROOT
 log="$(mktemp)"

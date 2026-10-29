@@ -11,7 +11,7 @@ use Core.Collections.Array;
 use Core.Results;
 use Testing.Assert;
 
-// SER-01..SER-06 structural cases. Fixture paths replace the host's canonical
+// Structural cases. Fixture paths replace the host's canonical
 // path planner; these tests prove shape and policy handling of the generated
 // typed AST, not execution of installed adapters.
 
@@ -286,7 +286,7 @@ string RecordErrorWith(Syntax.Builder builder, SpannedPath receiver, SpannedIden
     };
 }
 
-// SER-01: generic record with a parameter field and a primitive field.
+// Generic record with a parameter field and a primitive field.
 test SerializationGenericRecordEmitsEncoderThenDecoderGroup {
     Syntax.Builder builder = NewBuilder();
     SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
@@ -315,7 +315,7 @@ test SerializationGenericRecordEmitsEncoderThenDecoderGroup {
     Assert.Equal<i64>(ReadSites(fields, [Plain("value"), Plain("count")], []), 1_i64, "the T field reads through the issued correspondence");
 }
 
-// SER-01: nested GenericRecord<i32> and GenericRecord<string> keep distinct decoder bindings.
+// Nested GenericRecord<i32> and GenericRecord<string> keep distinct decoder bindings.
 test SerializationNestedGenericInstantiationsGetDistinctFieldDecoders {
     Syntax.Builder builder = NewBuilder();
     SpannedType ofInt = GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
@@ -329,7 +329,7 @@ test SerializationNestedGenericInstantiationsGetDistinctFieldDecoders {
     Assert.Equal<i64>(ReadSites(fields, [Plain("count"), Plain("label")], []), 2_i64, "each instantiation is its own ReadField site");
 }
 
-// SER-02: scalar profile including every explicit word width.
+// Scalar profile including every explicit word width.
 test SerializationWordScalarRequiresExactDeclaredWidthOnBothDirections {
     Syntax.Builder builder = NewBuilder();
     SpannedExpression value = Syntax.Local(builder, "value");
@@ -371,7 +371,7 @@ test SerializationEverySupportedPrimitiveReadsAndIneligibleOnesFailClosed {
     };
 }
 
-// SER-02: bytes policy is exactly u8[] and never silently reinterprets other arrays.
+// The bytes policy is exactly u8[] and never silently reinterprets other arrays.
 test SerializationBytesPolicyRequiresExactU8Array {
     Syntax.Builder builder = NewBuilder();
     match Read.Value(builder, Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::U8)), 0_u8, true, PlanFor(builder, []), 0_i64) {
@@ -389,7 +389,7 @@ test SerializationBytesPolicyRequiresExactU8Array {
     }
 }
 
-// SER-03: payload enum emits the same encoder/decoder group shape as a record.
+// A payload enum emits the same encoder/decoder group shape as a record.
 test SerializationPayloadEnumEmitsEncoderAndDecoderGroup {
     Syntax.Builder builder = NewBuilder();
     SpannedEnumVariant[] variants = [
@@ -418,7 +418,7 @@ test SerializationPayloadEnumRejectsUnreadablePayloadType {
     };
 }
 
-// SER-04: every field is read into a typed Option slot; absence is resolved after the full record read.
+// Every field is read into a typed Option slot; absence is resolved after the full record read.
 test SerializationRecordWithoutDefaultGeneratesCompleteDecoderGroup {
     Syntax.Builder builder = NewBuilder();
     SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
@@ -434,7 +434,8 @@ test SerializationSkipDeserializeWithoutTypedDefaultFailsBeforeGeneration {
     Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Holder"], []), [], fields, [policy]), "SerializationSkippedDefault", "skipped read requires typed default factory");
 }
 
-test SerializationSkipBothDirectionsWithDefaultKeepsDecoderFreeOfThatFieldBinding {
+/// A field skipped in both directions with a default needs no decoder binding.
+test SerializationSkipBothDirectionsNeedsNoDecoderBinding {
     Syntax.Builder builder = NewBuilder();
     SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
     SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
@@ -516,7 +517,8 @@ test SerializationSkipDeserializeWrittenFieldIsNotCapturedByCatchall {
     Assert.True(IsExpressionStatement(IfBody(loop[2_i64])[1_i64]), "cache is discarded before the catchall can see it");
 }
 
-test SerializationSkipDeserializeWrittenFieldRequiresDecoderBindingForNominalType {
+/// A written field skipped on deserialize still needs the decoder binding of its nominal type.
+test SerializationSkipDeserializeStillBindsTheDecoder {
     Syntax.Builder builder = NewBuilder();
     SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
     SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], []))];
@@ -542,7 +544,7 @@ test SerializationPolicyCountMismatchFailsClosed {
     Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Pair"], []), [], fields, [Plain("a")]), "SerializationFieldPolicy", "one policy per field");
 }
 
-// SER-05: policy validation through the real Policies entry points.
+// Policy validation through the real Policies entry points.
 test SerializationPoliciesRejectConflictingWireNamesUnlessDirectionsDiffer {
     Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
     mut SpannedField first = Syntax.DataField(builder, "first", Syntax.Primitive(builder, PrimitiveType::I32));
@@ -596,7 +598,7 @@ test SerializationPolicyWordWidthLiteralAcceptsOnlyDeclaredWidths {
     }
 }
 
-// SER-06: bounded recursion of generated source type descent.
+// Bounded recursion of generated source type descent.
 test SerializationGeneratedTypeDepthStopsAt128 {
     Syntax.Builder builder = NewBuilder();
     SpannedType nested = Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::I32));
@@ -744,7 +746,8 @@ test SerializationRecordWithMapFieldGeneratesEncoder {
 }
 
 // Gap 3: payload field policies.
-test SerializationVariantPoliciesRejectAsymmetricSkipPresentDefaultAndCatchall {
+/// Asymmetric skip, a present default and a catch-all are rejected on variants.
+test SerializationVariantPoliciesRejectInvalidCombinations {
     Syntax.Builder builder = NewBuilder();
     SpannedType number = Syntax.Primitive(builder, PrimitiveType::I32);
     Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [Flag(builder, "SkipSerialize")])])), "skip in one direction breaks positional payloads");

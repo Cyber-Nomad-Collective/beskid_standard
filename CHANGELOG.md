@@ -55,6 +55,11 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Corelib test targets `TextParserTests` (every `Core.Text.Parser` combinator and
+  term), `TextPestTests` (Pest grammar, expression and emit stages and the generated
+  regex parsers), `TextRegexBoundsTests` (subject cap, limits, depth and work budget of
+  `Core.Text.Regex.Bounded`) and `TextCasingTests` (ASCII byte classes and case
+  conversion edges).
 - `Process.Message(error)` returns one readable line for a `ProcessError`.
 - `Console.Hosting`: the `ConsoleHost` base host for console programs
   (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service

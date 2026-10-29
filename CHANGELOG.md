@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Platform.Terminal.PollResize` stores a new size in the fields of
+  `lastSize` (`lastSize = now;` changed only its own by-value parameter, so
+  `Console.RunTick` sent the same `Resize` on every later tick; the 0.6.7
+  compiler rejects that assignment as E1259).
 - A contract value crosses a port only when its contract embeds a transfer
   marker: `ParallelSuite`'s `Scored` embeds `Transferable` and its
   implementations are `[Isolated]`. Compile-fail fixtures

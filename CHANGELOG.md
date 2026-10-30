@@ -8,6 +8,17 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- `Core.Collections.Array.RemoveLast` documents that shrinking one handle never
+  changes what another handle to the same array sees (a shared array is copied
+  and the owner receives the shortened copy; an argument that is not an owner
+  returns a shortened copy and keeps its length). `Array.Clear` documents that
+  it keeps the length.
+- `Codec.Mem.Zeroed`, `Crypto.BigNat.Zeros` and `Crypto.BigNat.ZeroBytes`
+  allocate with `Array.Zeroed` instead of shortening a zero literal (the
+  literal tiers, `Mem.MaxSmall` and the `RemoveLast` trim loops are removed).
+- The bsol `WireEncoder.Abort` no longer shortens its output bytes and frames:
+  it is a non-allocating rollback and a shrink of a shared array copies. It
+  sets `used` to 0; the next `Begin` replaces both arrays.
 - `Core.Collections.Array.Append` documents that growing one handle never
   changes what another handle to the same array sees: when another handle can
   see the array, the growth copies it; an array no other handle sees still

@@ -91,7 +91,7 @@ unit FullReplay()
         },
         Result::Ok(ks) => {
             Assert.True(Same(ks.publicKey, ClientPublic()), "x25519 public key matches the trace");
-            match (Handshake.NewClientAfterHello(TraceConfig(), ks, VClientHello()))
+            match (Handshake.NewClientAfterHello(TraceConfig(), ks, ClientHello()))
             {
                 Result::Error(_) => {
                     Assert.Fail("engine");
@@ -113,7 +113,7 @@ unit FullReplay()
                     {
                         data: Slice.New(0_i64),
                     }];
-                    u8[] sh = VServerHello();
+                    u8[] sh = ServerHello();
                     Assert.Equal<i64>(TlsCode(Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh))), 0_i64, "ServerHello accepted");
                     Drain(e, out);
                     Assert.True(Same(BlobData(out, 0), ServerHsTraffic()), "server handshake secret event");
@@ -123,12 +123,12 @@ unit FullReplay()
                     Assert.Equal<i64>(TlsCode(Handshake.Feed(e, 2_i64, flight, 0_i64, 100_i64)), 0_i64, "first fragment");
                     Assert.Equal<i64>(TlsCode(Handshake.Feed(e, 2_i64, flight, 100_i64, Slice.Len(flight) - 100_i64)), 0_i64, "rest of flight");
                     u8[] fin = Drain(e, out);
-                    Assert.True(Same(fin, VClientFinished()), "client Finished matches RFC 8448");
+                    Assert.True(Same(fin, ClientFinished()), "client Finished matches RFC 8448");
                     Assert.True(Same(BlobData(out, 2), ServerApTraffic()), "server app secret");
                     Assert.True(Same(BlobData(out, 3), ClientApTraffic()), "client app secret");
                     Assert.True(Handshake.IsConnected(e), "connected");
                     Assert.True(Same(Handshake.ResumptionMasterSecret(e), TraceResumptionMaster()), "resumption master");
-                    u8[] nst = VNewSessionTicket();
+                    u8[] nst = NewSessionTicket();
                     Assert.Equal<i64>(TlsCode(Handshake.Feed(e, 3_i64, nst, 0_i64, Slice.Len(nst))), 0_i64, "ticket accepted and ignored");
                 },
             };
@@ -146,13 +146,13 @@ unit Rfc8448TamperedServerFinishedIsDecryptError()
             Assert.Fail("x25519 key");
         },
         Result::Ok(ks) => {
-            match (Handshake.NewClientAfterHello(TraceConfig(), ks, VClientHello()))
+            match (Handshake.NewClientAfterHello(TraceConfig(), ks, ClientHello()))
             {
                 Result::Error(_) => {
                     Assert.Fail("engine");
                 },
                 Result::Ok(e) => {
-                    u8[] sh = VServerHello();
+                    u8[] sh = ServerHello();
                     Assert.Equal<i64>(TlsCode(Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh))), 0_i64, "ServerHello");
                     u8[] flight = ServerFlight();
                     i64 n = Slice.Len(flight);
@@ -175,13 +175,13 @@ unit Rfc8448TamperedCertificateVerifyIsDecryptError()
             Assert.Fail("x25519 key");
         },
         Result::Ok(ks) => {
-            match (Handshake.NewClientAfterHello(TraceConfig(), ks, VClientHello()))
+            match (Handshake.NewClientAfterHello(TraceConfig(), ks, ClientHello()))
             {
                 Result::Error(_) => {
                     Assert.Fail("engine");
                 },
                 Result::Ok(e) => {
-                    u8[] sh = VServerHello();
+                    u8[] sh = ServerHello();
                     Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh));
                     u8[] flight = ServerFlight();
                     // Inside the CertificateVerify signature (EE 40 + Certificate 445 + 8 header bytes).
@@ -205,13 +205,13 @@ unit Rfc8448Rsa1024RejectedByDefaultPolicy()
         Result::Ok(ks) => {
             TlsClientConfig c = TraceConfig();
             c.minRsaBits = 2048_i64;
-            match (Handshake.NewClientAfterHello(c, ks, VClientHello()))
+            match (Handshake.NewClientAfterHello(c, ks, ClientHello()))
             {
                 Result::Error(_) => {
                     Assert.Fail("engine");
                 },
                 Result::Ok(e) => {
-                    u8[] sh = VServerHello();
+                    u8[] sh = ServerHello();
                     Handshake.Feed(e, 0_i64, sh, 0_i64, Slice.Len(sh));
                     u8[] flight = ServerFlight();
                     Assert.Equal<i64>(TlsCode(Handshake.Feed(e, 2_i64, flight, 0_i64, Slice.Len(flight))), 1071_i64, "insufficient_security");
@@ -240,27 +240,4 @@ test Rfc8448TamperedCertificateVerifyIsADecryptError
 test Rfc8448Rsa1024ServerKeyIsRejectedByTheDefaultPolicy
 {
     Rfc8448Rsa1024RejectedByDefaultPolicy();
-}
-
-pub u8[] VClientHello()
-{
-    string s = "010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b0009000006" + "736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4bd43d23d8e" + "435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e0403050306030203080408050806040105010601020104020502" + "06020202002d00020101001c00024001";
-    return Hex.Of(s);
-}
-
-pub u8[] VServerHello()
-{
-    string s = "020000560303a6af06a4121860dc5e6e60249cd34c95930c8ac5cb1434dac155772ed3e2692800130100002e00330024001d0020c9828876112095fe" + "66762bdbf7c672e156d6cc253b833df1dd69b1b04e751f0f002b00020304";
-    return Hex.Of(s);
-}
-
-pub u8[] VClientFinished()
-{
-    return Hex.Of("14000020a8ec436d677634ae525ac1fcebe11a039ec17694fac6e98527b642f2edd5ce61");
-}
-
-pub u8[] VNewSessionTicket()
-{
-    string s = "040000c90000001efad6aac502000000b22c035d829359ee5ff7af4ec900000000262a6494dc486d2c8a34cb33fa90bf1b0070ad3c498883c9367c09" + "a2be785abc55cd226097a3a982117283f82a03a143efd3ff5dd36d64e861be7fd61d2827db279cce145077d454a3664d4e6da4d29ee03725a6a4dafc" + "d0fc67d2aea70529513e3da2677fa5906c5b3f7d8f92f228bda40dda721470f9fbf297b5aea617646fac5c03272e970727c621a79141ef5f7de6505e" + "5bfbc388e93343694093934ae4d3570008002a000400000400";
-    return Hex.Of(s);
 }

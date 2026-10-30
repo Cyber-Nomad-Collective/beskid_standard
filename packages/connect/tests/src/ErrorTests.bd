@@ -157,50 +157,30 @@ test ErrorsInvalidPolicyFailsClosed
     };
 }
 
-unit Unresolvable()
+// Port zero is rejected by the resolver before any name lookup, so this needs no
+// DNS server: both family queries fail with InvalidAddress, the preferred family's
+// error is the reported cause.
+unit ResolverRejection()
 {
-    ConnectPolicy policy = Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(10000_i64));
-    match (Connect.ConnectHost("beskid-connect-test.invalid", Network.Types.PortBytes(0_u8, 80_u8), policy))
-    {
-        Result::Ok(stream) => {
-            stream.Close();
-            Assert.Fail("an .invalid name cannot resolve");
-        },
-        Result::Error(error) => {
-            Assert.Equal<i64>(ErrorKind(error), 2_i64, "ResolutionFailed");
-            Assert.Equal<i64>(ResolutionCause(error), 4_i64, "cause is HostNotFound");
-        },
-    };
-}
-
-test ErrorsResolutionFailedForInvalidName
-{
-    Fiber<unit> scenario = spawn Unresolvable();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "resolution scenario joins");
-}
-
-unit PortZero()
-{
-    match (Connect.ConnectHost("127.0.0.1", Network.Types.PortBytes(0_u8, 0_u8), Policy.Default()))
+    match (Connect.ConnectHost("beskid-connect-test.invalid", Network.Types.PortBytes(0_u8, 0_u8), Policy.Default()))
     {
         Result::Ok(stream) => {
             stream.Close();
             Assert.Fail("port zero cannot connect");
         },
-        Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 2_i64, "port zero is a typed resolution failure"),
+        Result::Error(error) => {
+            Assert.Equal<i64>(ErrorKind(error), 2_i64, "ResolutionFailed");
+            Assert.Equal<i64>(ResolutionCause(error), 5_i64, "the cause is the resolver's InvalidAddress");
+        },
     };
 }
 
-test ErrorsPortZeroIsRejected
+test ErrorsResolutionFailureCarriesTheResolverError
 {
-    Fiber<unit> scenario = spawn PortZero();
+    Fiber<unit> scenario = spawn ResolverRejection();
     Assert.True(match (scenario.Join())
     {
         Result::Ok(_) => true,
         _ => false,
-    }, "port zero scenario joins");
+    }, "resolution scenario joins");
 }

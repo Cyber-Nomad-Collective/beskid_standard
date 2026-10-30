@@ -54,19 +54,22 @@ test AesGcmMatchesTheGcmSpecification
 
 test AesGcmRejectsTamperedInputsAndBadNonces
 {
-    match (AesGcm.New(Hex("feffe9928665731c6d6a8f9467308308")))
+    // Inputs of AES-GCM test case 4 (the shared vector set).
+    AeadVector[] vectors = AesGcmVectors();
+    AeadVector v = vectors[3];
+    match (AesGcm.New(v.key))
     {
         Result::Error(_) => {
             Assert.Fail("key");
         },
         Result::Ok(key) => {
-            u8[] sealed = Unwrap(AesGcm.Seal(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), Hex("d9313225f88406e5a55909c5aff5269a86a7a9531534f7da2e4c303d8a318a721c3c0c95956809532fcf0e2449a6b525b16aedf5aa0de657ba637b39")));
+            u8[] sealed = Unwrap(AesGcm.Seal(key, v.nonce, v.aad, v.plaintext));
             mut i64 position = 0_i64;
             while (position < Slice.Len(sealed))
             {
                 u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
                 copy[position] = (copy[position] | 0x80_u8) - (copy[position] & 0x80_u8);
-                bool failed = match (AesGcm.Open(key, Hex("cafebabefacedbaddecaf888"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), copy))
+                bool failed = match (AesGcm.Open(key, v.nonce, v.aad, copy))
                 {
                     Result::Ok(_) => false,
                     Result::Error(e) => match (e)
@@ -78,7 +81,7 @@ test AesGcmRejectsTamperedInputsAndBadNonces
                 Assert.True(failed, "tampered byte rejected");
                 position = position + 7_i64;
             }
-            bool wrongNonce = match (AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), Hex("feedfacedeadbeeffeedfacedeadbeefabaddad2"), sealed))
+            bool wrongNonce = match (AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), v.aad, sealed))
             {
                 Result::Ok(_) => false,
                 Result::Error(_) => true,

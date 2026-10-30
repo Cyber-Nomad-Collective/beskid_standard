@@ -8,6 +8,9 @@ use Core.Text.Regex;
 use Core.Text.Regex.Engine;
 use Core.Text.Casing;
 use Core.Text.Regex.Generated;
+use Core.Text.Formatting;
+use Core.Results;
+use Core.Numeric.UnicodeScalar;
 
 // ---- Text Cursor ----
 
@@ -214,4 +217,79 @@ test RegexFindDigitRun
 test RegexMatchAlternation
 {
     Assert.True(Regex.Matches("(foo|bar)", "bar"), "alternation match");
+}
+
+// ---- Formatting ----
+
+// Core.Text.Formatting: the text form of every primitive type, read directly and through a
+// generic function bounded by `Formatting`.
+
+string Show<T>(T value) where T: Formatting
+{
+    return value.Format();
+}
+
+test SignedIntegersFormatAsDecimalDigits
+{
+    Assert.Equal<string>(Show<i8>(-128_i8), "-128", "i8 minimum");
+    Assert.Equal<string>(Show<i16>(32767_i16), "32767", "i16 maximum");
+    Assert.Equal<string>(Show<i32>(-7_i32), "-7", "i32");
+    Assert.Equal<string>(Show<i64>(9223372036854775807_i64), "9223372036854775807", "i64 maximum");
+}
+
+test UnsignedIntegersFormatAsDecimalDigits
+{
+    Assert.Equal<string>(Show<u8>(255_u8), "255", "u8 maximum");
+    Assert.Equal<string>(Show<u16>(65535_u16), "65535", "u16 maximum");
+    Assert.Equal<string>(Show<u32>(4294967295_u32), "4294967295", "u32 maximum");
+    Assert.Equal<string>(Show<u64>(18446744073709551615_u64), "18446744073709551615", "u64 above the i64 range");
+    Assert.Equal<string>(Show<u64>(0_u64), "0", "u64 zero");
+    Assert.Equal<string>(Show<word>(word(42_i64)), "42", "word");
+}
+
+test FloatsBoolsCharsAndStringsFormatAsText
+{
+    Assert.Equal<string>(Show<f64>(1.5_f64), "1.5", "f64");
+    Assert.Equal<string>(Show<f32>(0.25_f32), "0.25", "f32");
+    Assert.Equal<string>(Show<bool>(true), "true", "bool true");
+    Assert.Equal<string>(Show<bool>(false), "false", "bool false");
+    Assert.Equal<string>(Show<char>('A'), "A", "one-byte char");
+    Assert.Equal<string>(Show<char>('é'), "é", "two-byte char");
+    Assert.Equal<string>(Show<char>('€'), "€", "three-byte char");
+    Assert.Equal<string>(Show<char>('🙂'), "🙂", "four-byte char");
+    Assert.Equal<string>(Show<string>("beskid"), "beskid", "string is unchanged");
+}
+
+// ---- Unicode scalars ----
+
+test UnicodeScalarPublicRoundtripIncludesSupplementaryPlane
+{
+    u32[] values = [0_u32, 65_u32, 55295_u32, 57344_u32, 128512_u32, 1114111_u32];
+    mut i64 index = 0_i64;
+    while (index < 6_i64)
+    {
+        u32 value = values[index];
+        match (UnicodeScalar.FromCodePoint(value))
+        {
+            Result::Error(_) => Assert.Fail("valid Unicode scalar rejected"),
+            Result::Ok(character) => Assert.Equal(UnicodeScalar.ToCodePoint(character), value, "exact scalar roundtrip"),
+        };
+        index = index + 1_i64;
+    }
+}
+
+test UnicodeScalarPublicErrorsPreserveInvalidCodePoint
+{
+    match (UnicodeScalar.FromCodePoint(55296_u32))
+    {
+        Result::Error(UnicodeScalarError::Surrogate(value)) => Assert.Equal(value, 55296_u32, "surrogate payload"),
+        _ => Assert.Fail("surrogate must return its typed error"),
+    };
+    match (UnicodeScalar.FromCodePoint(1114112_u32))
+    {
+        Result::Error(UnicodeScalarError::OutOfRange(value)) => Assert.Equal(value, 1114112_u32, "range payload"),
+        _ => Assert.Fail("out of range must return its typed error"),
+    };
+    Assert.True(Results.IsError(UnicodeScalar.FromCodePoint(57343_u32)), "last surrogate rejected");
+    Assert.True(Results.IsError(UnicodeScalar.FromCodePoint(4294967295_u32)), "maximum u32 rejected");
 }

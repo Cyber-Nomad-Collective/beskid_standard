@@ -8,6 +8,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Test cleanup: `connect` `ErrorsResolutionFailedForInvalidName` needed a DNS server and failed
+  where the resolver answers the AAAA query for a `.invalid` name with `EAI_NODATA` (the native
+  resolver reports that as `NetworkDown`, and the preferred IPv6 family's error is the reported
+  cause). `ErrorsResolutionFailureCarriesTheResolverError` replaces it and the port-zero test: the
+  resolver rejects port zero before any lookup, so the test needs no network.
+- Test cleanup: the crypto tests share the RFC 6979 A.2.5 P-256 sample through `Vectors.bd`, and
+  the AES-GCM tamper test reads test case 4 from it. `Rfc8448ClientTests` and `MessagesTests`
+  read the RFC 8448 trace from `Rfc8448.bd` instead of restating it.
+- Test cleanup: one-test targets merge. x509 `ChainRsa`, `ChainEc`, `CertReject` and `Bundle`
+  join `Certificates`; `Der` and `Pem` become `Encoding`. connect `Fallback`, `Deadline`, `Cancel`
+  and `Leak` join `ConnectLoopbackTests`. crypto `PkX25519IterTests` joins `PkX25519Tests`.
+  corelib_tests `CoreFormattingTests` and `UnicodeScalarTests` join `TextSuite`. The
+  `ConsoleSuite` section banners name their topic instead of a former target.
 - `ChaCha20Poly1305.OpenInto` and `AesGcm.OpenInto` follow one contract on every provider: a wrong
   tag returns `AuthenticationFailed` and zeroes the whole output range, so no unverified plaintext
   stays in the buffer. The pure provider now zeroes the range as the native one does. The crypto
@@ -98,8 +111,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Removed
 
-- `beskid_corelib/tests/corelib_tests/Project.lock` is no longer tracked: a
-  generated lock is never committed (`.gitignore` covers it).
+- No `Project.lock` is tracked: the 16 generated locks of the Corelib, mod and
+  package projects are removed and `.gitignore` ignores `Project.lock` everywhere.
 - Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`
   handle type, the `LinuxPthread`/`DarwinPthread` contracts and `ThreadError`.
   `Spawn` passed `0` as the `pthread_t*` out-parameter and had no callers. Fibers

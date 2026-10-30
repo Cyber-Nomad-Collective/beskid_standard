@@ -1,3 +1,6 @@
+//! Connect over loopback: address ordering on the wire, fallback between families, deadlines,
+//! cancellation and release of every losing attempt.
+
 use Concurrency.Fiber;
 use Core.Time;
 use Core.Results;
@@ -9,6 +12,9 @@ use Connect;
 use Connect.Policy;
 use Testing.Assert;
 use TestSupport;
+use Concurrency;
+use Core.Collections.Array;
+use Connect.Failures;
 
 ConnectPolicy Fast()
 {
@@ -303,4 +309,433 @@ test ConnectHostIpv6Literal
         Result::Ok(_) => true,
         _ => false,
     }, "IPv6 literal scenario joins");
+}
+
+// Refused first, good second: the refusal starts the next attempt at once,
+// so the 2 s attempt delay is never waited for.
+Result<unit, NetworkError> RefusedThenGoodResult()
+{
+    SocketAddress refused = ClosedPort4()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    // The attempt delay is longer than the overall timeout, so a connection shows that the
+    // second attempt did not wait for it.
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(5000_i64)), Time.FromMilliseconds(60000_i64));
+    match (Connect.ConnectAddresses(List2(refused, good), policy))
+    {
+        Result::Ok(stream) => {
+            Assert.Equal<i64>(PeerPort(stream), good.port.Value(), "second address wins");
+            Exchange(listener, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("refused-then-good falls back"),
+    };
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit RefusedThenGood()
+{
+    match (RefusedThenGoodResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("refused scenario has no NetworkError"),
+    };
+}
+
+test FallbackRefusedFirstStartsNextImmediately
+{
+    Fiber<unit> scenario = spawn RefusedThenGood();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "refused scenario joins");
+}
+
+// Hanging first, good second: the second attempt starts after the attempt
+// delay (not after the 5 s deadline) and the hanging attempt is cancelled.
+Result<unit, NetworkError> HangingThenGoodResult()
+{
+    Blackhole hole = OpenBlackhole()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(5000_i64)), Time.FromMilliseconds(150_i64));
+    i64 before = Concurrency.NowMillis();
+    match (Connect.ConnectAddresses(List2(hole.address, good), policy))
+    {
+        Result::Ok(stream) => {
+            i64 elapsed = Concurrency.NowMillis() - before;
+            Assert.True(elapsed >= 140_i64, "second attempt waits for the attempt delay");
+            Assert.Equal<i64>(PeerPort(stream), good.port.Value(), "good address wins over the hanging one");
+            Exchange(listener, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("hanging-then-good falls back"),
+    };
+    listener.Close()?;
+    CloseBlackhole(hole);
+    return Result::Ok(());
+}
+
+unit HangingThenGood()
+{
+    match (HangingThenGoodResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("hanging scenario has no NetworkError"),
+    };
+}
+
+test FallbackHangingFirstIsRacedAfterAttemptDelay
+{
+    Fiber<unit> scenario = spawn HangingThenGood();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "hanging scenario joins");
+}
+
+// The attempt delay is clamped to at least 100 ms even when policy asks for less.
+Result<unit, NetworkError> ClampedDelayResult()
+{
+    Blackhole hole = OpenBlackhole()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(5000_i64)), Time.FromMilliseconds(1_i64));
+    i64 before = Concurrency.NowMillis();
+    match (Connect.ConnectAddresses(List2(hole.address, good), policy))
+    {
+        Result::Ok(stream) => {
+            Assert.True(Concurrency.NowMillis() - before >= 90_i64, "attempt delay never drops below 100 ms");
+            Exchange(listener, stream)?;
+        },
+        Result::Error(_) => Assert.Fail("clamped-delay race succeeds"),
+    };
+    listener.Close()?;
+    CloseBlackhole(hole);
+    return Result::Ok(());
+}
+
+unit ClampedDelay()
+{
+    match (ClampedDelayResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("clamp scenario has no NetworkError"),
+    };
+}
+
+test FallbackAttemptDelayHas100msFloor
+{
+    Fiber<unit> scenario = spawn ClampedDelay();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "clamp scenario joins");
+}
+
+pub i64 AttemptCount(ConnectError error)
+{
+    return Array.Len<AttemptFailure>(Failures.Attempts(error));
+}
+
+pub i64 AttemptKind(ConnectError error, i64 index)
+{
+    AttemptFailure[] attempts = Failures.Attempts(error);
+    AttemptFailure failure = attempts[index];
+    return NetworkKind(failure.error);
+}
+
+pub i64 AttemptPort(ConnectError error, i64 index)
+{
+    AttemptFailure[] attempts = Failures.Attempts(error);
+    AttemptFailure failure = attempts[index];
+    return failure.address.port.Value();
+}
+
+// Every address hangs: the overall deadline ends the race with a typed error
+// that keeps both attempts as TimedOut.
+Result<unit, NetworkError> DeadlineResult()
+{
+    Blackhole first = OpenBlackhole()?;
+    Blackhole second = OpenBlackhole()?;
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(400_i64)), Time.FromMilliseconds(100_i64));
+    i64 before = Concurrency.NowMillis();
+    match (Connect.ConnectAddresses(List2(first.address, second.address), policy))
+    {
+        Result::Ok(stream) => {
+            stream.Close();
+            Assert.Fail("a full accept queue cannot win");
+        },
+        Result::Error(error) => {
+            i64 elapsed = Concurrency.NowMillis() - before;
+            Assert.Equal<i64>(ErrorKind(error), 5_i64, "DeadlineExceeded");
+            Assert.True(elapsed >= 350_i64, "the deadline is not cut short");
+            Assert.Equal<i64>(AttemptCount(error), 2_i64, "both attempts are kept");
+            Assert.Equal<i64>(AttemptKind(error, 0_i64), 2_i64, "first attempt timed out");
+            Assert.Equal<i64>(AttemptKind(error, 1_i64), 2_i64, "second attempt timed out");
+        },
+    };
+    CloseBlackhole(first);
+    CloseBlackhole(second);
+    return Result::Ok(());
+}
+
+unit DeadlineScenario()
+{
+    match (DeadlineResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("deadline scenario has no NetworkError"),
+    };
+}
+
+test DeadlineExceededKeepsTimedOutAttempts
+{
+    Fiber<unit> scenario = spawn DeadlineScenario();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "deadline scenario joins");
+}
+
+// A deadline shorter than the attempt delay ends the race before a second attempt starts.
+Result<unit, NetworkError> ShortDeadlineResult()
+{
+    Blackhole first = OpenBlackhole()?;
+    Blackhole second = OpenBlackhole()?;
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(150_i64)), Time.FromMilliseconds(2000_i64));
+    match (Connect.ConnectAddresses(List2(first.address, second.address), policy))
+    {
+        Result::Ok(stream) => {
+            stream.Close();
+            Assert.Fail("a full accept queue cannot win");
+        },
+        Result::Error(error) => {
+            Assert.Equal<i64>(ErrorKind(error), 5_i64, "DeadlineExceeded");
+            Assert.Equal<i64>(AttemptCount(error), 1_i64, "only the first attempt started");
+            Assert.Equal<i64>(AttemptPort(error, 0_i64), first.address.port.Value(), "attempt keeps its address");
+        },
+    };
+    CloseBlackhole(first);
+    CloseBlackhole(second);
+    return Result::Ok(());
+}
+
+unit ShortDeadline()
+{
+    match (ShortDeadlineResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("short deadline scenario has no NetworkError"),
+    };
+}
+
+test DeadlineShorterThanAttemptDelay
+{
+    Fiber<unit> scenario = spawn ShortDeadline();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "short deadline scenario joins");
+}
+
+// Cancelling the calling fiber mid-race. The policy deadline bounds the orphaned
+// attempt and timers, which then end on their own without leaking a socket.
+i64 RaceBounded(SocketAddress hanging)
+{
+    ConnectPolicy policy = Policy.WithTimeout(Policy.Default(), Time.FromMilliseconds(400_i64));
+    match (Connect.ConnectAddresses(List1(hanging), policy))
+    {
+        Result::Ok(stream) => {
+            stream.Close();
+            return 0_i64;
+        },
+        Result::Error(error) => {
+            return ErrorKind(error);
+        },
+    };
+    return -1_i64;
+}
+
+Result<unit, NetworkError> CancelCallerResult()
+{
+    Blackhole hole = OpenBlackhole()?;
+    SocketAddress target = hole.address;
+    Fiber<i64> racer = spawn (() => RaceBounded(target));
+    match (Time.Sleep(Time.FromMilliseconds(100_i64)))
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("sleep completes"),
+    };
+    racer.Cancel();
+    i64 code = match (racer.Join())
+    {
+        Result::Ok(value) => value,
+        Result::Error(_) => 100_i64,
+    };
+    // A race that ran on to its 400 ms policy deadline would end as DeadlineExceeded (5).
+    Assert.True(code == 6_i64 || code == 100_i64, "the race ends as Cancelled");
+    // Let the orphaned attempt reach the policy deadline before the listener closes.
+    match (Time.Sleep(Time.FromMilliseconds(700_i64)))
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("sleep completes"),
+    };
+    CloseBlackhole(hole);
+    return Result::Ok(());
+}
+
+unit CancelCaller()
+{
+    match (CancelCallerResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("cancel scenario has no NetworkError"),
+    };
+}
+
+test CancelCallerFiberEndsRaceWithoutLeaks
+{
+    Fiber<unit> scenario = spawn CancelCaller();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "cancel scenario joins");
+}
+
+// The runtime socket table has 256 slots. 300 races, each with a refused loser
+// and an accepted winner, would exhaust it if any race leaked a socket; the
+// process-exit leak audit of the test runner reports anything left open.
+Result<unit, NetworkError> RefusedCyclesResult()
+{
+    SocketAddress refused = ClosedPort4()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    SocketAddress[] candidates = List2(refused, good);
+    mut i64 cycle = 0_i64;
+    while (cycle < 300_i64)
+    {
+        match (Connect.ConnectAddresses(candidates, Policy.Default()))
+        {
+            Result::Ok(stream) => {
+                Exchange(listener, stream)?;
+            },
+            Result::Error(_) => Assert.Fail("each cycle connects"),
+        };
+        cycle = cycle + 1_i64;
+    }
+    listener.Close()?;
+    TcpListener fresh = TcpListener.Bind(Loopback4(0_i64), 1_i64)?;
+    fresh.Close()?;
+    return Result::Ok(());
+}
+
+unit RefusedCycles()
+{
+    match (RefusedCyclesResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("refused cycles have no NetworkError (a leak surfaces as ResourceExhausted)"),
+    };
+}
+
+test LeakRefusedLosersOver300Races
+{
+    Fiber<unit> scenario = spawn RefusedCycles();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "refused cycles join");
+}
+
+// Losers still connecting when the winner arrives are cancelled and joined.
+Result<unit, NetworkError> CancelledLoserCyclesResult()
+{
+    Blackhole hole = OpenBlackhole()?;
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    SocketAddress[] candidates = List2(hole.address, good);
+    ConnectPolicy policy = Policy.WithAttemptDelay(Policy.Default(), Time.FromMilliseconds(100_i64));
+    mut i64 cycle = 0_i64;
+    while (cycle < 30_i64)
+    {
+        match (Connect.ConnectAddresses(candidates, policy))
+        {
+            Result::Ok(stream) => {
+                Assert.Equal<i64>(PeerPort(stream), good.port.Value(), "good address wins");
+                Exchange(listener, stream)?;
+            },
+            Result::Error(_) => Assert.Fail("each cycle connects"),
+        };
+        cycle = cycle + 1_i64;
+    }
+    listener.Close()?;
+    CloseBlackhole(hole);
+    return Result::Ok(());
+}
+
+unit CancelledLoserCycles()
+{
+    match (CancelledLoserCyclesResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("cancelled-loser cycles have no NetworkError"),
+    };
+}
+
+test LeakCancelledLosersAreJoined
+{
+    Fiber<unit> scenario = spawn CancelledLoserCycles();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "cancelled-loser cycles join");
+}
+
+// Resolving races (two name queries each) also release every fiber and socket,
+// well past the runtime's 64-entry channel table.
+Result<unit, NetworkError> ResolvingCyclesResult()
+{
+    TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
+    SocketAddress good = listener.LocalAddress()?;
+    mut i64 cycle = 0_i64;
+    while (cycle < 100_i64)
+    {
+        match (Connect.ConnectHost("127.0.0.1", good.port, Policy.Default()))
+        {
+            Result::Ok(stream) => {
+                Exchange(listener, stream)?;
+            },
+            Result::Error(_) => Assert.Fail("each resolving cycle connects"),
+        };
+        cycle = cycle + 1_i64;
+    }
+    listener.Close()?;
+    return Result::Ok(());
+}
+
+unit ResolvingCycles()
+{
+    match (ResolvingCyclesResult())
+    {
+        Result::Ok(_) => (),
+        Result::Error(_) => Assert.Fail("resolving cycles have no NetworkError"),
+    };
+}
+
+test LeakResolvingRacesPastChannelTable
+{
+    Fiber<unit> scenario = spawn ResolvingCycles();
+    Assert.True(match (scenario.Join())
+    {
+        Result::Ok(_) => true,
+        _ => false,
+    }, "resolving cycles join");
 }

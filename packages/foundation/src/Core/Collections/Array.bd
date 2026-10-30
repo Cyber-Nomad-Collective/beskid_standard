@@ -92,11 +92,14 @@ pub i64 Capacity<T>(T[] values)
 
 /// Appends `value` and returns the array that holds it.
 /// When the first argument owns its array (a local, a `mut` parameter or an aggregate field), the
-/// compiler lowers the call to the rooted in-place growth operation: growth is geometric (when
-/// the array is full, the replacement has twice the capacity, at least 4 elements), so a sequence
-/// of appends costs amortized O(1) per element; when capacity remains, the element is stored in
-/// place and every handle to the same array observes the new length, as with `RemoveLast`. The
-/// owner's slot is updated, so `Array.Append<T>(items, v);` needs no rebinding.
+/// compiler lowers the call to the rooted growth operation and updates the owner's slot, so
+/// `Array.Append<T>(items, v);` needs no rebinding. Growing one handle never changes what another
+/// handle to the same array sees (its length, or the elements written after the growth): when
+/// another handle can see the array (`ys = xs`, a field, a capture, a list element, an argument
+/// kept by the callee, a returned array), the growth copies it into a new array that only the
+/// owner holds. An array no other handle can see grows in place while capacity remains; growth is
+/// geometric (the replacement holds twice the length, at least 4 elements), so a sequence of
+/// appends costs amortized O(1) per element.
 /// A `mut` parameter is passed by value: its growth changes only the callee's copy of the handle.
 /// While the parameter still holds the caller's handle, the first growth copies the array, so the
 /// caller's array never changes, whatever its capacity; return the grown array to publish it.
@@ -119,17 +122,24 @@ pub bool TryAppend<T>(mut T[] values, T value)
     return false;
 }
 
-/// Clears a live slot through descriptor-aware typed storage.
+/// Clears a live slot through descriptor-aware typed storage. The length does not change: like
+/// any element write, the cleared slot is visible through every handle to the array.
 pub T[] Clear<T>(T[] values, i64 index)
 {
     // Canonical calls lower to a descriptor-typed zero store at `index`.
     return values;
 }
 
-/// Clears the final live slot and decreases logical length by one.
+/// Clears the final live slot and decreases logical length by one, and returns the shortened
+/// array. Shrinking one handle never changes what another handle to the same array sees: when the
+/// first argument owns its array (a local, a `mut` parameter or an aggregate field, as for
+/// `Append`) and no other handle can see it, the array is shortened in place; when another handle
+/// can see it, the owner receives a shortened copy and the other handles keep the old length and
+/// last element. Any other array (a parameter that is not `mut`, an element, a call result) is
+/// not owned by the caller: the call returns a shortened copy and the argument is unchanged.
 pub T[] RemoveLast<T>(T[] values)
 {
-    // Canonical calls lower to a final-slot clear followed by a direct length update.
+    // Canonical calls lower to the owner-aware shrink described above.
     return values;
 }
 

@@ -43,6 +43,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   and `Leak` join `ConnectLoopbackTests`. crypto `PkX25519IterTests` joins `PkX25519Tests`.
   corelib_tests `CoreFormattingTests` and `UnicodeScalarTests` join `TextSuite`. The
   `ConsoleSuite` section banners name their topic instead of a former target.
+- `Core.Collections.Array.RemoveLast` documents that shrinking one handle never
+  changes what another handle to the same array sees (a shared array is copied
+  and the owner receives the shortened copy; an argument that is not an owner
+  returns a shortened copy and keeps its length). `Array.Clear` documents that
+  it keeps the length.
+- `Codec.Mem.Zeroed`, `Crypto.BigNat.Zeros` and `Crypto.BigNat.ZeroBytes`
+  allocate with `Array.Zeroed` instead of shortening a zero literal (the
+  literal tiers, `Mem.MaxSmall` and the `RemoveLast` trim loops are removed).
+- The bsol `WireEncoder.Abort` no longer shortens its output bytes and frames:
+  it is a non-allocating rollback and a shrink of a shared array copies. It
+  sets `used` to 0; the next `Begin` replaces both arrays.
+- `Core.Collections.Array.Append` documents that growing one handle never
+  changes what another handle to the same array sees: when another handle can
+  see the array, the growth copies it; an array no other handle sees still
+  grows in place. Geometric growth doubles the length (a full array doubles its
+  capacity, as before).
 - `ChaCha20Poly1305.OpenInto` and `AesGcm.OpenInto` follow one contract on every provider: a wrong
   tag returns `AuthenticationFailed` and zeroes the whole output range, so no unverified plaintext
   stays in the buffer. The pure provider now zeroes the range as the native one does. The crypto

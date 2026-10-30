@@ -62,46 +62,6 @@ Greeter Pick(bool first)
     };
 }
 
-test AMutableContractLocalDispatchesToItsCurrentValue
-{
-    mut Greeter g = Hello { };
-    Assert.Equal<string>(g.Greet(), "hello", "the first value");
-    g = Bye
-    {
-        extra: 1_i64,
-    };
-    Assert.Equal<string>(g.Greet(), "bye", "the second value");
-    Assert.Equal<i64>(g.Rank(), 11_i64, "the second method slot");
-}
-
-test TwoImplementationsInOneArrayCalledInALoop
-{
-    Greeter[] all = [Hello { }, Bye
-    {
-        extra: 5_i64,
-    }, Hello { }];
-    mut i64 total = 0_i64;
-    mut i64 i = 0_i64;
-    while (i < 3_i64)
-    {
-        total = total + all[i].Rank();
-        i = i + 1_i64;
-    }
-    Assert.Equal<i64>(total, 17_i64, "each element dispatches to its own type");
-}
-
-test ContractValuesInAListDispatch
-{
-    mut List<Greeter> greeters = List.New<Greeter>();
-    greeters.Push(Hello { });
-    greeters.Push(Bye
-    {
-        extra: 2_i64,
-    });
-    Assert.Equal<i64>(RankAt(greeters, 0_i64), 1_i64, "the first element");
-    Assert.Equal<i64>(RankAt(greeters, 1_i64), 12_i64, "the second element");
-}
-
 i64 RankAt(List<Greeter> greeters, i64 index)
 {
     return match (greeters.Get(index))
@@ -109,62 +69,6 @@ i64 RankAt(List<Greeter> greeters, i64 index)
         Result::Ok(greeter) => greeter.Rank(),
         Result::Error(_) => -1_i64,
     };
-}
-
-test ContractTypedFieldsParametersAndReturnsDispatch
-{
-    Holder holder = Holder
-    {
-        greeter: Bye
-        {
-            extra: 2_i64,
-        },
-    };
-    Assert.Equal<i64>(holder.greeter.Rank(), 12_i64, "a plain contract-typed field");
-    Assert.Equal<i64>(Through(holder.greeter), 12_i64, "a contract value passed on");
-    Assert.Equal<i64>(Through(Hello { }), 1_i64, "a concrete argument");
-    Assert.Equal<i64>(Pick(false).Rank(), 15_i64, "a returned contract value");
-    Assert.Equal<string>(Pick(true).Greet(), "hello", "another returned contract value");
-}
-
-test APrimitiveIsBoxedIntoAContractValue
-{
-    Formatting number = 42_i32;
-    Assert.Equal<string>(number.Format(), "42", "an i32 through Formatting");
-    mut Formatting value = true;
-    Assert.Equal<string>(value.Format(), "true", "a bool through Formatting");
-    value = 1.5_f64;
-    Assert.Equal<string>(value.Format(), "1.5", "an f64 through Formatting");
-    value = "text";
-    Assert.Equal<string>(value.Format(), "text", "a string through Formatting");
-    Formatting[] mixed = [7_i64, false, 'A'];
-    Assert.Equal<string>(mixed[0].Format() + mixed[1].Format() + mixed[2].Format(), "7falseA", "mixed primitives in one array");
-}
-
-test ContractValuesInFieldsSurviveCollections
-{
-    mut Holder[] holders = [Holder
-    {
-        greeter: Hello { },
-    }, Holder
-    {
-        greeter: Bye
-        {
-            extra: 3_i64,
-        },
-    }];
-    mut i64 i = 0_i64;
-    mut i64 total = 0_i64;
-    while (i < 2000_i64)
-    {
-        holders[i % 2_i64] = Holder
-        {
-            greeter: Pick(i % 2_i64 == 0_i64),
-        };
-        total = total + holders[(i + 1_i64) % 2_i64].greeter.Rank();
-        i = i + 1_i64;
-    }
-    Assert.True(total > 0_i64, "every read reached a live implementation");
 }
 
 contract Reader
@@ -222,69 +126,168 @@ i64 ReadFrom(Reader reader)
     return reader.Read();
 }
 
-test EqualityOfContractValuesComparesTheHeldValues
+mod ContractValuesTests
 {
-    Hello hello = Hello { };
-    Greeter first = hello;
-    Greeter second = hello;
-    Greeter other = Hello { };
-    Assert.True(first == second, "the same object through two contract values");
-    Assert.True(first != other, "two objects of one type are different values");
-    mut Formatting left = 3_i32;
-    mut Formatting right = 3_i32;
-    Assert.True(left == right, "equal boxed primitives of one type");
-    right = 3_i64;
-    Assert.True(left != right, "equal bits of different primitive types differ");
-    left = 0.0_f64;
-    right = -0.0_f64;
-    Assert.True(left == right, "boxed floats compare as floats");
-}
-
-test AContractValueConvertsToAnEmbeddedContract
-{
-    mut Channel channel = File
+    test AMutableContractLocalDispatchesToItsCurrentValue
     {
-        position: 7_i64,
-    };
-    Reader reader = channel;
-    Assert.Equal<i64>(reader.Read(), 7_i64, "the embedded contract's method slot");
-    Assert.Equal<i64>(ReadFrom(channel), 7_i64, "a converted argument");
-    Assert.Equal<i64>(channel.Flush(), 100_i64, "the source value is unchanged");
-}
-
-test BranchesArmsAndLambdasConvertToTheExpectedContract
-{
-    bool flag = false;
-    Greeter chosen = flag ? Hello { } : Bye
-    {
-        extra: 1_i64,
-    };
-    Assert.Equal<i64>(chosen.Rank(), 11_i64, "the else branch");
-    Choice choice = Choice::First;
-    Greeter matched = match (choice)
-    {
-        Choice::First => Hello { },
-        Choice::Second => Bye
+        mut Greeter g = Hello { };
+        Assert.Equal<string>(g.Greet(), "hello", "the first value");
+        g = Bye
         {
-            extra: 0_i64,
-        },
-    };
-    Assert.Equal<i64>(matched.Rank(), 1_i64, "the first arm");
-    Greeter() make = () => Bye
-    {
-        extra: 4_i64,
-    };
-    Assert.Equal<i64>(make().Rank(), 14_i64, "a lambda body");
-}
+            extra: 1_i64,
+        };
+        Assert.Equal<string>(g.Greet(), "bye", "the second value");
+        Assert.Equal<i64>(g.Rank(), 11_i64, "the second method slot");
+    }
 
-test ContractTypeArgumentsAndGenericContracts
-{
-    mut Greeter g = Hello { };
-    g = Bye
+    test TwoImplementationsInOneArrayCalledInALoop
     {
-        extra: 2_i64,
-    };
-    Assert.Equal<i64>(RankOf<Greeter>(g), 12_i64, "T = Greeter dispatches at run time");
-    mut Repo<i64> repo = Numbers { };
-    Assert.Equal<i64>(repo.Get(), 9_i64, "a generic contract value");
+        Greeter[] all = [Hello { }, Bye
+        {
+            extra: 5_i64,
+        }, Hello { }];
+        mut i64 total = 0_i64;
+        mut i64 i = 0_i64;
+        while (i < 3_i64)
+        {
+            total = total + all[i].Rank();
+            i = i + 1_i64;
+        }
+        Assert.Equal<i64>(total, 17_i64, "each element dispatches to its own type");
+    }
+
+    test ContractValuesInAListDispatch
+    {
+        mut List<Greeter> greeters = List.New<Greeter>();
+        greeters.Push(Hello { });
+        greeters.Push(Bye
+        {
+            extra: 2_i64,
+        });
+        Assert.Equal<i64>(RankAt(greeters, 0_i64), 1_i64, "the first element");
+        Assert.Equal<i64>(RankAt(greeters, 1_i64), 12_i64, "the second element");
+    }
+
+    test ContractTypedFieldsParametersAndReturnsDispatch
+    {
+        Holder holder = Holder
+        {
+            greeter: Bye
+            {
+                extra: 2_i64,
+            },
+        };
+        Assert.Equal<i64>(holder.greeter.Rank(), 12_i64, "a plain contract-typed field");
+        Assert.Equal<i64>(Through(holder.greeter), 12_i64, "a contract value passed on");
+        Assert.Equal<i64>(Through(Hello { }), 1_i64, "a concrete argument");
+        Assert.Equal<i64>(Pick(false).Rank(), 15_i64, "a returned contract value");
+        Assert.Equal<string>(Pick(true).Greet(), "hello", "another returned contract value");
+    }
+
+    test APrimitiveIsBoxedIntoAContractValue
+    {
+        Formatting number = 42_i32;
+        Assert.Equal<string>(number.Format(), "42", "an i32 through Formatting");
+        mut Formatting value = true;
+        Assert.Equal<string>(value.Format(), "true", "a bool through Formatting");
+        value = 1.5_f64;
+        Assert.Equal<string>(value.Format(), "1.5", "an f64 through Formatting");
+        value = "text";
+        Assert.Equal<string>(value.Format(), "text", "a string through Formatting");
+        Formatting[] mixed = [7_i64, false, 'A'];
+        Assert.Equal<string>(mixed[0].Format() + mixed[1].Format() + mixed[2].Format(), "7falseA", "mixed primitives in one array");
+    }
+
+    test ContractValuesInFieldsSurviveCollections
+    {
+        mut Holder[] holders = [Holder
+        {
+            greeter: Hello { },
+        }, Holder
+        {
+            greeter: Bye
+            {
+                extra: 3_i64,
+            },
+        }];
+        mut i64 i = 0_i64;
+        mut i64 total = 0_i64;
+        while (i < 2000_i64)
+        {
+            holders[i % 2_i64] = Holder
+            {
+                greeter: Pick(i % 2_i64 == 0_i64),
+            };
+            total = total + holders[(i + 1_i64) % 2_i64].greeter.Rank();
+            i = i + 1_i64;
+        }
+        Assert.True(total > 0_i64, "every read reached a live implementation");
+    }
+
+    test EqualityOfContractValuesComparesTheHeldValues
+    {
+        Hello hello = Hello { };
+        Greeter first = hello;
+        Greeter second = hello;
+        Greeter other = Hello { };
+        Assert.True(first == second, "the same object through two contract values");
+        Assert.True(first != other, "two objects of one type are different values");
+        mut Formatting left = 3_i32;
+        mut Formatting right = 3_i32;
+        Assert.True(left == right, "equal boxed primitives of one type");
+        right = 3_i64;
+        Assert.True(left != right, "equal bits of different primitive types differ");
+        left = 0.0_f64;
+        right = -0.0_f64;
+        Assert.True(left == right, "boxed floats compare as floats");
+    }
+
+    test AContractValueConvertsToAnEmbeddedContract
+    {
+        mut Channel channel = File
+        {
+            position: 7_i64,
+        };
+        Reader reader = channel;
+        Assert.Equal<i64>(reader.Read(), 7_i64, "the embedded contract's method slot");
+        Assert.Equal<i64>(ReadFrom(channel), 7_i64, "a converted argument");
+        Assert.Equal<i64>(channel.Flush(), 100_i64, "the source value is unchanged");
+    }
+
+    test BranchesArmsAndLambdasConvertToTheExpectedContract
+    {
+        bool flag = false;
+        Greeter chosen = flag ? Hello { } : Bye
+        {
+            extra: 1_i64,
+        };
+        Assert.Equal<i64>(chosen.Rank(), 11_i64, "the else branch");
+        Choice choice = Choice::First;
+        Greeter matched = match (choice)
+        {
+            Choice::First => Hello { },
+            Choice::Second => Bye
+            {
+                extra: 0_i64,
+            },
+        };
+        Assert.Equal<i64>(matched.Rank(), 1_i64, "the first arm");
+        Greeter() make = () => Bye
+        {
+            extra: 4_i64,
+        };
+        Assert.Equal<i64>(make().Rank(), 14_i64, "a lambda body");
+    }
+
+    test ContractTypeArgumentsAndGenericContracts
+    {
+        mut Greeter g = Hello { };
+        g = Bye
+        {
+            extra: 2_i64,
+        };
+        Assert.Equal<i64>(RankOf<Greeter>(g), 12_i64, "T = Greeter dispatches at run time");
+        mut Repo<i64> repo = Numbers { };
+        Assert.Equal<i64>(repo.Get(), 9_i64, "a generic contract value");
+    }
 }

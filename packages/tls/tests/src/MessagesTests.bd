@@ -32,184 +32,187 @@ i64 ShCode(Result<Messages.ServerHello, TlsError> r)
     };
 }
 
-test Rfc8448ClientHelloDecodesAndRoundTrips
+mod MessagesTests
 {
-    match (Messages.DecodeClientHello(Body(ClientHello())))
+    test Rfc8448ClientHelloDecodesAndRoundTrips
     {
-        Result::Error(_) => {
-            Assert.Fail("decode");
-        },
-        Result::Ok(ch) => {
-            Assert.Equal<i64>(ch.legacyVersion, 0x0303_i64, "legacy version");
-            Assert.Equal<i64>(Slice.Len(ch.sessionId), 0_i64, "empty session id");
-            Assert.Equal<i64>(Array.Len<i64>(ch.cipherSuites), 3_i64, "three suites");
-            Assert.Equal<i64>(ch.cipherSuites[1], 0x1303_i64, "chacha second");
-            Assert.Equal<i64>(Array.Len<Extension>(ch.extensions), 9_i64, "nine extensions");
-            Assert.True(Same(Messages.EncodeClientHello(ch), ClientHello()), "re-encodes byte for byte");
-            match (Messages.ServerName(Messages.Data(ch.extensions, Wire.ExtServerName())))
-            {
-                Result::Ok(name) => {
-                    Assert.True(name == "server", "SNI server");
-                },
-                Result::Error(_) => {
-                    Assert.Fail("sni");
-                },
-            };
-            match (Messages.ClientShares(Messages.Data(ch.extensions, Wire.ExtKeyShare())))
-            {
-                Result::Ok(shares) => {
-                    Assert.Equal<i64>(Array.Len<KeyShareEntry>(shares), 1_i64, "one share");
-                    KeyShareEntry s = shares[0];
-                    Assert.Equal<i64>(s.group, 0x1d_i64, "x25519");
-                    Assert.True(Same(s.keyExchange, ClientPublic()), "client public");
-                },
-                Result::Error(_) => {
-                    Assert.Fail("shares");
-                },
-            };
-            match (Messages.ClientVersions(Messages.Data(ch.extensions, Wire.ExtSupportedVersions())))
-            {
-                Result::Ok(vs) => {
-                    Assert.True(Messages.InList(vs, 0x0304_i64), "offers 1.3");
-                },
-                Result::Error(_) => {
-                    Assert.Fail("versions");
-                },
-            };
-            match (Messages.U16List(Messages.Data(ch.extensions, Wire.ExtSignatureAlgorithms()), 2_i64))
-            {
-                Result::Ok(schemes) => {
-                    Assert.Equal<i64>(Array.Len<i64>(schemes), 15_i64, "15 schemes");
-                },
-                Result::Error(_) => {
-                    Assert.Fail("schemes");
-                },
-            };
-        },
-    };
-}
+        match (Messages.DecodeClientHello(Body(ClientHello())))
+        {
+            Result::Error(_) => {
+                Assert.Fail("decode");
+            },
+            Result::Ok(ch) => {
+                Assert.Equal<i64>(ch.legacyVersion, 0x0303_i64, "legacy version");
+                Assert.Equal<i64>(Slice.Len(ch.sessionId), 0_i64, "empty session id");
+                Assert.Equal<i64>(Array.Len<i64>(ch.cipherSuites), 3_i64, "three suites");
+                Assert.Equal<i64>(ch.cipherSuites[1], 0x1303_i64, "chacha second");
+                Assert.Equal<i64>(Array.Len<Extension>(ch.extensions), 9_i64, "nine extensions");
+                Assert.True(Same(Messages.EncodeClientHello(ch), ClientHello()), "re-encodes byte for byte");
+                match (Messages.ServerName(Messages.Data(ch.extensions, Wire.ExtServerName())))
+                {
+                    Result::Ok(name) => {
+                        Assert.True(name == "server", "SNI server");
+                    },
+                    Result::Error(_) => {
+                        Assert.Fail("sni");
+                    },
+                };
+                match (Messages.ClientShares(Messages.Data(ch.extensions, Wire.ExtKeyShare())))
+                {
+                    Result::Ok(shares) => {
+                        Assert.Equal<i64>(Array.Len<KeyShareEntry>(shares), 1_i64, "one share");
+                        KeyShareEntry s = shares[0];
+                        Assert.Equal<i64>(s.group, 0x1d_i64, "x25519");
+                        Assert.True(Same(s.keyExchange, ClientPublic()), "client public");
+                    },
+                    Result::Error(_) => {
+                        Assert.Fail("shares");
+                    },
+                };
+                match (Messages.ClientVersions(Messages.Data(ch.extensions, Wire.ExtSupportedVersions())))
+                {
+                    Result::Ok(vs) => {
+                        Assert.True(Messages.InList(vs, 0x0304_i64), "offers 1.3");
+                    },
+                    Result::Error(_) => {
+                        Assert.Fail("versions");
+                    },
+                };
+                match (Messages.U16List(Messages.Data(ch.extensions, Wire.ExtSignatureAlgorithms()), 2_i64))
+                {
+                    Result::Ok(schemes) => {
+                        Assert.Equal<i64>(Array.Len<i64>(schemes), 15_i64, "15 schemes");
+                    },
+                    Result::Error(_) => {
+                        Assert.Fail("schemes");
+                    },
+                };
+            },
+        };
+    }
 
-test Rfc8448ServerMessagesDecode
-{
-    match (Messages.DecodeServerHello(Body(ServerHello())))
+    test Rfc8448ServerMessagesDecode
     {
-        Result::Error(_) => {
-            Assert.Fail("sh");
-        },
-        Result::Ok(sh) => {
-            Assert.Equal<i64>(sh.cipherSuite, 0x1301_i64, "suite");
-            Assert.False(Messages.IsRetryRequest(sh), "not HRR");
-            Assert.True(Same(Messages.EncodeServerHello(sh), ServerHello()), "SH round trip");
-            match (Messages.ServerShare(Messages.Data(sh.extensions, Wire.ExtKeyShare())))
-            {
-                Result::Ok(s) => {
-                    Assert.Equal<i64>(Slice.Len(s.keyExchange), 32_i64, "server share");
-                },
-                Result::Error(_) => {
-                    Assert.Fail("server share");
-                },
-            };
-        },
-    };
-    match (Messages.DecodeEncryptedExtensions(Body(EncryptedExtensions())))
-    {
-        Result::Error(_) => {
-            Assert.Fail("ee");
-        },
-        Result::Ok(exts) => {
-            Assert.Equal<i64>(Array.Len<Extension>(exts), 3_i64, "EE extensions");
-        },
-    };
-    match (Messages.DecodeCertificate(Body(Certificate())))
-    {
-        Result::Error(_) => {
-            Assert.Fail("cert");
-        },
-        Result::Ok(cert) => {
-            Assert.Equal<i64>(Array.Len<CertificateEntry>(cert.entries), 1_i64, "one certificate");
-            CertificateEntry leaf = cert.entries[0];
-            Assert.Equal<i64>(Slice.Len(leaf.data), 432_i64, "432-byte certificate");
-            Assert.True(Same(Messages.EncodeCertificate(cert.context, cert.entries), Certificate()), "certificate round trip");
-        },
-    };
-    match (Messages.DecodeCertificateVerify(Body(CertificateVerify())))
-    {
-        Result::Error(_) => {
-            Assert.Fail("cv");
-        },
-        Result::Ok(cv) => {
-            Assert.Equal<i64>(cv.scheme, 0x0804_i64, "rsa_pss_rsae_sha256");
-            Assert.Equal<i64>(Slice.Len(cv.signature), 128_i64, "signature");
-        },
-    };
-    match (Messages.DecodeNewSessionTicket(Body(NewSessionTicket())))
-    {
-        Result::Error(_) => {
-            Assert.Fail("nst");
-        },
-        Result::Ok(t) => {
-            Assert.Equal<i64>(t.lifetime, 30_i64, "lifetime");
-            Assert.Equal<i64>(Slice.Len(t.ticket), 178_i64, "ticket");
-            Assert.Equal<i64>(Array.Len<Extension>(t.extensions), 1_i64, "early_data ext");
-        },
-    };
-}
+        match (Messages.DecodeServerHello(Body(ServerHello())))
+        {
+            Result::Error(_) => {
+                Assert.Fail("sh");
+            },
+            Result::Ok(sh) => {
+                Assert.Equal<i64>(sh.cipherSuite, 0x1301_i64, "suite");
+                Assert.False(Messages.IsRetryRequest(sh), "not HRR");
+                Assert.True(Same(Messages.EncodeServerHello(sh), ServerHello()), "SH round trip");
+                match (Messages.ServerShare(Messages.Data(sh.extensions, Wire.ExtKeyShare())))
+                {
+                    Result::Ok(s) => {
+                        Assert.Equal<i64>(Slice.Len(s.keyExchange), 32_i64, "server share");
+                    },
+                    Result::Error(_) => {
+                        Assert.Fail("server share");
+                    },
+                };
+            },
+        };
+        match (Messages.DecodeEncryptedExtensions(Body(EncryptedExtensions())))
+        {
+            Result::Error(_) => {
+                Assert.Fail("ee");
+            },
+            Result::Ok(exts) => {
+                Assert.Equal<i64>(Array.Len<Extension>(exts), 3_i64, "EE extensions");
+            },
+        };
+        match (Messages.DecodeCertificate(Body(Certificate())))
+        {
+            Result::Error(_) => {
+                Assert.Fail("cert");
+            },
+            Result::Ok(cert) => {
+                Assert.Equal<i64>(Array.Len<CertificateEntry>(cert.entries), 1_i64, "one certificate");
+                CertificateEntry leaf = cert.entries[0];
+                Assert.Equal<i64>(Slice.Len(leaf.data), 432_i64, "432-byte certificate");
+                Assert.True(Same(Messages.EncodeCertificate(cert.context, cert.entries), Certificate()), "certificate round trip");
+            },
+        };
+        match (Messages.DecodeCertificateVerify(Body(CertificateVerify())))
+        {
+            Result::Error(_) => {
+                Assert.Fail("cv");
+            },
+            Result::Ok(cv) => {
+                Assert.Equal<i64>(cv.scheme, 0x0804_i64, "rsa_pss_rsae_sha256");
+                Assert.Equal<i64>(Slice.Len(cv.signature), 128_i64, "signature");
+            },
+        };
+        match (Messages.DecodeNewSessionTicket(Body(NewSessionTicket())))
+        {
+            Result::Error(_) => {
+                Assert.Fail("nst");
+            },
+            Result::Ok(t) => {
+                Assert.Equal<i64>(t.lifetime, 30_i64, "lifetime");
+                Assert.Equal<i64>(Slice.Len(t.ticket), 178_i64, "ticket");
+                Assert.Equal<i64>(Array.Len<Extension>(t.extensions), 1_i64, "early_data ext");
+            },
+        };
+    }
 
-test MalformedClientHellosRejected
-{
-    u8[] body = Body(ClientHello());
-    i64 n = Slice.Len(body);
-    Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(Slice.SubSlice(body, 0_i64, n - 1_i64))), 1050_i64, "truncated: decode_error");
-    u8[] longer = Slice.New(n + 1_i64);
-    Slice.Copy(longer, 0_i64, body, 0_i64, n);
-    Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(longer)), 1050_i64, "trailing byte: decode_error");
-    u8[] badSuites = Slice.SubSlice(body, 0_i64, n);
-    badSuites[36] = 7_u8;
-    Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(badSuites)), 1050_i64, "odd suite length: decode_error");
-    u8[] longSession = Slice.SubSlice(body, 0_i64, n);
-    longSession[34] = 33_u8;
-    Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(longSession)), 1050_i64, "session id above 32: decode_error");
-    // Duplicate extension: rewrite the second extension type (ec_point/renegotiation_info) to server_name.
-    u8[] dup = Slice.SubSlice(body, 0_i64, n);
-    dup[62] = 0_u8;
-    dup[63] = 0_u8;
-    Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(dup)), 1047_i64, "duplicate extension: illegal_parameter");
-}
+    test MalformedClientHellosRejected
+    {
+        u8[] body = Body(ClientHello());
+        i64 n = Slice.Len(body);
+        Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(Slice.SubSlice(body, 0_i64, n - 1_i64))), 1050_i64, "truncated: decode_error");
+        u8[] longer = Slice.New(n + 1_i64);
+        Slice.Copy(longer, 0_i64, body, 0_i64, n);
+        Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(longer)), 1050_i64, "trailing byte: decode_error");
+        u8[] badSuites = Slice.SubSlice(body, 0_i64, n);
+        badSuites[36] = 7_u8;
+        Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(badSuites)), 1050_i64, "odd suite length: decode_error");
+        u8[] longSession = Slice.SubSlice(body, 0_i64, n);
+        longSession[34] = 33_u8;
+        Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(longSession)), 1050_i64, "session id above 32: decode_error");
+        // Duplicate extension: rewrite the second extension type (ec_point/renegotiation_info) to server_name.
+        u8[] dup = Slice.SubSlice(body, 0_i64, n);
+        dup[62] = 0_u8;
+        dup[63] = 0_u8;
+        Assert.Equal<i64>(ChCode(Messages.DecodeClientHello(dup)), 1047_i64, "duplicate extension: illegal_parameter");
+    }
 
-test MalformedServerHelloAndExtensionsRejected
-{
-    u8[] body = Body(ServerHello());
-    i64 n = Slice.Len(body);
-    Assert.Equal<i64>(ShCode(Messages.DecodeServerHello(Slice.SubSlice(body, 0_i64, 35_i64))), 1050_i64, "truncated SH");
-    Result<i64, TlsError> ku = Messages.DecodeKeyUpdate([2_u8]);
-    Assert.True(match (ku)
+    test MalformedServerHelloAndExtensionsRejected
     {
-        Result::Error(e) => TlsErrors.Code(e) == 1047_i64,
-        _ => false,
-    }, "KeyUpdate 2 is illegal_parameter");
-    Result<string[], TlsError> emptyName = Messages.AlpnList(Hex.Of("0003000000"));
-    Assert.True(match (emptyName)
-    {
-        Result::Error(_) => true,
-        _ => false,
-    }, "empty ALPN name rejected");
-    Result<string[], TlsError> alpn = Messages.AlpnList(Messages.EncodeAlpn(["h2", "http/1.1"]));
-    Assert.True(match (alpn)
-    {
-        Result::Ok(l) => Array.Len<string>(l) == 2_i64,
-        _ => false,
-    }, "ALPN round trip");
-    Result<string, TlsError> dotted = Messages.ServerName(Messages.EncodeServerName("example.com."));
-    Assert.True(match (dotted)
-    {
-        Result::Error(_) => true,
-        _ => false,
-    }, "trailing dot SNI rejected");
-    Result<i64, TlsError> big = Messages.MessageLength(Hex.Of("0b010000"), 0_i64, 4_i64);
-    Assert.True(match (big)
-    {
-        Result::Error(_) => true,
-        _ => false,
-    }, "oversized handshake message rejected");
-    Assert.Equal<i64>(n, 86_i64, "SH body length");
+        u8[] body = Body(ServerHello());
+        i64 n = Slice.Len(body);
+        Assert.Equal<i64>(ShCode(Messages.DecodeServerHello(Slice.SubSlice(body, 0_i64, 35_i64))), 1050_i64, "truncated SH");
+        Result<i64, TlsError> ku = Messages.DecodeKeyUpdate([2_u8]);
+        Assert.True(match (ku)
+        {
+            Result::Error(e) => TlsErrors.Code(e) == 1047_i64,
+            _ => false,
+        }, "KeyUpdate 2 is illegal_parameter");
+        Result<string[], TlsError> emptyName = Messages.AlpnList(Hex.Of("0003000000"));
+        Assert.True(match (emptyName)
+        {
+            Result::Error(_) => true,
+            _ => false,
+        }, "empty ALPN name rejected");
+        Result<string[], TlsError> alpn = Messages.AlpnList(Messages.EncodeAlpn(["h2", "http/1.1"]));
+        Assert.True(match (alpn)
+        {
+            Result::Ok(l) => Array.Len<string>(l) == 2_i64,
+            _ => false,
+        }, "ALPN round trip");
+        Result<string, TlsError> dotted = Messages.ServerName(Messages.EncodeServerName("example.com."));
+        Assert.True(match (dotted)
+        {
+            Result::Error(_) => true,
+            _ => false,
+        }, "trailing dot SNI rejected");
+        Result<i64, TlsError> big = Messages.MessageLength(Hex.Of("0b010000"), 0_i64, 4_i64);
+        Assert.True(match (big)
+        {
+            Result::Error(_) => true,
+            _ => false,
+        }, "oversized handshake message rejected");
+        Assert.Equal<i64>(n, 86_i64, "SH body length");
+    }
 }

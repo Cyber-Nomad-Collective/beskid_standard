@@ -235,42 +235,6 @@ unit ExpectFullShape(FullShape decoded)
     Assert.Equal(u64(decoded.span), 4294967295_u64, "word at its declared width");
 }
 
-test SerializationGeneratedFullShapeRecordRoundtripsThroughBsol
-{
-    FullShape decoded = DecodeBsol<FullShape>(EncodeBsol<FullShape>(FullFixture()), FullFixture(), "FullShape");
-    ExpectFullShape(decoded);
-}
-
-test SerializationGeneratedNestedGenericRecordDecodesAtTopLevel
-{
-    Pair<Point> value = Pair<Point>
-    {
-        left: Point
-        {
-            x: 1_i32,
-            y: -2_i32,
-        },
-        right: Point
-        {
-            x: 2147483647_i32,
-            y: (-2147483647_i32 - 1_i32),
-        },
-    };
-    Pair<Point> decoded = DecodeBsol<Pair<Point>>(EncodeBsol<Pair<Point>>(value), value, "Pair<Point>");
-    ExpectPoint(decoded.left, 1_i32, -2_i32, "left");
-    ExpectPoint(decoded.right, 2147483647_i32, (-2147483647_i32 - 1_i32), "right");
-    Point point = DecodeBsol<Point>(EncodeBsol<Point>(Point
-    {
-        x: -7_i32,
-        y: 9_i32,
-    }), Point
-    {
-        x: -7_i32,
-        y: 9_i32,
-    }, "Point");
-    ExpectPoint(point, -7_i32, 9_i32, "top-level Point");
-}
-
 /// One recorded call of a hand-built JSON test tape.
 TapeToken Call(string kind, string text, i64 signed, u8 width)
 {
@@ -279,88 +243,6 @@ TapeToken Call(string kind, string text, i64 signed, u8 width)
     token.signed = signed;
     token.width = width;
     return token;
-}
-
-// Abstract fields bound to a scalar or a canonical container are written and read through the
-// canonical writes and reads the field codec correspondence issues: a BSOL round trip, and
-// hand-built typed call tapes of the JSON test format that pin the exact read calls.
-/// Scalar and container applications decode through one correspondence.
-test SerializationGeneratedScalarsAndContainersDecode
-{
-    Boxed<i32> numbers = Boxed<i32>
-    {
-        item: -5_i32,
-        history: List.FromArray<i32>([1_i32, -2_i32]),
-    };
-    Boxed<i32> roundNumbers = DecodeBsol<Boxed<i32>>(EncodeBsol<Boxed<i32>>(numbers), numbers, "Boxed<i32>");
-    Assert.Equal(roundNumbers.item, -5_i32, "abstract field bound to i32 round-trips at its exact width");
-    Assert.Equal(roundNumbers.history.Count(), 2_i64, "List<i32> round-trips its length");
-    Assert.Equal(roundNumbers.history.ToArray()[1], -2_i32, "List<i32> round-trips its elements");
-    Boxed<string> texts = Boxed<string>
-    {
-        item: "only",
-        history: List.FromArray<string>(["first"]),
-    };
-    Boxed<string> roundTexts = DecodeBsol<Boxed<string>>(EncodeBsol<Boxed<string>>(texts), texts, "Boxed<string>");
-    Assert.Equal(roundTexts.item, "only", "abstract field bound to string round-trips");
-    Assert.Equal(roundTexts.history.ToArray()[0], "first", "List<string> round-trips its elements");
-    JsonTraceEncoder traced = NewJsonTrace();
-    Assert.True(Results.IsOk(Contracts.Encode<Boxed<i32>, JsonTraceEncoder>(numbers, traced, Limits.DefaultLimits())), "Boxed<i32> drives the JSON test format");
-    Assert.Equal(traced.text, "{\"item\":-5,\"history\":[1,-2]}", "the issued i32 and List writes make the declared calls");
-    string numbersShape = Metadata.FormatShapeId(Descriptors.CompiledShape<Boxed<i32>>().id);
-    TapeToken[] numbersTape = [Call("record", numbersShape, 2_i64, 0_u8), Call("field", "item", 0_i64, 0_u8), Call("signed", "", -5_i64, 32_u8), Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 2_i64, 0_u8), Call("signed", "", 1_i64, 32_u8), Call("signed", "", -2_i64, 32_u8)];
-    JsonTapeReader numbersReader = JsonTapeReader
-    {
-        tape: numbersTape,
-        position: 0_i64,
-    };
-    match (Contracts.Decode<Boxed<i32>, Decoding.IssuedDecoder<Boxed<i32>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<i32>, JsonTapeReader>(numbersReader), Limits.DefaultLimits()))
-    {
-        Result::Error(error) => Assert.Fail("Boxed<i32> decodes: " + Errors.Code(error)),
-        Result::Ok(decoded) => {
-            Assert.Equal(decoded.item, -5_i32, "abstract field bound to i32 reads its exact width");
-            Assert.Equal(decoded.history.Count(), 2_i64, "List<T> bound to List<i32> keeps its length");
-            Assert.Equal(decoded.history.ToArray()[1], -2_i32, "List<i32> element");
-        },
-    };
-    TapeToken[] wideTape = [Call("record", numbersShape, 2_i64, 0_u8), Call("field", "item", 0_i64, 0_u8), Call("signed", "", 5_i64, 64_u8), Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 0_i64, 0_u8)];
-    JsonTapeReader wideReader = JsonTapeReader
-    {
-        tape: wideTape,
-        position: 0_i64,
-    };
-    Assert.True(Results.IsError(Contracts.Decode<Boxed<i32>, Decoding.IssuedDecoder<Boxed<i32>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<i32>, JsonTapeReader>(wideReader), Limits.DefaultLimits())), "the issued i32 read never accepts a 64-bit call");
-    string textsShape = Metadata.FormatShapeId(Descriptors.CompiledShape<Boxed<string>>().id);
-    TapeToken[] textsTape = [Call("record", textsShape, 2_i64, 0_u8), Call("field", "item", 0_i64, 0_u8), Call("string", "only", 0_i64, 0_u8), Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 0_i64, 0_u8)];
-    JsonTapeReader textsReader = JsonTapeReader
-    {
-        tape: textsTape,
-        position: 0_i64,
-    };
-    match (Contracts.Decode<Boxed<string>, Decoding.IssuedDecoder<Boxed<string>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<string>, JsonTapeReader>(textsReader), Limits.DefaultLimits()))
-    {
-        Result::Error(error) => Assert.Fail("Boxed<string> decodes: " + Errors.Code(error)),
-        Result::Ok(decoded) => {
-            Assert.Equal(decoded.item, "only", "abstract field bound to string");
-            Assert.Equal(decoded.history.Count(), 0_i64, "empty List<string>");
-        },
-    };
-    Boxed<Point> points = Boxed<Point>
-    {
-        item: Point
-        {
-            x: 3_i32,
-            y: 4_i32,
-        },
-        history: List.FromArray<Point>([Point
-        {
-            x: 5_i32,
-            y: 6_i32,
-        }]),
-    };
-    Boxed<Point> decodedPoints = DecodeBsol<Boxed<Point>>(EncodeBsol<Boxed<Point>>(points), points, "Boxed<Point>");
-    ExpectPoint(decodedPoints.item, 3_i32, 4_i32, "abstract field bound to Point");
-    ExpectPoint(decodedPoints.history.ToArray()[0], 5_i32, 6_i32, "List<Point> element");
 }
 
 /// Whether `declared` occurs in `observed` in the same order (nested field names may interleave).
@@ -377,77 +259,6 @@ bool InDeclaredOrder(string[] observed, string[] declared)
         index = index + 1_i64;
     }
     return next == Array.Len<string>(declared);
-}
-
-test SerializationGeneratedVariantIdentityAndFieldOrderSurviveTypedDecode
-{
-    Signal[] values = [Signal::Idle, Signal::Level(-9007199254740993_i64), Signal::Named("", 0_u8), Signal::Named("probe", 255_u8)];
-    mut i64 index = 0_i64;
-    while (index < Array.Len<Signal>(values))
-    {
-        ExpectSignal(DecodeBsol<Signal>(EncodeBsol<Signal>(values[index]), values[index], "Signal"), values[index], "Signal");
-        index = index + 1_i64;
-    }
-    // Declared field order reaches the format and the compiled descriptor, and the typed decode of
-    // that same call sequence reconstructs every field.
-    JsonTraceEncoder json = NewJsonTrace();
-    Assert.True(Results.IsOk(Contracts.Encode<FullShape, JsonTraceEncoder>(FullFixture(), json, Limits.DefaultLimits())), "FullShape drives the JSON test format");
-    string[] declared = ["flag", "tiny", "small", "medium", "large", "octet", "port", "unsignedWord", "huge", "narrow", "wide", "letter", "text", "payload", "nothing", "corners", "samples", "tags", "counts", "signal", "window", "span"];
-    Assert.Equal(json.fields[0], "flag", "the first written field is the first declared field");
-    Assert.True(InDeclaredOrder(json.fields, declared), "record output follows declaration order");
-    ShapeDescriptor full = Descriptors.CompiledShape<FullShape>();
-    Assert.Equal(Array.Len<FieldDescriptor>(full.fields), Array.Len<string>(declared), "every declared field is in the descriptor");
-    index = 0_i64;
-    while (index < Array.Len<string>(declared))
-    {
-        Assert.Equal(full.fields[index].name, declared[index], "descriptor field order is declaration order");
-        index = index + 1_i64;
-    }
-    ExpectFullShape(DecodeJson<FullShape>(json, FullFixture(), "FullShape"));
-}
-
-test SerializationGeneratedF32AndF64BitsSurviveTypedDecode
-{
-    Pair<Sample> value = Pair<Sample>
-    {
-        left: Sample
-        {
-            narrow: FloatBits.FromBits32(0x80000000_u32),
-            wide: FloatBits.FromBits64(0x3fb999999999999a_u64),
-        },
-        right: Sample
-        {
-            narrow: FloatBits.FromBits32(0x3dcccccd_u32),
-            wide: FloatBits.FromBits64(0x8000000000000000_u64),
-        },
-    };
-    Pair<Sample> decoded = DecodeBsol<Pair<Sample>>(EncodeBsol<Pair<Sample>>(value), value, "Pair<Sample>");
-    Assert.Equal(FloatBits.ToBits32(decoded.left.narrow), 0x80000000_u32, "BSOL f32 negative zero");
-    Assert.Equal(FloatBits.ToBits64(decoded.left.wide), 0x3fb999999999999a_u64, "BSOL f64 one tenth");
-    Assert.Equal(FloatBits.ToBits32(decoded.right.narrow), 0x3dcccccd_u32, "BSOL f32 one tenth without widening");
-    Assert.Equal(FloatBits.ToBits64(decoded.right.wide), 0x8000000000000000_u64, "BSOL f64 negative zero");
-}
-
-test SerializationGeneratedWordUsesDeclaredWidthAndRangeChecks
-{
-    mut FullShape fixture = FullFixture();
-    fixture.span = word(4294967295_u64);
-    Assert.Equal(u64(DecodeBsol<FullShape>(EncodeBsol<FullShape>(fixture), fixture, "FullShape").span), 4294967295_u64, "word maximum at its declared 32-bit width");
-    fixture.span = word(4294967296_u64);
-    Registry.ShapeRegistry table = Registry.Create();
-    Assert.True(Results.IsOk(Registry.RegisterCompiled<FullShape>(table, 1048576_i64, 8388608_i64, 100000_i64)), "compiler-issued descriptor closure of FullShape registers");
-    Assert.True(Results.IsError(Serialization.WriteTyped<FullShape>(fixture, Descriptors.CompiledShape<FullShape>().id, table, Limits.DefaultLimits())), "word value above its declared width rejects instead of truncating");
-}
-
-test SerializationGeneratedDecoderRejectsTrailingInputWithoutPublishing
-{
-    string text = EncodeBsol<Point>(Point
-    {
-        x: 1_i32,
-        y: 2_i32,
-    });
-    Assert.True(Results.IsError(Serialization.Read<Point>(text + " trailing", Limits.DefaultLimits())), "trailing input fails Reader.Finish and publishes no Point");
-    Assert.True(Results.IsError(Serialization.Read<Pair<Point>>(text, Limits.DefaultLimits())), "a Point document is not a Pair<Point>");
 }
 
 /// One recorded typed call of the JSON test format.
@@ -935,110 +746,302 @@ T DecodeJson<T>(JsonTraceEncoder encoded, T original, string what)
     return original;
 }
 
-test SerializationGeneratedRecordUsesOneDescriptorAndDecoderForBsolAndJson
-{
-    ShapeDescriptor pair = Descriptors.CompiledShape<Pair<Point>>();
-    string point = Metadata.FormatShapeId(Descriptors.CompiledShape<Point>().id);
-    Pair<Point> value = Pair<Point>
-    {
-        left: Point
-        {
-            x: 1_i32,
-            y: -2_i32,
-        },
-        right: Point
-        {
-            x: 2147483647_i32,
-            y: (-2147483647_i32 - 1_i32),
-        },
-    };
-    JsonTraceEncoder json = NewJsonTrace();
-    match (Contracts.Encode<Pair<Point>, JsonTraceEncoder>(value, json, Limits.DefaultLimits()))
-    {
-        Result::Error(error) => Assert.Fail("generated adapter drives the JSON test format: " + Errors.Code(error)),
-        Result::Ok(_) => { },
-    };
-    Assert.Equal(json.text, "{\"left\":{\"x\":1,\"y\":-2},\"right\":{\"x\":2147483647,\"y\":-2147483648}}", "JSON test format owns its representation of the same calls");
-    Assert.Equal(Array.Len<string>(json.shapes), 3_i64, "one record shape per record value");
-    Assert.Equal(json.shapes[0], Metadata.FormatShapeId(pair.id), "JSON adapter receives the compiled generic record descriptor identity");
-    Assert.Equal(json.shapes[1], point, "JSON adapter receives the compiled nested record identity");
-    Assert.Equal(Array.Len<FieldDescriptor>(pair.fields), 2_i64, "the descriptor declares both generic fields");
-    Assert.Equal(pair.fields[0].name, json.fields[0], "descriptor field order is the adapter field order");
-    Pair<Point> fromJson = DecodeJson<Pair<Point>>(json, value, "Pair<Point>");
-    Pair<Point> fromBsol = DecodeBsol<Pair<Point>>(EncodeBsol<Pair<Point>>(value), value, "Pair<Point>");
-    ExpectPoint(fromJson.left, 1_i32, -2_i32, "JSON left");
-    ExpectPoint(fromJson.right, 2147483647_i32, (-2147483647_i32 - 1_i32), "JSON right");
-    ExpectPoint(fromBsol.left, fromJson.left.x, fromJson.left.y, "BSOL and JSON decode the same left");
-    ExpectPoint(fromBsol.right, fromJson.right.x, fromJson.right.y, "BSOL and JSON decode the same right");
-}
-
-test SerializationGeneratedF32AndF64BitsSurviveBothFormatsWithoutCoercion
-{
-    Pair<Sample> value = Pair<Sample>
-    {
-        left: Sample
-        {
-            narrow: FloatBits.FromBits32(0x80000000_u32),
-            wide: FloatBits.FromBits64(0x3fb999999999999a_u64),
-        },
-        right: Sample
-        {
-            narrow: FloatBits.FromBits32(0x3dcccccd_u32),
-            wide: FloatBits.FromBits64(0x8000000000000000_u64),
-        },
-    };
-    JsonTraceEncoder json = NewJsonTrace();
-    Assert.True(Results.IsOk(Contracts.Encode<Pair<Sample>, JsonTraceEncoder>(value, json, Limits.DefaultLimits())), "generated adapter drives the JSON test format");
-    Assert.Equal(Array.Len<i64>(json.floatWidths), 4_i64, "four float calls");
-    Assert.Equal(json.floatWidths[0], 32_i64, "f32 field reaches the format at width 32");
-    Assert.Equal(json.floatWidths[1], 64_i64, "f64 field reaches the format at width 64");
-    Assert.True(String.Contains(json.text, "{\"f32\":2147483648}"), "JSON keeps f32 negative zero bits");
-    Assert.True(String.Contains(json.text, "{\"f64\":4591870180066957722}"), "JSON keeps f64 one tenth bits");
-    Pair<Sample> decoded = DecodeJson<Pair<Sample>>(json, value, "Pair<Sample>");
-    Assert.Equal(FloatBits.ToBits32(decoded.left.narrow), 0x80000000_u32, "JSON f32 negative zero survives typed decode");
-    Assert.Equal(FloatBits.ToBits64(decoded.left.wide), 0x3fb999999999999a_u64, "JSON f64 one tenth survives typed decode");
-    Assert.Equal(FloatBits.ToBits32(decoded.right.narrow), 0x3dcccccd_u32, "JSON f32 one tenth survives without widening");
-    Assert.Equal(FloatBits.ToBits64(decoded.right.wide), 0x8000000000000000_u64, "JSON f64 negative zero survives typed decode");
-}
-
-test SerializationGeneratedEnumDecodesThroughTheJsonTestFormat
-{
-    Signal[] values = [Signal::Idle, Signal::Level(-9007199254740993_i64), Signal::Named("probe", 7_u8)];
-    mut i64 index = 0_i64;
-    while (index < Array.Len<Signal>(values))
-    {
-        JsonTraceEncoder json = NewJsonTrace();
-        Assert.True(Results.IsOk(Contracts.Encode<Signal, JsonTraceEncoder>(values[index], json, Limits.DefaultLimits())), "generated enum adapter drives the JSON test format");
-        ExpectSignal(DecodeJson<Signal>(json, values[index], "Signal"), values[index], "JSON Signal");
-        index = index + 1_i64;
-    }
-}
-
-test SerializationGeneratedJsonReaderRejectsADifferentWidth
-{
-    JsonTraceEncoder json = NewJsonTrace();
-    Assert.True(Results.IsOk(Contracts.Encode<Point, JsonTraceEncoder>(Point
-    {
-        x: 1_i32,
-        y: 2_i32,
-    }, json, Limits.DefaultLimits())), "Point encodes");
-    mut TapeToken[] tape = json.tape;
-    mut TapeToken widened = tape[2];
-    Assert.Equal(widened.kind, "signed", "the third call is the x field value");
-    widened.width = 64_u8;
-    tape[2] = widened;
-    JsonTapeReader reader = JsonTapeReader
-    {
-        tape: tape,
-        position: 0_i64,
-    };
-    Assert.True(Results.IsError(Contracts.Decode<Point, Decoding.IssuedDecoder<Point, JsonTapeReader>>(Decoding.DecoderFor<Point, JsonTapeReader>(reader), Limits.DefaultLimits())), "an i32 field never accepts a 64-bit integer call");
-}
-
 Map<string, i64> SampleCounts()
 {
     Map<string, i64> counts = Map.New<string, i64>();
     counts.Insert("beta", 2_i64);
     counts.Insert("alpha", 1_i64);
     return counts;
+}
+
+mod GeneratedTests
+{
+    test FullShapeRecordRoundtripsThroughBsol
+    {
+        FullShape decoded = DecodeBsol<FullShape>(EncodeBsol<FullShape>(FullFixture()), FullFixture(), "FullShape");
+        ExpectFullShape(decoded);
+    }
+
+    test NestedGenericRecordDecodesAtTopLevel
+    {
+        Pair<Point> value = Pair<Point>
+        {
+            left: Point
+            {
+                x: 1_i32,
+                y: -2_i32,
+            },
+            right: Point
+            {
+                x: 2147483647_i32,
+                y: (-2147483647_i32 - 1_i32),
+            },
+        };
+        Pair<Point> decoded = DecodeBsol<Pair<Point>>(EncodeBsol<Pair<Point>>(value), value, "Pair<Point>");
+        ExpectPoint(decoded.left, 1_i32, -2_i32, "left");
+        ExpectPoint(decoded.right, 2147483647_i32, (-2147483647_i32 - 1_i32), "right");
+        Point point = DecodeBsol<Point>(EncodeBsol<Point>(Point
+        {
+            x: -7_i32,
+            y: 9_i32,
+        }), Point
+        {
+            x: -7_i32,
+            y: 9_i32,
+        }, "Point");
+        ExpectPoint(point, -7_i32, 9_i32, "top-level Point");
+    }
+
+    // Abstract fields bound to a scalar or a canonical container are written and read through the
+    // canonical writes and reads the field codec correspondence issues: a BSOL round trip, and
+    // hand-built typed call tapes of the JSON test format that pin the exact read calls.
+    /// Scalar and container applications decode through one correspondence.
+    test ScalarsAndContainersDecode
+    {
+        Boxed<i32> numbers = Boxed<i32>
+        {
+            item: -5_i32,
+            history: List.FromArray<i32>([1_i32, -2_i32]),
+        };
+        Boxed<i32> roundNumbers = DecodeBsol<Boxed<i32>>(EncodeBsol<Boxed<i32>>(numbers), numbers, "Boxed<i32>");
+        Assert.Equal(roundNumbers.item, -5_i32, "abstract field bound to i32 round-trips at its exact width");
+        Assert.Equal(roundNumbers.history.Count(), 2_i64, "List<i32> round-trips its length");
+        Assert.Equal(roundNumbers.history.ToArray()[1], -2_i32, "List<i32> round-trips its elements");
+        Boxed<string> texts = Boxed<string>
+        {
+            item: "only",
+            history: List.FromArray<string>(["first"]),
+        };
+        Boxed<string> roundTexts = DecodeBsol<Boxed<string>>(EncodeBsol<Boxed<string>>(texts), texts, "Boxed<string>");
+        Assert.Equal(roundTexts.item, "only", "abstract field bound to string round-trips");
+        Assert.Equal(roundTexts.history.ToArray()[0], "first", "List<string> round-trips its elements");
+        JsonTraceEncoder traced = NewJsonTrace();
+        Assert.True(Results.IsOk(Contracts.Encode<Boxed<i32>, JsonTraceEncoder>(numbers, traced, Limits.DefaultLimits())), "Boxed<i32> drives the JSON test format");
+        Assert.Equal(traced.text, "{\"item\":-5,\"history\":[1,-2]}", "the issued i32 and List writes make the declared calls");
+        string numbersShape = Metadata.FormatShapeId(Descriptors.CompiledShape<Boxed<i32>>().id);
+        TapeToken[] numbersTape = [Call("record", numbersShape, 2_i64, 0_u8), Call("field", "item", 0_i64, 0_u8), Call("signed", "", -5_i64, 32_u8), Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 2_i64, 0_u8), Call("signed", "", 1_i64, 32_u8), Call("signed", "", -2_i64, 32_u8)];
+        JsonTapeReader numbersReader = JsonTapeReader
+        {
+            tape: numbersTape,
+            position: 0_i64,
+        };
+        match (Contracts.Decode<Boxed<i32>, Decoding.IssuedDecoder<Boxed<i32>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<i32>, JsonTapeReader>(numbersReader), Limits.DefaultLimits()))
+        {
+            Result::Error(error) => Assert.Fail("Boxed<i32> decodes: " + Errors.Code(error)),
+            Result::Ok(decoded) => {
+                Assert.Equal(decoded.item, -5_i32, "abstract field bound to i32 reads its exact width");
+                Assert.Equal(decoded.history.Count(), 2_i64, "List<T> bound to List<i32> keeps its length");
+                Assert.Equal(decoded.history.ToArray()[1], -2_i32, "List<i32> element");
+            },
+        };
+        TapeToken[] wideTape = [Call("record", numbersShape, 2_i64, 0_u8), Call("field", "item", 0_i64, 0_u8), Call("signed", "", 5_i64, 64_u8), Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 0_i64, 0_u8)];
+        JsonTapeReader wideReader = JsonTapeReader
+        {
+            tape: wideTape,
+            position: 0_i64,
+        };
+        Assert.True(Results.IsError(Contracts.Decode<Boxed<i32>, Decoding.IssuedDecoder<Boxed<i32>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<i32>, JsonTapeReader>(wideReader), Limits.DefaultLimits())), "the issued i32 read never accepts a 64-bit call");
+        string textsShape = Metadata.FormatShapeId(Descriptors.CompiledShape<Boxed<string>>().id);
+        TapeToken[] textsTape = [Call("record", textsShape, 2_i64, 0_u8), Call("field", "item", 0_i64, 0_u8), Call("string", "only", 0_i64, 0_u8), Call("field", "history", 0_i64, 0_u8), Call("sequence", "", 0_i64, 0_u8)];
+        JsonTapeReader textsReader = JsonTapeReader
+        {
+            tape: textsTape,
+            position: 0_i64,
+        };
+        match (Contracts.Decode<Boxed<string>, Decoding.IssuedDecoder<Boxed<string>, JsonTapeReader>>(Decoding.DecoderFor<Boxed<string>, JsonTapeReader>(textsReader), Limits.DefaultLimits()))
+        {
+            Result::Error(error) => Assert.Fail("Boxed<string> decodes: " + Errors.Code(error)),
+            Result::Ok(decoded) => {
+                Assert.Equal(decoded.item, "only", "abstract field bound to string");
+                Assert.Equal(decoded.history.Count(), 0_i64, "empty List<string>");
+            },
+        };
+        Boxed<Point> points = Boxed<Point>
+        {
+            item: Point
+            {
+                x: 3_i32,
+                y: 4_i32,
+            },
+            history: List.FromArray<Point>([Point
+            {
+                x: 5_i32,
+                y: 6_i32,
+            }]),
+        };
+        Boxed<Point> decodedPoints = DecodeBsol<Boxed<Point>>(EncodeBsol<Boxed<Point>>(points), points, "Boxed<Point>");
+        ExpectPoint(decodedPoints.item, 3_i32, 4_i32, "abstract field bound to Point");
+        ExpectPoint(decodedPoints.history.ToArray()[0], 5_i32, 6_i32, "List<Point> element");
+    }
+
+    test VariantIdentityAndFieldOrderSurviveTypedDecode
+    {
+        Signal[] values = [Signal::Idle, Signal::Level(-9007199254740993_i64), Signal::Named("", 0_u8), Signal::Named("probe", 255_u8)];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<Signal>(values))
+        {
+            ExpectSignal(DecodeBsol<Signal>(EncodeBsol<Signal>(values[index]), values[index], "Signal"), values[index], "Signal");
+            index = index + 1_i64;
+        }
+        // Declared field order reaches the format and the compiled descriptor, and the typed decode of
+        // that same call sequence reconstructs every field.
+        JsonTraceEncoder json = NewJsonTrace();
+        Assert.True(Results.IsOk(Contracts.Encode<FullShape, JsonTraceEncoder>(FullFixture(), json, Limits.DefaultLimits())), "FullShape drives the JSON test format");
+        string[] declared = ["flag", "tiny", "small", "medium", "large", "octet", "port", "unsignedWord", "huge", "narrow", "wide", "letter", "text", "payload", "nothing", "corners", "samples", "tags", "counts", "signal", "window", "span"];
+        Assert.Equal(json.fields[0], "flag", "the first written field is the first declared field");
+        Assert.True(InDeclaredOrder(json.fields, declared), "record output follows declaration order");
+        ShapeDescriptor full = Descriptors.CompiledShape<FullShape>();
+        Assert.Equal(Array.Len<FieldDescriptor>(full.fields), Array.Len<string>(declared), "every declared field is in the descriptor");
+        index = 0_i64;
+        while (index < Array.Len<string>(declared))
+        {
+            Assert.Equal(full.fields[index].name, declared[index], "descriptor field order is declaration order");
+            index = index + 1_i64;
+        }
+        ExpectFullShape(DecodeJson<FullShape>(json, FullFixture(), "FullShape"));
+    }
+
+    test F32AndF64BitsSurviveTypedDecode
+    {
+        Pair<Sample> value = Pair<Sample>
+        {
+            left: Sample
+            {
+                narrow: FloatBits.FromBits32(0x80000000_u32),
+                wide: FloatBits.FromBits64(0x3fb999999999999a_u64),
+            },
+            right: Sample
+            {
+                narrow: FloatBits.FromBits32(0x3dcccccd_u32),
+                wide: FloatBits.FromBits64(0x8000000000000000_u64),
+            },
+        };
+        Pair<Sample> decoded = DecodeBsol<Pair<Sample>>(EncodeBsol<Pair<Sample>>(value), value, "Pair<Sample>");
+        Assert.Equal(FloatBits.ToBits32(decoded.left.narrow), 0x80000000_u32, "BSOL f32 negative zero");
+        Assert.Equal(FloatBits.ToBits64(decoded.left.wide), 0x3fb999999999999a_u64, "BSOL f64 one tenth");
+        Assert.Equal(FloatBits.ToBits32(decoded.right.narrow), 0x3dcccccd_u32, "BSOL f32 one tenth without widening");
+        Assert.Equal(FloatBits.ToBits64(decoded.right.wide), 0x8000000000000000_u64, "BSOL f64 negative zero");
+    }
+
+    test WordUsesDeclaredWidthAndRangeChecks
+    {
+        mut FullShape fixture = FullFixture();
+        fixture.span = word(4294967295_u64);
+        Assert.Equal(u64(DecodeBsol<FullShape>(EncodeBsol<FullShape>(fixture), fixture, "FullShape").span), 4294967295_u64, "word maximum at its declared 32-bit width");
+        fixture.span = word(4294967296_u64);
+        Registry.ShapeRegistry table = Registry.Create();
+        Assert.True(Results.IsOk(Registry.RegisterCompiled<FullShape>(table, 1048576_i64, 8388608_i64, 100000_i64)), "compiler-issued descriptor closure of FullShape registers");
+        Assert.True(Results.IsError(Serialization.WriteTyped<FullShape>(fixture, Descriptors.CompiledShape<FullShape>().id, table, Limits.DefaultLimits())), "word value above its declared width rejects instead of truncating");
+    }
+
+    test DecoderRejectsTrailingInputWithoutPublishing
+    {
+        string text = EncodeBsol<Point>(Point
+        {
+            x: 1_i32,
+            y: 2_i32,
+        });
+        Assert.True(Results.IsError(Serialization.Read<Point>(text + " trailing", Limits.DefaultLimits())), "trailing input fails Reader.Finish and publishes no Point");
+        Assert.True(Results.IsError(Serialization.Read<Pair<Point>>(text, Limits.DefaultLimits())), "a Point document is not a Pair<Point>");
+    }
+
+    test RecordUsesOneDescriptorAndDecoderForBsolAndJson
+    {
+        ShapeDescriptor pair = Descriptors.CompiledShape<Pair<Point>>();
+        string point = Metadata.FormatShapeId(Descriptors.CompiledShape<Point>().id);
+        Pair<Point> value = Pair<Point>
+        {
+            left: Point
+            {
+                x: 1_i32,
+                y: -2_i32,
+            },
+            right: Point
+            {
+                x: 2147483647_i32,
+                y: (-2147483647_i32 - 1_i32),
+            },
+        };
+        JsonTraceEncoder json = NewJsonTrace();
+        match (Contracts.Encode<Pair<Point>, JsonTraceEncoder>(value, json, Limits.DefaultLimits()))
+        {
+            Result::Error(error) => Assert.Fail("generated adapter drives the JSON test format: " + Errors.Code(error)),
+            Result::Ok(_) => { },
+        };
+        Assert.Equal(json.text, "{\"left\":{\"x\":1,\"y\":-2},\"right\":{\"x\":2147483647,\"y\":-2147483648}}", "JSON test format owns its representation of the same calls");
+        Assert.Equal(Array.Len<string>(json.shapes), 3_i64, "one record shape per record value");
+        Assert.Equal(json.shapes[0], Metadata.FormatShapeId(pair.id), "JSON adapter receives the compiled generic record descriptor identity");
+        Assert.Equal(json.shapes[1], point, "JSON adapter receives the compiled nested record identity");
+        Assert.Equal(Array.Len<FieldDescriptor>(pair.fields), 2_i64, "the descriptor declares both generic fields");
+        Assert.Equal(pair.fields[0].name, json.fields[0], "descriptor field order is the adapter field order");
+        Pair<Point> fromJson = DecodeJson<Pair<Point>>(json, value, "Pair<Point>");
+        Pair<Point> fromBsol = DecodeBsol<Pair<Point>>(EncodeBsol<Pair<Point>>(value), value, "Pair<Point>");
+        ExpectPoint(fromJson.left, 1_i32, -2_i32, "JSON left");
+        ExpectPoint(fromJson.right, 2147483647_i32, (-2147483647_i32 - 1_i32), "JSON right");
+        ExpectPoint(fromBsol.left, fromJson.left.x, fromJson.left.y, "BSOL and JSON decode the same left");
+        ExpectPoint(fromBsol.right, fromJson.right.x, fromJson.right.y, "BSOL and JSON decode the same right");
+    }
+
+    test F32AndF64BitsSurviveBothFormatsWithoutCoercion
+    {
+        Pair<Sample> value = Pair<Sample>
+        {
+            left: Sample
+            {
+                narrow: FloatBits.FromBits32(0x80000000_u32),
+                wide: FloatBits.FromBits64(0x3fb999999999999a_u64),
+            },
+            right: Sample
+            {
+                narrow: FloatBits.FromBits32(0x3dcccccd_u32),
+                wide: FloatBits.FromBits64(0x8000000000000000_u64),
+            },
+        };
+        JsonTraceEncoder json = NewJsonTrace();
+        Assert.True(Results.IsOk(Contracts.Encode<Pair<Sample>, JsonTraceEncoder>(value, json, Limits.DefaultLimits())), "generated adapter drives the JSON test format");
+        Assert.Equal(Array.Len<i64>(json.floatWidths), 4_i64, "four float calls");
+        Assert.Equal(json.floatWidths[0], 32_i64, "f32 field reaches the format at width 32");
+        Assert.Equal(json.floatWidths[1], 64_i64, "f64 field reaches the format at width 64");
+        Assert.True(String.Contains(json.text, "{\"f32\":2147483648}"), "JSON keeps f32 negative zero bits");
+        Assert.True(String.Contains(json.text, "{\"f64\":4591870180066957722}"), "JSON keeps f64 one tenth bits");
+        Pair<Sample> decoded = DecodeJson<Pair<Sample>>(json, value, "Pair<Sample>");
+        Assert.Equal(FloatBits.ToBits32(decoded.left.narrow), 0x80000000_u32, "JSON f32 negative zero survives typed decode");
+        Assert.Equal(FloatBits.ToBits64(decoded.left.wide), 0x3fb999999999999a_u64, "JSON f64 one tenth survives typed decode");
+        Assert.Equal(FloatBits.ToBits32(decoded.right.narrow), 0x3dcccccd_u32, "JSON f32 one tenth survives without widening");
+        Assert.Equal(FloatBits.ToBits64(decoded.right.wide), 0x8000000000000000_u64, "JSON f64 negative zero survives typed decode");
+    }
+
+    test EnumDecodesThroughTheJsonTestFormat
+    {
+        Signal[] values = [Signal::Idle, Signal::Level(-9007199254740993_i64), Signal::Named("probe", 7_u8)];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<Signal>(values))
+        {
+            JsonTraceEncoder json = NewJsonTrace();
+            Assert.True(Results.IsOk(Contracts.Encode<Signal, JsonTraceEncoder>(values[index], json, Limits.DefaultLimits())), "generated enum adapter drives the JSON test format");
+            ExpectSignal(DecodeJson<Signal>(json, values[index], "Signal"), values[index], "JSON Signal");
+            index = index + 1_i64;
+        }
+    }
+
+    test JsonReaderRejectsADifferentWidth
+    {
+        JsonTraceEncoder json = NewJsonTrace();
+        Assert.True(Results.IsOk(Contracts.Encode<Point, JsonTraceEncoder>(Point
+        {
+            x: 1_i32,
+            y: 2_i32,
+        }, json, Limits.DefaultLimits())), "Point encodes");
+        mut TapeToken[] tape = json.tape;
+        mut TapeToken widened = tape[2];
+        Assert.Equal(widened.kind, "signed", "the third call is the x field value");
+        widened.width = 64_u8;
+        tape[2] = widened;
+        JsonTapeReader reader = JsonTapeReader
+        {
+            tape: tape,
+            position: 0_i64,
+        };
+        Assert.True(Results.IsError(Contracts.Decode<Point, Decoding.IssuedDecoder<Point, JsonTapeReader>>(Decoding.DecoderFor<Point, JsonTapeReader>(reader), Limits.DefaultLimits())), "an i32 field never accepts a 64-bit integer call");
+    }
 }

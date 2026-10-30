@@ -10,57 +10,60 @@ string[] Sha1Digests()
     return ["a9993e364706816aba3e25717850c26c9cd0d89d", "da39a3ee5e6b4b0d3255bfef95601890afd80709", "84983e441c3bd26ebaae4aa1f95129e5e54670f1", "a49b2446a02c645bf419f995b67091253a04a259"];
 }
 
-test Sha1MatchesFips180Examples
+mod Sha1Tests
 {
-    DigestVector[] messages = Sha256Vectors();
-    string[] digests = Sha1Digests();
-    mut i64 i = 0;
-    while (i < 4)
+    test MatchesFips180Examples
     {
-        Assert.True(Same(Sha1.Hash(messages[i].message), Hex(digests[i])), "SHA-1 " + digests[i]);
-        i = i + 1;
+        DigestVector[] messages = Sha256Vectors();
+        string[] digests = Sha1Digests();
+        mut i64 i = 0;
+        while (i < 4)
+        {
+            Assert.True(Same(Sha1.Hash(messages[i].message), Hex(digests[i])), "SHA-1 " + digests[i]);
+            i = i + 1;
+        }
     }
-}
 
-test Sha1GivesTheSameDigestForEverySplitOfTheInput
-{
-    u8[] m = Ascii(Fips180LongMessage());
-    mut i64 split = 0;
-    while (split <= Slice.Len(m))
+    test GivesTheSameDigestForEverySplitOfTheInput
+    {
+        u8[] m = Ascii(Fips180LongMessage());
+        mut i64 split = 0;
+        while (split <= Slice.Len(m))
+        {
+            Sha1State s = Sha1.New();
+            Assert.True(Sha1.UpdateRange(s, m, 0, split), "first part");
+            Assert.True(Sha1.UpdateRange(s, m, split, Slice.Len(m) - split), "second part");
+            Assert.True(Same(Sha1.Finish(s), Hex("a49b2446a02c645bf419f995b67091253a04a259")), "split digest");
+            split = split + 13;
+        }
+    }
+
+    test HashesTheWebSocketAcceptInput
+    {
+        // RFC 6455 section 1.3: SHA-1 of key + GUID, before base64.
+        u8[] d = Sha1.Hash(Ascii("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
+        Assert.True(Same(d, Hex("b37a4f2cc0624f1690f64606cf385945b2bec4ea")), "accept digest");
+    }
+
+    test FinishTwiceGivesTheSameDigestAndRejectsLaterUpdates
     {
         Sha1State s = Sha1.New();
-        Assert.True(Sha1.UpdateRange(s, m, 0, split), "first part");
-        Assert.True(Sha1.UpdateRange(s, m, split, Slice.Len(m) - split), "second part");
-        Assert.True(Same(Sha1.Finish(s), Hex("a49b2446a02c645bf419f995b67091253a04a259")), "split digest");
-        split = split + 13;
+        Sha1.Update(s, Ascii("abc"));
+        u8[] first = Sha1.Finish(s);
+        Assert.False(Sha1.Update(s, Ascii("x")), "no update after finish");
+        Assert.True(Same(Sha1.Finish(s), first), "same digest");
     }
-}
 
-test Sha1HashesTheWebSocketAcceptInput
-{
-    // RFC 6455 section 1.3: SHA-1 of key + GUID, before base64.
-    u8[] d = Sha1.Hash(Ascii("dGhlIHNhbXBsZSBub25jZQ==258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
-    Assert.True(Same(d, Hex("b37a4f2cc0624f1690f64606cf385945b2bec4ea")), "accept digest");
-}
-
-test Sha1FinishTwiceGivesTheSameDigestAndRejectsLaterUpdates
-{
-    Sha1State s = Sha1.New();
-    Sha1.Update(s, Ascii("abc"));
-    u8[] first = Sha1.Finish(s);
-    Assert.False(Sha1.Update(s, Ascii("x")), "no update after finish");
-    Assert.True(Same(Sha1.Finish(s), first), "same digest");
-}
-
-test Sha1MatchesTheFips180MillionAExample
-{
-    u8[] block = Slice.Fill(Slice.New(1000), 0, 1000, 97_u8);
-    Sha1State s = Sha1.New();
-    mut i64 i = 0;
-    while (i < 1000)
+    test MatchesTheFips180MillionAExample
     {
-        Sha1.Update(s, block);
-        i = i + 1;
+        u8[] block = Slice.Fill(Slice.New(1000), 0, 1000, 97_u8);
+        Sha1State s = Sha1.New();
+        mut i64 i = 0;
+        while (i < 1000)
+        {
+            Sha1.Update(s, block);
+            i = i + 1;
+        }
+        Assert.True(Same(Sha1.Finish(s), Hex("34aa973cd4c4daa4f61eeb2bdbad27316534016f")), "million a");
     }
-    Assert.True(Same(Sha1.Finish(s), Hex("34aa973cd4c4daa4f61eeb2bdbad27316534016f")), "million a");
 }

@@ -14,8 +14,6 @@ use Core.Text.Pest.Names;
 use Core.Text.Regex.Generated;
 use Testing.Assert;
 
-// ---- Helpers ----
-
 string Nl()
 {
     return String.CodeUnitChar(10);
@@ -142,207 +140,212 @@ i64 RestAt(Parser.Result.TextParseResult<string> result)
     };
 }
 
-// ---- Names ----
-
-test RuleNamesMapToPascalCaseCallables
+mod NamesTests
 {
-    Assert.Equal(Names.RuleNameToPascal("pat_branch"), "PatBranch", "pascal");
-    Assert.Equal(Names.RuleNameToCallable("digit_run"), "ParseDigitRun", "callable");
-    Assert.Equal(Names.RuleNameToCallable("pat"), "ParsePat", "one part");
+    test RuleNamesMapToPascalCaseCallables
+    {
+        Assert.Equal(Names.RuleNameToPascal("pat_branch"), "PatBranch", "pascal");
+        Assert.Equal(Names.RuleNameToCallable("digit_run"), "ParseDigitRun", "callable");
+        Assert.Equal(Names.RuleNameToCallable("pat"), "ParsePat", "one part");
+    }
 }
 
-// ---- Grammar ----
-
-test ParseGrammarRulesReadsOneLineRules
+mod GrammarTests
 {
-    string source = "digit = { \"0\" | \"1\" }" + Nl() + "run = { digit+ }" + Nl();
-    Assert.Equal(Rules(source), "digit=\"0\" | \"1\" ; run=digit+", "two rules in order");
+    test ParseGrammarRulesReadsOneLineRules
+    {
+        string source = "digit = { \"0\" | \"1\" }" + Nl() + "run = { digit+ }" + Nl();
+        Assert.Equal(Rules(source), "digit=\"0\" | \"1\" ; run=digit+", "two rules in order");
+    }
+
+    test ParseGrammarRulesJoinsARuleSpreadOverLines
+    {
+        string source = "pat = {" + Nl() + "    branch ~" + Nl() + "    tail" + Nl() + "}" + Nl() + "tail = { ANY }";
+        Assert.Equal(Rules(source), "pat=branch ~ tail ; tail=ANY", "joined body");
+    }
+
+    test ParseGrammarRulesSkipsCommentsAndBlankLines
+    {
+        string source = "// header" + Nl() + Nl() + "x = { \"a\" } // trailing" + Nl() + "   " + Nl();
+        Assert.Equal(Rules(source), "x=\"a\"", "one rule");
+    }
+
+    test ParseGrammarRulesRejectsSourceWithoutRules
+    {
+        Assert.Equal(Rules(""), "error: no grammar rules found", "empty");
+        Assert.Equal(Rules("// only a comment" + Nl()), "error: no grammar rules found", "comment only");
+        Assert.Equal(Rules(" = { a }"), "error: empty rule name", "empty name");
+    }
+
+    test RuleExistsFindsRulesByExactName
+    {
+        GrammarRule[] rules = SampleRules();
+        Assert.Equal(Grammar.RuleCount(rules), 3, "count");
+        Assert.True(Grammar.RuleExists(rules, "lower_run"), "present");
+        Assert.False(Grammar.RuleExists(rules, "lower_"), "prefix only");
+        Assert.False(Grammar.RuleExists(rules, "missing"), "absent");
+        Assert.Equal(Grammar.RuleAt(rules, 1).expression, "lower+", "rule at index");
+    }
+
+    test GrammarLineHelpersTrimBracesAndComments
+    {
+        Assert.Equal(Grammar.StripLineComment("a ~ b // why"), "a ~ b ", "comment cut");
+        Assert.Equal(Grammar.StripLineComment("a ~ b"), "a ~ b", "no comment");
+        Assert.Equal(Grammar.TrimStartBrace("  { a ~ b"), "a ~ b", "opening brace");
+        Assert.Equal(Grammar.TrimEndBrace("a ~ b }  "), "a ~ b", "closing brace");
+        Assert.Equal(Grammar.TrimEndBrace("a ~ b"), "a ~ b", "no brace");
+        Assert.True(Grammar.LineEndsWithBrace("x = { a }  "), "ends with brace");
+        Assert.False(Grammar.LineEndsWithBrace("x = {"), "open line");
+        Assert.False(Grammar.LineEndsWithBrace("   "), "blank line");
+    }
 }
 
-test ParseGrammarRulesJoinsARuleSpreadOverLines
+mod ExpressionsTests
 {
-    string source = "pat = {" + Nl() + "    branch ~" + Nl() + "    tail" + Nl() + "}" + Nl() + "tail = { ANY }";
-    Assert.Equal(Rules(source), "pat=branch ~ tail ; tail=ANY", "joined body");
+    test ParseExprGivesChoiceTheLowestPrecedence
+    {
+        Assert.Equal(Parsed("a | b ~ c"), "Choice(a, Seq(b, c))", "choice of sequences");
+        Assert.Equal(Parsed("a"), "a", "a single rule reference is not wrapped");
+    }
+
+    test ParseExprReadsPostfixOperatorsAndGroups
+    {
+        Assert.Equal(Parsed("\"(\" ~ pat ~ \")\" ~ quant?"), "Seq('(', pat, ')', Opt(quant))", "optional suffix");
+        Assert.Equal(Parsed("lower+"), "Repeat+(lower)", "one or more");
+        Assert.Equal(Parsed("( \"|\" ~ branch )*"), "Repeat*(Group(Seq('|', branch)))", "repeated group");
+        Assert.Equal(Parsed("!( \"]\" ) ~ ANY"), "Seq(Not(Group(']')), ANY)", "negative lookahead");
+    }
+
+    test ParseExprReportsUnsupportedInput
+    {
+        Assert.Equal(Parsed("1abc"), "error: unsupported primary", "not an identifier");
+        Assert.Equal(Parsed("(a) (b)"), "error: invalid group", "two groups without a separator");
+        Assert.Equal(Parsed("(a"), "error: invalid choice", "unbalanced parenthesis");
+        Assert.Equal(Parsed("\"abc"), "error: invalid choice", "unterminated literal");
+        Assert.Equal(Parsed("  "), "error: invalid choice", "empty");
+    }
+
+    test ParseStringLiteralDecodesEscapes
+    {
+        string expected = String.CodeUnitChar(10) + String.CodeUnitChar(9) + "\\" + "\"";
+        Assert.Equal(LiteralText("\"\\n\\t\\\\\\\"\""), expected, "newline, tab, backslash, quote");
+        Assert.Equal(LiteralText("\"\\q\""), "\\q", "unknown escape is kept");
+        Assert.Equal(LiteralText("\"ab\" trailing"), "ab", "literal ends at its closing quote");
+        Assert.Equal(LiteralText("\"abc"), "error: unterminated string literal", "no closing quote");
+        Assert.Equal(LiteralText("abc"), "error: expected opening quote", "no opening quote");
+    }
+
+    test SplitManyIgnoresSeparatorsInsideLiteralsAndGroups
+    {
+        Assert.Equal(Split("\"|\" | (a | b) | c", "|"), "\"|\" / (a | b) / c", "three alternatives");
+        Assert.Equal(Split("a ~ b", "|"), "a ~ b", "no separator");
+        Assert.Equal(Split("a | (b", "|"), "error: unbalanced parentheses", "open group");
+    }
+
+    test StripParensNeedsOneEnclosingGroup
+    {
+        Assert.Equal(Expr.UnwrapStringOk(Expr.StripParens(" ( a ~ (b) ) ")), "a ~ (b)", "outer group removed");
+        Assert.True(Core.Results.IsError<string, string>(Expr.StripParens("(a) (b)")), "two groups");
+        Assert.True(Core.Results.IsError<string, string>(Expr.StripParens("a")), "no group");
+        Assert.Equal(Parsed("( \")\" )"), "Group(')')", "a closing parenthesis inside a literal");
+    }
+
+    test IsIdentAcceptsSnakeCaseRuleNames
+    {
+        Assert.True(Expr.IsIdent("pat_branch"), "snake case");
+        Assert.True(Expr.IsIdent("_x9"), "leading underscore");
+        Assert.False(Expr.IsIdent("9x"), "leading digit");
+        Assert.False(Expr.IsIdent("a-b"), "hyphen");
+        Assert.False(Expr.IsIdent(""), "empty");
+    }
 }
 
-test ParseGrammarRulesSkipsCommentsAndBlankLines
+mod EmitTests
 {
-    string source = "// header" + Nl() + Nl() + "x = { \"a\" } // trailing" + Nl() + "   " + Nl();
-    Assert.Equal(Rules(source), "x=\"a\"", "one rule");
+    test EscapeBeskidStringEscapesQuotesBackslashesAndInterpolation
+    {
+        string bs = "\\";
+        string q = "\"";
+        string dollar = "$";
+        string input = "a" + bs + "b" + q + "c" + dollar + "{d}" + dollar + "e";
+        string expected = "a" + bs + bs + "b" + bs + q + "c" + bs + dollar + "{d}" + dollar + "e";
+        Assert.Equal(Emit.EscapeBeskidString(input), expected, "escaped");
+    }
+
+    test OnlyPrintableAsciiLiteralsAreRepresentable
+    {
+        Assert.True(Emit.IsBeskidStringRepresentable("a b~"), "printable ASCII and space");
+        Assert.True(Emit.IsBeskidStringRepresentable(""), "empty");
+        Assert.False(Emit.IsBeskidStringRepresentable(String.CodeUnitChar(9)), "tab");
+        Assert.False(Emit.IsBeskidStringRepresentable("é"), "non-ASCII");
+    }
+
+    test IndentBlockPadsEveryNonEmptyLine
+    {
+        Assert.Equal(Emit.IndentBlock("a" + Nl() + "b", 2), "  a" + Nl() + "  b", "two lines");
+        Assert.Equal(Emit.IndentBlock("a" + Nl() + Nl() + "b", 2), "  a" + Nl() + Nl() + "  b", "blank line not padded");
+        Assert.Equal(Emit.IndentBlock("", 4), "", "empty");
+    }
+
+    test BuiltinTermsNeedTheExactRuleAndAlphabet
+    {
+        string digits = "\"0\" | \"1\" | \"2\" | \"3\" | \"4\" | \"5\" | \"6\" | \"7\" | \"8\" | \"9\"";
+        Assert.Equal(Emit.EmitBuiltinTerm(digits, "digit"), "Digit", "digit alphabet");
+        Assert.Equal(Emit.EmitBuiltinTerm(digits, "digits"), "", "other rule name");
+        Assert.Equal(Emit.EmitBuiltinTerm("\"0\" | \"1\"", "digit"), "", "partial alphabet");
+        Assert.Equal(Emit.EmitRuleBody(digits, "digit", SampleRules()), "return Core.Text.Parser.Terms.Digit(c, \"digit\");", "builtin body");
+    }
+
+    test EmitRuleBodyTurnsUnknownRulesAndBadExpressionsIntoFailures
+    {
+        string unknown = Emit.EmitRuleBody("missing", "start", SampleRules());
+        Assert.True(String.StartsWith(unknown, "return Parser.Fail(c, "), "unknown rule returns a failure");
+        Assert.Contains(unknown, "start: unknown rule missing", "failure names the rule");
+        string bad = Emit.EmitRuleBody("1abc", "start", SampleRules());
+        Assert.True(String.StartsWith(bad, "return Parser.Fail(c, "), "parse error returns a failure");
+        Assert.Contains(bad, "start: unsupported primary", "failure carries the parse error");
+    }
+
+    test EmitCombinatorModuleDefinesOneParserPerRule
+    {
+        string module = Emit.EmitCombinatorModule("sample", SampleRules());
+        Assert.True(String.StartsWith(module, "// CHECKED IN: regenerated by corelib_pest_gen"), "header");
+        Assert.Contains(module, "use Core.Text.Parser;", "parser import");
+        Assert.Contains(module, "pub Parser.Result.TextParseResult<string> ParseLower(Cursor.TextCursor c) {", "lower");
+        Assert.Contains(module, "pub Parser.Result.TextParseResult<string> ParseLowerRun(Cursor.TextCursor c) {", "lower_run");
+        Assert.Contains(module, "pub Parser.Result.TextParseResult<string> ParseStart(Cursor.TextCursor c) {", "start");
+        Assert.Contains(module, "start: unknown rule missing", "unknown reference fails");
+        Assert.True(String.EndsWith(module, "}" + Nl()), "ends with one newline");
+        Assert.False(String.EndsWith(module, Nl() + Nl()), "no blank last line");
+    }
 }
 
-test ParseGrammarRulesRejectsSourceWithoutRules
+mod GeneratedTests
 {
-    Assert.Equal(Rules(""), "error: no grammar rules found", "empty");
-    Assert.Equal(Rules("// only a comment" + Nl()), "error: no grammar rules found", "comment only");
-    Assert.Equal(Rules(" = { a }"), "error: empty rule name", "empty name");
-}
+    test RunsConsumeTheWholeRun
+    {
+        Assert.Equal(RestAt(Generated.ParseLowerRun(Cursor.From("abc1"))), 3, "lower run");
+        Assert.Equal(RestAt(Generated.ParseDigitRun(Cursor.From("x"))), -1, "digit run needs a digit");
+        Assert.Equal(RestAt(Generated.ParseWordRun(Cursor.From("Ab_9-"))), 4, "word run");
+        Assert.Equal(RestAt(Generated.ParseSpaceRun(Cursor.From("  x"))), 2, "space run");
+    }
 
-test RuleExistsFindsRulesByExactName
-{
-    GrammarRule[] rules = SampleRules();
-    Assert.Equal(Grammar.RuleCount(rules), 3, "count");
-    Assert.True(Grammar.RuleExists(rules, "lower_run"), "present");
-    Assert.False(Grammar.RuleExists(rules, "lower_"), "prefix only");
-    Assert.False(Grammar.RuleExists(rules, "missing"), "absent");
-    Assert.Equal(Grammar.RuleAt(rules, 1).expression, "lower+", "rule at index");
-}
+    test AnyUnitReadsOneScalar
+    {
+        Assert.Equal(RestAt(Generated.ParseAnyUnit(Cursor.From("éa"))), 2, "two-byte scalar");
+        Assert.Equal(RestAt(Generated.ParseAnyUnit(Cursor.From(""))), -1, "end of input");
+    }
 
-test GrammarLineHelpersTrimBracesAndComments
-{
-    Assert.Equal(Grammar.StripLineComment("a ~ b // why"), "a ~ b ", "comment cut");
-    Assert.Equal(Grammar.StripLineComment("a ~ b"), "a ~ b", "no comment");
-    Assert.Equal(Grammar.TrimStartBrace("  { a ~ b"), "a ~ b", "opening brace");
-    Assert.Equal(Grammar.TrimEndBrace("a ~ b }  "), "a ~ b", "closing brace");
-    Assert.Equal(Grammar.TrimEndBrace("a ~ b"), "a ~ b", "no brace");
-    Assert.True(Grammar.LineEndsWithBrace("x = { a }  "), "ends with brace");
-    Assert.False(Grammar.LineEndsWithBrace("x = {"), "open line");
-    Assert.False(Grammar.LineEndsWithBrace("   "), "blank line");
-}
+    test PatConsumesAWholeValidPattern
+    {
+        string pattern = "(a|b)*[^x-z]\\d+";
+        Assert.Equal(RestAt(Generated.ParsePat(Cursor.From(pattern))), String.Len(pattern), "whole pattern");
+        Assert.Equal(RestAt(Generated.ParsePat(Cursor.From("(a"))), -1, "open group");
+    }
 
-// ---- Expressions ----
-
-test ParseExprGivesChoiceTheLowestPrecedence
-{
-    Assert.Equal(Parsed("a | b ~ c"), "Choice(a, Seq(b, c))", "choice of sequences");
-    Assert.Equal(Parsed("a"), "a", "a single rule reference is not wrapped");
-}
-
-test ParseExprReadsPostfixOperatorsAndGroups
-{
-    Assert.Equal(Parsed("\"(\" ~ pat ~ \")\" ~ quant?"), "Seq('(', pat, ')', Opt(quant))", "optional suffix");
-    Assert.Equal(Parsed("lower+"), "Repeat+(lower)", "one or more");
-    Assert.Equal(Parsed("( \"|\" ~ branch )*"), "Repeat*(Group(Seq('|', branch)))", "repeated group");
-    Assert.Equal(Parsed("!( \"]\" ) ~ ANY"), "Seq(Not(Group(']')), ANY)", "negative lookahead");
-}
-
-test ParseExprReportsUnsupportedInput
-{
-    Assert.Equal(Parsed("1abc"), "error: unsupported primary", "not an identifier");
-    Assert.Equal(Parsed("(a) (b)"), "error: invalid group", "two groups without a separator");
-    Assert.Equal(Parsed("(a"), "error: invalid choice", "unbalanced parenthesis");
-    Assert.Equal(Parsed("\"abc"), "error: invalid choice", "unterminated literal");
-    Assert.Equal(Parsed("  "), "error: invalid choice", "empty");
-}
-
-test ParseStringLiteralDecodesEscapes
-{
-    string expected = String.CodeUnitChar(10) + String.CodeUnitChar(9) + "\\" + "\"";
-    Assert.Equal(LiteralText("\"\\n\\t\\\\\\\"\""), expected, "newline, tab, backslash, quote");
-    Assert.Equal(LiteralText("\"\\q\""), "\\q", "unknown escape is kept");
-    Assert.Equal(LiteralText("\"ab\" trailing"), "ab", "literal ends at its closing quote");
-    Assert.Equal(LiteralText("\"abc"), "error: unterminated string literal", "no closing quote");
-    Assert.Equal(LiteralText("abc"), "error: expected opening quote", "no opening quote");
-}
-
-test SplitManyIgnoresSeparatorsInsideLiteralsAndGroups
-{
-    Assert.Equal(Split("\"|\" | (a | b) | c", "|"), "\"|\" / (a | b) / c", "three alternatives");
-    Assert.Equal(Split("a ~ b", "|"), "a ~ b", "no separator");
-    Assert.Equal(Split("a | (b", "|"), "error: unbalanced parentheses", "open group");
-}
-
-test StripParensNeedsOneEnclosingGroup
-{
-    Assert.Equal(Expr.UnwrapStringOk(Expr.StripParens(" ( a ~ (b) ) ")), "a ~ (b)", "outer group removed");
-    Assert.True(Core.Results.IsError<string, string>(Expr.StripParens("(a) (b)")), "two groups");
-    Assert.True(Core.Results.IsError<string, string>(Expr.StripParens("a")), "no group");
-    Assert.Equal(Parsed("( \")\" )"), "Group(')')", "a closing parenthesis inside a literal");
-}
-
-test IsIdentAcceptsSnakeCaseRuleNames
-{
-    Assert.True(Expr.IsIdent("pat_branch"), "snake case");
-    Assert.True(Expr.IsIdent("_x9"), "leading underscore");
-    Assert.False(Expr.IsIdent("9x"), "leading digit");
-    Assert.False(Expr.IsIdent("a-b"), "hyphen");
-    Assert.False(Expr.IsIdent(""), "empty");
-}
-
-// ---- Emit ----
-
-test EscapeBeskidStringEscapesQuotesBackslashesAndInterpolation
-{
-    string bs = "\\";
-    string q = "\"";
-    string dollar = "$";
-    string input = "a" + bs + "b" + q + "c" + dollar + "{d}" + dollar + "e";
-    string expected = "a" + bs + bs + "b" + bs + q + "c" + bs + dollar + "{d}" + dollar + "e";
-    Assert.Equal(Emit.EscapeBeskidString(input), expected, "escaped");
-}
-
-test OnlyPrintableAsciiLiteralsAreRepresentable
-{
-    Assert.True(Emit.IsBeskidStringRepresentable("a b~"), "printable ASCII and space");
-    Assert.True(Emit.IsBeskidStringRepresentable(""), "empty");
-    Assert.False(Emit.IsBeskidStringRepresentable(String.CodeUnitChar(9)), "tab");
-    Assert.False(Emit.IsBeskidStringRepresentable("é"), "non-ASCII");
-}
-
-test IndentBlockPadsEveryNonEmptyLine
-{
-    Assert.Equal(Emit.IndentBlock("a" + Nl() + "b", 2), "  a" + Nl() + "  b", "two lines");
-    Assert.Equal(Emit.IndentBlock("a" + Nl() + Nl() + "b", 2), "  a" + Nl() + Nl() + "  b", "blank line not padded");
-    Assert.Equal(Emit.IndentBlock("", 4), "", "empty");
-}
-
-test BuiltinTermsNeedTheExactRuleAndAlphabet
-{
-    string digits = "\"0\" | \"1\" | \"2\" | \"3\" | \"4\" | \"5\" | \"6\" | \"7\" | \"8\" | \"9\"";
-    Assert.Equal(Emit.EmitBuiltinTerm(digits, "digit"), "Digit", "digit alphabet");
-    Assert.Equal(Emit.EmitBuiltinTerm(digits, "digits"), "", "other rule name");
-    Assert.Equal(Emit.EmitBuiltinTerm("\"0\" | \"1\"", "digit"), "", "partial alphabet");
-    Assert.Equal(Emit.EmitRuleBody(digits, "digit", SampleRules()), "return Core.Text.Parser.Terms.Digit(c, \"digit\");", "builtin body");
-}
-
-test EmitRuleBodyTurnsUnknownRulesAndBadExpressionsIntoFailures
-{
-    string unknown = Emit.EmitRuleBody("missing", "start", SampleRules());
-    Assert.True(String.StartsWith(unknown, "return Parser.Fail(c, "), "unknown rule returns a failure");
-    Assert.Contains(unknown, "start: unknown rule missing", "failure names the rule");
-    string bad = Emit.EmitRuleBody("1abc", "start", SampleRules());
-    Assert.True(String.StartsWith(bad, "return Parser.Fail(c, "), "parse error returns a failure");
-    Assert.Contains(bad, "start: unsupported primary", "failure carries the parse error");
-}
-
-test EmitCombinatorModuleDefinesOneParserPerRule
-{
-    string module = Emit.EmitCombinatorModule("sample", SampleRules());
-    Assert.True(String.StartsWith(module, "// CHECKED IN: regenerated by corelib_pest_gen"), "header");
-    Assert.Contains(module, "use Core.Text.Parser;", "parser import");
-    Assert.Contains(module, "pub Parser.Result.TextParseResult<string> ParseLower(Cursor.TextCursor c) {", "lower");
-    Assert.Contains(module, "pub Parser.Result.TextParseResult<string> ParseLowerRun(Cursor.TextCursor c) {", "lower_run");
-    Assert.Contains(module, "pub Parser.Result.TextParseResult<string> ParseStart(Cursor.TextCursor c) {", "start");
-    Assert.Contains(module, "start: unknown rule missing", "unknown reference fails");
-    Assert.True(String.EndsWith(module, "}" + Nl()), "ends with one newline");
-    Assert.False(String.EndsWith(module, Nl() + Nl()), "no blank last line");
-}
-
-// ---- Generated regex grammar ----
-
-test GeneratedRunsConsumeTheWholeRun
-{
-    Assert.Equal(RestAt(Generated.ParseLowerRun(Cursor.From("abc1"))), 3, "lower run");
-    Assert.Equal(RestAt(Generated.ParseDigitRun(Cursor.From("x"))), -1, "digit run needs a digit");
-    Assert.Equal(RestAt(Generated.ParseWordRun(Cursor.From("Ab_9-"))), 4, "word run");
-    Assert.Equal(RestAt(Generated.ParseSpaceRun(Cursor.From("  x"))), 2, "space run");
-}
-
-test GeneratedAnyUnitReadsOneScalar
-{
-    Assert.Equal(RestAt(Generated.ParseAnyUnit(Cursor.From("éa"))), 2, "two-byte scalar");
-    Assert.Equal(RestAt(Generated.ParseAnyUnit(Cursor.From(""))), -1, "end of input");
-}
-
-test GeneratedPatConsumesAWholeValidPattern
-{
-    string pattern = "(a|b)*[^x-z]\\d+";
-    Assert.Equal(RestAt(Generated.ParsePat(Cursor.From(pattern))), String.Len(pattern), "whole pattern");
-    Assert.Equal(RestAt(Generated.ParsePat(Cursor.From("(a"))), -1, "open group");
-}
-
-test GeneratedClassCharStopsAtTheClosingBracket
-{
-    Assert.Equal(RestAt(Generated.ParsePatClassChar(Cursor.From("a]"))), 1, "class char");
-    Assert.Equal(RestAt(Generated.ParsePatClassChar(Cursor.From("]"))), -1, "closing bracket");
+    test ClassCharStopsAtTheClosingBracket
+    {
+        Assert.Equal(RestAt(Generated.ParsePatClassChar(Cursor.From("a]"))), 1, "class char");
+        Assert.Equal(RestAt(Generated.ParsePatClassChar(Cursor.From("]"))), -1, "closing bracket");
+    }
 }

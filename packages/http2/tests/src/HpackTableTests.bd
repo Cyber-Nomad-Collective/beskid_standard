@@ -4,12 +4,10 @@ use Core.Collections.Array;
 use Core.Results;
 use Core.String;
 use Http2.Hpack;
-
 use Http2.HpackTable;
 use HpackSupport;
 
 // RFC 7541 sections 2.3 and 4: static table, dynamic table size accounting and eviction.
-
 HeaderField Sized(string name, i64 valueLength)
 {
     mut string value = "";
@@ -37,114 +35,117 @@ HeaderField LookupOk(StaticTable statics, DynamicTable table, i64 index)
     return Hpack.Field("", "");
 }
 
-test StaticTableMatchesAppendixA
+mod TableTests
 {
-    StaticTable statics = HpackTable.NewStaticTable();
-    DynamicTable table = HpackTable.NewDynamicTable(4096_i64);
-    Assert.Equal<i64>(Array.Len<HeaderField>(statics.entries), 61_i64, "61 entries");
-    ExpectField(LookupOk(statics, table, 1_i64), ":authority", "", "1");
-    ExpectField(LookupOk(statics, table, 2_i64), ":method", "GET", "2");
-    ExpectField(LookupOk(statics, table, 8_i64), ":status", "200", "8");
-    ExpectField(LookupOk(statics, table, 16_i64), "accept-encoding", "gzip, deflate", "16");
-    ExpectField(LookupOk(statics, table, 32_i64), "cookie", "", "32");
-    ExpectField(LookupOk(statics, table, 55_i64), "set-cookie", "", "55");
-    ExpectField(LookupOk(statics, table, 61_i64), "www-authenticate", "", "61");
-    Result<HeaderField, HpackError> past = HpackTable.Lookup(statics, table, 62_i64);
-    match (past)
+    test StaticTableMatchesAppendixA
     {
-        Result::Ok(_) => {
-            Assert.Fail("62 on an empty table");
-        },
-        Result::Error(e) => {
-            Assert.Equal<i64>(ErrorCode(e), 3_i64, "InvalidIndex");
-        },
-    };
-}
-
-test EntrySizeCounts32OctetsOverhead
-{
-    Assert.Equal<i64>(Hpack.FieldSize(Hpack.Field("custom-key", "custom-header")), 55_i64, "10 + 13 + 32");
-    Assert.Equal<i64>(Hpack.FieldSize(Hpack.Field("", "")), 32_i64, "empty field");
-}
-
-test InsertEvictsOldestFirst
-{
-    StaticTable statics = HpackTable.NewStaticTable();
-    mut DynamicTable table = HpackTable.NewDynamicTable(100_i64);
-    HpackTable.DynamicInsert(table, Sized("a", 9_i64));
-    HpackTable.DynamicInsert(table, Sized("b", 9_i64));
-    HpackTable.DynamicInsert(table, Sized("c", 9_i64));
-    // 42 * 3 > 100, so "a" was evicted.
-    Assert.Equal<i64>(HpackTable.DynamicCount(table), 2_i64, "two entries");
-    Assert.Equal<i64>(table.size, 84_i64, "size 84");
-    ExpectField(LookupOk(statics, table, 62_i64), "c", "vvvvvvvvv", "newest is 62");
-    ExpectField(LookupOk(statics, table, 63_i64), "b", "vvvvvvvvv", "older is 63");
-}
-
-test EntryExactlyFillingTheTableIsKept
-{
-    mut DynamicTable table = HpackTable.NewDynamicTable(55_i64);
-    HpackTable.DynamicInsert(table, Hpack.Field("custom-key", "custom-header"));
-    Assert.Equal<i64>(HpackTable.DynamicCount(table), 1_i64, "fits exactly");
-    Assert.Equal<i64>(table.size, 55_i64, "size 55");
-}
-
-test EntryLargerThanTableEmptiesIt
-{
-    mut DynamicTable table = HpackTable.NewDynamicTable(100_i64);
-    HpackTable.DynamicInsert(table, Sized("a", 9_i64));
-    HpackTable.DynamicInsert(table, Sized("big", 70_i64));
-    Assert.Equal<i64>(HpackTable.DynamicCount(table), 0_i64, "emptied");
-    Assert.Equal<i64>(table.size, 0_i64, "size 0");
-}
-
-test ResizeEvictsUntilItFits
-{
-    mut DynamicTable table = HpackTable.NewDynamicTable(4096_i64);
-    mut i64 i = 0_i64;
-    while (i < 10_i64)
-    {
-        HpackTable.DynamicInsert(table, Sized("k", 9_i64));
-        i = i + 1_i64;
+        StaticTable statics = HpackTable.NewStaticTable();
+        DynamicTable table = HpackTable.NewDynamicTable(4096_i64);
+        Assert.Equal<i64>(Array.Len<HeaderField>(statics.entries), 61_i64, "61 entries");
+        ExpectField(LookupOk(statics, table, 1_i64), ":authority", "", "1");
+        ExpectField(LookupOk(statics, table, 2_i64), ":method", "GET", "2");
+        ExpectField(LookupOk(statics, table, 8_i64), ":status", "200", "8");
+        ExpectField(LookupOk(statics, table, 16_i64), "accept-encoding", "gzip, deflate", "16");
+        ExpectField(LookupOk(statics, table, 32_i64), "cookie", "", "32");
+        ExpectField(LookupOk(statics, table, 55_i64), "set-cookie", "", "55");
+        ExpectField(LookupOk(statics, table, 61_i64), "www-authenticate", "", "61");
+        Result<HeaderField, HpackError> past = HpackTable.Lookup(statics, table, 62_i64);
+        match (past)
+        {
+            Result::Ok(_) => {
+                Assert.Fail("62 on an empty table");
+            },
+            Result::Error(e) => {
+                Assert.Equal<i64>(ErrorCode(e), 3_i64, "InvalidIndex");
+            },
+        };
     }
-    Assert.Equal<i64>(table.size, 420_i64, "ten entries of 42");
-    HpackTable.DynamicResize(table, 100_i64);
-    Assert.Equal<i64>(HpackTable.DynamicCount(table), 2_i64, "two remain");
-    Assert.Equal<i64>(table.size, 84_i64, "84");
-    HpackTable.DynamicResize(table, 0_i64);
-    Assert.Equal<i64>(HpackTable.DynamicCount(table), 0_i64, "zero size empties");
-}
 
-test ManyInsertsKeepOrderAcrossCompaction
-{
-    StaticTable statics = HpackTable.NewStaticTable();
-    mut DynamicTable table = HpackTable.NewDynamicTable(420_i64);
-    string digits = "0123456789";
-    mut i64 i = 0_i64;
-    while (i < 500_i64)
+    test EntrySizeCounts32OctetsOverhead
     {
-        string name = "n" + String.SubSlice(digits, (i / 100_i64) % 10_i64, 1_i64) + String.SubSlice(digits, (i / 10_i64) % 10_i64, 1_i64) + String.SubSlice(digits, i % 10_i64, 1_i64);
-        HpackTable.DynamicInsert(table, Hpack.Field(name, "vvvvvv"));
-        i = i + 1_i64;
+        Assert.Equal<i64>(Hpack.FieldSize(Hpack.Field("custom-key", "custom-header")), 55_i64, "10 + 13 + 32");
+        Assert.Equal<i64>(Hpack.FieldSize(Hpack.Field("", "")), 32_i64, "empty field");
     }
-    // Each entry is 4 + 6 + 32 = 42 octets, so ten fit.
-    Assert.Equal<i64>(HpackTable.DynamicCount(table), 10_i64, "ten entries");
-    Assert.Equal<i64>(table.size, 420_i64, "full");
-    Assert.True(Array.Len<HeaderField>(table.entries) < 64_i64, "backing array compacted");
-    ExpectField(LookupOk(statics, table, 62_i64), "n499", "vvvvvv", "newest");
-    ExpectField(LookupOk(statics, table, 71_i64), "n490", "vvvvvv", "oldest");
-}
 
-test FindPrefersLowestIndex
-{
-    StaticTable statics = HpackTable.NewStaticTable();
-    mut DynamicTable table = HpackTable.NewDynamicTable(4096_i64);
-    HpackTable.DynamicInsert(table, Hpack.Field(":status", "302"));
-    HpackTable.DynamicInsert(table, Hpack.Field("x-custom", "1"));
-    Assert.Equal<i64>(HpackTable.FindField(statics, table, Hpack.Field(":method", "GET")), 2_i64, "static full match");
-    Assert.Equal<i64>(HpackTable.FindField(statics, table, Hpack.Field(":status", "302")), 63_i64, "dynamic full match");
-    Assert.Equal<i64>(HpackTable.FindField(statics, table, Hpack.Field(":status", "307")), 0_i64, "no full match");
-    Assert.Equal<i64>(HpackTable.FindName(statics, table, Convert.StringToBytes(":status")), 8_i64, "static name first");
-    Assert.Equal<i64>(HpackTable.FindName(statics, table, Convert.StringToBytes("x-custom")), 62_i64, "dynamic name");
-    Assert.Equal<i64>(HpackTable.FindName(statics, table, Convert.StringToBytes("x-other")), 0_i64, "unknown name");
+    test InsertEvictsOldestFirst
+    {
+        StaticTable statics = HpackTable.NewStaticTable();
+        mut DynamicTable table = HpackTable.NewDynamicTable(100_i64);
+        HpackTable.DynamicInsert(table, Sized("a", 9_i64));
+        HpackTable.DynamicInsert(table, Sized("b", 9_i64));
+        HpackTable.DynamicInsert(table, Sized("c", 9_i64));
+        // 42 * 3 > 100, so "a" was evicted.
+        Assert.Equal<i64>(HpackTable.DynamicCount(table), 2_i64, "two entries");
+        Assert.Equal<i64>(table.size, 84_i64, "size 84");
+        ExpectField(LookupOk(statics, table, 62_i64), "c", "vvvvvvvvv", "newest is 62");
+        ExpectField(LookupOk(statics, table, 63_i64), "b", "vvvvvvvvv", "older is 63");
+    }
+
+    test EntryExactlyFillingTheTableIsKept
+    {
+        mut DynamicTable table = HpackTable.NewDynamicTable(55_i64);
+        HpackTable.DynamicInsert(table, Hpack.Field("custom-key", "custom-header"));
+        Assert.Equal<i64>(HpackTable.DynamicCount(table), 1_i64, "fits exactly");
+        Assert.Equal<i64>(table.size, 55_i64, "size 55");
+    }
+
+    test EntryLargerThanTableEmptiesIt
+    {
+        mut DynamicTable table = HpackTable.NewDynamicTable(100_i64);
+        HpackTable.DynamicInsert(table, Sized("a", 9_i64));
+        HpackTable.DynamicInsert(table, Sized("big", 70_i64));
+        Assert.Equal<i64>(HpackTable.DynamicCount(table), 0_i64, "emptied");
+        Assert.Equal<i64>(table.size, 0_i64, "size 0");
+    }
+
+    test ResizeEvictsUntilItFits
+    {
+        mut DynamicTable table = HpackTable.NewDynamicTable(4096_i64);
+        mut i64 i = 0_i64;
+        while (i < 10_i64)
+        {
+            HpackTable.DynamicInsert(table, Sized("k", 9_i64));
+            i = i + 1_i64;
+        }
+        Assert.Equal<i64>(table.size, 420_i64, "ten entries of 42");
+        HpackTable.DynamicResize(table, 100_i64);
+        Assert.Equal<i64>(HpackTable.DynamicCount(table), 2_i64, "two remain");
+        Assert.Equal<i64>(table.size, 84_i64, "84");
+        HpackTable.DynamicResize(table, 0_i64);
+        Assert.Equal<i64>(HpackTable.DynamicCount(table), 0_i64, "zero size empties");
+    }
+
+    test ManyInsertsKeepOrderAcrossCompaction
+    {
+        StaticTable statics = HpackTable.NewStaticTable();
+        mut DynamicTable table = HpackTable.NewDynamicTable(420_i64);
+        string digits = "0123456789";
+        mut i64 i = 0_i64;
+        while (i < 500_i64)
+        {
+            string name = "n" + String.SubSlice(digits, (i / 100_i64) % 10_i64, 1_i64) + String.SubSlice(digits, (i / 10_i64) % 10_i64, 1_i64) + String.SubSlice(digits, i % 10_i64, 1_i64);
+            HpackTable.DynamicInsert(table, Hpack.Field(name, "vvvvvv"));
+            i = i + 1_i64;
+        }
+        // Each entry is 4 + 6 + 32 = 42 octets, so ten fit.
+        Assert.Equal<i64>(HpackTable.DynamicCount(table), 10_i64, "ten entries");
+        Assert.Equal<i64>(table.size, 420_i64, "full");
+        Assert.True(Array.Len<HeaderField>(table.entries) < 64_i64, "backing array compacted");
+        ExpectField(LookupOk(statics, table, 62_i64), "n499", "vvvvvv", "newest");
+        ExpectField(LookupOk(statics, table, 71_i64), "n490", "vvvvvv", "oldest");
+    }
+
+    test FindPrefersLowestIndex
+    {
+        StaticTable statics = HpackTable.NewStaticTable();
+        mut DynamicTable table = HpackTable.NewDynamicTable(4096_i64);
+        HpackTable.DynamicInsert(table, Hpack.Field(":status", "302"));
+        HpackTable.DynamicInsert(table, Hpack.Field("x-custom", "1"));
+        Assert.Equal<i64>(HpackTable.FindField(statics, table, Hpack.Field(":method", "GET")), 2_i64, "static full match");
+        Assert.Equal<i64>(HpackTable.FindField(statics, table, Hpack.Field(":status", "302")), 63_i64, "dynamic full match");
+        Assert.Equal<i64>(HpackTable.FindField(statics, table, Hpack.Field(":status", "307")), 0_i64, "no full match");
+        Assert.Equal<i64>(HpackTable.FindName(statics, table, Convert.StringToBytes(":status")), 8_i64, "static name first");
+        Assert.Equal<i64>(HpackTable.FindName(statics, table, Convert.StringToBytes("x-custom")), 62_i64, "dynamic name");
+        Assert.Equal<i64>(HpackTable.FindName(statics, table, Convert.StringToBytes("x-other")), 0_i64, "unknown name");
+    }
 }

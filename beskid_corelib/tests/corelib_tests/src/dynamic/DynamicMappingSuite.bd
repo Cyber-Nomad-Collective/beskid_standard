@@ -302,197 +302,200 @@ unit AssertWideOrder(MapOrderWide order, string label, i64 points)
     };
 }
 
-// An AOT-issued plan through the registered token; the destination is fresh and
-// mutation in either direction never reaches the other value.
-test DynamicMappingFreshNestedDestinationIsIsolatedFromSource
-{
-    DynamicValueV1 source = OrderCell("order", 3_i64);
-    u64 token = Token(Mapping<MapOrder, MapOrderWide>(), "a lossless nested plan is approved");
-    Assert.True(token != 0_u64, "an approved mapping token is nonzero");
-    DynamicValueV1 mapped = MapOrThrow(source, token, "registered mapping succeeds");
-    Assert.True(Results.IsError(Cast(mapped, Shape<MapOrder>())), "the destination is a new cell of the destination shape");
-    AssertWideOrder(WideOrder(mapped), "order", 3_i64);
-    AssertSourceOrder(SourceOrder(source), "order", 3_i64);
-
-    MapOrderWide wide = WideOrder(mapped);
-    mut MapPointWide origin = wide.origin;
-    origin.x = 99_i64;
-    mut MapPointWide first = wide.path[0];
-    first.y = 77_i64;
-    i64[] weights = wide.weights;
-    weights[0] = 555_i64;
-    MapOrderWide again = WideOrder(mapped);
-    Assert.Equal(again.origin.x, 99_i64, "destination mutation is visible through the destination");
-    Assert.Equal(again.path[0].y, 77_i64, "destination array element mutation is visible through the destination");
-    Assert.Equal(again.weights[0], 555_i64, "destination scalar array mutation is visible through the destination");
-    AssertSourceOrder(SourceOrder(source), "order", 3_i64);
-
-    MapOrder original = SourceOrder(source);
-    mut MapPoint last = original.path[2];
-    last.y = -1_i32;
-    mut MapPoint sourceOrigin = original.origin;
-    sourceOrigin.y = -2_i32;
-    MapOrderWide after = WideOrder(mapped);
-    Assert.Equal(after.path[2].y, 8_i64, "source mutation does not reach the destination array");
-    Assert.Equal(after.origin.y, 2_i64, "source mutation does not reach the destination record");
-}
-
-// An identity plan still copies every mutable aggregate.
-test DynamicMappingIdentityPlanCopiesInsteadOfAliasing
-{
-    DynamicValueV1 source = OrderCell("same", 2_i64);
-    u64 token = Token(Mapping<MapOrder, MapOrder>(), "the identity plan is approved");
-    DynamicValueV1 mapped = MapOrThrow(source, token, "identity mapping succeeds");
-    MapOrder copy = SourceOrder(mapped);
-    AssertSourceOrder(copy, "same", 2_i64);
-    mut MapPoint point = copy.path[0];
-    point.x = 1000_i32;
-    i64[] weights = copy.weights;
-    weights[1] = 0_i64;
-    AssertSourceOrder(SourceOrder(source), "same", 2_i64);
-    Assert.Equal(SourceOrder(mapped).path[0].x, 1000_i32, "the copy owns its own nested record");
-}
-
-// The source shape is known only at run time; each erased cell maps only
-// through the registered mapping whose source is its own shape.
-test DynamicMappingRuntimeKnownSourceShapeSelectsTheRegisteredMapping
-{
-    DynamicValueV1[] cells = [PointCell(4_i32, -6_i32), OrderCell("runtime", 2_i64), BoxCell(-9_i32, 4_i64)];
-    u64[] tokens = [Token(Mapping<MapPoint, MapPointWide>(), "point plan is approved"), Token(Mapping<MapOrder, MapOrderWide>(), "order plan is approved"), Token(Mapping<MapBox<i32>, MapBox<i64>>(), "generic instantiation plan is approved")];
-    Assert.True(tokens[0] != tokens[1] && tokens[1] != tokens[2] && tokens[0] != tokens[2], "distinct plans have distinct tokens");
-    mut i64 cell = 0_i64;
-    mut i64 mappedCount = 0_i64;
-    while (cell < 3_i64)
-    {
-        mut i64 token = 0_i64;
-        while (token < 3_i64)
-        {
-            match (Dynamic.Map(cells[cell], tokens[token]))
-            {
-                Result::Error(_) => Assert.True(cell != token, "the matching registered mapping succeeds"),
-                Result::Ok(mapped) => {
-                    Assert.Equal(cell, token, "a mapping never accepts a cell of another source shape");
-                    mappedCount = mappedCount + 1_i64;
-                    if (cell == 0_i64)
-                    {
-                        match (Cast(mapped, Shape<MapPointWide>()))
-                        {
-                            Result::Error(_) => Assert.Fail("point maps to the wide point shape"),
-                            Result::Ok(payload) => match (Unpack<MapPointWide>(payload))
-                            {
-                                Result::Error(_) => Assert.Fail("wide point is extracted"),
-                                Result::Ok(point) => {
-                                    Assert.Equal(point.x, 4_i64, "point x widens");
-                                    Assert.Equal(point.y, -6_i64, "negative i32 sign-extends to i64");
-                                },
-                            },
-                        };
-                    }
-                    if (cell == 1_i64)
-                    {
-                        AssertWideOrder(WideOrder(mapped), "runtime", 2_i64);
-                    }
-                    if (cell == 2_i64)
-                    {
-                        match (Cast(mapped, Shape<MapBox<i64>>()))
-                        {
-                            Result::Error(_) => Assert.Fail("box maps to the i64 instantiation"),
-                            Result::Ok(payload) => match (Unpack<MapBox<i64>>(payload))
-                            {
-                                Result::Error(_) => Assert.Fail("i64 box is extracted"),
-                                Result::Ok(boxed) => {
-                                    Assert.Equal(boxed.item, -9_i64, "generic item widens");
-                                    Assert.Equal(Array.Len<i64>(boxed.items), 4_i64, "generic array keeps its length");
-                                    Assert.Equal(boxed.items[0], -5_i64, "generic array elements sign-extend");
-                                    Assert.Equal(boxed.items[3], -2_i64, "generic array maps every element");
-                                },
-                            },
-                        };
-                    }
-                },
-            };
-            token = token + 1_i64;
-        }
-        cell = cell + 1_i64;
-    }
-    Assert.Equal(mappedCount, 3_i64, "exactly one registered mapping accepts each runtime shape");
-}
-
-// Numeric narrowing, sign change and string coercion have no approved plan.
-test DynamicMappingNumericNarrowingIsRejectedWithoutDestination
-{
-    Assert.True(Results.IsError(Mapping<MapPointWide, MapPoint>()), "i64 to i32 narrowing is rejected");
-    Assert.True(Results.IsError(Mapping<MapPoint, MapPointNarrow>()), "i32 to i16 narrowing is rejected");
-    Assert.True(Results.IsError(Mapping<MapPoint, MapPointUnsigned>()), "i32 to u32 sign change is rejected");
-    Assert.True(Results.IsError(Mapping<MapPoint, MapPointText>()), "i32 to string coercion is rejected");
-    Assert.True(Results.IsError(Mapping<MapBox<i64>, MapBox<i32>>()), "generic instantiation narrowing is rejected");
-    DynamicValueV1 source = PointCell(70000_i32, -70000_i32);
-    Assert.True(Results.IsError(Dynamic.Map(source, 0_u64)), "a rejected plan has no token to map with");
-    match (Cast(source, Shape<MapPoint>()))
-    {
-        Result::Error(_) => Assert.Fail("the source cell is unchanged"),
-        Result::Ok(payload) => match (Unpack<MapPoint>(payload))
-        {
-            Result::Error(_) => Assert.Fail("the source payload is unchanged"),
-            Result::Ok(point) => {
-                Assert.Equal(point.x, 70000_i32, "source x is unchanged");
-                Assert.Equal(point.y, -70000_i32, "source y is unchanged");
-            },
-        },
-    };
-}
-
-// A plan whose earlier fields are compatible but whose later nested field narrows
-// is rejected as a whole; nothing is registered and no partial destination exists.
-test DynamicMappingLateNestedFailureRejectsTheWholePlan
-{
-    Assert.True(Results.IsError(Mapping<MapOrder, MapOrderLateNarrow>()), "late scalar array narrowing rejects the plan");
-    Assert.True(Results.IsError(Mapping<MapOrder, MapOrderNestedNarrow>()), "narrowing inside an array of records rejects the plan");
-    Assert.True(Results.IsError(Mapping<MapOrder, MapOrderDropsWeights>()), "an unknown source field rejects the plan");
-    Assert.True(Results.IsError(Mapping<MapPoint, MapPointDeep>()), "a destination field without source or optional declaration rejects the plan");
-    DynamicValueV1 source = OrderCell("late", 4_i64);
-    u64 pointToken = Token(Mapping<MapPoint, MapPointWide>(), "an unrelated plan is approved");
-    Assert.True(Results.IsError(Dynamic.Map(source, pointToken)), "a mapping registered for another source shape rejects");
-    AssertSourceOrder(SourceOrder(source), "late", 4_i64);
-    u64 orderToken = Token(Mapping<MapOrder, MapOrderWide>(), "the compatible plan is approved");
-    AssertWideOrder(WideOrder(MapOrThrow(source, orderToken, "the source still maps after rejections")), "late", 4_i64);
-}
-
 DynamicValueV1 ScopedOrderCell(i64 points)
 {
     return OrderCell("collected order", points);
 }
 
-// Large nested sources allocate many destination objects per map,
-// with churn and forced collections between and after mappings; only the cells root them.
-test DynamicMappingDestinationSurvivesCollectionDuringAndAfterMap
+mod MappingTests
 {
-    DynamicValueV1 source = ScopedOrderCell(256_i64);
-    u64 token = Token(Mapping<MapOrder, MapOrderWide>(), "the compatible plan is approved");
-    mut DynamicValueV1 kept = MapOrThrow(source, token, "first mapping succeeds");
-    mut i64 round = 0_i64;
-    while (round < 24_i64)
+    // An AOT-issued plan through the registered token; the destination is fresh and
+    // mutation in either direction never reaches the other value.
+    test FreshNestedDestinationIsIsolatedFromSource
     {
-        mut i64 churn = 0_i64;
-        while (churn < 64_i64)
-        {
-            MapOrder garbage = Order("garbage", 16_i64);
-            Assert.Equal(Array.Len<MapPoint>(garbage.path), 16_i64, "garbage is allocated");
-            churn = churn + 1_i64;
-        }
-        if (round % 6_i64 == 0_i64)
-        {
-            Assert.CollectGarbage();
-        }
-        DynamicValueV1 mapped = MapOrThrow(source, token, "repeated mapping succeeds");
-        if (round % 8_i64 == 0_i64)
-        {
-            kept = mapped;
-        }
-        round = round + 1_i64;
+        DynamicValueV1 source = OrderCell("order", 3_i64);
+        u64 token = Token(Mapping<MapOrder, MapOrderWide>(), "a lossless nested plan is approved");
+        Assert.True(token != 0_u64, "an approved mapping token is nonzero");
+        DynamicValueV1 mapped = MapOrThrow(source, token, "registered mapping succeeds");
+        Assert.True(Results.IsError(Cast(mapped, Shape<MapOrder>())), "the destination is a new cell of the destination shape");
+        AssertWideOrder(WideOrder(mapped), "order", 3_i64);
+        AssertSourceOrder(SourceOrder(source), "order", 3_i64);
+
+        MapOrderWide wide = WideOrder(mapped);
+        mut MapPointWide origin = wide.origin;
+        origin.x = 99_i64;
+        mut MapPointWide first = wide.path[0];
+        first.y = 77_i64;
+        i64[] weights = wide.weights;
+        weights[0] = 555_i64;
+        MapOrderWide again = WideOrder(mapped);
+        Assert.Equal(again.origin.x, 99_i64, "destination mutation is visible through the destination");
+        Assert.Equal(again.path[0].y, 77_i64, "destination array element mutation is visible through the destination");
+        Assert.Equal(again.weights[0], 555_i64, "destination scalar array mutation is visible through the destination");
+        AssertSourceOrder(SourceOrder(source), "order", 3_i64);
+
+        MapOrder original = SourceOrder(source);
+        mut MapPoint last = original.path[2];
+        last.y = -1_i32;
+        mut MapPoint sourceOrigin = original.origin;
+        sourceOrigin.y = -2_i32;
+        MapOrderWide after = WideOrder(mapped);
+        Assert.Equal(after.path[2].y, 8_i64, "source mutation does not reach the destination array");
+        Assert.Equal(after.origin.y, 2_i64, "source mutation does not reach the destination record");
     }
-    Assert.CollectGarbage();
-    Assert.CollectGarbage();
-    AssertWideOrder(WideOrder(kept), "collected order", 256_i64);
-    AssertSourceOrder(SourceOrder(source), "collected order", 256_i64);
+
+    // An identity plan still copies every mutable aggregate.
+    test IdentityPlanCopiesInsteadOfAliasing
+    {
+        DynamicValueV1 source = OrderCell("same", 2_i64);
+        u64 token = Token(Mapping<MapOrder, MapOrder>(), "the identity plan is approved");
+        DynamicValueV1 mapped = MapOrThrow(source, token, "identity mapping succeeds");
+        MapOrder copy = SourceOrder(mapped);
+        AssertSourceOrder(copy, "same", 2_i64);
+        mut MapPoint point = copy.path[0];
+        point.x = 1000_i32;
+        i64[] weights = copy.weights;
+        weights[1] = 0_i64;
+        AssertSourceOrder(SourceOrder(source), "same", 2_i64);
+        Assert.Equal(SourceOrder(mapped).path[0].x, 1000_i32, "the copy owns its own nested record");
+    }
+
+    // The source shape is known only at run time; each erased cell maps only
+    // through the registered mapping whose source is its own shape.
+    test RuntimeKnownSourceShapeSelectsTheRegisteredMapping
+    {
+        DynamicValueV1[] cells = [PointCell(4_i32, -6_i32), OrderCell("runtime", 2_i64), BoxCell(-9_i32, 4_i64)];
+        u64[] tokens = [Token(Mapping<MapPoint, MapPointWide>(), "point plan is approved"), Token(Mapping<MapOrder, MapOrderWide>(), "order plan is approved"), Token(Mapping<MapBox<i32>, MapBox<i64>>(), "generic instantiation plan is approved")];
+        Assert.True(tokens[0] != tokens[1] && tokens[1] != tokens[2] && tokens[0] != tokens[2], "distinct plans have distinct tokens");
+        mut i64 cell = 0_i64;
+        mut i64 mappedCount = 0_i64;
+        while (cell < 3_i64)
+        {
+            mut i64 token = 0_i64;
+            while (token < 3_i64)
+            {
+                match (Dynamic.Map(cells[cell], tokens[token]))
+                {
+                    Result::Error(_) => Assert.True(cell != token, "the matching registered mapping succeeds"),
+                    Result::Ok(mapped) => {
+                        Assert.Equal(cell, token, "a mapping never accepts a cell of another source shape");
+                        mappedCount = mappedCount + 1_i64;
+                        if (cell == 0_i64)
+                        {
+                            match (Cast(mapped, Shape<MapPointWide>()))
+                            {
+                                Result::Error(_) => Assert.Fail("point maps to the wide point shape"),
+                                Result::Ok(payload) => match (Unpack<MapPointWide>(payload))
+                                {
+                                    Result::Error(_) => Assert.Fail("wide point is extracted"),
+                                    Result::Ok(point) => {
+                                        Assert.Equal(point.x, 4_i64, "point x widens");
+                                        Assert.Equal(point.y, -6_i64, "negative i32 sign-extends to i64");
+                                    },
+                                },
+                            };
+                        }
+                        if (cell == 1_i64)
+                        {
+                            AssertWideOrder(WideOrder(mapped), "runtime", 2_i64);
+                        }
+                        if (cell == 2_i64)
+                        {
+                            match (Cast(mapped, Shape<MapBox<i64>>()))
+                            {
+                                Result::Error(_) => Assert.Fail("box maps to the i64 instantiation"),
+                                Result::Ok(payload) => match (Unpack<MapBox<i64>>(payload))
+                                {
+                                    Result::Error(_) => Assert.Fail("i64 box is extracted"),
+                                    Result::Ok(boxed) => {
+                                        Assert.Equal(boxed.item, -9_i64, "generic item widens");
+                                        Assert.Equal(Array.Len<i64>(boxed.items), 4_i64, "generic array keeps its length");
+                                        Assert.Equal(boxed.items[0], -5_i64, "generic array elements sign-extend");
+                                        Assert.Equal(boxed.items[3], -2_i64, "generic array maps every element");
+                                    },
+                                },
+                            };
+                        }
+                    },
+                };
+                token = token + 1_i64;
+            }
+            cell = cell + 1_i64;
+        }
+        Assert.Equal(mappedCount, 3_i64, "exactly one registered mapping accepts each runtime shape");
+    }
+
+    // Numeric narrowing, sign change and string coercion have no approved plan.
+    test NumericNarrowingIsRejectedWithoutDestination
+    {
+        Assert.True(Results.IsError(Mapping<MapPointWide, MapPoint>()), "i64 to i32 narrowing is rejected");
+        Assert.True(Results.IsError(Mapping<MapPoint, MapPointNarrow>()), "i32 to i16 narrowing is rejected");
+        Assert.True(Results.IsError(Mapping<MapPoint, MapPointUnsigned>()), "i32 to u32 sign change is rejected");
+        Assert.True(Results.IsError(Mapping<MapPoint, MapPointText>()), "i32 to string coercion is rejected");
+        Assert.True(Results.IsError(Mapping<MapBox<i64>, MapBox<i32>>()), "generic instantiation narrowing is rejected");
+        DynamicValueV1 source = PointCell(70000_i32, -70000_i32);
+        Assert.True(Results.IsError(Dynamic.Map(source, 0_u64)), "a rejected plan has no token to map with");
+        match (Cast(source, Shape<MapPoint>()))
+        {
+            Result::Error(_) => Assert.Fail("the source cell is unchanged"),
+            Result::Ok(payload) => match (Unpack<MapPoint>(payload))
+            {
+                Result::Error(_) => Assert.Fail("the source payload is unchanged"),
+                Result::Ok(point) => {
+                    Assert.Equal(point.x, 70000_i32, "source x is unchanged");
+                    Assert.Equal(point.y, -70000_i32, "source y is unchanged");
+                },
+            },
+        };
+    }
+
+    // A plan whose earlier fields are compatible but whose later nested field narrows
+    // is rejected as a whole; nothing is registered and no partial destination exists.
+    test LateNestedFailureRejectsTheWholePlan
+    {
+        Assert.True(Results.IsError(Mapping<MapOrder, MapOrderLateNarrow>()), "late scalar array narrowing rejects the plan");
+        Assert.True(Results.IsError(Mapping<MapOrder, MapOrderNestedNarrow>()), "narrowing inside an array of records rejects the plan");
+        Assert.True(Results.IsError(Mapping<MapOrder, MapOrderDropsWeights>()), "an unknown source field rejects the plan");
+        Assert.True(Results.IsError(Mapping<MapPoint, MapPointDeep>()), "a destination field without source or optional declaration rejects the plan");
+        DynamicValueV1 source = OrderCell("late", 4_i64);
+        u64 pointToken = Token(Mapping<MapPoint, MapPointWide>(), "an unrelated plan is approved");
+        Assert.True(Results.IsError(Dynamic.Map(source, pointToken)), "a mapping registered for another source shape rejects");
+        AssertSourceOrder(SourceOrder(source), "late", 4_i64);
+        u64 orderToken = Token(Mapping<MapOrder, MapOrderWide>(), "the compatible plan is approved");
+        AssertWideOrder(WideOrder(MapOrThrow(source, orderToken, "the source still maps after rejections")), "late", 4_i64);
+    }
+
+    // Large nested sources allocate many destination objects per map,
+    // with churn and forced collections between and after mappings; only the cells root them.
+    test DestinationSurvivesCollectionDuringAndAfterMap
+    {
+        DynamicValueV1 source = ScopedOrderCell(256_i64);
+        u64 token = Token(Mapping<MapOrder, MapOrderWide>(), "the compatible plan is approved");
+        mut DynamicValueV1 kept = MapOrThrow(source, token, "first mapping succeeds");
+        mut i64 round = 0_i64;
+        while (round < 24_i64)
+        {
+            mut i64 churn = 0_i64;
+            while (churn < 64_i64)
+            {
+                MapOrder garbage = Order("garbage", 16_i64);
+                Assert.Equal(Array.Len<MapPoint>(garbage.path), 16_i64, "garbage is allocated");
+                churn = churn + 1_i64;
+            }
+            if (round % 6_i64 == 0_i64)
+            {
+                Assert.CollectGarbage();
+            }
+            DynamicValueV1 mapped = MapOrThrow(source, token, "repeated mapping succeeds");
+            if (round % 8_i64 == 0_i64)
+            {
+                kept = mapped;
+            }
+            round = round + 1_i64;
+        }
+        Assert.CollectGarbage();
+        Assert.CollectGarbage();
+        AssertWideOrder(WideOrder(kept), "collected order", 256_i64);
+        AssertSourceOrder(SourceOrder(source), "collected order", 256_i64);
+    }
 }

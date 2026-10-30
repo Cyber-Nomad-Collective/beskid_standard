@@ -12,326 +12,6 @@ use Core.Collections.Map;
 use Core.String;
 use Core.Memory.Managed;
 
-// ---- Array ----
-
-// Public API coverage for typed `Core.Collections.Array` operations.
-
-test ArrayAppendPreservesTypedValues
-{
-    mut i64[] values = Array.Empty<i64>();
-    Array.Append<i64>(values, 10);
-    Array.Append<i64>(values, 20);
-    Array.Append<i64>(values, 30);
-    Assert.Equal(Array.Len<i64>(values), 3, "append grows logical length");
-    Assert.Equal(Array.Get<i64>(values, 0), 10, "growth preserves first value");
-    Assert.Equal(Array.Get<i64>(values, 2), 30, "append stores tail value");
-}
-
-test ArraySetUsesDirectIndexSemantics
-{
-    mut i64[] values = Array.Empty<i64>();
-    Array.Append<i64>(values, 1);
-    values = Array.Set<i64>(values, 0, 9);
-    Assert.Equal(Array.Get<i64>(values, 0), 9, "set replaces indexed value");
-}
-
-test ArrayPointerValuesSurviveForcedGcDuringGrowth
-{
-    mut string[] values = Array.Empty<string>();
-    Array.Append<string>(values, "first");
-    Assert.CollectGarbage();
-    Array.Append<string>(values, "second");
-    Assert.CollectGarbage();
-    Assert.Equal(Array.Get<string>(values, 0), "first", "rooted growth retains the first pointer value");
-    Assert.Equal(Array.Get<string>(values, 1), "second", "publication retains the appended pointer value");
-}
-
-test ArrayCapacityIsNotLogicalLength
-{
-    mut i64[] values = Array.Empty<i64>();
-    Array.Append<i64>(values, 1);
-    Assert.Equal(Array.Len<i64>(values), 1, "append exposes exactly one initialized value");
-    Assert.True(Array.Capacity<i64>(values) >= Array.Len<i64>(values), "capacity may exceed logical length");
-}
-
-test ArrayIteratorStopsAtLogicalLength
-{
-    mut i64[] values = Array.Empty<i64>();
-    Array.Append<i64>(values, 4);
-    Array.Append<i64>(values, 5);
-    mut ArrayIter<i64> iterator = Array.Iterate<i64>(values);
-    Assert.True(Array.HasNext<i64>(iterator), "iterator starts in bounds");
-    Assert.Equal(Array.Current<i64>(values, iterator), 4, "iterator reads first value");
-    iterator = Array.Advance<i64>(iterator);
-    Assert.Equal(Array.Current<i64>(values, iterator), 5, "iterator reads second value");
-    iterator = Array.Advance<i64>(iterator);
-    Assert.False(Array.HasNext<i64>(iterator), "iterator stops at logical length");
-}
-
-// Append grows geometrically, so n appends reallocate O(log n) times and copy O(n) in total.
-test ArrayAppendGrowthIsGeometric
-{
-    mut u8[] values = Array.Empty<u8>();
-    mut i64 capacity = Array.Capacity<u8>(values);
-    mut i64 growths = 0;
-    mut i64 i = 0;
-    while (i < 262144)
-    {
-        i64 value = i % 256;
-        Array.Append<u8>(values, u8(value));
-        if (Array.Capacity<u8>(values) != capacity)
-        {
-            capacity = Array.Capacity<u8>(values);
-            growths = growths + 1;
-        }
-        i = i + 1;
-    }
-    Assert.Equal(Array.Len<u8>(values), 262144, "every append is visible");
-    Assert.True(Array.Capacity<u8>(values) >= 262144, "capacity covers the length");
-    Assert.True(Array.Capacity<u8>(values) <= 524288, "capacity at most doubles past the length");
-    Assert.True(growths <= 19, "256 Ki appends grow the storage at most 19 times, so growth is geometric");
-    u8 first = values[0];
-    u8 middle = values[255];
-    u8 last = values[262143];
-    i64 sum = i64(first) + i64(middle) + i64(last);
-    Assert.Equal(sum, 510, "appended values are stored in order");
-}
-
-test ArrayRemoveLastShortensTheArrayInPlace
-{
-    mut i64[] values = [1_i64, 2_i64, 3_i64];
-    i64[] rest = Array.RemoveLast<i64>(values);
-    Assert.Equal(Array.Len<i64>(values), 2, "the caller's array loses its last element");
-    Assert.Equal(Array.Len<i64>(rest), 2, "the returned array is the shortened array");
-    Assert.Equal(values[0], 1_i64, "first element stays");
-    Assert.Equal(values[1], 2_i64, "second element stays");
-    Array.Append<i64>(values, 9_i64);
-    Assert.Equal(values[2], 9_i64, "the freed slot takes the next append");
-}
-
-test ArrayCopyRangeCopiesASubrangeAtAnOffset
-{
-    i64[] source = [10_i64, 20_i64, 30_i64, 40_i64];
-    i64[] destination = Array.Zeroed<i64>(5);
-    Array.CopyRange<i64>(destination, 1, source, 2, 2);
-    Assert.Equal(destination[0], 0_i64, "before the offset is untouched");
-    Assert.Equal(destination[1], 30_i64, "first copied element");
-    Assert.Equal(destination[2], 40_i64, "second copied element");
-    Assert.Equal(destination[3], 0_i64, "after the range is untouched");
-    Assert.Equal(source[2], 30_i64, "the source is unchanged");
-    Array.CopyRange<i64>(destination, 0, source, 0, 0);
-    Assert.Equal(destination[0], 0_i64, "a zero-length copy changes nothing");
-}
-
-test ArrayIndexReportsTheIteratorPosition
-{
-    i64[] values = [7_i64, 8_i64];
-    mut ArrayIter<i64> iterator = Array.Iterate<i64>(values);
-    Assert.Equal(Array.Index<i64>(iterator), 0, "a new iterator is at index 0");
-    iterator = Array.Advance<i64>(iterator);
-    Assert.Equal(Array.Index<i64>(iterator), 1, "Advance moves to index 1");
-    iterator = Array.Advance<i64>(iterator);
-    Assert.Equal(Array.Index<i64>(iterator), 2, "past the end the index is the length");
-    Assert.False(Array.HasNext<i64>(iterator), "and HasNext is false");
-}
-
-test ArrayZeroedAllocatesExactZeroFilledLength
-{
-    i64[] values = Array.Zeroed<i64>(1000);
-    Assert.Equal(Array.Len<i64>(values), 1000, "zeroed length");
-    Assert.Equal(Array.Capacity<i64>(values), 1000, "zeroed capacity");
-    i64 sum = values[0] + values[999];
-    Assert.Equal(sum, 0, "zeroed elements");
-}
-
-// Reference elements survive geometric growth and forced collections (pointer map, barriers).
-test ArrayAppendOfManagedReferencesSurvivesCollection
-{
-    mut string[] values = Array.Empty<string>();
-    mut i64 i = 0;
-    while (i < 3000)
-    {
-        Array.Append<string>(values, "item");
-        if (i % 500 == 0)
-        {
-            Assert.CollectGarbage();
-        }
-        i = i + 1;
-    }
-    Assert.CollectGarbage();
-    Assert.Equal(Array.Len<string>(values), 3000, "every reference element is present");
-    Assert.Equal(values[0], "item", "first reference survives growth");
-    Assert.Equal(values[2999], "item", "last reference survives growth");
-    mut i64[] nested = Array.Zeroed<i64>(16);
-    mut i64 round = 0;
-    while (round < 200)
-    {
-        i64[] inner = Array.Zeroed<i64>(4096);
-        nested[round % 16] = Array.Len<i64>(inner);
-        round = round + 1;
-    }
-    Assert.Equal(nested[15], 4096, "zeroed arrays allocated in a loop have their length");
-}
-
-// ---- Typed Array length ----
-
-test TypedArrayLengthAndEmptySemantics
-{
-    mut i64[] populated = Array.Empty<i64>();
-    Assert.True(Array.IsEmpty<i64>(populated), "new typed array is empty");
-    Array.Append<i64>(populated, 5);
-    Assert.Equal(Array.Len<i64>(populated), 1, "append advances logical length");
-    Assert.False(Array.IsEmpty<i64>(populated), "populated typed array is not empty");
-}
-
-// ---- Collections ----
-
-// Cross-collection public API integration coverage.
-
-test CollectionReceiverMethodsAreThePublicSurface
-{
-    List<i64> list = List.New<i64>();
-    list.Push(42);
-    Stack<i64> stack = Stack.New<i64>();
-    stack.Push(42);
-    Assert.Equal(list.Count(), 1, "list receiver method updates count");
-    Assert.Equal(stack.Count(), 1, "stack receiver method updates count");
-}
-
-// ---- List ----
-
-// Public API coverage for `Core.Collections.List`.
-
-test ListRetainsValuesAcrossGrowth
-{
-    List<i64> values = List.New<i64>();
-    values.Push(10);
-    values.Push(20);
-    values.Push(30);
-    Assert.Equal(values.Count(), 3, "list count after growth");
-    i64 first = match (values.Get(0))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    i64 last = match (values.Get(2))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(first, 10, "list preserves first value");
-    Assert.Equal(last, 30, "list appends at tail");
-}
-
-test ListPopRemovesOnlyTheTail
-{
-    List<i64> values = List.New<i64>();
-    values.Push(7);
-    values.Push(8);
-    values.Pop();
-    Assert.Equal(values.Count(), 1, "pop decrements count");
-    i64 retained = match (values.Get(0))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(retained, 7, "pop retains preceding values");
-}
-
-test ListPopClearsPointerTailBeforeCollection
-{
-    List<string> values = List.New<string>();
-    values.Push("retained");
-    values.Push("removed");
-    values.Pop();
-    Assert.CollectGarbage();
-    string retained = match (values.Get(0))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => "error",
-    };
-    Assert.Equal(retained, "retained", "pop clears the removed tail without losing retained pointers");
-}
-
-test ListGetRejectsDirectBounds
-{
-    List<i64> values = List.New<i64>();
-    bool negative = match (values.Get(-1))
-    {
-        Core.Results.Result::Ok(_) => false,
-        Core.Results.Result::Error(_) => true,
-    };
-    bool atEnd = match (values.Get(0))
-    {
-        Core.Results.Result::Ok(_) => false,
-        Core.Results.Result::Error(_) => true,
-    };
-    Assert.True(negative, "negative index is out of bounds");
-    Assert.True(atEnd, "index at count is out of bounds");
-}
-
-// ---- In-place mutation and copy on assignment ----
-
-// Collections change in place: `items.Push(x);` needs no rebinding. A `List` is copied on
-// assignment and when it is passed to a parameter that is not `mut`, returned, captured or bound
-// by a `for` loop; the copy is copy-on-write, so two names share the backing array only until
-// one of them writes. A plain parameter gets a lent view that copies before it writes; a `mut`
-// parameter shares the caller's list.
-
-test ListPushChangesTheListInPlace
-{
-    List<string> items = List.New<string>();
-    items.Push("milk");
-    items.Push("bread");
-    Assert.Equal(items.Count(), 2, "push changes the receiver");
-    Assert.Equal(StringOr(items.Get(1), "?"), "bread", "push appends at the tail");
-    Assert.Equal(StringOrNone(items.Pop()), "bread", "pop returns the tail");
-    Assert.Equal(items.Count(), 1, "pop changes the receiver");
-}
-
-test ListAssignmentCopies
-{
-    List<i64> a = List.New<i64>();
-    a.Push(1);
-    List<i64> b = a;
-    b.Push(2);
-    Assert.Equal(a.Count(), 1, "the source keeps its count");
-    Assert.Equal(b.Count(), 2, "the copy grows on its own");
-    b.Set(0, 9);
-    Assert.Equal(I64Or(a.Get(0), -1), 1, "a write through the copy is not visible in the source");
-    a.Set(0, 5);
-    Assert.Equal(I64Or(b.Get(0), -1), 9, "a write through the source is not visible in the copy");
-}
-
-test ListReassignmentCopies
-{
-    List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
-    mut List<i64> b = List.New<i64>();
-    b = a;
-    a.Push(3);
-    Assert.Equal(b.Count(), 2, "an assigned list does not see later pushes to its source");
-}
-
-test ListGrowthDoesNotWriteIntoSharedStorage
-{
-    List<i64> a = List.New<i64>();
-    a.Push(0);
-    a.Pop();
-    List<i64> b = a;
-    b.Push(1);
-    a.Push(2);
-    Assert.Equal(I64Or(b.Get(0), -1), 1, "the copy holds its own element");
-    Assert.Equal(I64Or(a.Get(0), -1), 2, "the source holds its own element");
-    mut i64 index = 0;
-    while (index < 64)
-    {
-        a.Push(index);
-        index = index + 1;
-    }
-    Assert.Equal(b.Count(), 1, "growth of the source does not change the copy");
-    Assert.Equal(I64Or(b.Get(0), -1), 1, "growth of the source keeps the copy's element");
-}
-
 unit GrowCopy(List<i64> l)
 {
     l.Push(9);
@@ -344,59 +24,14 @@ unit GrowShared(mut List<i64> l)
     return;
 }
 
-test ListParameterGetsItsOwnCopy
-{
-    List<i64> a = List.New<i64>();
-    GrowCopy(a);
-    Assert.Equal(a.Count(), 0, "a parameter that is not mut does not change the caller's list");
-}
-
-test ListMutParameterSharesTheCallersList
-{
-    List<i64> a = List.New<i64>();
-    GrowShared(a);
-    Assert.Equal(a.Count(), 1, "a mut parameter changes the caller's list");
-}
-
 type ListHolder
 {
     List<i64> items;
 }
 
-test ListFieldStoreCopies
-{
-    List<i64> a = List.FromArray<i64>([1_i64]);
-    ListHolder holder = ListHolder
-    {
-        items: a,
-    };
-    a.Push(2);
-    Assert.Equal(holder.items.Count(), 1, "a list stored in a field is a copy");
-    List<i64> read = holder.items;
-    read.Push(3);
-    Assert.Equal(holder.items.Count(), 1, "a list read from a field is a copy");
-    holder.items.Push(4);
-    Assert.Equal(holder.items.Count(), 2, "a method call through the field changes the field");
-}
-
-test ListCollectionsOfListsHoldCopies
-{
-    List<i64> inner = List.FromArray<i64>([1_i64]);
-    List<List<i64>> outer = List.New<List<i64>>();
-    outer.Push(inner);
-    inner.Push(2);
-    i64 stored = match (outer.Get(0))
-    {
-        Core.Results.Result::Ok(list) => list.Count(),
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(stored, 1, "an element pushed into a list is a copy");
-}
-
 // A sole owner writes in place: a list built and returned by a function, and a list lent to a
 // call that only reads it (a plain parameter), stays the only holder of its backing array, so
 // a write after the call does not copy the array. A real copy (`kept = items`) does.
-
 Core.Results.Result<List<i64>, string> BuildNumbers(i64 count)
 {
     List<i64> items = List.New<i64>();
@@ -436,101 +71,11 @@ Core.Results.Result<bool, string> BuiltListIsTheSoleOwner()
     return Core.Results.Result::Ok(WritesInPlace(items, seen));
 }
 
-test ListSoleOwnerWritesInPlaceAfterBorrowsAndBuilders
-{
-    bool inPlace = match (BuiltListIsTheSoleOwner())
-    {
-        Core.Results.Result::Ok(flag) => flag,
-        Core.Results.Result::Error(_) => false,
-    };
-    Assert.True(inPlace, "a built list lent to readers is still the sole owner of its array");
-    List<i64> items = List.FromArray<i64>([1_i64, 2_i64]);
-    GrowCopy(items);
-    Assert.True(WritesInPlace(items, 5), "a callee that copied its lent view leaves the caller the sole owner");
-    List<i64> kept = items;
-    Assert.False(WritesInPlace(items, 6), "a list with a copy copies its array before it writes");
-    Assert.Equal(I64Or(kept.Get(0), -1), 5, "the copy keeps the value from before the write");
-}
-
 /// Writes through the element `Get` returns: the element is a copy, so the list is unchanged.
 Core.Results.Result<i64, string> PushIntoFirst(List<List<i64>> lists)
 {
     lists.Get(0)?.Push(5);
     return Core.Results.Result::Ok(lists.Get(0)?.Count());
-}
-
-test ListElementWriteThroughGetDoesNotReachEitherList
-{
-    List<List<i64>> a = List.New<List<i64>>();
-    a.Push(List.FromArray<i64>([1_i64]));
-    List<List<i64>> b = a;
-    i64 counted = match (PushIntoFirst(b))
-    {
-        Core.Results.Result::Ok(count) => count,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(counted, 1, "a write through a returned element does not reach the list");
-    i64 inA = match (a.Get(0))
-    {
-        Core.Results.Result::Ok(list) => list.Count(),
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(inA, 1, "the list that shares the array is unchanged");
-}
-
-test StackQueueSetAndMapChangeInPlace
-{
-    Stack<i64> stack = Stack.New<i64>();
-    stack.Push(1);
-    stack.Push(2);
-    Assert.Equal(I64OrNone(stack.Pop()), 2, "stack pop returns the top");
-    Queue<i64> queue = Queue.New<i64>();
-    queue.Enqueue(1);
-    queue.Enqueue(2);
-    Assert.Equal(I64OrNone(queue.Dequeue()), 1, "dequeue returns the front");
-    Assert.Equal(queue.Count(), 1, "dequeue changes the queue");
-    Set<i64> set = Set.New<i64>();
-    Assert.True(set.Add(1), "add of a new member");
-    Assert.False(set.Add(1), "add of an existing member");
-    Assert.True(set.Remove(1), "remove of a member");
-    Map<i64, i64> map = Map.New<i64, i64>();
-    map.Insert(1, 10);
-    Assert.True(map.Remove(1), "remove of a present key");
-    Assert.False(map.Remove(1), "remove of an absent key");
-}
-
-test ListCopySharesStorageUntilAWrite
-{
-    List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
-    List<i64> b = a;
-    Assert.True(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "a read-only copy copies no elements");
-    b.Set(0, 7);
-    Assert.False(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "the first write copies the array");
-    Assert.Equal(I64Or(a.Get(0), -1), 1, "the source keeps its element");
-    Assert.Equal(I64Or(b.Get(0), -1), 7, "the copy holds the write");
-    a.Pop();
-    Assert.Equal(b.Count(), 2, "a pop through the source does not shrink the copy");
-}
-
-test ListForVariableIsACopy
-{
-    List<i64>[] lists = [List.FromArray<i64>([1_i64])];
-    for item in lists
-    {
-        item.Push(2);
-    }
-    Assert.Equal(lists[0].Count(), 1, "a write through the loop variable does not reach the element");
-}
-
-test ListCaptureIsACopy
-{
-    List<i64> a = List.FromArray<i64>([1_i64]);
-    let grow = () => {
-        a.Push(2);
-        return a.Count();
-    };
-    Assert.Equal(grow(), 2, "the closure writes its own copy");
-    Assert.Equal(a.Count(), 1, "a write through a capture does not reach the captured list");
 }
 
 Core.Results.Result<List<i64>, string> Wrapped(List<i64> list)
@@ -545,19 +90,6 @@ Core.Results.Result<i64, string> TakeAndGrow(Core.Results.Result<List<i64>, stri
     return Core.Results.Result::Ok(taken.Count());
 }
 
-test ListTryPayloadIsACopy
-{
-    List<i64> a = List.FromArray<i64>([1_i64]);
-    Core.Results.Result<List<i64>, string> held = Wrapped(a);
-    Assert.Equal(I64Or(TakeAndGrow(held), -1), 2, "the payload taken with ? is written");
-    List<i64> again = match (held)
-    {
-        Core.Results.Result::Ok(list) => list,
-        Core.Results.Result::Error(_) => List.New<i64>(),
-    };
-    Assert.Equal(again.Count(), 1, "the Result still holds the unwritten list");
-}
-
 i64 GrowBound(Core.Optional.Option<List<i64>> held)
 {
     mut i64 count = -1;
@@ -570,302 +102,6 @@ i64 GrowBound(Core.Optional.Option<List<i64>> held)
         Core.Optional.Option::None => { },
     };
     return count;
-}
-
-test ListPatternBindingIsACopy
-{
-    Core.Optional.Option<List<i64>> held = Core.Optional.Option::Some(List.FromArray<i64>([1_i64]));
-    Assert.Equal(GrowBound(held), 2, "the arm writes its own copy");
-    i64 stored = match (held)
-    {
-        Core.Optional.Option::Some(list) => list.Count(),
-        Core.Optional.Option::None => -1,
-    };
-    Assert.Equal(stored, 1, "a write through a pattern binding does not reach the matched value");
-}
-
-test ListBorrowIsAViewThatCopiesBeforeItWrites
-{
-    mut List<i64> owner = List.FromArray<i64>([1_i64, 2_i64]);
-    mut List<i64> view = owner.Borrow();
-    Assert.True(Managed.SameIdentity<i64[]>(owner.Borrow().BorrowStorage(), owner.BorrowStorage()), "a view shares the owner's array until it writes");
-    Assert.Equal(view.Count(), 2, "the view has the owner's elements");
-    Assert.Equal(I64Or(view.Get(1), -1), 2, "the view reads the owner's storage");
-    view.Push(3);
-    view.Set(0, 9);
-    Assert.Equal(view.Count(), 3, "the view changed");
-    Assert.Equal(owner.Count(), 2, "a write through the view does not reach the owner");
-    Assert.Equal(I64Or(owner.Get(0), -1), 1, "the owner's first element is unchanged");
-    owner.Push(4);
-    Assert.Equal(owner.Count(), 3, "the owner still writes after lending a view");
-    Assert.Equal(I64Or(view.Get(2), -1), 3, "and its write does not reach the view");
-}
-
-test ListDetachedOwnsItsStorage
-{
-    mut List<i64> first = List.FromArray<i64>([1_i64, 2_i64]);
-    List<i64> second = first;
-    mut List<i64> detached = second.Detached();
-    Assert.False(Managed.SameIdentity<i64[]>(detached.BorrowStorage(), second.BorrowStorage()), "a shared list detaches with an array of its own");
-    detached.Set(0, 7);
-    detached.Push(8);
-    Assert.Equal(detached.Count(), 3, "the detached list keeps every element and its own writes");
-    Assert.Equal(I64Or(detached.Get(1), -1), 2, "the detached list holds the same elements");
-    Assert.Equal(I64Or(first.Get(0), -1), 1, "a write to the detached list reaches no list that shared the storage");
-    Assert.Equal(I64Or(second.Get(0), -1), 1, "the source of Detached is unchanged");
-    Assert.Equal(second.Count(), 2, "the source keeps its count");
-    mut List<i64> sole = List.FromArray<i64>([5_i64]);
-    i64[] soleStorage = sole.BorrowStorage();
-    mut List<i64> moved = sole.Detached();
-    Assert.True(Managed.SameIdentity<i64[]>(moved.BorrowStorage(), soleStorage), "a sole owner detaches without a copy");
-    moved.Push(6);
-    Assert.Equal(moved.Count(), 2, "a sole owner's detached list writes normally");
-}
-
-test ListLinearGrowthStaysCorrect
-{
-    List<i64> values = List.New<i64>();
-    mut i64 index = 0;
-    while (index < 100)
-    {
-        values.Push(index);
-        index = index + 1;
-    }
-    i64 last = match (values.Get(99))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(values.Count(), 100, "linear pushes count");
-    Assert.Equal(last, 99, "linear pushes keep order");
-}
-
-// ---- Map ----
-
-// Public API coverage for `Core.Collections.Map`.
-
-test MapInsertGetAndUpdateOwnRealEntries
-{
-    Map<i64, i64> values = Map.New<i64, i64>();
-    values.Insert(1, 10);
-    values.Insert(2, 20);
-    values.Insert(1, 11);
-    Assert.Equal(values.Count(), 2, "updating a key preserves count");
-    i64 updated = match (values.Get(1))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(updated, 11, "updated value replaces prior value");
-    Assert.True(values.ContainsKey(2), "second key is retained");
-}
-
-test MapPointerAggregateSurvivesForcedGcGrowth
-{
-    Map<string, string> values = Map.New<string, string>();
-    values.Insert("first", "one");
-    Assert.CollectGarbage();
-    values.Insert("second", "two");
-    Assert.CollectGarbage();
-    string first = match (values.Get("first"))
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => "error",
-    };
-    Assert.Equal(first, "one", "MapEntry pointer fields survive rooted growth and publication");
-}
-
-test MapRemovePreservesRemainingEntries
-{
-    Map<i64, i64> values = Map.New<i64, i64>();
-    values.Insert(1, 10);
-    values.Insert(2, 20);
-    values.Insert(3, 30);
-    values.Remove(2);
-    Assert.Equal(values.Count(), 2, "remove decrements count");
-    Assert.True(values.ContainsKey(1), "remove preserves earlier entry");
-    Assert.True(values.ContainsKey(3), "remove preserves later entry");
-    Assert.False(values.ContainsKey(2), "removed key is absent");
-}
-
-test MapKeysOfEmptyMapIsEmpty
-{
-    Map<string, i64> values = Map.New<string, i64>();
-    string[] keys = values.Keys();
-    Assert.Equal(Array.Len<string>(keys), 0, "empty map has no keys");
-    Assert.Equal(Array.Len<string>(String.SortOrdinal(keys)), 0, "sorting no keys yields no keys");
-}
-
-test MapKeysFollowEntryOrderAfterUpdateAndRemove
-{
-    Map<string, i64> values = Map.New<string, i64>();
-    values.Insert("b", 1);
-    values.Insert("a", 2);
-    values.Insert("c", 3);
-    values.Insert("b", 4);
-    values.Remove("a");
-    string[] keys = values.Keys();
-    Assert.Equal(Array.Len<string>(keys), 2, "keys match count after update and remove");
-    Assert.Equal(Array.Get<string>(keys, 0), "b", "update keeps the entry position");
-    Assert.Equal(Array.Get<string>(keys, 1), "c", "remove shifts later entries");
-}
-
-test MapKeysSortInOrdinalUtf8Order
-{
-    Map<string, i64> values = Map.New<string, i64>();
-    values.Insert("é", 1);
-    values.Insert("abc", 2);
-    values.Insert("Z", 3);
-    values.Insert("ab", 4);
-    values.Insert("z", 5);
-    values.Insert("", 6);
-    string[] keys = values.Keys();
-    string[] sorted = String.SortOrdinal(keys);
-    Assert.Equal(Array.Len<string>(sorted), 6, "sorting keeps every key");
-    Assert.Equal(Array.Get<string>(sorted, 0), "", "empty string orders first");
-    Assert.Equal(Array.Get<string>(sorted, 1), "Z", "uppercase ASCII orders before lowercase");
-    Assert.Equal(Array.Get<string>(sorted, 2), "ab", "a proper prefix orders first");
-    Assert.Equal(Array.Get<string>(sorted, 3), "abc", "the longer string follows its prefix");
-    Assert.Equal(Array.Get<string>(sorted, 4), "z", "ASCII orders before multi-byte UTF-8");
-    Assert.Equal(Array.Get<string>(sorted, 5), "é", "U+00E9 (C3 A9) orders after z (7A)");
-    Assert.Equal(Array.Get<string>(keys, 0), "é", "sorting does not modify the input array");
-    Assert.Equal(String.CompareOrdinal("ab", "ab"), 0, "equal strings compare equal");
-    Assert.Equal(String.CompareOrdinal("ab", "abc"), -1, "prefix compares lower");
-    Assert.Equal(String.CompareOrdinal("b", "abc"), 1, "first differing byte decides");
-}
-
-test MapKeysSnapshotIsIndependentOfLaterMutation
-{
-    Map<string, i64> values = Map.New<string, i64>();
-    values.Insert("first", 1);
-    values.Insert("second", 2);
-    string[] keys = values.Keys();
-    values.Remove("first");
-    values.Insert("third", 3);
-    values.Insert("second", 20);
-    Assert.CollectGarbage();
-    Assert.Equal(Array.Len<string>(keys), 2, "later insert and remove do not resize the snapshot");
-    Assert.Equal(Array.Get<string>(keys, 0), "first", "removed key stays in the snapshot");
-    Assert.Equal(Array.Get<string>(keys, 1), "second", "snapshot keeps its order");
-    Assert.Equal(Array.Len<string>(values.Keys()), 2, "a new snapshot reflects the mutation");
-}
-
-// ---- Set ----
-
-// Public API coverage for `Core.Collections.Set`.
-
-test SetAddIsUniqueAndSearchable
-{
-    Set<i64> values = Set.New<i64>();
-    values.Add(42);
-    values.Add(42);
-    Assert.Equal(values.Count(), 1, "duplicate add does not change count");
-    Assert.True(values.Contains(42), "added value is retained");
-    Assert.False(values.Contains(9), "missing value is absent");
-}
-
-test SetRemovePreservesOtherValues
-{
-    Set<i64> values = Set.New<i64>();
-    values.Add(1);
-    values.Add(2);
-    values.Add(3);
-    values.Remove(2);
-    Assert.Equal(values.Count(), 2, "remove decrements count");
-    Assert.True(values.Contains(1), "remove preserves earlier value");
-    Assert.True(values.Contains(3), "remove preserves later value");
-    Assert.False(values.Contains(2), "removed value is absent");
-}
-
-// ---- Queue ----
-
-// Public API coverage for `Core.Collections.Queue`.
-
-test QueueIsFifoAndRetainsValues
-{
-    Queue<i64> queue = Queue.New<i64>();
-    queue.Enqueue(10);
-    queue.Enqueue(20);
-    queue.Enqueue(30);
-    i64 first = match (queue.Peek())
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(first, 10, "peek returns oldest value");
-    queue.Dequeue();
-    i64 second = match (queue.Peek())
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(second, 20, "dequeue advances in FIFO order");
-    Assert.Equal(queue.Count(), 2, "dequeue decrements count");
-}
-
-test QueueHeadAdvancesAndClearedPointerSlotsSurviveGc
-{
-    Queue<string> queue = Queue.New<string>();
-    queue.Enqueue("first");
-    queue.Enqueue("second");
-    queue.Dequeue();
-    Assert.CollectGarbage();
-    string head = match (queue.Peek())
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => "error",
-    };
-    Assert.Equal(head, "second", "dequeue advances head without shifting retained pointer values");
-    queue.Enqueue("third");
-    Assert.CollectGarbage();
-    Assert.Equal(queue.Count(), 2, "enqueue appends after an advanced head");
-}
-
-test QueueEmptyPeekIsError
-{
-    Queue<i64> queue = Queue.New<i64>();
-    bool isError = match (queue.Peek())
-    {
-        Core.Results.Result::Ok(_) => false,
-        Core.Results.Result::Error(_) => true,
-    };
-    Assert.True(isError, "empty queue has no head value");
-}
-
-// ---- Stack ----
-
-// Public API coverage for `Core.Collections.Stack`.
-
-test StackIsLifoAndRetainsValues
-{
-    Stack<i64> stack = Stack.New<i64>();
-    stack.Push(10);
-    stack.Push(20);
-    i64 top = match (stack.Peek())
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(top, 20, "peek returns latest value");
-    stack.Pop();
-    i64 next = match (stack.Peek())
-    {
-        Core.Results.Result::Ok(value) => value,
-        Core.Results.Result::Error(_) => -1,
-    };
-    Assert.Equal(next, 10, "pop reveals preceding value");
-    Assert.Equal(stack.Count(), 1, "pop decrements count");
-}
-
-test StackEmptyPeekIsError
-{
-    Stack<i64> stack = Stack.New<i64>();
-    bool isError = match (stack.Peek())
-    {
-        Core.Results.Result::Ok(_) => false,
-        Core.Results.Result::Error(_) => true,
-    };
-    Assert.True(isError, "empty stack has no top value");
 }
 
 i64 I64Or(Core.Results.Result<i64, string> value, i64 fallback)
@@ -902,4 +138,765 @@ string StringOrNone(Core.Optional.Option<string> value)
         Core.Optional.Option::Some(v) => v,
         Core.Optional.Option::None => "?",
     };
+}
+
+mod ArrayTests
+{
+    // Public API coverage for typed `Core.Collections.Array` operations.
+    test AppendPreservesTypedValues
+    {
+        mut i64[] values = Array.Empty<i64>();
+        Array.Append<i64>(values, 10);
+        Array.Append<i64>(values, 20);
+        Array.Append<i64>(values, 30);
+        Assert.Equal(Array.Len<i64>(values), 3, "append grows logical length");
+        Assert.Equal(Array.Get<i64>(values, 0), 10, "growth preserves first value");
+        Assert.Equal(Array.Get<i64>(values, 2), 30, "append stores tail value");
+    }
+
+    test SetUsesDirectIndexSemantics
+    {
+        mut i64[] values = Array.Empty<i64>();
+        Array.Append<i64>(values, 1);
+        values = Array.Set<i64>(values, 0, 9);
+        Assert.Equal(Array.Get<i64>(values, 0), 9, "set replaces indexed value");
+    }
+
+    test PointerValuesSurviveForcedGcDuringGrowth
+    {
+        mut string[] values = Array.Empty<string>();
+        Array.Append<string>(values, "first");
+        Assert.CollectGarbage();
+        Array.Append<string>(values, "second");
+        Assert.CollectGarbage();
+        Assert.Equal(Array.Get<string>(values, 0), "first", "rooted growth retains the first pointer value");
+        Assert.Equal(Array.Get<string>(values, 1), "second", "publication retains the appended pointer value");
+    }
+
+    test CapacityIsNotLogicalLength
+    {
+        mut i64[] values = Array.Empty<i64>();
+        Array.Append<i64>(values, 1);
+        Assert.Equal(Array.Len<i64>(values), 1, "append exposes exactly one initialized value");
+        Assert.True(Array.Capacity<i64>(values) >= Array.Len<i64>(values), "capacity may exceed logical length");
+    }
+
+    test IteratorStopsAtLogicalLength
+    {
+        mut i64[] values = Array.Empty<i64>();
+        Array.Append<i64>(values, 4);
+        Array.Append<i64>(values, 5);
+        mut ArrayIter<i64> iterator = Array.Iterate<i64>(values);
+        Assert.True(Array.HasNext<i64>(iterator), "iterator starts in bounds");
+        Assert.Equal(Array.Current<i64>(values, iterator), 4, "iterator reads first value");
+        iterator = Array.Advance<i64>(iterator);
+        Assert.Equal(Array.Current<i64>(values, iterator), 5, "iterator reads second value");
+        iterator = Array.Advance<i64>(iterator);
+        Assert.False(Array.HasNext<i64>(iterator), "iterator stops at logical length");
+    }
+
+    // Append grows geometrically, so n appends reallocate O(log n) times and copy O(n) in total.
+    test AppendGrowthIsGeometric
+    {
+        mut u8[] values = Array.Empty<u8>();
+        mut i64 capacity = Array.Capacity<u8>(values);
+        mut i64 growths = 0;
+        mut i64 i = 0;
+        while (i < 262144)
+        {
+            i64 value = i % 256;
+            Array.Append<u8>(values, u8(value));
+            if (Array.Capacity<u8>(values) != capacity)
+            {
+                capacity = Array.Capacity<u8>(values);
+                growths = growths + 1;
+            }
+            i = i + 1;
+        }
+        Assert.Equal(Array.Len<u8>(values), 262144, "every append is visible");
+        Assert.True(Array.Capacity<u8>(values) >= 262144, "capacity covers the length");
+        Assert.True(Array.Capacity<u8>(values) <= 524288, "capacity at most doubles past the length");
+        Assert.True(growths <= 19, "256 Ki appends grow the storage at most 19 times, so growth is geometric");
+        u8 first = values[0];
+        u8 middle = values[255];
+        u8 last = values[262143];
+        i64 sum = i64(first) + i64(middle) + i64(last);
+        Assert.Equal(sum, 510, "appended values are stored in order");
+    }
+
+    test RemoveLastShortensTheArrayInPlace
+    {
+        mut i64[] values = [1_i64, 2_i64, 3_i64];
+        i64[] rest = Array.RemoveLast<i64>(values);
+        Assert.Equal(Array.Len<i64>(values), 2, "the caller's array loses its last element");
+        Assert.Equal(Array.Len<i64>(rest), 2, "the returned array is the shortened array");
+        Assert.Equal(values[0], 1_i64, "first element stays");
+        Assert.Equal(values[1], 2_i64, "second element stays");
+        Array.Append<i64>(values, 9_i64);
+        Assert.Equal(values[2], 9_i64, "the freed slot takes the next append");
+    }
+
+    test CopyRangeCopiesASubrangeAtAnOffset
+    {
+        i64[] source = [10_i64, 20_i64, 30_i64, 40_i64];
+        i64[] destination = Array.Zeroed<i64>(5);
+        Array.CopyRange<i64>(destination, 1, source, 2, 2);
+        Assert.Equal(destination[0], 0_i64, "before the offset is untouched");
+        Assert.Equal(destination[1], 30_i64, "first copied element");
+        Assert.Equal(destination[2], 40_i64, "second copied element");
+        Assert.Equal(destination[3], 0_i64, "after the range is untouched");
+        Assert.Equal(source[2], 30_i64, "the source is unchanged");
+        Array.CopyRange<i64>(destination, 0, source, 0, 0);
+        Assert.Equal(destination[0], 0_i64, "a zero-length copy changes nothing");
+    }
+
+    test IndexReportsTheIteratorPosition
+    {
+        i64[] values = [7_i64, 8_i64];
+        mut ArrayIter<i64> iterator = Array.Iterate<i64>(values);
+        Assert.Equal(Array.Index<i64>(iterator), 0, "a new iterator is at index 0");
+        iterator = Array.Advance<i64>(iterator);
+        Assert.Equal(Array.Index<i64>(iterator), 1, "Advance moves to index 1");
+        iterator = Array.Advance<i64>(iterator);
+        Assert.Equal(Array.Index<i64>(iterator), 2, "past the end the index is the length");
+        Assert.False(Array.HasNext<i64>(iterator), "and HasNext is false");
+    }
+
+    test ZeroedAllocatesExactZeroFilledLength
+    {
+        i64[] values = Array.Zeroed<i64>(1000);
+        Assert.Equal(Array.Len<i64>(values), 1000, "zeroed length");
+        Assert.Equal(Array.Capacity<i64>(values), 1000, "zeroed capacity");
+        i64 sum = values[0] + values[999];
+        Assert.Equal(sum, 0, "zeroed elements");
+    }
+
+    // Reference elements survive geometric growth and forced collections (pointer map, barriers).
+    test AppendOfManagedReferencesSurvivesCollection
+    {
+        mut string[] values = Array.Empty<string>();
+        mut i64 i = 0;
+        while (i < 3000)
+        {
+            Array.Append<string>(values, "item");
+            if (i % 500 == 0)
+            {
+                Assert.CollectGarbage();
+            }
+            i = i + 1;
+        }
+        Assert.CollectGarbage();
+        Assert.Equal(Array.Len<string>(values), 3000, "every reference element is present");
+        Assert.Equal(values[0], "item", "first reference survives growth");
+        Assert.Equal(values[2999], "item", "last reference survives growth");
+        mut i64[] nested = Array.Zeroed<i64>(16);
+        mut i64 round = 0;
+        while (round < 200)
+        {
+            i64[] inner = Array.Zeroed<i64>(4096);
+            nested[round % 16] = Array.Len<i64>(inner);
+            round = round + 1;
+        }
+        Assert.Equal(nested[15], 4096, "zeroed arrays allocated in a loop have their length");
+    }
+
+    test TypedArrayLengthAndEmptySemantics
+    {
+        mut i64[] populated = Array.Empty<i64>();
+        Assert.True(Array.IsEmpty<i64>(populated), "new typed array is empty");
+        Array.Append<i64>(populated, 5);
+        Assert.Equal(Array.Len<i64>(populated), 1, "append advances logical length");
+        Assert.False(Array.IsEmpty<i64>(populated), "populated typed array is not empty");
+    }
+}
+
+mod ReceiversTests
+{
+    // Cross-collection public API integration coverage.
+    test ReceiverMethodsAreThePublicSurface
+    {
+        List<i64> list = List.New<i64>();
+        list.Push(42);
+        Stack<i64> stack = Stack.New<i64>();
+        stack.Push(42);
+        Assert.Equal(list.Count(), 1, "list receiver method updates count");
+        Assert.Equal(stack.Count(), 1, "stack receiver method updates count");
+    }
+}
+
+mod ListTests
+{
+    // Public API coverage for `Core.Collections.List`.
+    test RetainsValuesAcrossGrowth
+    {
+        List<i64> values = List.New<i64>();
+        values.Push(10);
+        values.Push(20);
+        values.Push(30);
+        Assert.Equal(values.Count(), 3, "list count after growth");
+        i64 first = match (values.Get(0))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        i64 last = match (values.Get(2))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(first, 10, "list preserves first value");
+        Assert.Equal(last, 30, "list appends at tail");
+    }
+
+    test PopRemovesOnlyTheTail
+    {
+        List<i64> values = List.New<i64>();
+        values.Push(7);
+        values.Push(8);
+        values.Pop();
+        Assert.Equal(values.Count(), 1, "pop decrements count");
+        i64 retained = match (values.Get(0))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(retained, 7, "pop retains preceding values");
+    }
+
+    test PopClearsPointerTailBeforeCollection
+    {
+        List<string> values = List.New<string>();
+        values.Push("retained");
+        values.Push("removed");
+        values.Pop();
+        Assert.CollectGarbage();
+        string retained = match (values.Get(0))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => "error",
+        };
+        Assert.Equal(retained, "retained", "pop clears the removed tail without losing retained pointers");
+    }
+
+    test GetRejectsDirectBounds
+    {
+        List<i64> values = List.New<i64>();
+        bool negative = match (values.Get(-1))
+        {
+            Core.Results.Result::Ok(_) => false,
+            Core.Results.Result::Error(_) => true,
+        };
+        bool atEnd = match (values.Get(0))
+        {
+            Core.Results.Result::Ok(_) => false,
+            Core.Results.Result::Error(_) => true,
+        };
+        Assert.True(negative, "negative index is out of bounds");
+        Assert.True(atEnd, "index at count is out of bounds");
+    }
+}
+
+mod CopyOnAssignTests
+{
+    // Collections change in place: `items.Push(x);` needs no rebinding. A `List` is copied on
+    // assignment and when it is passed to a parameter that is not `mut`, returned, captured or bound
+    // by a `for` loop; the copy is copy-on-write, so two names share the backing array only until
+    // one of them writes. A plain parameter gets a lent view that copies before it writes; a `mut`
+    // parameter shares the caller's list.
+    test PushChangesTheListInPlace
+    {
+        List<string> items = List.New<string>();
+        items.Push("milk");
+        items.Push("bread");
+        Assert.Equal(items.Count(), 2, "push changes the receiver");
+        Assert.Equal(StringOr(items.Get(1), "?"), "bread", "push appends at the tail");
+        Assert.Equal(StringOrNone(items.Pop()), "bread", "pop returns the tail");
+        Assert.Equal(items.Count(), 1, "pop changes the receiver");
+    }
+
+    test AssignmentCopies
+    {
+        List<i64> a = List.New<i64>();
+        a.Push(1);
+        List<i64> b = a;
+        b.Push(2);
+        Assert.Equal(a.Count(), 1, "the source keeps its count");
+        Assert.Equal(b.Count(), 2, "the copy grows on its own");
+        b.Set(0, 9);
+        Assert.Equal(I64Or(a.Get(0), -1), 1, "a write through the copy is not visible in the source");
+        a.Set(0, 5);
+        Assert.Equal(I64Or(b.Get(0), -1), 9, "a write through the source is not visible in the copy");
+    }
+
+    test ReassignmentCopies
+    {
+        List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
+        mut List<i64> b = List.New<i64>();
+        b = a;
+        a.Push(3);
+        Assert.Equal(b.Count(), 2, "an assigned list does not see later pushes to its source");
+    }
+
+    test GrowthDoesNotWriteIntoSharedStorage
+    {
+        List<i64> a = List.New<i64>();
+        a.Push(0);
+        a.Pop();
+        List<i64> b = a;
+        b.Push(1);
+        a.Push(2);
+        Assert.Equal(I64Or(b.Get(0), -1), 1, "the copy holds its own element");
+        Assert.Equal(I64Or(a.Get(0), -1), 2, "the source holds its own element");
+        mut i64 index = 0;
+        while (index < 64)
+        {
+            a.Push(index);
+            index = index + 1;
+        }
+        Assert.Equal(b.Count(), 1, "growth of the source does not change the copy");
+        Assert.Equal(I64Or(b.Get(0), -1), 1, "growth of the source keeps the copy's element");
+    }
+
+    test ParameterGetsItsOwnCopy
+    {
+        List<i64> a = List.New<i64>();
+        GrowCopy(a);
+        Assert.Equal(a.Count(), 0, "a parameter that is not mut does not change the caller's list");
+    }
+
+    test MutParameterSharesTheCallersList
+    {
+        List<i64> a = List.New<i64>();
+        GrowShared(a);
+        Assert.Equal(a.Count(), 1, "a mut parameter changes the caller's list");
+    }
+
+    test FieldStoreCopies
+    {
+        List<i64> a = List.FromArray<i64>([1_i64]);
+        ListHolder holder = ListHolder
+        {
+            items: a,
+        };
+        a.Push(2);
+        Assert.Equal(holder.items.Count(), 1, "a list stored in a field is a copy");
+        List<i64> read = holder.items;
+        read.Push(3);
+        Assert.Equal(holder.items.Count(), 1, "a list read from a field is a copy");
+        holder.items.Push(4);
+        Assert.Equal(holder.items.Count(), 2, "a method call through the field changes the field");
+    }
+
+    test CollectionsOfListsHoldCopies
+    {
+        List<i64> inner = List.FromArray<i64>([1_i64]);
+        List<List<i64>> outer = List.New<List<i64>>();
+        outer.Push(inner);
+        inner.Push(2);
+        i64 stored = match (outer.Get(0))
+        {
+            Core.Results.Result::Ok(list) => list.Count(),
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(stored, 1, "an element pushed into a list is a copy");
+    }
+
+    test SoleOwnerWritesInPlaceAfterBorrowsAndBuilders
+    {
+        bool inPlace = match (BuiltListIsTheSoleOwner())
+        {
+            Core.Results.Result::Ok(flag) => flag,
+            Core.Results.Result::Error(_) => false,
+        };
+        Assert.True(inPlace, "a built list lent to readers is still the sole owner of its array");
+        List<i64> items = List.FromArray<i64>([1_i64, 2_i64]);
+        GrowCopy(items);
+        Assert.True(WritesInPlace(items, 5), "a callee that copied its lent view leaves the caller the sole owner");
+        List<i64> kept = items;
+        Assert.False(WritesInPlace(items, 6), "a list with a copy copies its array before it writes");
+        Assert.Equal(I64Or(kept.Get(0), -1), 5, "the copy keeps the value from before the write");
+    }
+
+    test ElementWriteThroughGetDoesNotReachEitherList
+    {
+        List<List<i64>> a = List.New<List<i64>>();
+        a.Push(List.FromArray<i64>([1_i64]));
+        List<List<i64>> b = a;
+        i64 counted = match (PushIntoFirst(b))
+        {
+            Core.Results.Result::Ok(count) => count,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(counted, 1, "a write through a returned element does not reach the list");
+        i64 inA = match (a.Get(0))
+        {
+            Core.Results.Result::Ok(list) => list.Count(),
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(inA, 1, "the list that shares the array is unchanged");
+    }
+
+    test StackQueueSetAndMapChangeInPlace
+    {
+        Stack<i64> stack = Stack.New<i64>();
+        stack.Push(1);
+        stack.Push(2);
+        Assert.Equal(I64OrNone(stack.Pop()), 2, "stack pop returns the top");
+        Queue<i64> queue = Queue.New<i64>();
+        queue.Enqueue(1);
+        queue.Enqueue(2);
+        Assert.Equal(I64OrNone(queue.Dequeue()), 1, "dequeue returns the front");
+        Assert.Equal(queue.Count(), 1, "dequeue changes the queue");
+        Set<i64> set = Set.New<i64>();
+        Assert.True(set.Add(1), "add of a new member");
+        Assert.False(set.Add(1), "add of an existing member");
+        Assert.True(set.Remove(1), "remove of a member");
+        Map<i64, i64> map = Map.New<i64, i64>();
+        map.Insert(1, 10);
+        Assert.True(map.Remove(1), "remove of a present key");
+        Assert.False(map.Remove(1), "remove of an absent key");
+    }
+
+    test CopySharesStorageUntilAWrite
+    {
+        List<i64> a = List.FromArray<i64>([1_i64, 2_i64]);
+        List<i64> b = a;
+        Assert.True(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "a read-only copy copies no elements");
+        b.Set(0, 7);
+        Assert.False(Managed.SameIdentity<i64[]>(a.BorrowStorage(), b.BorrowStorage()), "the first write copies the array");
+        Assert.Equal(I64Or(a.Get(0), -1), 1, "the source keeps its element");
+        Assert.Equal(I64Or(b.Get(0), -1), 7, "the copy holds the write");
+        a.Pop();
+        Assert.Equal(b.Count(), 2, "a pop through the source does not shrink the copy");
+    }
+
+    test ForVariableIsACopy
+    {
+        List<i64>[] lists = [List.FromArray<i64>([1_i64])];
+        for item in lists
+        {
+            item.Push(2);
+        }
+        Assert.Equal(lists[0].Count(), 1, "a write through the loop variable does not reach the element");
+    }
+
+    test CaptureIsACopy
+    {
+        List<i64> a = List.FromArray<i64>([1_i64]);
+        let grow = () => {
+            a.Push(2);
+            return a.Count();
+        };
+        Assert.Equal(grow(), 2, "the closure writes its own copy");
+        Assert.Equal(a.Count(), 1, "a write through a capture does not reach the captured list");
+    }
+
+    test TryPayloadIsACopy
+    {
+        List<i64> a = List.FromArray<i64>([1_i64]);
+        Core.Results.Result<List<i64>, string> held = Wrapped(a);
+        Assert.Equal(I64Or(TakeAndGrow(held), -1), 2, "the payload taken with ? is written");
+        List<i64> again = match (held)
+        {
+            Core.Results.Result::Ok(list) => list,
+            Core.Results.Result::Error(_) => List.New<i64>(),
+        };
+        Assert.Equal(again.Count(), 1, "the Result still holds the unwritten list");
+    }
+
+    test PatternBindingIsACopy
+    {
+        Core.Optional.Option<List<i64>> held = Core.Optional.Option::Some(List.FromArray<i64>([1_i64]));
+        Assert.Equal(GrowBound(held), 2, "the arm writes its own copy");
+        i64 stored = match (held)
+        {
+            Core.Optional.Option::Some(list) => list.Count(),
+            Core.Optional.Option::None => -1,
+        };
+        Assert.Equal(stored, 1, "a write through a pattern binding does not reach the matched value");
+    }
+
+    test BorrowIsAViewThatCopiesBeforeItWrites
+    {
+        mut List<i64> owner = List.FromArray<i64>([1_i64, 2_i64]);
+        mut List<i64> view = owner.Borrow();
+        Assert.True(Managed.SameIdentity<i64[]>(owner.Borrow().BorrowStorage(), owner.BorrowStorage()), "a view shares the owner's array until it writes");
+        Assert.Equal(view.Count(), 2, "the view has the owner's elements");
+        Assert.Equal(I64Or(view.Get(1), -1), 2, "the view reads the owner's storage");
+        view.Push(3);
+        view.Set(0, 9);
+        Assert.Equal(view.Count(), 3, "the view changed");
+        Assert.Equal(owner.Count(), 2, "a write through the view does not reach the owner");
+        Assert.Equal(I64Or(owner.Get(0), -1), 1, "the owner's first element is unchanged");
+        owner.Push(4);
+        Assert.Equal(owner.Count(), 3, "the owner still writes after lending a view");
+        Assert.Equal(I64Or(view.Get(2), -1), 3, "and its write does not reach the view");
+    }
+
+    test DetachedOwnsItsStorage
+    {
+        mut List<i64> first = List.FromArray<i64>([1_i64, 2_i64]);
+        List<i64> second = first;
+        mut List<i64> detached = second.Detached();
+        Assert.False(Managed.SameIdentity<i64[]>(detached.BorrowStorage(), second.BorrowStorage()), "a shared list detaches with an array of its own");
+        detached.Set(0, 7);
+        detached.Push(8);
+        Assert.Equal(detached.Count(), 3, "the detached list keeps every element and its own writes");
+        Assert.Equal(I64Or(detached.Get(1), -1), 2, "the detached list holds the same elements");
+        Assert.Equal(I64Or(first.Get(0), -1), 1, "a write to the detached list reaches no list that shared the storage");
+        Assert.Equal(I64Or(second.Get(0), -1), 1, "the source of Detached is unchanged");
+        Assert.Equal(second.Count(), 2, "the source keeps its count");
+        mut List<i64> sole = List.FromArray<i64>([5_i64]);
+        i64[] soleStorage = sole.BorrowStorage();
+        mut List<i64> moved = sole.Detached();
+        Assert.True(Managed.SameIdentity<i64[]>(moved.BorrowStorage(), soleStorage), "a sole owner detaches without a copy");
+        moved.Push(6);
+        Assert.Equal(moved.Count(), 2, "a sole owner's detached list writes normally");
+    }
+
+    test LinearGrowthStaysCorrect
+    {
+        List<i64> values = List.New<i64>();
+        mut i64 index = 0;
+        while (index < 100)
+        {
+            values.Push(index);
+            index = index + 1;
+        }
+        i64 last = match (values.Get(99))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(values.Count(), 100, "linear pushes count");
+        Assert.Equal(last, 99, "linear pushes keep order");
+    }
+}
+
+mod MapTests
+{
+    // Public API coverage for `Core.Collections.Map`.
+    test InsertGetAndUpdateOwnRealEntries
+    {
+        Map<i64, i64> values = Map.New<i64, i64>();
+        values.Insert(1, 10);
+        values.Insert(2, 20);
+        values.Insert(1, 11);
+        Assert.Equal(values.Count(), 2, "updating a key preserves count");
+        i64 updated = match (values.Get(1))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(updated, 11, "updated value replaces prior value");
+        Assert.True(values.ContainsKey(2), "second key is retained");
+    }
+
+    test PointerAggregateSurvivesForcedGcGrowth
+    {
+        Map<string, string> values = Map.New<string, string>();
+        values.Insert("first", "one");
+        Assert.CollectGarbage();
+        values.Insert("second", "two");
+        Assert.CollectGarbage();
+        string first = match (values.Get("first"))
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => "error",
+        };
+        Assert.Equal(first, "one", "MapEntry pointer fields survive rooted growth and publication");
+    }
+
+    test RemovePreservesRemainingEntries
+    {
+        Map<i64, i64> values = Map.New<i64, i64>();
+        values.Insert(1, 10);
+        values.Insert(2, 20);
+        values.Insert(3, 30);
+        values.Remove(2);
+        Assert.Equal(values.Count(), 2, "remove decrements count");
+        Assert.True(values.ContainsKey(1), "remove preserves earlier entry");
+        Assert.True(values.ContainsKey(3), "remove preserves later entry");
+        Assert.False(values.ContainsKey(2), "removed key is absent");
+    }
+
+    test KeysOfEmptyMapIsEmpty
+    {
+        Map<string, i64> values = Map.New<string, i64>();
+        string[] keys = values.Keys();
+        Assert.Equal(Array.Len<string>(keys), 0, "empty map has no keys");
+        Assert.Equal(Array.Len<string>(String.SortOrdinal(keys)), 0, "sorting no keys yields no keys");
+    }
+
+    test KeysFollowEntryOrderAfterUpdateAndRemove
+    {
+        Map<string, i64> values = Map.New<string, i64>();
+        values.Insert("b", 1);
+        values.Insert("a", 2);
+        values.Insert("c", 3);
+        values.Insert("b", 4);
+        values.Remove("a");
+        string[] keys = values.Keys();
+        Assert.Equal(Array.Len<string>(keys), 2, "keys match count after update and remove");
+        Assert.Equal(Array.Get<string>(keys, 0), "b", "update keeps the entry position");
+        Assert.Equal(Array.Get<string>(keys, 1), "c", "remove shifts later entries");
+    }
+
+    test KeysSortInOrdinalUtf8Order
+    {
+        Map<string, i64> values = Map.New<string, i64>();
+        values.Insert("é", 1);
+        values.Insert("abc", 2);
+        values.Insert("Z", 3);
+        values.Insert("ab", 4);
+        values.Insert("z", 5);
+        values.Insert("", 6);
+        string[] keys = values.Keys();
+        string[] sorted = String.SortOrdinal(keys);
+        Assert.Equal(Array.Len<string>(sorted), 6, "sorting keeps every key");
+        Assert.Equal(Array.Get<string>(sorted, 0), "", "empty string orders first");
+        Assert.Equal(Array.Get<string>(sorted, 1), "Z", "uppercase ASCII orders before lowercase");
+        Assert.Equal(Array.Get<string>(sorted, 2), "ab", "a proper prefix orders first");
+        Assert.Equal(Array.Get<string>(sorted, 3), "abc", "the longer string follows its prefix");
+        Assert.Equal(Array.Get<string>(sorted, 4), "z", "ASCII orders before multi-byte UTF-8");
+        Assert.Equal(Array.Get<string>(sorted, 5), "é", "U+00E9 (C3 A9) orders after z (7A)");
+        Assert.Equal(Array.Get<string>(keys, 0), "é", "sorting does not modify the input array");
+        Assert.Equal(String.CompareOrdinal("ab", "ab"), 0, "equal strings compare equal");
+        Assert.Equal(String.CompareOrdinal("ab", "abc"), -1, "prefix compares lower");
+        Assert.Equal(String.CompareOrdinal("b", "abc"), 1, "first differing byte decides");
+    }
+
+    test KeysSnapshotIsIndependentOfLaterMutation
+    {
+        Map<string, i64> values = Map.New<string, i64>();
+        values.Insert("first", 1);
+        values.Insert("second", 2);
+        string[] keys = values.Keys();
+        values.Remove("first");
+        values.Insert("third", 3);
+        values.Insert("second", 20);
+        Assert.CollectGarbage();
+        Assert.Equal(Array.Len<string>(keys), 2, "later insert and remove do not resize the snapshot");
+        Assert.Equal(Array.Get<string>(keys, 0), "first", "removed key stays in the snapshot");
+        Assert.Equal(Array.Get<string>(keys, 1), "second", "snapshot keeps its order");
+        Assert.Equal(Array.Len<string>(values.Keys()), 2, "a new snapshot reflects the mutation");
+    }
+}
+
+mod SetTests
+{
+    // Public API coverage for `Core.Collections.Set`.
+    test AddIsUniqueAndSearchable
+    {
+        Set<i64> values = Set.New<i64>();
+        values.Add(42);
+        values.Add(42);
+        Assert.Equal(values.Count(), 1, "duplicate add does not change count");
+        Assert.True(values.Contains(42), "added value is retained");
+        Assert.False(values.Contains(9), "missing value is absent");
+    }
+
+    test RemovePreservesOtherValues
+    {
+        Set<i64> values = Set.New<i64>();
+        values.Add(1);
+        values.Add(2);
+        values.Add(3);
+        values.Remove(2);
+        Assert.Equal(values.Count(), 2, "remove decrements count");
+        Assert.True(values.Contains(1), "remove preserves earlier value");
+        Assert.True(values.Contains(3), "remove preserves later value");
+        Assert.False(values.Contains(2), "removed value is absent");
+    }
+}
+
+mod QueueTests
+{
+    // Public API coverage for `Core.Collections.Queue`.
+    test IsFifoAndRetainsValues
+    {
+        Queue<i64> queue = Queue.New<i64>();
+        queue.Enqueue(10);
+        queue.Enqueue(20);
+        queue.Enqueue(30);
+        i64 first = match (queue.Peek())
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(first, 10, "peek returns oldest value");
+        queue.Dequeue();
+        i64 second = match (queue.Peek())
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(second, 20, "dequeue advances in FIFO order");
+        Assert.Equal(queue.Count(), 2, "dequeue decrements count");
+    }
+
+    test HeadAdvancesAndClearedPointerSlotsSurviveGc
+    {
+        Queue<string> queue = Queue.New<string>();
+        queue.Enqueue("first");
+        queue.Enqueue("second");
+        queue.Dequeue();
+        Assert.CollectGarbage();
+        string head = match (queue.Peek())
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => "error",
+        };
+        Assert.Equal(head, "second", "dequeue advances head without shifting retained pointer values");
+        queue.Enqueue("third");
+        Assert.CollectGarbage();
+        Assert.Equal(queue.Count(), 2, "enqueue appends after an advanced head");
+    }
+
+    test EmptyPeekIsError
+    {
+        Queue<i64> queue = Queue.New<i64>();
+        bool isError = match (queue.Peek())
+        {
+            Core.Results.Result::Ok(_) => false,
+            Core.Results.Result::Error(_) => true,
+        };
+        Assert.True(isError, "empty queue has no head value");
+    }
+}
+
+mod StackTests
+{
+    // Public API coverage for `Core.Collections.Stack`.
+    test IsLifoAndRetainsValues
+    {
+        Stack<i64> stack = Stack.New<i64>();
+        stack.Push(10);
+        stack.Push(20);
+        i64 top = match (stack.Peek())
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(top, 20, "peek returns latest value");
+        stack.Pop();
+        i64 next = match (stack.Peek())
+        {
+            Core.Results.Result::Ok(value) => value,
+            Core.Results.Result::Error(_) => -1,
+        };
+        Assert.Equal(next, 10, "pop reveals preceding value");
+        Assert.Equal(stack.Count(), 1, "pop decrements count");
+    }
+
+    test EmptyPeekIsError
+    {
+        Stack<i64> stack = Stack.New<i64>();
+        bool isError = match (stack.Peek())
+        {
+            Core.Results.Result::Ok(_) => false,
+            Core.Results.Result::Error(_) => true,
+        };
+        Assert.True(isError, "empty stack has no top value");
+    }
 }

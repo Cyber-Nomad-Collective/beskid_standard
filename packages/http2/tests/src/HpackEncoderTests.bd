@@ -5,13 +5,11 @@ use Core.String;
 use Http2.Hpack;
 use Http2.HpackDecoder;
 use Http2.HpackEncoder;
-
 use Http.Types;
 use HpackSupport;
 
 // Encoder policy: never-indexed fields, Huffman choice, table size updates,
 // and conversion to and from corelib Http.Types.Header.
-
 HeaderField[] One(HeaderField field)
 {
     mut HeaderField[] out = Array.Empty<HeaderField>();
@@ -32,161 +30,164 @@ unit SetSize(mut Encoder encoder, i64 size)
     return;
 }
 
-test AuthorizationIsNeverIndexed
+mod EncoderTests
 {
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "secret"])), "1f0806736563726574", "never-indexed with static name 23");
-    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "not inserted");
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "secret"])), "1f0806736563726574", "still a literal");
-    mut Decoder decoder = NewTestDecoder(4096_i64);
-    HeaderField[] fields = DecodeOk(decoder, "1f0806736563726574", "decode");
-    HeaderField first = Array.Get<HeaderField>(fields, 0_i64);
-    Assert.True(first.sensitive, "decoded as sensitive");
-}
-
-test ShortCookieBytes
-{
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"])), "1f1103613d62", "short cookie");
-}
-
-test ShortCookieNotInserted
-{
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    u8[] wire = HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"]));
-    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "short cookie not inserted");
-}
-
-test LongCookieIsIndexed
-{
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "60146161616161616161616161616161616161616161", "long cookie indexed");
-    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "long cookie inserted");
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "be", "then indexed");
-}
-
-test DecodedSensitiveFieldsStayNeverIndexed
-{
-    mut Decoder decoder = NewTestDecoder(4096_i64);
-    HeaderField[] fields = DecodeOk(decoder, "100870617373776f726406736563726574", "C.2.3");
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    ExpectBytes(HpackEncoder.Encode(encoder, fields), "100870617373776f726406736563726574", "re-encoded never indexed");
-}
-
-test CustomNeverIndexNames
-{
-    mut EncoderPolicy policy = RfcPolicy(4096_i64, false);
-    policy.neverIndexNames = ["x-token"];
-    mut Encoder encoder = NewTestEncoder(policy);
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["x-token", "t"])), "1007782d746f6b656e0174", "custom never-index");
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "t"])), "57" + "0174", "authorization indexed when not listed");
-}
-
-test HuffmanOnlyWhenShorter
-{
-    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
-    mut Encoder encoder = NewTestEncoder(policy);
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":authority", "www.example.com"])), "418cf1e3c2e5f23a6ba0ab90f4ff", "Huffman is shorter");
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields(["user-agent", "~~~~"])), "7a047e7e7e7e", "raw is shorter");
-}
-
-test SizeUpdatesStartTheNextBlock
-{
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    mut Decoder decoder = NewTestDecoder(4096_i64);
-    u8[] first = HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header"]));
-    HeaderField[] a = DecodeOk(decoder, HexText(first), "first");
-    SetSize(encoder, 0_i64);
-    SetSize(encoder, 256_i64);
-    u8[] second = HpackEncoder.Encode(encoder, Fields([":method", "GET"]));
-    ExpectBytes(second, "203fe10182", "minimum then final update");
-    HeaderField[] b = DecodeOk(decoder, HexText(second), "second");
-    Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 0_i64, "decoder evicted");
-    Assert.Equal<i64>(HpackDecoder.TableMaxSize(decoder), 256_i64, "decoder max 256");
-    SetSize(encoder, 1000_i64);
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "3fc90782", "single update");
-    ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "82", "no update afterwards");
-}
-
-test ReducedTableEvictsInEncoder
-{
-    mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
-    u8[] first = HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header", "x-a", "1"]));
-    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 2_i64, "two entries");
-    SetSize(encoder, 40_i64);
-    Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "only x-a fits");
-    Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 36_i64, "size 36");
-}
-
-test HttpHeaderConversion
-{
-    mut Header[] headers = Array.Empty<Header>();
-    Array.Append<Header>(headers, Header
+    test AuthorizationIsNeverIndexed
     {
-        name: "Content-Type",
-        value: "text/html",
-    });
-    Array.Append<Header>(headers, Header
-    {
-        name: "x-ok",
-        value: "1",
-    });
-    HeaderField[] fields = Hpack.FromHttpHeaders(headers);
-    ExpectFields(fields, ["content-type", "text/html", "x-ok", "1"], "lowercased");
-    Result<Header[], HpackError> back = Hpack.ToHttpHeaders(fields);
-    match (back)
-    {
-        Result::Error(_) => {
-            Assert.Fail("ToHttpHeaders");
-        },
-        Result::Ok(items) => {
-            Assert.Equal<i64>(Array.Len<Header>(items), 2_i64, "two headers");
-            Header h = Array.Get<Header>(items, 0_i64);
-            Assert.True(h.name == "content-type" && h.value == "text/html", "first header");
-        },
-    };
-    Result<Header, HpackError> invalid = Hpack.ToHttpHeader(HeaderField
-    {
-        name: [0xff_u8],
-        value: [0xff_u8],
-        sensitive: false,
-    });
-    match (invalid)
-    {
-        Result::Ok(_) => {
-            Assert.Fail("non-UTF-8 accepted");
-        },
-        Result::Error(error) => {
-            Assert.Equal<i64>(ErrorCode(error), 13_i64, "InvalidText");
-        },
-    };
-}
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "secret"])), "1f0806736563726574", "never-indexed with static name 23");
+        Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "not inserted");
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "secret"])), "1f0806736563726574", "still a literal");
+        mut Decoder decoder = NewTestDecoder(4096_i64);
+        HeaderField[] fields = DecodeOk(decoder, "1f0806736563726574", "decode");
+        HeaderField first = Array.Get<HeaderField>(fields, 0_i64);
+        Assert.True(first.sensitive, "decoded as sensitive");
+    }
 
-test LongRoundTripWithEviction
-{
-    string digits = "0123456789";
-    mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
-    policy.tableSize = 256_i64;
-    mut Encoder encoder = NewTestEncoder(policy);
-    mut Decoder decoder = NewTestDecoder(256_i64);
-    mut i64 i = 0_i64;
-    while (i < 60_i64)
+    test ShortCookieBytes
     {
-        string n = String.SubSlice(digits, i % 10_i64, 1_i64) + String.SubSlice(digits, (i / 10_i64) % 10_i64, 1_i64);
-        string[] pairs = [":status", "200", "cache-control", "private", "x-request-id", "req-" + n, "authorization", "Bearer " + n, "x-n" + String.SubSlice(digits, i % 7_i64, 1_i64), n];
-        u8[] wire = HpackEncoder.Encode(encoder, Fields(pairs));
-        Result<HeaderField[], HpackError> decoded = HpackDecoder.Decode(decoder, wire);
-        match (decoded)
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"])), "1f1103613d62", "short cookie");
+    }
+
+    test ShortCookieNotInserted
+    {
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        u8[] wire = HpackEncoder.Encode(encoder, Fields(["cookie", "a=b"]));
+        Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 0_i64, "short cookie not inserted");
+    }
+
+    test LongCookieIsIndexed
+    {
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "60146161616161616161616161616161616161616161", "long cookie indexed");
+        Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "long cookie inserted");
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["cookie", "aaaaaaaaaaaaaaaaaaaa"])), "be", "then indexed");
+    }
+
+    test DecodedSensitiveFieldsStayNeverIndexed
+    {
+        mut Decoder decoder = NewTestDecoder(4096_i64);
+        HeaderField[] fields = DecodeOk(decoder, "100870617373776f726406736563726574", "C.2.3");
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        ExpectBytes(HpackEncoder.Encode(encoder, fields), "100870617373776f726406736563726574", "re-encoded never indexed");
+    }
+
+    test CustomNeverIndexNames
+    {
+        mut EncoderPolicy policy = RfcPolicy(4096_i64, false);
+        policy.neverIndexNames = ["x-token"];
+        mut Encoder encoder = NewTestEncoder(policy);
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["x-token", "t"])), "1007782d746f6b656e0174", "custom never-index");
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["authorization", "t"])), "57" + "0174", "authorization indexed when not listed");
+    }
+
+    test HuffmanOnlyWhenShorter
+    {
+        mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+        mut Encoder encoder = NewTestEncoder(policy);
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields([":authority", "www.example.com"])), "418cf1e3c2e5f23a6ba0ab90f4ff", "Huffman is shorter");
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields(["user-agent", "~~~~"])), "7a047e7e7e7e", "raw is shorter");
+    }
+
+    test SizeUpdatesStartTheNextBlock
+    {
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        mut Decoder decoder = NewTestDecoder(4096_i64);
+        u8[] first = HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header"]));
+        HeaderField[] a = DecodeOk(decoder, HexText(first), "first");
+        SetSize(encoder, 0_i64);
+        SetSize(encoder, 256_i64);
+        u8[] second = HpackEncoder.Encode(encoder, Fields([":method", "GET"]));
+        ExpectBytes(second, "203fe10182", "minimum then final update");
+        HeaderField[] b = DecodeOk(decoder, HexText(second), "second");
+        Assert.Equal<i64>(HpackDecoder.TableCount(decoder), 0_i64, "decoder evicted");
+        Assert.Equal<i64>(HpackDecoder.TableMaxSize(decoder), 256_i64, "decoder max 256");
+        SetSize(encoder, 1000_i64);
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "3fc90782", "single update");
+        ExpectBytes(HpackEncoder.Encode(encoder, Fields([":method", "GET"])), "82", "no update afterwards");
+    }
+
+    test ReducedTableEvictsInEncoder
+    {
+        mut Encoder encoder = NewTestEncoder(RfcPolicy(4096_i64, false));
+        u8[] first = HpackEncoder.Encode(encoder, Fields(["custom-key", "custom-header", "x-a", "1"]));
+        Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 2_i64, "two entries");
+        SetSize(encoder, 40_i64);
+        Assert.Equal<i64>(HpackEncoder.EncoderTableCount(encoder), 1_i64, "only x-a fits");
+        Assert.Equal<i64>(HpackEncoder.EncoderTableSize(encoder), 36_i64, "size 36");
+    }
+
+    test HttpHeaderConversion
+    {
+        mut Header[] headers = Array.Empty<Header>();
+        Array.Append<Header>(headers, Header
         {
-            Result::Ok(fields) => {
-                ExpectFields(fields, pairs, "round trip");
-            },
+            name: "Content-Type",
+            value: "text/html",
+        });
+        Array.Append<Header>(headers, Header
+        {
+            name: "x-ok",
+            value: "1",
+        });
+        HeaderField[] fields = Hpack.FromHttpHeaders(headers);
+        ExpectFields(fields, ["content-type", "text/html", "x-ok", "1"], "lowercased");
+        Result<Header[], HpackError> back = Hpack.ToHttpHeaders(fields);
+        match (back)
+        {
             Result::Error(_) => {
-                Assert.Fail("round trip decode");
+                Assert.Fail("ToHttpHeaders");
+            },
+            Result::Ok(items) => {
+                Assert.Equal<i64>(Array.Len<Header>(items), 2_i64, "two headers");
+                Header h = Array.Get<Header>(items, 0_i64);
+                Assert.True(h.name == "content-type" && h.value == "text/html", "first header");
             },
         };
-        Assert.Equal<i64>(HpackDecoder.TableSize(decoder), HpackEncoder.EncoderTableSize(encoder), "tables agree");
-        Assert.True(HpackDecoder.TableSize(decoder) <= 256_i64, "bounded");
-        i = i + 1_i64;
+        Result<Header, HpackError> invalid = Hpack.ToHttpHeader(HeaderField
+        {
+            name: [0xff_u8],
+            value: [0xff_u8],
+            sensitive: false,
+        });
+        match (invalid)
+        {
+            Result::Ok(_) => {
+                Assert.Fail("non-UTF-8 accepted");
+            },
+            Result::Error(error) => {
+                Assert.Equal<i64>(ErrorCode(error), 13_i64, "InvalidText");
+            },
+        };
+    }
+
+    test LongRoundTripWithEviction
+    {
+        string digits = "0123456789";
+        mut EncoderPolicy policy = HpackEncoder.DefaultEncoderPolicy();
+        policy.tableSize = 256_i64;
+        mut Encoder encoder = NewTestEncoder(policy);
+        mut Decoder decoder = NewTestDecoder(256_i64);
+        mut i64 i = 0_i64;
+        while (i < 60_i64)
+        {
+            string n = String.SubSlice(digits, i % 10_i64, 1_i64) + String.SubSlice(digits, (i / 10_i64) % 10_i64, 1_i64);
+            string[] pairs = [":status", "200", "cache-control", "private", "x-request-id", "req-" + n, "authorization", "Bearer " + n, "x-n" + String.SubSlice(digits, i % 7_i64, 1_i64), n];
+            u8[] wire = HpackEncoder.Encode(encoder, Fields(pairs));
+            Result<HeaderField[], HpackError> decoded = HpackDecoder.Decode(decoder, wire);
+            match (decoded)
+            {
+                Result::Ok(fields) => {
+                    ExpectFields(fields, pairs, "round trip");
+                },
+                Result::Error(_) => {
+                    Assert.Fail("round trip decode");
+                },
+            };
+            Assert.Equal<i64>(HpackDecoder.TableSize(decoder), HpackEncoder.EncoderTableSize(encoder), "tables agree");
+            Assert.True(HpackDecoder.TableSize(decoder) <= 256_i64, "bounded");
+            i = i + 1_i64;
+        }
     }
 }

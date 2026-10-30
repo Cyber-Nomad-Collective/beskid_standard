@@ -18,385 +18,7 @@ use Concurrency.ChannelOptions;
 use Core.Threading.Thread;
 use Core.Collections.Array;
 
-// ---- Status Abi ----
-
-// ABI contract for Concurrency.Status discriminated union mapping.
-// The Status enum now carries its payload as variant arguments; the
-// bidirectional ToI64/FromI64 codec is replaced by FromCode (decode) and
-// Discriminant (encode).
-
-test DiscriminantOkIsZero
-{
-    Assert.Equal(Status.Discriminant(Status::Ok), 0, "Ok maps to 0");
-}
-
-test DiscriminantClosedIsOne
-{
-    Assert.Equal(Status.Discriminant(Status::Closed(0)), 1, "Closed maps to 1");
-}
-
-test DiscriminantCancelledIsTwo
-{
-    Assert.Equal(Status.Discriminant(Status::Cancelled(0)), 2, "Cancelled maps to 2");
-}
-
-test DiscriminantWouldBlockIsThree
-{
-    Assert.Equal(Status.Discriminant(Status::WouldBlock), 3, "WouldBlock maps to 3");
-}
-
-test DiscriminantHubEmptyIsFour
-{
-    Assert.Equal(Status.Discriminant(Status::HubEmpty), 4, "HubEmpty maps to 4");
-}
-
-test DiscriminantHubLimitIsFive
-{
-    Assert.Equal(Status.Discriminant(Status::HubLimit(256)), 5, "HubLimit maps to 5");
-}
-
-test DiscriminantHubNotFoundIsSix
-{
-    Assert.Equal(Status.Discriminant(Status::HubNotFound(7)), 6, "HubNotFound maps to 6");
-}
-
-test FromcodeZeroIsOk
-{
-    Status status = Status.FromCode(0);
-    i64 label = match (status)
-    {
-        Status::Ok => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(0) is Ok");
-}
-
-test FromcodeOneIsClosed
-{
-    Status status = Status.FromCode(1);
-    i64 label = match (status)
-    {
-        Status::Closed(_) => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(1) is Closed");
-}
-
-test FromcodeTwoIsCancelled
-{
-    Status status = Status.FromCode(2);
-    i64 label = match (status)
-    {
-        Status::Cancelled(_) => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(2) is Cancelled");
-}
-
-test FromcodeThreeIsWouldBlock
-{
-    Status status = Status.FromCode(3);
-    i64 label = match (status)
-    {
-        Status::WouldBlock => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(3) is WouldBlock");
-}
-
-test FromcodeFourIsHubEmpty
-{
-    Status status = Status.FromCode(4);
-    i64 label = match (status)
-    {
-        Status::HubEmpty => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(4) is HubEmpty");
-}
-
-test FromcodeFiveIsHubLimit
-{
-    Status status = Status.FromCode(5);
-    i64 label = match (status)
-    {
-        Status::HubLimit(_) => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(5) is HubLimit");
-}
-
-test FromcodeSixIsHubNotFound
-{
-    Status status = Status.FromCode(6);
-    i64 label = match (status)
-    {
-        Status::HubNotFound(_) => 0,
-        _ => 1,
-    };
-    Assert.Equal(label, 0, "FromCode(6) is HubNotFound");
-}
-
-test DiscriminantRoundtrip
-{
-    Assert.Equal(Status.Discriminant(Status.FromCode(2)), 2, "Discriminant(FromCode(2)) is 2");
-}
-
-test FromCodeUnknownIsUnexpected
-{
-    Status status = Status.FromCode(999);
-    i64 code = match (status)
-    {
-        Status::Unexpected(raw) => raw,
-        _ => -1,
-    };
-    Assert.Equal(code, 999, "an unknown code is Unexpected with its raw code, never Ok");
-    Assert.Equal(Status.Discriminant(status), 999, "Unexpected round-trips its raw code");
-}
-
-// ---- Channel Api ----
-
-// Channel wrapper surface tests.
-
-test ChannelCreateReturnsDistinctHandles
-{
-    Channel<i64> first = Channel<i64>.Create();
-    Channel<i64> second = Channel<i64>.Create();
-    Assert.NotEqual(Channel.Handle<i64>(first), Channel.Handle<i64>(second), "each channel has its own runtime queue");
-}
-
-test ChannelSendOnAnOpenChannelIsOk
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.Send(ch, 42);
-    Assert.True(Results.IsOk(result), "an open unbounded channel accepts a send");
-}
-
-test ChannelReceiveReturnsTheSentValuesInOrder
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    Assert.True(Results.IsOk(Channel<i64>.Send(ch, 42)), "first send");
-    Assert.True(Results.IsOk(Channel<i64>.Send(ch, 43)), "second send");
-    match (Channel<i64>.Receive(ch))
-    {
-        Result::Ok(value) => Assert.Equal(value, 42_i64, "first in, first out"),
-        Result::Error(_) => Assert.Fail("a queued value is received"),
-    };
-    match (Channel<i64>.Receive(ch))
-    {
-        Result::Ok(value) => Assert.Equal(value, 43_i64, "second value next"),
-        Result::Error(_) => Assert.Fail("a queued value is received"),
-    };
-}
-
-test ChannelTrySendReturnsTryResult
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    TryResult<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.TrySend(ch, 99);
-    match (result)
-    {
-        TryResult::Ok(_) => Assert.True(true, "empty channel accepts a non-blocking send"),
-        _ => Assert.True(false, "empty channel must not reject its first non-blocking send"),
-    };
-}
-
-test ChannelTryReceiveDistinguishesEmptyAndClaimedValues
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    TryResult<i64, Concurrency.ChannelError> empty = Channel<i64>.TryReceive(ch);
-    match (empty)
-    {
-        TryResult::WouldBlock => Assert.True(true, "empty channel reports WouldBlock"),
-        _ => Assert.True(false, "empty channel must not manufacture a value"),
-    };
-
-    TryResult<Channel.SendOk, Concurrency.ChannelError> sent = Channel<i64>.TrySend(ch, 99_i64);
-    match (sent)
-    {
-        TryResult::Ok(_) => Assert.True(true, "empty channel accepts the published value"),
-        _ => Assert.True(false, "empty channel must accept one published value"),
-    };
-    TryResult<i64, Concurrency.ChannelError> received = Channel<i64>.TryReceive(ch);
-    match (received)
-    {
-        TryResult::Ok(value) => Assert.Equal(value, 99_i64, "try receive returns the single claimed value"),
-        _ => Assert.True(false, "published value must be claimed exactly once"),
-    };
-    TryResult<i64, Concurrency.ChannelError> consumed = Channel<i64>.TryReceive(ch);
-    match (consumed)
-    {
-        TryResult::WouldBlock => Assert.True(true, "claimed value is removed from the queue"),
-        _ => Assert.True(false, "one publication cannot satisfy two receivers"),
-    };
-}
-
-test ChannelCloseIsIdempotentAndRejectsLaterSends
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    i64 handle = Channel.Handle<i64>(ch);
-    Channel<i64>.Close(ch);
-    Channel<i64>.Close(ch);
-    match (Channel<i64>.TrySend(ch, 1))
-    {
-        TryResult::Err(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, handle, "the error names the closed channel"),
-        _ => Assert.Fail("a closed channel rejects a non-blocking send"),
-    };
-    match (Channel<i64>.Send(ch, 1))
-    {
-        Result::Error(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, handle, "the error names the closed channel"),
-        _ => Assert.Fail("a closed channel rejects a send"),
-    };
-    match (Channel<i64>.TryReceive(ch))
-    {
-        TryResult::Err(Concurrency.ChannelError::Closed(_)) => { },
-        _ => Assert.Fail("a closed, empty channel reports Closed"),
-    };
-    match (Channel<i64>.Receive(ch))
-    {
-        Result::Error(Concurrency.ChannelError::Closed(_)) => { },
-        _ => Assert.Fail("a blocking receive on a closed, empty channel reports Closed"),
-    };
-}
-
-test ChannelCloseDrainsCommittedValue
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    let sent = Channel.Send<i64>(ch, 42_i64);
-    Assert.True(Results.IsOk(sent), "send commits once");
-    Channel.Close<i64>(ch);
-    Channel.Close<i64>(ch);
-    match (Channel.TryReceive<i64>(ch))
-    {
-        TryResult::Ok(value) => Assert.Equal(value, 42_i64, "close retains committed value"),
-        _ => Assert.True(false, "close must not drain queue storage"),
-    };
-    match (Channel.TryReceive<i64>(ch))
-    {
-        TryResult::Err(Concurrency.ChannelError::Closed(_)) => Assert.True(true, "closed after drain"),
-        _ => Assert.True(false, "one committed value is delivered exactly once"),
-    };
-}
-
-// ---- Mutex Try Lock ----
-
-// Mutex wrapper surface tests.
-
-test MutexTryLockIsExclusiveUntilUnlock
-{
-    Mutex mutex = Mutex.Create();
-    Concurrency.MutexGuard guard = match (Mutex.TryLock(mutex))
-    {
-        TryResult::Ok(held) => held,
-        _ => {
-            Assert.Fail("a fresh mutex try-locks");
-            return;
-        },
-    };
-    match (Mutex.TryLock(mutex))
-    {
-        TryResult::WouldBlock => { },
-        TryResult::Ok(_) => Assert.Fail("a held mutex is not locked twice"),
-        TryResult::Err(_) => Assert.Fail("a held mutex reports WouldBlock, not an error"),
-    };
-    Mutex.Unlock(guard);
-    match (Mutex.TryLock(mutex))
-    {
-        TryResult::Ok(again) => Mutex.Unlock(again),
-        _ => Assert.Fail("an unlocked mutex try-locks again"),
-    };
-}
-
-test MutexLockOnAFreshMutexIsOk
-{
-    Mutex mutex = Mutex.Create();
-    match (Mutex.Lock(mutex))
-    {
-        Result::Ok(guard) => Mutex.Unlock(guard),
-        Result::Error(_) => Assert.Fail("a fresh mutex locks"),
-    };
-}
-
-// ---- Concurrency Clock ----
-
-// Scheduler clock and yield wrappers.
-
-test NowMillisNonNegative
-{
-    i64 now = Concurrency.NowMillis();
-    Assert.True(now >= 0, "NowMillis should be non-negative");
-}
-
-test ProcessorCountPositive
-{
-    i64 count = Concurrency.ProcessorCount();
-    Assert.True(count >= 1, "ProcessorCount should be at least 1");
-}
-
-test YieldKeepsTheSchedulerUsable
-{
-    Fiber<i64> fiber = spawn ProduceValue();
-    Concurrency.Yield();
-    Thread.Yield();
-    match (fiber.Join())
-    {
-        Result::Ok(value) => Assert.Equal(value, 42_i64, "a fiber spawned before both yields joins with its value"),
-        Result::Error(_) => Assert.Fail("yielding does not cancel other fibers"),
-    };
-}
-
-// ---- Hub Register ----
-
-// Hub registration tests.
-
-test HubWithoutMembersReportsEmpty
-{
-    Hub<i64> hub = Hub<i64>.Create();
-    match (Hub.WaitReceive<i64>(hub))
-    {
-        Result::Error(HubError::Empty) => { },
-        _ => Assert.Fail("a hub without members has nothing to wait for"),
-    };
-}
-
-test HubRegisterDeliversTheMemberValueWithItsIndex
-{
-    Hub<i64> hub = Hub<i64>.Create();
-    Channel<i64> ch = Channel<i64>.Create();
-    Assert.True(Results.IsOk(Hub.Register<i64>(hub, 3_i64, ch)), "a live hub registers a live channel");
-    Assert.True(Results.IsOk(Channel<i64>.Send(ch, 7)), "send to the member");
-    match (Hub.WaitReceive<i64>(hub))
-    {
-        Result::Ok(received) => {
-            Assert.Equal(received.index, 3_i64, "the result names the member index");
-            Assert.Equal(received.value, 7_i64, "the result carries the member's value");
-        },
-        Result::Error(_) => Assert.Fail("a ready member satisfies WaitReceive"),
-    };
-}
-
-test HubUnregisterRemovesTheMember
-{
-    Hub<i64> hub = Hub<i64>.Create();
-    Channel<i64> ch = Channel<i64>.Create();
-    Assert.True(Results.IsOk(Hub.Register<i64>(hub, 0_i64, ch)), "register");
-    Hub.Unregister<i64>(hub, 0_i64);
-    Assert.True(Results.IsOk(Channel<i64>.Send(ch, 1)), "the channel itself stays open");
-    match (Hub.WaitReceive<i64>(hub))
-    {
-        Result::Error(HubError::Empty) => { },
-        _ => Assert.Fail("an unregistered member no longer feeds the hub"),
-    };
-    match (Channel<i64>.TryReceive(ch))
-    {
-        TryResult::Ok(value) => Assert.Equal(value, 1_i64, "the value stays in the channel"),
-        _ => Assert.Fail("the hub did not consume the value"),
-    };
-}
-
-// ---- Wait Group ----
-
 // WaitGroup wrapper surface.
-
 i64 SendThenDone(Channel<i64> results, WaitGroup group, i64 value)
 {
     match (Channel<i64>.Send(results, value))
@@ -408,68 +30,10 @@ i64 SendThenDone(Channel<i64> results, WaitGroup group, i64 value)
     return value;
 }
 
-test WaitGroupWaitReturnsAfterEveryDone
-{
-    WaitGroup group = WaitGroup.Create();
-    Channel<i64> results = Channel<i64>.Create();
-    WaitGroup.Add(group, 2);
-    Fiber<i64> first = spawn SendThenDone(results, group, 1);
-    Fiber<i64> second = spawn SendThenDone(results, group, 2);
-    WaitGroup.Wait(group);
-    mut i64 sum = 0;
-    mut i64 count = 0;
-    mut bool draining = true;
-    while (draining)
-    {
-        match (Channel<i64>.TryReceive(results))
-        {
-            TryResult::Ok(value) => {
-                sum = sum + value;
-                count = count + 1;
-            },
-            _ => {
-                draining = false;
-            },
-        };
-    }
-    Assert.Equal(count, 2, "both fibers sent before Wait returned");
-    Assert.Equal(sum, 3, "both values arrived");
-    first.Detach();
-    second.Detach();
-}
-
-// ---- Fiber Handle ----
-
 // Fiber handle runtime tests, exercised through the public Fiber API only.
-
 i64 ProduceValue()
 {
     return 42_i64;
-}
-
-test SpawnedFiberJoinReturnsItsValue
-{
-    Fiber<i64> fiber = spawn ProduceValue();
-    Core.Results.Result<i64, FiberError> result = fiber.Join();
-    match (result)
-    {
-        Result::Ok(value) => Assert.True(value == 42_i64, "Fiber.Join returns the typed terminal value"),
-        Result::Error(_) => Assert.True(false, "a completed fiber must join with a value"),
-    };
-}
-
-test RepeatedCancelThenJoinIsSafe
-{
-    Fiber<i64> fiber = spawn ProduceValue();
-    fiber.Cancel();
-    fiber.Cancel();
-    Core.Results.Result<i64, FiberError> result = fiber.Join();
-    match (result)
-    {
-        Result::Ok(value) => Assert.True(value == 42_i64, "a fiber that finished before cancellation keeps its value"),
-        Result::Error(FiberError::Cancelled(_, _)) => Assert.True(true, "a cancelled fiber joins as cancelled"),
-        Result::Error(_) => Assert.True(false, "cancellation must not produce another error kind"),
-    };
 }
 
 i64 SendOnce(Channel<i64> output, i64 value)
@@ -481,20 +45,6 @@ i64 SendOnce(Channel<i64> output, i64 value)
     };
     return value;
 }
-
-test DetachedFiberStillRuns
-{
-    Channel<i64> output = Channel<i64>.Create();
-    Fiber<i64> fiber = spawn SendOnce(output, 5);
-    fiber.Detach();
-    match (Channel<i64>.Receive(output))
-    {
-        Result::Ok(value) => Assert.Equal(value, 5_i64, "the detached fiber's send arrives"),
-        Result::Error(_) => Assert.Fail("the detached fiber runs to completion"),
-    };
-}
-
-// ---- Runtime limits: every runtime table grows on demand (v06-runtime-limits) ----
 
 // A chain of nested spawn+join keeps `depth` fibers alive at once; the scheduler's chunked fiber
 // table has to grow past its first chunk, and every finished slot is reused afterwards.
@@ -513,171 +63,12 @@ i64 SpawnChain(i64 depth)
     };
 }
 
-test TenThousandFibersSpawnAndJoinWithBoundedConcurrency
-{
-    mut i64 total = 0_i64;
-    mut i64 round = 0_i64;
-    while (round < 50_i64)
-    {
-        i64 chain = SpawnChain(200_i64);
-        Assert.Equal(chain, 200_i64, "every fiber in a chain of 200 joins with its value");
-        total = total + chain;
-        round = round + 1_i64;
-    }
-    Assert.Equal(total, 10000_i64, "10,000 fibers spawned and joined through a growable table");
-}
-
-test OneThousandChannelsEachDeliverOneValue
-{
-    mut i64 index = 0_i64;
-    mut i64 delivered = 0_i64;
-    while (index < 1000_i64)
-    {
-        Channel<i64> ch = Channel<i64>.Create();
-        let sent = Channel.Send<i64>(ch, index);
-        Assert.True(Results.IsOk(sent), "a fresh channel beyond the old 64-slot table accepts a send");
-        match (Channel.TryReceive<i64>(ch))
-        {
-            TryResult::Ok(value) => {
-                if (value == index)
-                {
-                    delivered = delivered + 1_i64;
-                }
-            },
-            _ => Assert.True(false, "the committed value is claimed from its own channel"),
-        };
-        Channel.Close<i64>(ch);
-        index = index + 1_i64;
-    }
-    Assert.Equal(delivered, 1000_i64, "1,000 channels created and used in one scheduler");
-}
-
-test OneThousandMutexesLockAndUnlock
-{
-    mut i64 index = 0_i64;
-    mut i64 locked = 0_i64;
-    while (index < 1000_i64)
-    {
-        Mutex mutex = Mutex.Create();
-        match (Mutex.Lock(mutex))
-        {
-            Result::Ok(guard) => {
-                locked = locked + 1_i64;
-                Mutex.Unlock(guard);
-            },
-            Result::Error(_) => Assert.True(false, "a fresh mutex beyond the old 32-slot table locks"),
-        };
-        index = index + 1_i64;
-    }
-    Assert.Equal(locked, 1000_i64, "1,000 mutexes created and locked in one scheduler");
-}
-
-test OneThousandWaitGroupsComplete
-{
-    mut i64 completed = 0_i64;
-    mut i64 index = 0_i64;
-    while (index < 1000_i64)
-    {
-        WaitGroup group = WaitGroup.Create();
-        WaitGroup.Add(group, 1_i64);
-        WaitGroup.Done(group);
-        WaitGroup.Wait(group);
-        completed = completed + 1_i64;
-        index = index + 1_i64;
-    }
-    Assert.Equal(completed, 1000_i64, "1,000 wait groups beyond the old 16-slot table each return from Wait");
-}
-
-test OneHubRegistersOneThousandChannelsAndReceivesFromTheLast
-{
-    Hub<i64> hub = Hub<i64>.Create();
-    mut i64 index = 0_i64;
-    mut i64 registered = 0_i64;
-    Channel<i64> last = Channel<i64>.Create();
-    while (index < 1000_i64)
-    {
-        mut Channel<i64> member = Channel<i64>.Create();
-        if (index == 999_i64)
-        {
-            member = last;
-        }
-        match (Hub.Register<i64>(hub, index, member))
-        {
-            Result::Ok(_) => {
-                registered = registered + 1_i64;
-            },
-            Result::Error(_) => Assert.True(false, "registrations beyond the old 256-entry cap succeed"),
-        };
-        index = index + 1_i64;
-    }
-    Assert.Equal(registered, 1000_i64, "1,000 registrations on one hub");
-    let sent = Channel.Send<i64>(last, 7_i64);
-    Assert.True(Results.IsOk(sent), "the last member accepts a value");
-    match (Hub.WaitReceive<i64>(hub))
-    {
-        Result::Ok(received) => Assert.Equal(received.index, 999_i64, "the hub delivers from the only ready member"),
-        Result::Error(_) => Assert.True(false, "a ready member satisfies WaitReceive"),
-    };
-}
-
-// ---- Channel error mapping and Main as the root fiber ----
-
-test MapChannelErrorTurnsWouldBlockIntoUnexpected
-{
-    Concurrency.ChannelError error = Channel.MapChannelError(Status::WouldBlock, 5_i64);
-    i64 code = match (error)
-    {
-        Concurrency.ChannelError::Unexpected(raw) => raw,
-        _ => -1_i64,
-    };
-    Assert.Equal(code, 3_i64, "a status outside the receive contract is Unexpected, not Closed(0)");
-}
-
-test MapChannelErrorClosedNamesTheEndpoint
-{
-    Concurrency.ChannelError error = Channel.MapChannelError(Status.FromCode(1), 5_i64);
-    i64 endpoint = match (error)
-    {
-        Concurrency.ChannelError::Closed(id) => id,
-        _ => -1_i64,
-    };
-    Assert.Equal(endpoint, 5_i64, "Closed carries the channel handle, not 0");
-}
-
-test ReceiveOnAClosedChannelNamesItsHandle
-{
-    Channel<i64> other = Channel<i64>.Create();
-    Channel.Close<i64>(other);
-    i64 expected = Channel.Handle<i64>(other);
-    match (Channel.Receive<i64>(other))
-    {
-        Result::Error(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, expected, "Closed names the closed channel"),
-        _ => Assert.True(false, "a closed, empty channel reports Closed"),
-    };
-}
-
 unit SendAfterYields(Channel<i64> ch, i64 value)
 {
     Concurrency.Yield();
     Concurrency.Yield();
     let sent = Channel.Send<i64>(ch, value);
     return;
-}
-
-test ReceiveInTheRootFiberParksUntilAFiberSends
-{
-    Channel<i64> ch = Channel<i64>.Create();
-    Fiber<unit> sender = spawn (() => SendAfterYields(ch, 41_i64));
-    match (Channel.Receive<i64>(ch))
-    {
-        Result::Ok(value) => Assert.Equal(value, 41_i64, "the root fiber parks on an empty channel and receives the sent value"),
-        Result::Error(_) => Assert.True(false, "Receive in the root fiber must park, not fail"),
-    };
-    match (sender.Join())
-    {
-        Result::Ok(_) => Assert.True(true, "the sender finished"),
-        Result::Error(_) => Assert.True(false, "the sender must finish"),
-    };
 }
 
 unit DoneAfterYields(WaitGroup group, i64[] state)
@@ -687,114 +78,6 @@ unit DoneAfterYields(WaitGroup group, i64[] state)
     WaitGroup.Done(group);
     return;
 }
-
-test WaitInTheRootFiberParksUntilAFiberCallsDone
-{
-    // state[0] is set by the fiber just before Done.
-    i64[] state = [0_i64];
-    WaitGroup group = WaitGroup.Create();
-    WaitGroup.Add(group, 1_i64);
-    Fiber<unit> finisher = spawn (() => DoneAfterYields(group, state));
-    WaitGroup.Wait(group);
-    Assert.Equal(Array.Get<i64>(state, 0_i64), 1_i64, "Wait returned only after the fiber ran up to Done");
-    finisher.Detach();
-}
-
-// ---- Hub and Mutex statuses outside their contract are Unexpected ----
-
-test MapLockErrorTurnsAnUnknownStatusIntoUnexpected
-{
-    i64 code = match (Mutex.MapLockError(Status.FromCode(42)))
-    {
-        MutexError::Unexpected(raw) => raw,
-        _ => -1_i64,
-    };
-    Assert.Equal(code, 42_i64, "an unknown lock status is Unexpected with its code, not Cancelled(0)");
-    i64 cancelled = match (Mutex.MapLockError(Status.FromCode(1)))
-    {
-        MutexError::Cancelled(_) => 1_i64,
-        _ => 0_i64,
-    };
-    Assert.Equal(cancelled, 1_i64, "lock status 1 stays the documented cancellation");
-}
-
-test MapRegisterErrorNamesTheMemberIndex
-{
-    i64 member = match (Hub.MapRegisterError(Status.FromCode(6), 17_i64))
-    {
-        HubError::Closed(index) => index,
-        _ => -100_i64,
-    };
-    Assert.Equal(member, 17_i64, "a not-found registration names the member index, not 0");
-    i64 code = match (Hub.MapRegisterError(Status::WouldBlock, 17_i64))
-    {
-        HubError::Unexpected(raw) => raw,
-        _ => -1_i64,
-    };
-    Assert.Equal(code, 3_i64, "a status outside the register contract is Unexpected, not Closed(0)");
-}
-
-test MapWaitReceiveErrorTurnsAnUnknownStatusIntoUnexpected
-{
-    i64 code = match (Hub.MapWaitReceiveError(Status.FromCode(3), 0_i64))
-    {
-        HubError::Unexpected(raw) => raw,
-        _ => -1_i64,
-    };
-    Assert.Equal(code, 3_i64, "a status outside the wait contract is Unexpected, not Closed(0)");
-}
-
-test MapWaitReceiveErrorNamesTheClosedMember
-{
-    i64 member = match (Hub.MapWaitReceiveError(Status.FromCode(1), 4_i64))
-    {
-        HubError::Closed(index) => index,
-        _ => -1_i64,
-    };
-    Assert.Equal(member, 4_i64, "a closed wait names the member the runtime reports");
-}
-
-test WaitReceiveInMainOverClosedMembersIsClosed
-{
-    Hub<i64> hub = Hub<i64>.Create();
-    Channel<i64> first = Hub.CreateMemberChannel();
-    Channel<i64> second = Hub.CreateMemberChannel();
-    match (Hub.Register<i64>(hub, 5_i64, first))
-    {
-        Result::Ok(_) => Assert.True(true, "first member registered"),
-        Result::Error(_) => Assert.Fail("first member registers"),
-    };
-    match (Hub.Register<i64>(hub, 9_i64, second))
-    {
-        Result::Ok(_) => Assert.True(true, "second member registered"),
-        Result::Error(_) => Assert.Fail("second member registers"),
-    };
-    Channel.Close<i64>(first);
-    Channel.Close<i64>(second);
-    i64 member = match (Hub.WaitReceive<i64>(hub))
-    {
-        Result::Error(HubError::Closed(index)) => index,
-        _ => -1_i64,
-    };
-    Assert.Equal(member, 5_i64, "a wait over closed members returns Closed with the first member, not a deadlock trap");
-}
-
-test WaitReceiveOnAnEmptyHubIsEmpty
-{
-    Hub<i64> hub = Hub<i64>.Create();
-    match (Hub.WaitReceive<i64>(hub))
-    {
-        Result::Error(HubError::Empty) => Assert.True(true, "an empty hub reports Empty"),
-        _ => Assert.Fail("an empty hub reports Empty, not Closed(-1)"),
-    };
-    match (Hub.MapWaitReceiveError(Status::HubNotFound(0), 0_i64))
-    {
-        HubError::Empty => Assert.True(true, "an unknown hub reports Empty"),
-        _ => Assert.Fail("an unknown hub reports Empty"),
-    };
-}
-
-// ---- A Main local survives collections while Main parks ----
 
 unit ChurnThenSend(Channel<i64> done)
 {
@@ -813,79 +96,6 @@ unit ChurnThenSend(Channel<i64> done)
     return;
 }
 
-test AFreshObjectHeldOnlyByMainSurvivesCollectionsDuringARootPark
-{
-    string kept = "kept ${41_i64}";
-    Channel<i64> done = Channel<i64>.Create();
-    Fiber<unit> churn = spawn (() => ChurnThenSend(done));
-    match (Channel.Receive<i64>(done))
-    {
-        Result::Ok(empty) => Assert.Equal(empty, 0_i64, "the churning fiber finished while Main waited"),
-        Result::Error(_) => Assert.Fail("Receive in the root fiber must park, not fail"),
-    };
-    Assert.Equal(kept, "kept 41", "Main's fresh string survived the collections the fiber caused");
-    match (churn.Join())
-    {
-        Result::Ok(_) => Assert.True(true, "the churning fiber finished"),
-        Result::Error(_) => Assert.Fail("the churning fiber must finish"),
-    };
-}
-
-// ---- Channel options: capacity and reader/writer hints ----
-
-test ChannelOptionsEncodeCapacityAndHints
-{
-    Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.Default()), 0_i64, "default is unbounded");
-    Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.Default()), 0_i64, "default has no hints");
-    Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.Unbounded()), 0_i64, "unbounded is capacity 0");
-    Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.Bounded(3)), 3_i64, "bounded keeps its capacity");
-    Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.Bounded(3)), 0_i64, "bounded has no hints");
-    Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.SingleReader()), 1_i64, "single reader is flag 1");
-    Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.SingleReader()), 0_i64, "single reader is unbounded");
-    Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.SingleWriter()), 2_i64, "single writer is flag 2");
-    Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.SingleWriter()), 0_i64, "single writer is unbounded");
-}
-
-test BoundedChannelReportsWouldBlockWhenFull
-{
-    Channel<i64> ch = Channel.CreateWithOptions<i64>(ChannelOptions.Bounded(2));
-    match (Channel<i64>.TrySend(ch, 1))
-    {
-        TryResult::Ok(_) => { },
-        _ => Assert.Fail("first slot is free"),
-    };
-    match (Channel<i64>.TrySend(ch, 2))
-    {
-        TryResult::Ok(_) => { },
-        _ => Assert.Fail("second slot is free"),
-    };
-    match (Channel<i64>.TrySend(ch, 3))
-    {
-        TryResult::WouldBlock => { },
-        _ => Assert.Fail("a full bounded channel reports WouldBlock"),
-    };
-    match (Channel<i64>.TryReceive(ch))
-    {
-        TryResult::Ok(value) => Assert.Equal(value, 1_i64, "first in, first out"),
-        _ => Assert.Fail("a full channel has a value"),
-    };
-    match (Channel<i64>.TrySend(ch, 3))
-    {
-        TryResult::Ok(_) => { },
-        _ => Assert.Fail("a receive frees one slot"),
-    };
-    match (Channel<i64>.TryReceive(ch))
-    {
-        TryResult::Ok(value) => Assert.Equal(value, 2_i64, "second value next"),
-        _ => Assert.Fail("second value is queued"),
-    };
-    match (Channel<i64>.TryReceive(ch))
-    {
-        TryResult::Ok(value) => Assert.Equal(value, 3_i64, "the late value is last"),
-        _ => Assert.Fail("the late value is queued"),
-    };
-}
-
 i64 SendRange(Channel<i64> ch, i64 count)
 {
     mut i64 i = 0;
@@ -902,53 +112,845 @@ i64 SendRange(Channel<i64> ch, i64 count)
     return count;
 }
 
-test BoundedChannelSenderParksUntilTheReceiverDrains
+mod StatusTests
 {
-    Channel<i64> ch = Channel.CreateWithOptions<i64>(ChannelOptions.Bounded(1));
-    Fiber<i64> sender = spawn SendRange(ch, 5);
-    mut i64 expected = 0;
-    mut bool open = true;
-    while (open)
+    // ABI contract for Concurrency.Status discriminated union mapping.
+    // The Status enum now carries its payload as variant arguments; the
+    // bidirectional ToI64/FromI64 codec is replaced by FromCode (decode) and
+    // Discriminant (encode).
+    test DiscriminantOkIsZero
     {
-        match (Channel<i64>.Receive(ch))
-        {
-            Result::Ok(value) => {
-                Assert.Equal(value, expected, "values arrive in order through one slot");
-                expected = expected + 1;
-            },
-            Result::Error(_) => {
-                open = false;
-            },
-        };
+        Assert.Equal(Status.Discriminant(Status::Ok), 0, "Ok maps to 0");
     }
-    Assert.Equal(expected, 5, "every value passed the one-slot channel");
-    match (sender.Join())
+
+    test DiscriminantClosedIsOne
     {
-        Result::Ok(sent) => Assert.Equal(sent, 5_i64, "the sender finished"),
-        Result::Error(_) => Assert.Fail("the parked sender resumes and finishes"),
-    };
+        Assert.Equal(Status.Discriminant(Status::Closed(0)), 1, "Closed maps to 1");
+    }
+
+    test DiscriminantCancelledIsTwo
+    {
+        Assert.Equal(Status.Discriminant(Status::Cancelled(0)), 2, "Cancelled maps to 2");
+    }
+
+    test DiscriminantWouldBlockIsThree
+    {
+        Assert.Equal(Status.Discriminant(Status::WouldBlock), 3, "WouldBlock maps to 3");
+    }
+
+    test DiscriminantHubEmptyIsFour
+    {
+        Assert.Equal(Status.Discriminant(Status::HubEmpty), 4, "HubEmpty maps to 4");
+    }
+
+    test DiscriminantHubLimitIsFive
+    {
+        Assert.Equal(Status.Discriminant(Status::HubLimit(256)), 5, "HubLimit maps to 5");
+    }
+
+    test DiscriminantHubNotFoundIsSix
+    {
+        Assert.Equal(Status.Discriminant(Status::HubNotFound(7)), 6, "HubNotFound maps to 6");
+    }
+
+    test FromcodeZeroIsOk
+    {
+        Status status = Status.FromCode(0);
+        i64 label = match (status)
+        {
+            Status::Ok => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(0) is Ok");
+    }
+
+    test FromcodeOneIsClosed
+    {
+        Status status = Status.FromCode(1);
+        i64 label = match (status)
+        {
+            Status::Closed(_) => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(1) is Closed");
+    }
+
+    test FromcodeTwoIsCancelled
+    {
+        Status status = Status.FromCode(2);
+        i64 label = match (status)
+        {
+            Status::Cancelled(_) => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(2) is Cancelled");
+    }
+
+    test FromcodeThreeIsWouldBlock
+    {
+        Status status = Status.FromCode(3);
+        i64 label = match (status)
+        {
+            Status::WouldBlock => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(3) is WouldBlock");
+    }
+
+    test FromcodeFourIsHubEmpty
+    {
+        Status status = Status.FromCode(4);
+        i64 label = match (status)
+        {
+            Status::HubEmpty => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(4) is HubEmpty");
+    }
+
+    test FromcodeFiveIsHubLimit
+    {
+        Status status = Status.FromCode(5);
+        i64 label = match (status)
+        {
+            Status::HubLimit(_) => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(5) is HubLimit");
+    }
+
+    test FromcodeSixIsHubNotFound
+    {
+        Status status = Status.FromCode(6);
+        i64 label = match (status)
+        {
+            Status::HubNotFound(_) => 0,
+            _ => 1,
+        };
+        Assert.Equal(label, 0, "FromCode(6) is HubNotFound");
+    }
+
+    test DiscriminantRoundtrip
+    {
+        Assert.Equal(Status.Discriminant(Status.FromCode(2)), 2, "Discriminant(FromCode(2)) is 2");
+    }
+
+    test FromCodeUnknownIsUnexpected
+    {
+        Status status = Status.FromCode(999);
+        i64 code = match (status)
+        {
+            Status::Unexpected(raw) => raw,
+            _ => -1,
+        };
+        Assert.Equal(code, 999, "an unknown code is Unexpected with its raw code, never Ok");
+        Assert.Equal(Status.Discriminant(status), 999, "Unexpected round-trips its raw code");
+    }
 }
 
-test SingleReaderAndSingleWriterChannelsDeliverInOrder
+mod ChannelTests
 {
-    Channel<i64> reader = Channel.CreateWithOptions<i64>(ChannelOptions.SingleReader());
-    Channel<i64> writer = Channel.CreateWithOptions<i64>(ChannelOptions.SingleWriter());
-    Assert.True(Results.IsOk(Channel<i64>.Send(reader, 10)), "single reader accepts");
-    Assert.True(Results.IsOk(Channel<i64>.Send(reader, 11)), "single reader accepts a second value");
-    Assert.True(Results.IsOk(Channel<i64>.Send(writer, 20)), "single writer accepts");
-    match (Channel<i64>.Receive(reader))
+    // Channel wrapper surface tests.
+    test CreateReturnsDistinctHandles
     {
-        Result::Ok(value) => Assert.Equal(value, 10_i64, "single reader is FIFO"),
-        Result::Error(_) => Assert.Fail("single reader delivers"),
-    };
-    match (Channel<i64>.Receive(reader))
+        Channel<i64> first = Channel<i64>.Create();
+        Channel<i64> second = Channel<i64>.Create();
+        Assert.NotEqual(Channel.Handle<i64>(first), Channel.Handle<i64>(second), "each channel has its own runtime queue");
+    }
+
+    test SendOnAnOpenChannelIsOk
     {
-        Result::Ok(value) => Assert.Equal(value, 11_i64, "single reader is FIFO"),
-        Result::Error(_) => Assert.Fail("single reader delivers"),
-    };
-    match (Channel<i64>.Receive(writer))
+        Channel<i64> ch = Channel<i64>.Create();
+        Core.Results.Result<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.Send(ch, 42);
+        Assert.True(Results.IsOk(result), "an open unbounded channel accepts a send");
+    }
+
+    test ReceiveReturnsTheSentValuesInOrder
     {
-        Result::Ok(value) => Assert.Equal(value, 20_i64, "single writer delivers"),
-        Result::Error(_) => Assert.Fail("single writer delivers"),
-    };
+        Channel<i64> ch = Channel<i64>.Create();
+        Assert.True(Results.IsOk(Channel<i64>.Send(ch, 42)), "first send");
+        Assert.True(Results.IsOk(Channel<i64>.Send(ch, 43)), "second send");
+        match (Channel<i64>.Receive(ch))
+        {
+            Result::Ok(value) => Assert.Equal(value, 42_i64, "first in, first out"),
+            Result::Error(_) => Assert.Fail("a queued value is received"),
+        };
+        match (Channel<i64>.Receive(ch))
+        {
+            Result::Ok(value) => Assert.Equal(value, 43_i64, "second value next"),
+            Result::Error(_) => Assert.Fail("a queued value is received"),
+        };
+    }
+
+    test TrySendReturnsTryResult
+    {
+        Channel<i64> ch = Channel<i64>.Create();
+        TryResult<Channel.SendOk, Concurrency.ChannelError> result = Channel<i64>.TrySend(ch, 99);
+        match (result)
+        {
+            TryResult::Ok(_) => Assert.True(true, "empty channel accepts a non-blocking send"),
+            _ => Assert.True(false, "empty channel must not reject its first non-blocking send"),
+        };
+    }
+
+    test TryReceiveDistinguishesEmptyAndClaimedValues
+    {
+        Channel<i64> ch = Channel<i64>.Create();
+        TryResult<i64, Concurrency.ChannelError> empty = Channel<i64>.TryReceive(ch);
+        match (empty)
+        {
+            TryResult::WouldBlock => Assert.True(true, "empty channel reports WouldBlock"),
+            _ => Assert.True(false, "empty channel must not manufacture a value"),
+        };
+
+        TryResult<Channel.SendOk, Concurrency.ChannelError> sent = Channel<i64>.TrySend(ch, 99_i64);
+        match (sent)
+        {
+            TryResult::Ok(_) => Assert.True(true, "empty channel accepts the published value"),
+            _ => Assert.True(false, "empty channel must accept one published value"),
+        };
+        TryResult<i64, Concurrency.ChannelError> received = Channel<i64>.TryReceive(ch);
+        match (received)
+        {
+            TryResult::Ok(value) => Assert.Equal(value, 99_i64, "try receive returns the single claimed value"),
+            _ => Assert.True(false, "published value must be claimed exactly once"),
+        };
+        TryResult<i64, Concurrency.ChannelError> consumed = Channel<i64>.TryReceive(ch);
+        match (consumed)
+        {
+            TryResult::WouldBlock => Assert.True(true, "claimed value is removed from the queue"),
+            _ => Assert.True(false, "one publication cannot satisfy two receivers"),
+        };
+    }
+
+    test CloseIsIdempotentAndRejectsLaterSends
+    {
+        Channel<i64> ch = Channel<i64>.Create();
+        i64 handle = Channel.Handle<i64>(ch);
+        Channel<i64>.Close(ch);
+        Channel<i64>.Close(ch);
+        match (Channel<i64>.TrySend(ch, 1))
+        {
+            TryResult::Err(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, handle, "the error names the closed channel"),
+            _ => Assert.Fail("a closed channel rejects a non-blocking send"),
+        };
+        match (Channel<i64>.Send(ch, 1))
+        {
+            Result::Error(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, handle, "the error names the closed channel"),
+            _ => Assert.Fail("a closed channel rejects a send"),
+        };
+        match (Channel<i64>.TryReceive(ch))
+        {
+            TryResult::Err(Concurrency.ChannelError::Closed(_)) => { },
+            _ => Assert.Fail("a closed, empty channel reports Closed"),
+        };
+        match (Channel<i64>.Receive(ch))
+        {
+            Result::Error(Concurrency.ChannelError::Closed(_)) => { },
+            _ => Assert.Fail("a blocking receive on a closed, empty channel reports Closed"),
+        };
+    }
+
+    test CloseDrainsCommittedValue
+    {
+        Channel<i64> ch = Channel<i64>.Create();
+        let sent = Channel.Send<i64>(ch, 42_i64);
+        Assert.True(Results.IsOk(sent), "send commits once");
+        Channel.Close<i64>(ch);
+        Channel.Close<i64>(ch);
+        match (Channel.TryReceive<i64>(ch))
+        {
+            TryResult::Ok(value) => Assert.Equal(value, 42_i64, "close retains committed value"),
+            _ => Assert.True(false, "close must not drain queue storage"),
+        };
+        match (Channel.TryReceive<i64>(ch))
+        {
+            TryResult::Err(Concurrency.ChannelError::Closed(_)) => Assert.True(true, "closed after drain"),
+            _ => Assert.True(false, "one committed value is delivered exactly once"),
+        };
+    }
+
+    test OptionsEncodeCapacityAndHints
+    {
+        Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.Default()), 0_i64, "default is unbounded");
+        Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.Default()), 0_i64, "default has no hints");
+        Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.Unbounded()), 0_i64, "unbounded is capacity 0");
+        Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.Bounded(3)), 3_i64, "bounded keeps its capacity");
+        Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.Bounded(3)), 0_i64, "bounded has no hints");
+        Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.SingleReader()), 1_i64, "single reader is flag 1");
+        Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.SingleReader()), 0_i64, "single reader is unbounded");
+        Assert.Equal(ChannelOptions.EncodeFlags(ChannelOptions.SingleWriter()), 2_i64, "single writer is flag 2");
+        Assert.Equal(ChannelOptions.EncodeCapacity(ChannelOptions.SingleWriter()), 0_i64, "single writer is unbounded");
+    }
+
+    test BoundedChannelReportsWouldBlockWhenFull
+    {
+        Channel<i64> ch = Channel.CreateWithOptions<i64>(ChannelOptions.Bounded(2));
+        match (Channel<i64>.TrySend(ch, 1))
+        {
+            TryResult::Ok(_) => { },
+            _ => Assert.Fail("first slot is free"),
+        };
+        match (Channel<i64>.TrySend(ch, 2))
+        {
+            TryResult::Ok(_) => { },
+            _ => Assert.Fail("second slot is free"),
+        };
+        match (Channel<i64>.TrySend(ch, 3))
+        {
+            TryResult::WouldBlock => { },
+            _ => Assert.Fail("a full bounded channel reports WouldBlock"),
+        };
+        match (Channel<i64>.TryReceive(ch))
+        {
+            TryResult::Ok(value) => Assert.Equal(value, 1_i64, "first in, first out"),
+            _ => Assert.Fail("a full channel has a value"),
+        };
+        match (Channel<i64>.TrySend(ch, 3))
+        {
+            TryResult::Ok(_) => { },
+            _ => Assert.Fail("a receive frees one slot"),
+        };
+        match (Channel<i64>.TryReceive(ch))
+        {
+            TryResult::Ok(value) => Assert.Equal(value, 2_i64, "second value next"),
+            _ => Assert.Fail("second value is queued"),
+        };
+        match (Channel<i64>.TryReceive(ch))
+        {
+            TryResult::Ok(value) => Assert.Equal(value, 3_i64, "the late value is last"),
+            _ => Assert.Fail("the late value is queued"),
+        };
+    }
+
+    test BoundedChannelSenderParksUntilTheReceiverDrains
+    {
+        Channel<i64> ch = Channel.CreateWithOptions<i64>(ChannelOptions.Bounded(1));
+        Fiber<i64> sender = spawn SendRange(ch, 5);
+        mut i64 expected = 0;
+        mut bool open = true;
+        while (open)
+        {
+            match (Channel<i64>.Receive(ch))
+            {
+                Result::Ok(value) => {
+                    Assert.Equal(value, expected, "values arrive in order through one slot");
+                    expected = expected + 1;
+                },
+                Result::Error(_) => {
+                    open = false;
+                },
+            };
+        }
+        Assert.Equal(expected, 5, "every value passed the one-slot channel");
+        match (sender.Join())
+        {
+            Result::Ok(sent) => Assert.Equal(sent, 5_i64, "the sender finished"),
+            Result::Error(_) => Assert.Fail("the parked sender resumes and finishes"),
+        };
+    }
+
+    test SingleReaderAndSingleWriterChannelsDeliverInOrder
+    {
+        Channel<i64> reader = Channel.CreateWithOptions<i64>(ChannelOptions.SingleReader());
+        Channel<i64> writer = Channel.CreateWithOptions<i64>(ChannelOptions.SingleWriter());
+        Assert.True(Results.IsOk(Channel<i64>.Send(reader, 10)), "single reader accepts");
+        Assert.True(Results.IsOk(Channel<i64>.Send(reader, 11)), "single reader accepts a second value");
+        Assert.True(Results.IsOk(Channel<i64>.Send(writer, 20)), "single writer accepts");
+        match (Channel<i64>.Receive(reader))
+        {
+            Result::Ok(value) => Assert.Equal(value, 10_i64, "single reader is FIFO"),
+            Result::Error(_) => Assert.Fail("single reader delivers"),
+        };
+        match (Channel<i64>.Receive(reader))
+        {
+            Result::Ok(value) => Assert.Equal(value, 11_i64, "single reader is FIFO"),
+            Result::Error(_) => Assert.Fail("single reader delivers"),
+        };
+        match (Channel<i64>.Receive(writer))
+        {
+            Result::Ok(value) => Assert.Equal(value, 20_i64, "single writer delivers"),
+            Result::Error(_) => Assert.Fail("single writer delivers"),
+        };
+    }
+}
+
+mod MutexTests
+{
+    // Mutex wrapper surface tests.
+    test TryLockIsExclusiveUntilUnlock
+    {
+        Mutex mutex = Mutex.Create();
+        Concurrency.MutexGuard guard = match (Mutex.TryLock(mutex))
+        {
+            TryResult::Ok(held) => held,
+            _ => {
+                Assert.Fail("a fresh mutex try-locks");
+                return;
+            },
+        };
+        match (Mutex.TryLock(mutex))
+        {
+            TryResult::WouldBlock => { },
+            TryResult::Ok(_) => Assert.Fail("a held mutex is not locked twice"),
+            TryResult::Err(_) => Assert.Fail("a held mutex reports WouldBlock, not an error"),
+        };
+        Mutex.Unlock(guard);
+        match (Mutex.TryLock(mutex))
+        {
+            TryResult::Ok(again) => Mutex.Unlock(again),
+            _ => Assert.Fail("an unlocked mutex try-locks again"),
+        };
+    }
+
+    test LockOnAFreshMutexIsOk
+    {
+        Mutex mutex = Mutex.Create();
+        match (Mutex.Lock(mutex))
+        {
+            Result::Ok(guard) => Mutex.Unlock(guard),
+            Result::Error(_) => Assert.Fail("a fresh mutex locks"),
+        };
+    }
+}
+
+mod ClockTests
+{
+    // Scheduler clock and yield wrappers.
+    test NowMillisNonNegative
+    {
+        i64 now = Concurrency.NowMillis();
+        Assert.True(now >= 0, "NowMillis should be non-negative");
+    }
+
+    test ProcessorCountPositive
+    {
+        i64 count = Concurrency.ProcessorCount();
+        Assert.True(count >= 1, "ProcessorCount should be at least 1");
+    }
+
+    test YieldKeepsTheSchedulerUsable
+    {
+        Fiber<i64> fiber = spawn ProduceValue();
+        Concurrency.Yield();
+        Thread.Yield();
+        match (fiber.Join())
+        {
+            Result::Ok(value) => Assert.Equal(value, 42_i64, "a fiber spawned before both yields joins with its value"),
+            Result::Error(_) => Assert.Fail("yielding does not cancel other fibers"),
+        };
+    }
+}
+
+mod HubTests
+{
+    // Hub registration tests.
+    test WithoutMembersReportsEmpty
+    {
+        Hub<i64> hub = Hub<i64>.Create();
+        match (Hub.WaitReceive<i64>(hub))
+        {
+            Result::Error(HubError::Empty) => { },
+            _ => Assert.Fail("a hub without members has nothing to wait for"),
+        };
+    }
+
+    test RegisterDeliversTheMemberValueWithItsIndex
+    {
+        Hub<i64> hub = Hub<i64>.Create();
+        Channel<i64> ch = Channel<i64>.Create();
+        Assert.True(Results.IsOk(Hub.Register<i64>(hub, 3_i64, ch)), "a live hub registers a live channel");
+        Assert.True(Results.IsOk(Channel<i64>.Send(ch, 7)), "send to the member");
+        match (Hub.WaitReceive<i64>(hub))
+        {
+            Result::Ok(received) => {
+                Assert.Equal(received.index, 3_i64, "the result names the member index");
+                Assert.Equal(received.value, 7_i64, "the result carries the member's value");
+            },
+            Result::Error(_) => Assert.Fail("a ready member satisfies WaitReceive"),
+        };
+    }
+
+    test UnregisterRemovesTheMember
+    {
+        Hub<i64> hub = Hub<i64>.Create();
+        Channel<i64> ch = Channel<i64>.Create();
+        Assert.True(Results.IsOk(Hub.Register<i64>(hub, 0_i64, ch)), "register");
+        Hub.Unregister<i64>(hub, 0_i64);
+        Assert.True(Results.IsOk(Channel<i64>.Send(ch, 1)), "the channel itself stays open");
+        match (Hub.WaitReceive<i64>(hub))
+        {
+            Result::Error(HubError::Empty) => { },
+            _ => Assert.Fail("an unregistered member no longer feeds the hub"),
+        };
+        match (Channel<i64>.TryReceive(ch))
+        {
+            TryResult::Ok(value) => Assert.Equal(value, 1_i64, "the value stays in the channel"),
+            _ => Assert.Fail("the hub did not consume the value"),
+        };
+    }
+}
+
+mod WaitGroupTests
+{
+    test WaitReturnsAfterEveryDone
+    {
+        WaitGroup group = WaitGroup.Create();
+        Channel<i64> results = Channel<i64>.Create();
+        WaitGroup.Add(group, 2);
+        Fiber<i64> first = spawn SendThenDone(results, group, 1);
+        Fiber<i64> second = spawn SendThenDone(results, group, 2);
+        WaitGroup.Wait(group);
+        mut i64 sum = 0;
+        mut i64 count = 0;
+        mut bool draining = true;
+        while (draining)
+        {
+            match (Channel<i64>.TryReceive(results))
+            {
+                TryResult::Ok(value) => {
+                    sum = sum + value;
+                    count = count + 1;
+                },
+                _ => {
+                    draining = false;
+                },
+            };
+        }
+        Assert.Equal(count, 2, "both fibers sent before Wait returned");
+        Assert.Equal(sum, 3, "both values arrived");
+        first.Detach();
+        second.Detach();
+    }
+}
+
+mod FiberTests
+{
+    test SpawnedFiberJoinReturnsItsValue
+    {
+        Fiber<i64> fiber = spawn ProduceValue();
+        Core.Results.Result<i64, FiberError> result = fiber.Join();
+        match (result)
+        {
+            Result::Ok(value) => Assert.True(value == 42_i64, "Fiber.Join returns the typed terminal value"),
+            Result::Error(_) => Assert.True(false, "a completed fiber must join with a value"),
+        };
+    }
+
+    test RepeatedCancelThenJoinIsSafe
+    {
+        Fiber<i64> fiber = spawn ProduceValue();
+        fiber.Cancel();
+        fiber.Cancel();
+        Core.Results.Result<i64, FiberError> result = fiber.Join();
+        match (result)
+        {
+            Result::Ok(value) => Assert.True(value == 42_i64, "a fiber that finished before cancellation keeps its value"),
+            Result::Error(FiberError::Cancelled(_, _)) => Assert.True(true, "a cancelled fiber joins as cancelled"),
+            Result::Error(_) => Assert.True(false, "cancellation must not produce another error kind"),
+        };
+    }
+
+    test DetachedFiberStillRuns
+    {
+        Channel<i64> output = Channel<i64>.Create();
+        Fiber<i64> fiber = spawn SendOnce(output, 5);
+        fiber.Detach();
+        match (Channel<i64>.Receive(output))
+        {
+            Result::Ok(value) => Assert.Equal(value, 5_i64, "the detached fiber's send arrives"),
+            Result::Error(_) => Assert.Fail("the detached fiber runs to completion"),
+        };
+    }
+}
+
+mod LimitsTests
+{
+    test TenThousandFibersSpawnAndJoinWithBoundedConcurrency
+    {
+        mut i64 total = 0_i64;
+        mut i64 round = 0_i64;
+        while (round < 50_i64)
+        {
+            i64 chain = SpawnChain(200_i64);
+            Assert.Equal(chain, 200_i64, "every fiber in a chain of 200 joins with its value");
+            total = total + chain;
+            round = round + 1_i64;
+        }
+        Assert.Equal(total, 10000_i64, "10,000 fibers spawned and joined through a growable table");
+    }
+
+    test OneThousandChannelsEachDeliverOneValue
+    {
+        mut i64 index = 0_i64;
+        mut i64 delivered = 0_i64;
+        while (index < 1000_i64)
+        {
+            Channel<i64> ch = Channel<i64>.Create();
+            let sent = Channel.Send<i64>(ch, index);
+            Assert.True(Results.IsOk(sent), "a fresh channel beyond the old 64-slot table accepts a send");
+            match (Channel.TryReceive<i64>(ch))
+            {
+                TryResult::Ok(value) => {
+                    if (value == index)
+                    {
+                        delivered = delivered + 1_i64;
+                    }
+                },
+                _ => Assert.True(false, "the committed value is claimed from its own channel"),
+            };
+            Channel.Close<i64>(ch);
+            index = index + 1_i64;
+        }
+        Assert.Equal(delivered, 1000_i64, "1,000 channels created and used in one scheduler");
+    }
+
+    test OneThousandMutexesLockAndUnlock
+    {
+        mut i64 index = 0_i64;
+        mut i64 locked = 0_i64;
+        while (index < 1000_i64)
+        {
+            Mutex mutex = Mutex.Create();
+            match (Mutex.Lock(mutex))
+            {
+                Result::Ok(guard) => {
+                    locked = locked + 1_i64;
+                    Mutex.Unlock(guard);
+                },
+                Result::Error(_) => Assert.True(false, "a fresh mutex beyond the old 32-slot table locks"),
+            };
+            index = index + 1_i64;
+        }
+        Assert.Equal(locked, 1000_i64, "1,000 mutexes created and locked in one scheduler");
+    }
+
+    test OneThousandWaitGroupsComplete
+    {
+        mut i64 completed = 0_i64;
+        mut i64 index = 0_i64;
+        while (index < 1000_i64)
+        {
+            WaitGroup group = WaitGroup.Create();
+            WaitGroup.Add(group, 1_i64);
+            WaitGroup.Done(group);
+            WaitGroup.Wait(group);
+            completed = completed + 1_i64;
+            index = index + 1_i64;
+        }
+        Assert.Equal(completed, 1000_i64, "1,000 wait groups beyond the old 16-slot table each return from Wait");
+    }
+
+    test OneHubRegistersOneThousandChannelsAndReceivesFromTheLast
+    {
+        Hub<i64> hub = Hub<i64>.Create();
+        mut i64 index = 0_i64;
+        mut i64 registered = 0_i64;
+        Channel<i64> last = Channel<i64>.Create();
+        while (index < 1000_i64)
+        {
+            mut Channel<i64> member = Channel<i64>.Create();
+            if (index == 999_i64)
+            {
+                member = last;
+            }
+            match (Hub.Register<i64>(hub, index, member))
+            {
+                Result::Ok(_) => {
+                    registered = registered + 1_i64;
+                },
+                Result::Error(_) => Assert.True(false, "registrations beyond the old 256-entry cap succeed"),
+            };
+            index = index + 1_i64;
+        }
+        Assert.Equal(registered, 1000_i64, "1,000 registrations on one hub");
+        let sent = Channel.Send<i64>(last, 7_i64);
+        Assert.True(Results.IsOk(sent), "the last member accepts a value");
+        match (Hub.WaitReceive<i64>(hub))
+        {
+            Result::Ok(received) => Assert.Equal(received.index, 999_i64, "the hub delivers from the only ready member"),
+            Result::Error(_) => Assert.True(false, "a ready member satisfies WaitReceive"),
+        };
+    }
+}
+
+mod ChannelErrorsTests
+{
+    test MapChannelErrorTurnsWouldBlockIntoUnexpected
+    {
+        Concurrency.ChannelError error = Channel.MapChannelError(Status::WouldBlock, 5_i64);
+        i64 code = match (error)
+        {
+            Concurrency.ChannelError::Unexpected(raw) => raw,
+            _ => -1_i64,
+        };
+        Assert.Equal(code, 3_i64, "a status outside the receive contract is Unexpected, not Closed(0)");
+    }
+
+    test MapChannelErrorClosedNamesTheEndpoint
+    {
+        Concurrency.ChannelError error = Channel.MapChannelError(Status.FromCode(1), 5_i64);
+        i64 endpoint = match (error)
+        {
+            Concurrency.ChannelError::Closed(id) => id,
+            _ => -1_i64,
+        };
+        Assert.Equal(endpoint, 5_i64, "Closed carries the channel handle, not 0");
+    }
+
+    test ReceiveOnAClosedChannelNamesItsHandle
+    {
+        Channel<i64> other = Channel<i64>.Create();
+        Channel.Close<i64>(other);
+        i64 expected = Channel.Handle<i64>(other);
+        match (Channel.Receive<i64>(other))
+        {
+            Result::Error(Concurrency.ChannelError::Closed(endpoint)) => Assert.Equal(endpoint, expected, "Closed names the closed channel"),
+            _ => Assert.True(false, "a closed, empty channel reports Closed"),
+        };
+    }
+
+    test ReceiveInTheRootFiberParksUntilAFiberSends
+    {
+        Channel<i64> ch = Channel<i64>.Create();
+        Fiber<unit> sender = spawn (() => SendAfterYields(ch, 41_i64));
+        match (Channel.Receive<i64>(ch))
+        {
+            Result::Ok(value) => Assert.Equal(value, 41_i64, "the root fiber parks on an empty channel and receives the sent value"),
+            Result::Error(_) => Assert.True(false, "Receive in the root fiber must park, not fail"),
+        };
+        match (sender.Join())
+        {
+            Result::Ok(_) => Assert.True(true, "the sender finished"),
+            Result::Error(_) => Assert.True(false, "the sender must finish"),
+        };
+    }
+
+    test WaitInTheRootFiberParksUntilAFiberCallsDone
+    {
+        // state[0] is set by the fiber just before Done.
+        i64[] state = [0_i64];
+        WaitGroup group = WaitGroup.Create();
+        WaitGroup.Add(group, 1_i64);
+        Fiber<unit> finisher = spawn (() => DoneAfterYields(group, state));
+        WaitGroup.Wait(group);
+        Assert.Equal(Array.Get<i64>(state, 0_i64), 1_i64, "Wait returned only after the fiber ran up to Done");
+        finisher.Detach();
+    }
+}
+
+mod StatusErrorsTests
+{
+    test MapLockErrorTurnsAnUnknownStatusIntoUnexpected
+    {
+        i64 code = match (Mutex.MapLockError(Status.FromCode(42)))
+        {
+            MutexError::Unexpected(raw) => raw,
+            _ => -1_i64,
+        };
+        Assert.Equal(code, 42_i64, "an unknown lock status is Unexpected with its code, not Cancelled(0)");
+        i64 cancelled = match (Mutex.MapLockError(Status.FromCode(1)))
+        {
+            MutexError::Cancelled(_) => 1_i64,
+            _ => 0_i64,
+        };
+        Assert.Equal(cancelled, 1_i64, "lock status 1 stays the documented cancellation");
+    }
+
+    test MapRegisterErrorNamesTheMemberIndex
+    {
+        i64 member = match (Hub.MapRegisterError(Status.FromCode(6), 17_i64))
+        {
+            HubError::Closed(index) => index,
+            _ => -100_i64,
+        };
+        Assert.Equal(member, 17_i64, "a not-found registration names the member index, not 0");
+        i64 code = match (Hub.MapRegisterError(Status::WouldBlock, 17_i64))
+        {
+            HubError::Unexpected(raw) => raw,
+            _ => -1_i64,
+        };
+        Assert.Equal(code, 3_i64, "a status outside the register contract is Unexpected, not Closed(0)");
+    }
+
+    test MapWaitReceiveErrorTurnsAnUnknownStatusIntoUnexpected
+    {
+        i64 code = match (Hub.MapWaitReceiveError(Status.FromCode(3), 0_i64))
+        {
+            HubError::Unexpected(raw) => raw,
+            _ => -1_i64,
+        };
+        Assert.Equal(code, 3_i64, "a status outside the wait contract is Unexpected, not Closed(0)");
+    }
+
+    test MapWaitReceiveErrorNamesTheClosedMember
+    {
+        i64 member = match (Hub.MapWaitReceiveError(Status.FromCode(1), 4_i64))
+        {
+            HubError::Closed(index) => index,
+            _ => -1_i64,
+        };
+        Assert.Equal(member, 4_i64, "a closed wait names the member the runtime reports");
+    }
+
+    test WaitReceiveInMainOverClosedMembersIsClosed
+    {
+        Hub<i64> hub = Hub<i64>.Create();
+        Channel<i64> first = Hub.CreateMemberChannel();
+        Channel<i64> second = Hub.CreateMemberChannel();
+        match (Hub.Register<i64>(hub, 5_i64, first))
+        {
+            Result::Ok(_) => Assert.True(true, "first member registered"),
+            Result::Error(_) => Assert.Fail("first member registers"),
+        };
+        match (Hub.Register<i64>(hub, 9_i64, second))
+        {
+            Result::Ok(_) => Assert.True(true, "second member registered"),
+            Result::Error(_) => Assert.Fail("second member registers"),
+        };
+        Channel.Close<i64>(first);
+        Channel.Close<i64>(second);
+        i64 member = match (Hub.WaitReceive<i64>(hub))
+        {
+            Result::Error(HubError::Closed(index)) => index,
+            _ => -1_i64,
+        };
+        Assert.Equal(member, 5_i64, "a wait over closed members returns Closed with the first member, not a deadlock trap");
+    }
+
+    test WaitReceiveOnAnEmptyHubIsEmpty
+    {
+        Hub<i64> hub = Hub<i64>.Create();
+        match (Hub.WaitReceive<i64>(hub))
+        {
+            Result::Error(HubError::Empty) => Assert.True(true, "an empty hub reports Empty"),
+            _ => Assert.Fail("an empty hub reports Empty, not Closed(-1)"),
+        };
+        match (Hub.MapWaitReceiveError(Status::HubNotFound(0), 0_i64))
+        {
+            HubError::Empty => Assert.True(true, "an unknown hub reports Empty"),
+            _ => Assert.Fail("an unknown hub reports Empty"),
+        };
+    }
+}
+
+mod RootFiberTests
+{
+    test AFreshObjectHeldOnlyByMainSurvivesCollectionsDuringARootPark
+    {
+        string kept = "kept ${41_i64}";
+        Channel<i64> done = Channel<i64>.Create();
+        Fiber<unit> churn = spawn (() => ChurnThenSend(done));
+        match (Channel.Receive<i64>(done))
+        {
+            Result::Ok(empty) => Assert.Equal(empty, 0_i64, "the churning fiber finished while Main waited"),
+            Result::Error(_) => Assert.Fail("Receive in the root fiber must park, not fail"),
+        };
+        Assert.Equal(kept, "kept 41", "Main's fresh string survived the collections the fiber caused");
+        match (churn.Join())
+        {
+            Result::Ok(_) => Assert.True(true, "the churning fiber finished"),
+            Result::Error(_) => Assert.Fail("the churning fiber must finish"),
+        };
+    }
 }

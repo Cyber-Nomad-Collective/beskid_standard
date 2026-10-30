@@ -12,91 +12,94 @@ u8[] Range(i64 n)
     return Pattern(n, 1, 0);
 }
 
-test AesEncryptsTheFips197AppendixCBlocks
+mod AesTests
 {
-    u8[] plaintext = Hex("00112233445566778899aabbccddeeff");
-    Assert.True(Same(Unwrap(Aes.Encrypt(Range(16), plaintext)), Hex("69c4e0d86a7b0430d8cdb78070b4c55a")), "AES-128 C.1");
-    Assert.True(Same(Unwrap(Aes.Encrypt(Range(24), plaintext)), Hex("dda97ca4864cdfe06eaf70a0ec0d7191")), "AES-192 C.2");
-    Assert.True(Same(Unwrap(Aes.Encrypt(Range(32), plaintext)), Hex("8ea2b7ca516745bfeafc49904b496089")), "AES-256 C.3");
-}
-
-test AesRejectsA20ByteKey
-{
-    bool rejected = match (Aes.NewKey(Slice.New(20_i64)))
+    test EncryptsTheFips197AppendixCBlocks
     {
-        Result::Ok(_) => false,
-        Result::Error(e) => match (e)
+        u8[] plaintext = Hex("00112233445566778899aabbccddeeff");
+        Assert.True(Same(Unwrap(Aes.Encrypt(Range(16), plaintext)), Hex("69c4e0d86a7b0430d8cdb78070b4c55a")), "AES-128 C.1");
+        Assert.True(Same(Unwrap(Aes.Encrypt(Range(24), plaintext)), Hex("dda97ca4864cdfe06eaf70a0ec0d7191")), "AES-192 C.2");
+        Assert.True(Same(Unwrap(Aes.Encrypt(Range(32), plaintext)), Hex("8ea2b7ca516745bfeafc49904b496089")), "AES-256 C.3");
+    }
+
+    test RejectsA20ByteKey
+    {
+        bool rejected = match (Aes.NewKey(Slice.New(20_i64)))
         {
-            CryptoError::InvalidKeyLength => true,
-            _ => false,
-        },
-    };
-    Assert.True(rejected, "20-byte key");
-}
+            Result::Ok(_) => false,
+            Result::Error(e) => match (e)
+            {
+                CryptoError::InvalidKeyLength => true,
+                _ => false,
+            },
+        };
+        Assert.True(rejected, "20-byte key");
+    }
 
-test AesGcmMatchesTheGcmSpecification
-{
-    for v in AesGcmVectors()
+    test GcmMatchesTheGcmSpecification
     {
+        for v in AesGcmVectors()
+        {
+            match (AesGcm.New(v.key))
+            {
+                Result::Error(_) => {
+                    Assert.Fail("key " + v.label);
+                },
+                Result::Ok(key) => {
+                    u8[] sealed = Unwrap(AesGcm.Seal(key, v.nonce, v.aad, v.plaintext));
+                    Assert.True(Same(sealed, Hex(v.sealed)), "sealed " + v.label);
+                    Assert.True(Same(Unwrap(AesGcm.Open(key, v.nonce, v.aad, sealed)), v.plaintext), "opened " + v.label);
+                },
+            };
+        }
+    }
+
+    test GcmRejectsTamperedInputsAndBadNonces
+    {
+        // Inputs of AES-GCM test case 4 (the shared vector set).
+        AeadVector[] vectors = AesGcmVectors();
+        AeadVector v = vectors[3];
         match (AesGcm.New(v.key))
         {
             Result::Error(_) => {
-                Assert.Fail("key " + v.label);
+                Assert.Fail("key");
             },
             Result::Ok(key) => {
                 u8[] sealed = Unwrap(AesGcm.Seal(key, v.nonce, v.aad, v.plaintext));
-                Assert.True(Same(sealed, Hex(v.sealed)), "sealed " + v.label);
-                Assert.True(Same(Unwrap(AesGcm.Open(key, v.nonce, v.aad, sealed)), v.plaintext), "opened " + v.label);
-            },
-        };
-    }
-}
-
-test AesGcmRejectsTamperedInputsAndBadNonces
-{
-    // Inputs of AES-GCM test case 4 (the shared vector set).
-    AeadVector[] vectors = AesGcmVectors();
-    AeadVector v = vectors[3];
-    match (AesGcm.New(v.key))
-    {
-        Result::Error(_) => {
-            Assert.Fail("key");
-        },
-        Result::Ok(key) => {
-            u8[] sealed = Unwrap(AesGcm.Seal(key, v.nonce, v.aad, v.plaintext));
-            mut i64 position = 0_i64;
-            while (position < Slice.Len(sealed))
-            {
-                u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
-                copy[position] = (copy[position] | 0x80_u8) - (copy[position] & 0x80_u8);
-                bool failed = match (AesGcm.Open(key, v.nonce, v.aad, copy))
+                mut i64 position = 0_i64;
+                while (position < Slice.Len(sealed))
+                {
+                    u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+                    copy[position] = (copy[position] | 0x80_u8) - (copy[position] & 0x80_u8);
+                    bool failed = match (AesGcm.Open(key, v.nonce, v.aad, copy))
+                    {
+                        Result::Ok(_) => false,
+                        Result::Error(e) => match (e)
+                        {
+                            CryptoError::AuthenticationFailed => true,
+                            _ => false,
+                        },
+                    };
+                    Assert.True(failed, "tampered byte rejected");
+                    position = position + 7_i64;
+                }
+                bool wrongNonce = match (AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), v.aad, sealed))
+                {
+                    Result::Ok(_) => false,
+                    Result::Error(_) => true,
+                };
+                Assert.True(wrongNonce, "nonce bound");
+                bool badNonce = match (AesGcm.Seal(key, Hex("cafebabe"), Hex(""), Hex("")))
                 {
                     Result::Ok(_) => false,
                     Result::Error(e) => match (e)
                     {
-                        CryptoError::AuthenticationFailed => true,
+                        CryptoError::InvalidNonceLength => true,
                         _ => false,
                     },
                 };
-                Assert.True(failed, "tampered byte rejected");
-                position = position + 7_i64;
-            }
-            bool wrongNonce = match (AesGcm.Open(key, Hex("cafebabefacedbaddecaf889"), v.aad, sealed))
-            {
-                Result::Ok(_) => false,
-                Result::Error(_) => true,
-            };
-            Assert.True(wrongNonce, "nonce bound");
-            bool badNonce = match (AesGcm.Seal(key, Hex("cafebabe"), Hex(""), Hex("")))
-            {
-                Result::Ok(_) => false,
-                Result::Error(e) => match (e)
-                {
-                    CryptoError::InvalidNonceLength => true,
-                    _ => false,
-                },
-            };
-            Assert.True(badNonce, "nonce length");
-        },
-    };
+                Assert.True(badNonce, "nonce length");
+            },
+        };
+    }
 }

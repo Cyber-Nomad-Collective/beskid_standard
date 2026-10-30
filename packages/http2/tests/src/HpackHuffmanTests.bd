@@ -3,12 +3,10 @@ use Core.Bytes.Convert;
 use Core.Bytes.Slice;
 use Core.Results;
 use Http2.Hpack;
-
 use Http2.HpackHuffman;
 use HpackSupport;
 
 // RFC 7541 section 5.2 and Appendix B Huffman coding.
-
 u8[] HuffmanBytes(HuffmanTables tables, u8[] data)
 {
     mut u8[] out = [];
@@ -56,91 +54,94 @@ unit ExpectHuffman(HuffmanTables tables, string text, string hex)
     return;
 }
 
-test AppendixCHuffmanStrings
+mod HuffmanTests
 {
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    ExpectHuffman(tables, "www.example.com", "f1e3c2e5f23a6ba0ab90f4ff");
-    ExpectHuffman(tables, "no-cache", "a8eb10649cbf");
-    ExpectHuffman(tables, "custom-key", "25a849e95ba97d7f");
-    ExpectHuffman(tables, "custom-value", "25a849e95bb8e8b4bf");
-    ExpectHuffman(tables, "302", "6402");
-    ExpectHuffman(tables, "private", "aec3771a4b");
-    ExpectHuffman(tables, "Mon, 21 Oct 2013 20:13:21 GMT", "d07abe941054d444a8200595040b8166e082a62d1bff");
-    ExpectHuffman(tables, "https://www.example.com", "9d29ad171863c78f0b97c8e9ae82ae43d3");
-    ExpectHuffman(tables, "gzip", "9bd9ab");
-}
-
-test EmptyStringIsEmpty
-{
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    u8[] empty = [];
-    Assert.Equal<i64>(Slice.Len(HuffmanBytes(tables, empty)), 0_i64, "no octets");
-    Assert.Equal<i64>(Slice.Len(HuffmanDecodeOk(tables, empty, "empty")), 0_i64, "nothing decoded");
-}
-
-test EveryOctetRoundTrips
-{
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    u8[] all = Slice.New(256_i64);
-    mut i64 i = 0_i64;
-    while (i < 256_i64)
+    test AppendixCHuffmanStrings
     {
-        all[i] = u8(i);
-        i = i + 1_i64;
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        ExpectHuffman(tables, "www.example.com", "f1e3c2e5f23a6ba0ab90f4ff");
+        ExpectHuffman(tables, "no-cache", "a8eb10649cbf");
+        ExpectHuffman(tables, "custom-key", "25a849e95ba97d7f");
+        ExpectHuffman(tables, "custom-value", "25a849e95bb8e8b4bf");
+        ExpectHuffman(tables, "302", "6402");
+        ExpectHuffman(tables, "private", "aec3771a4b");
+        ExpectHuffman(tables, "Mon, 21 Oct 2013 20:13:21 GMT", "d07abe941054d444a8200595040b8166e082a62d1bff");
+        ExpectHuffman(tables, "https://www.example.com", "9d29ad171863c78f0b97c8e9ae82ae43d3");
+        ExpectHuffman(tables, "gzip", "9bd9ab");
     }
-    u8[] wire = HuffmanBytes(tables, all);
-    Assert.Equal<i64>(Slice.Len(wire), HpackHuffman.HuffmanEncodedLength(tables, all), "length agrees");
-    Assert.True(Hpack.BytesEqual(HuffmanDecodeOk(tables, wire, "all octets"), all), "all octets round trip");
-    // Each single octet on its own exercises every padding length.
-    i = 0_i64;
-    while (i < 256_i64)
+
+    test EmptyStringIsEmpty
     {
-        u8[] one = [u8(i)];
-        Assert.True(Hpack.BytesEqual(HuffmanDecodeOk(tables, HuffmanBytes(tables, one), "one octet"), one), "single octet round trip");
-        i = i + 1_i64;
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        u8[] empty = [];
+        Assert.Equal<i64>(Slice.Len(HuffmanBytes(tables, empty)), 0_i64, "no octets");
+        Assert.Equal<i64>(Slice.Len(HuffmanDecodeOk(tables, empty, "empty")), 0_i64, "nothing decoded");
     }
-}
 
-test PaddingLongerThan7BitsIsRejected
-{
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    // 'a' is 00011; then 11 one bits of padding.
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "1fff"), 5_i64, "11-bit padding");
-    // A whole octet of ones as padding.
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "ff"), 5_i64, "8-bit padding alone");
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "1f"), 0_i64, "3-bit padding is fine");
-}
-
-test PaddingNotMatchingEosIsRejected
-{
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    // 'a' then padding 000.
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "18"), 6_i64, "zero padding");
-    // 'a' then padding 101.
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "1d"), 6_i64, "mixed padding");
-}
-
-test EosSymbolIsRejected
-{
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    // 30 one bits form EOS.
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "ffffffff"), 7_i64, "EOS");
-    // 'a' followed by EOS.
-    Assert.Equal<i64>(HuffmanErrorCode(tables, "1fffffffff"), 7_i64, "EOS after a symbol");
-}
-
-test DecodedLengthIsBounded
-{
-    HuffmanTables tables = HpackHuffman.NewHuffmanTables();
-    u8[] wire = HuffmanBytes(tables, Convert.StringToBytes("aaaaaaaa"));
-    Result<u8[], HpackError> r = HpackHuffman.HuffmanDecode(tables, wire, 0_i64, Slice.Len(wire), 7_i64);
-    match (r)
+    test EveryOctetRoundTrips
     {
-        Result::Ok(_) => {
-            Assert.Fail("limit ignored");
-        },
-        Result::Error(error) => {
-            Assert.Equal<i64>(ErrorCode(error), 4_i64, "StringTooLong");
-        },
-    };
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        u8[] all = Slice.New(256_i64);
+        mut i64 i = 0_i64;
+        while (i < 256_i64)
+        {
+            all[i] = u8(i);
+            i = i + 1_i64;
+        }
+        u8[] wire = HuffmanBytes(tables, all);
+        Assert.Equal<i64>(Slice.Len(wire), HpackHuffman.HuffmanEncodedLength(tables, all), "length agrees");
+        Assert.True(Hpack.BytesEqual(HuffmanDecodeOk(tables, wire, "all octets"), all), "all octets round trip");
+        // Each single octet on its own exercises every padding length.
+        i = 0_i64;
+        while (i < 256_i64)
+        {
+            u8[] one = [u8(i)];
+            Assert.True(Hpack.BytesEqual(HuffmanDecodeOk(tables, HuffmanBytes(tables, one), "one octet"), one), "single octet round trip");
+            i = i + 1_i64;
+        }
+    }
+
+    test PaddingLongerThan7BitsIsRejected
+    {
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        // 'a' is 00011; then 11 one bits of padding.
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "1fff"), 5_i64, "11-bit padding");
+        // A whole octet of ones as padding.
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "ff"), 5_i64, "8-bit padding alone");
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "1f"), 0_i64, "3-bit padding is fine");
+    }
+
+    test PaddingNotMatchingEosIsRejected
+    {
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        // 'a' then padding 000.
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "18"), 6_i64, "zero padding");
+        // 'a' then padding 101.
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "1d"), 6_i64, "mixed padding");
+    }
+
+    test EosSymbolIsRejected
+    {
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        // 30 one bits form EOS.
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "ffffffff"), 7_i64, "EOS");
+        // 'a' followed by EOS.
+        Assert.Equal<i64>(HuffmanErrorCode(tables, "1fffffffff"), 7_i64, "EOS after a symbol");
+    }
+
+    test DecodedLengthIsBounded
+    {
+        HuffmanTables tables = HpackHuffman.NewHuffmanTables();
+        u8[] wire = HuffmanBytes(tables, Convert.StringToBytes("aaaaaaaa"));
+        Result<u8[], HpackError> r = HpackHuffman.HuffmanDecode(tables, wire, 0_i64, Slice.Len(wire), 7_i64);
+        match (r)
+        {
+            Result::Ok(_) => {
+                Assert.Fail("limit ignored");
+            },
+            Result::Error(error) => {
+                Assert.Equal<i64>(ErrorCode(error), 4_i64, "StringTooLong");
+            },
+        };
+    }
 }

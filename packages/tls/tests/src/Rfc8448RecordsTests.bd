@@ -33,181 +33,184 @@ pub u8[] SealBytes(RecordKeys keys, u8[] buf, i64 ct, u8[] payload, i64 padding)
     };
 }
 
-test Rfc8448DecryptServerHandshakeFlight
+mod RecordsTests
 {
-    u8[] buf = Slice.New(Record.BufferLength());
-    match (Record.FromSecret(Suites.Aes128(), ServerHsTraffic()))
+    test DecryptServerHandshakeFlight
     {
-        Result::Error(_) => {
-            Assert.Fail("server hs keys");
-        },
-        Result::Ok(keys) => {
-            u8[] record = ServerFlightRecord();
-            Assert.Equal<i64>(OpenCode(keys, buf, record), 22_i64 * 100000_i64 + 657_i64, "handshake type and 657 octets");
-            Assert.True(Same(Slice.SubSlice(buf, 5_i64, 657_i64), ServerFlight()), "EE..Finished plaintext");
-            Assert.Equal<i64>(Record.Sequence(keys), 1_i64, "sequence advanced");
-        },
-    };
-}
-
-test Rfc8448SealClientFinishedRecord
-{
-    u8[] buf = Slice.New(Record.BufferLength());
-    match (Record.FromSecret(Suites.Aes128(), ClientHsTraffic()))
-    {
-        Result::Error(_) => {
-            Assert.Fail("client hs keys");
-        },
-        Result::Ok(keys) => {
-            u8[] record = SealBytes(keys, buf, Wire.ContentHandshake(), ClientFinished(), 0_i64);
-            Assert.True(Same(record, ClientFinishedRecord()), "client Finished record matches RFC 8448");
-        },
-    };
-}
-
-test Rfc8448ApplicationRecordsBothDirections
-{
-    u8[] buf = Slice.New(Record.BufferLength());
-    match (Record.FromSecret(Suites.Aes128(), ClientApTraffic()))
-    {
-        Result::Error(_) => {
-            Assert.Fail("client ap keys");
-        },
-        Result::Ok(keys) => {
-            Assert.True(Same(SealBytes(keys, buf, Wire.ContentApplicationData(), AppData(), 0_i64), ClientAppRecord()), "client app record");
-            Assert.True(Same(SealBytes(keys, buf, Wire.ContentAlert(), Hex.Of("0100"), 0_i64), ClientAlertRecord()), "client alert record");
-        },
-    };
-    match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
-    {
-        Result::Error(_) => {
-            Assert.Fail("server ap keys");
-        },
-        Result::Ok(keys) => {
-            Assert.Equal<i64>(OpenCode(keys, buf, NewSessionTicketRecord()), 22_i64 * 100000_i64 + 205_i64, "ticket record");
-            Assert.True(Same(Slice.SubSlice(buf, 5_i64, 205_i64), NewSessionTicket()), "ticket plaintext");
-            Assert.Equal<i64>(OpenCode(keys, buf, ServerAppRecord()), 23_i64 * 100000_i64 + 50_i64, "server app record");
-            Assert.True(Same(Slice.SubSlice(buf, 5_i64, 50_i64), AppData()), "server app plaintext");
-            Assert.Equal<i64>(OpenCode(keys, buf, ServerAlertRecord()), 21_i64 * 100000_i64 + 2_i64, "server alert record");
-        },
-    };
-}
-
-test RecordTamperAndReplayRejected
-{
-    u8[] buf = Slice.New(Record.BufferLength());
-    match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
-    {
-        Result::Error(_) => {
-            Assert.Fail("keys");
-        },
-        Result::Ok(keys) => {
-            // Out of order: the app record is sequence 1, not 0.
-            Assert.Equal<i64>(OpenCode(keys, buf, ServerAppRecord()), -1020_i64, "wrong sequence is bad_record_mac");
-        },
-    };
-    match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
-    {
-        Result::Error(_) => {
-            Assert.Fail("keys");
-        },
-        Result::Ok(keys) => {
-            u8[] record = NewSessionTicketRecord();
-            record[40] = record[40] + 1_u8;
-            Assert.Equal<i64>(OpenCode(keys, buf, record), -1020_i64, "flipped byte is bad_record_mac");
-            Assert.Equal<i64>(Record.Sequence(keys), 0_i64, "failed open does not advance");
-        },
-    };
-}
-
-test RecordPaddingAndTypesAllSuites
-{
-    u8[] buf = Slice.New(Record.BufferLength());
-    // 48 bytes: long enough for the SHA-384 suite's HKDF PRK.
-    u8[] secret = Hex.Of("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
-    CipherSuite[] suites = Suites.All();
-    mut i64 i = 0_i64;
-    while (i < 3_i64)
-    {
-        CipherSuite suite = suites[i];
-        match (Record.FromSecret(suite, secret))
+        u8[] buf = Slice.New(Record.BufferLength());
+        match (Record.FromSecret(Suites.Aes128(), ServerHsTraffic()))
         {
             Result::Error(_) => {
-                Assert.Fail("seal keys");
+                Assert.Fail("server hs keys");
+            },
+            Result::Ok(keys) => {
+                u8[] record = ServerFlightRecord();
+                Assert.Equal<i64>(OpenCode(keys, buf, record), 22_i64 * 100000_i64 + 657_i64, "handshake type and 657 octets");
+                Assert.True(Same(Slice.SubSlice(buf, 5_i64, 657_i64), ServerFlight()), "EE..Finished plaintext");
+                Assert.Equal<i64>(Record.Sequence(keys), 1_i64, "sequence advanced");
+            },
+        };
+    }
+
+    test SealClientFinishedRecord
+    {
+        u8[] buf = Slice.New(Record.BufferLength());
+        match (Record.FromSecret(Suites.Aes128(), ClientHsTraffic()))
+        {
+            Result::Error(_) => {
+                Assert.Fail("client hs keys");
+            },
+            Result::Ok(keys) => {
+                u8[] record = SealBytes(keys, buf, Wire.ContentHandshake(), ClientFinished(), 0_i64);
+                Assert.True(Same(record, ClientFinishedRecord()), "client Finished record matches RFC 8448");
+            },
+        };
+    }
+
+    test ApplicationRecordsBothDirections
+    {
+        u8[] buf = Slice.New(Record.BufferLength());
+        match (Record.FromSecret(Suites.Aes128(), ClientApTraffic()))
+        {
+            Result::Error(_) => {
+                Assert.Fail("client ap keys");
+            },
+            Result::Ok(keys) => {
+                Assert.True(Same(SealBytes(keys, buf, Wire.ContentApplicationData(), AppData(), 0_i64), ClientAppRecord()), "client app record");
+                Assert.True(Same(SealBytes(keys, buf, Wire.ContentAlert(), Hex.Of("0100"), 0_i64), ClientAlertRecord()), "client alert record");
+            },
+        };
+        match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
+        {
+            Result::Error(_) => {
+                Assert.Fail("server ap keys");
+            },
+            Result::Ok(keys) => {
+                Assert.Equal<i64>(OpenCode(keys, buf, NewSessionTicketRecord()), 22_i64 * 100000_i64 + 205_i64, "ticket record");
+                Assert.True(Same(Slice.SubSlice(buf, 5_i64, 205_i64), NewSessionTicket()), "ticket plaintext");
+                Assert.Equal<i64>(OpenCode(keys, buf, ServerAppRecord()), 23_i64 * 100000_i64 + 50_i64, "server app record");
+                Assert.True(Same(Slice.SubSlice(buf, 5_i64, 50_i64), AppData()), "server app plaintext");
+                Assert.Equal<i64>(OpenCode(keys, buf, ServerAlertRecord()), 21_i64 * 100000_i64 + 2_i64, "server alert record");
+            },
+        };
+    }
+
+    test TamperAndReplayRejected
+    {
+        u8[] buf = Slice.New(Record.BufferLength());
+        match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
+        {
+            Result::Error(_) => {
+                Assert.Fail("keys");
+            },
+            Result::Ok(keys) => {
+                // Out of order: the app record is sequence 1, not 0.
+                Assert.Equal<i64>(OpenCode(keys, buf, ServerAppRecord()), -1020_i64, "wrong sequence is bad_record_mac");
+            },
+        };
+        match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
+        {
+            Result::Error(_) => {
+                Assert.Fail("keys");
+            },
+            Result::Ok(keys) => {
+                u8[] record = NewSessionTicketRecord();
+                record[40] = record[40] + 1_u8;
+                Assert.Equal<i64>(OpenCode(keys, buf, record), -1020_i64, "flipped byte is bad_record_mac");
+                Assert.Equal<i64>(Record.Sequence(keys), 0_i64, "failed open does not advance");
+            },
+        };
+    }
+
+    test PaddingAndTypesAllSuites
+    {
+        u8[] buf = Slice.New(Record.BufferLength());
+        // 48 bytes: long enough for the SHA-384 suite's HKDF PRK.
+        u8[] secret = Hex.Of("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f");
+        CipherSuite[] suites = Suites.All();
+        mut i64 i = 0_i64;
+        while (i < 3_i64)
+        {
+            CipherSuite suite = suites[i];
+            match (Record.FromSecret(suite, secret))
+            {
+                Result::Error(_) => {
+                    Assert.Fail("seal keys");
+                },
+                Result::Ok(w) => {
+                    match (Record.FromSecret(suite, secret))
+                    {
+                        Result::Error(_) => {
+                            Assert.Fail("open keys");
+                        },
+                        Result::Ok(r) => {
+                            u8[] record = SealBytes(w, buf, Wire.ContentApplicationData(), AppData(), 100_i64);
+                            Assert.Equal<i64>(Slice.Len(record), 5_i64 + 50_i64 + 1_i64 + 100_i64 + 16_i64, "padded length");
+                            Assert.Equal<i64>(OpenCode(r, buf, record), 23_i64 * 100000_i64 + 50_i64, "padding stripped");
+                            u8[] empty = SealBytes(w, buf, Wire.ContentApplicationData(), Slice.New(0_i64), 0_i64);
+                            Assert.Equal<i64>(OpenCode(r, buf, empty), 23_i64 * 100000_i64, "empty app record");
+                        },
+                    };
+                },
+            };
+            i = i + 1_i64;
+        }
+    }
+
+    test AllZeroInnerPlaintextIsUnexpected
+    {
+        u8[] buf = Slice.New(Record.BufferLength());
+        u8[] secret = ServerApTraffic();
+        match (Record.FromSecret(Suites.ChaCha(), secret))
+        {
+            Result::Error(_) => {
+                Assert.Fail("keys");
             },
             Result::Ok(w) => {
-                match (Record.FromSecret(suite, secret))
+                match (Record.FromSecret(Suites.ChaCha(), secret))
                 {
                     Result::Error(_) => {
-                        Assert.Fail("open keys");
+                        Assert.Fail("keys");
                     },
                     Result::Ok(r) => {
-                        u8[] record = SealBytes(w, buf, Wire.ContentApplicationData(), AppData(), 100_i64);
-                        Assert.Equal<i64>(Slice.Len(record), 5_i64 + 50_i64 + 1_i64 + 100_i64 + 16_i64, "padded length");
-                        Assert.Equal<i64>(OpenCode(r, buf, record), 23_i64 * 100000_i64 + 50_i64, "padding stripped");
-                        u8[] empty = SealBytes(w, buf, Wire.ContentApplicationData(), Slice.New(0_i64), 0_i64);
-                        Assert.Equal<i64>(OpenCode(r, buf, empty), 23_i64 * 100000_i64, "empty app record");
+                        // Content type 0 with padding: no non-zero byte in the inner plaintext.
+                        u8[] record = SealBytes(w, buf, 0_i64, Slice.New(0_i64), 5_i64);
+                        Assert.Equal<i64>(OpenCode(r, buf, record), -1010_i64, "unexpected_message");
                     },
                 };
             },
         };
-        i = i + 1_i64;
     }
-}
 
-test RecordAllZeroInnerPlaintextIsUnexpected
-{
-    u8[] buf = Slice.New(Record.BufferLength());
-    u8[] secret = ServerApTraffic();
-    match (Record.FromSecret(Suites.ChaCha(), secret))
+    test SizeLimits
     {
-        Result::Error(_) => {
-            Assert.Fail("keys");
-        },
-        Result::Ok(w) => {
-            match (Record.FromSecret(Suites.ChaCha(), secret))
-            {
-                Result::Error(_) => {
-                    Assert.Fail("keys");
-                },
-                Result::Ok(r) => {
-                    // Content type 0 with padding: no non-zero byte in the inner plaintext.
-                    u8[] record = SealBytes(w, buf, 0_i64, Slice.New(0_i64), 5_i64);
-                    Assert.Equal<i64>(OpenCode(r, buf, record), -1010_i64, "unexpected_message");
-                },
-            };
-        },
-    };
-}
-
-test RecordSizeLimits
-{
-    u8[] buf = Slice.New(Record.BufferLength());
-    match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
-    {
-        Result::Error(_) => {
-            Assert.Fail("keys");
-        },
-        Result::Ok(keys) => {
-            Result<i64, TlsError> tooBig = Record.Seal(keys, buf, 23_i64, 16385_i64, 0_i64);
-            Assert.True(match (tooBig)
-            {
-                Result::Error(_) => true,
-                _ => false,
-            }, "plaintext above 2^14 is refused");
-            Result<i64, TlsError> full = Record.Seal(keys, buf, 23_i64, 16384_i64, 0_i64);
-            Assert.True(match (full)
-            {
-                Result::Ok(n) => n == 5_i64 + 16384_i64 + 17_i64,
-                _ => false,
-            }, "2^14 plaintext fits");
-            Result<Opened, TlsError> over = Record.Open(keys, buf, 5_i64 + 16641_i64);
-            i64 code = match (over)
-            {
-                Result::Error(e) => TlsErrors.Code(e),
-                _ => 0_i64,
-            };
-            Assert.Equal<i64>(code, 1022_i64, "record_overflow");
-        },
-    };
+        u8[] buf = Slice.New(Record.BufferLength());
+        match (Record.FromSecret(Suites.Aes128(), ServerApTraffic()))
+        {
+            Result::Error(_) => {
+                Assert.Fail("keys");
+            },
+            Result::Ok(keys) => {
+                Result<i64, TlsError> tooBig = Record.Seal(keys, buf, 23_i64, 16385_i64, 0_i64);
+                Assert.True(match (tooBig)
+                {
+                    Result::Error(_) => true,
+                    _ => false,
+                }, "plaintext above 2^14 is refused");
+                Result<i64, TlsError> full = Record.Seal(keys, buf, 23_i64, 16384_i64, 0_i64);
+                Assert.True(match (full)
+                {
+                    Result::Ok(n) => n == 5_i64 + 16384_i64 + 17_i64,
+                    _ => false,
+                }, "2^14 plaintext fits");
+                Result<Opened, TlsError> over = Record.Open(keys, buf, 5_i64 + 16641_i64);
+                i64 code = match (over)
+                {
+                    Result::Error(e) => TlsErrors.Code(e),
+                    _ => 0_i64,
+                };
+                Assert.Equal<i64>(code, 1022_i64, "record_overflow");
+            },
+        };
+    }
 }

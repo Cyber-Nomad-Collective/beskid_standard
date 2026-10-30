@@ -30,133 +30,6 @@ use Concurrency.TryResult;
 use Core.Environment;
 use Core.Results;
 
-// ---- ANSI escape ----
-
-// Golden CSI framing checks for `Ansi.Escape` only (builders live in AnsiBuildersTests.bd).
-
-test AnsiCsiBoldRed
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Escape.CsiSequence("1;31", "m");
-    string expected = "${esc}[1;31m";
-    Assert.Equal(seq, expected, "expected CSI bold red sequence");
-}
-
-test AnsiReset
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Escape.CsiSequence("0", "m");
-    string expected = "${esc}[0m";
-    Assert.Equal(seq, expected, "expected CSI reset sequence");
-}
-
-test AnsiPrivateAltScreen
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Escape.PrivateMode("1049", true);
-    string expected = "${esc}[?1049h";
-    Assert.Equal(seq, expected, "expected alt-screen enable sequence");
-}
-
-test AnsiDecSaveCursor
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Escape.DecSaveCursor();
-    Assert.Equal(seq, "${esc}7", "expected DEC save cursor");
-}
-
-// ---- ANSI style chain ----
-
-// Golden prefix sequences for `Ansi.StyleChain` and `Ansi.Sgr` (ungated CSI builders).
-
-test StyleChainBoldWraps
-{
-    string esc = Ansi.Escape.Esc();
-    string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Bold(Ansi.StyleChain.New()));
-    string expected = "${esc}[1m";
-    Assert.Equal(prefix, expected, "bold style-chain prefix");
-}
-
-test StyleChainInversePrefix
-{
-    string esc = Ansi.Escape.Esc();
-    string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Inverse(Ansi.StyleChain.New()));
-    Assert.Contains(prefix, "${esc}[7m", "inverse SGR should contain [7m");
-}
-
-test SgrBuilderFgBasicGolden
-{
-    string esc = Ansi.Escape.Esc();
-    string prefix = Ansi.Sgr.IntoPrefix(Ansi.Sgr.FgBasic(Ansi.Sgr.Start(), 31));
-    Assert.Contains(prefix, "${esc}[31m", "basic red fg should contain [31m");
-}
-
-// ---- ANSI SGR golden ----
-
-// Golden tests for SGR and OSC escape sequences (ungated CSI/OSC builders).
-
-test AnsiBoldGolden
-{
-    string esc = Ansi.Escape.Esc();
-    string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Bold(Ansi.StyleChain.New()));
-    Assert.Contains(prefix, "${esc}[1m", "bold SGR should contain [1m");
-}
-
-test AnsiFg256Golden
-{
-    string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Fg256(Ansi.StyleChain.New(), 196));
-    Assert.Contains(prefix, "38;5;196", "256-color fg should contain 38;5;196");
-}
-
-test AnsiSgrBoldPrefixGolden
-{
-    string esc = Ansi.Escape.Esc();
-    string reset = Ansi.Escape.Csi("0", "m");
-    Assert.Contains(Ansi.Sgr.IntoPrefix(Ansi.Sgr.Bold(Ansi.Sgr.Start())), "[1m", "Sgr bold prefix should contain [1m");
-    Assert.Contains(reset, "${esc}[0m", "reset CSI should contain [0m");
-}
-
-test AnsiOscTitleGolden
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Escape.OscSequence("0;beskid");
-    Assert.Contains(seq, "${esc}]0;beskid", "OSC title should contain ]0;beskid");
-}
-
-test AnsiOscHyperlinkContainsUri
-{
-    string open = Ansi.Escape.OscSequence("8;;https://beskid.dev");
-    string close = Ansi.Escape.OscSequence("8;;");
-    string linked = "${open}link${close}";
-    Assert.Contains(linked, "8;;https://beskid.dev", "hyperlink open should embed uri");
-    Assert.Contains(linked, "link", "hyperlink should preserve label");
-}
-
-// ---- Controls progress bar ----
-
-// Progress bar clamping, render, and incremental cursor output.
-
-test ProgressBarClampsPercent
-{
-    ProgressBar.ProgressBar bar = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 150);
-    Assert.Equal(bar.percent, 100_i64, "expected percent clamped to 100");
-    ProgressBar.ProgressBar low = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), -5_i64);
-    Assert.Equal(low.percent, 0_i64, "expected percent clamped to 0");
-}
-
-test ProgressBarRendersBodyWithExactFill
-{
-    ProgressBar.ProgressBar bar = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 50_i64);
-    string rendered = ProgressBar.BarBody(bar, 10);
-    Assert.Equal(rendered, "[====    ] 50%", "expected progress bar fill to match the requested width");
-}
-
-test ProgressBarFormatsNumericInterpolation
-{
-    string rendered = "${50_i64}";
-    Assert.Equal(rendered, "50", "expected numeric interpolation to preserve the integer value");
-}
-
 pub i64 NumericInterpolationLength()
 {
     string rendered = "${50_i64}";
@@ -175,584 +48,6 @@ pub u8 NumericInterpolationSecondByte()
     return String.ByteAt(rendered, 1);
 }
 
-test ProgressBarConcatenatesAdjacentStringInterpolations
-{
-    string filled = "====";
-    string empty = "    ";
-    string rendered = "[${filled}${empty}]";
-    Assert.Equal(rendered, "[====    ]", "expected adjacent string interpolation to preserve both values");
-}
-
-// ---- Controls layout ----
-
-// Stack containers: child count, joined render and measure.
-
-test VerticalStackChildCount
-{
-    VerticalStack.VerticalStack stack = VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.New(), "a"), "b");
-    Assert.Equal(VerticalStack.VerticalStack.ChildCount(stack), 2, "expected two vertical stack children");
-}
-
-// ---- Capabilities ----
-
-// `Console.Capabilities` color/TTY policy helpers.
-
-test ShouldStripWhenNoColorSet
-{
-    Capabilities.Capabilities caps = Capabilities.Capabilities
-    {
-        isTty: true,
-        colorDisabled: true,
-        colorForced: false,
-        model: Capabilities.ColorModel::Indexed256,
-    };
-    Assert.True(Capabilities.ShouldStripColor(caps), "NO_COLOR should force strip");
-}
-
-test ShouldStripWhenNotTtyAndNotForced
-{
-    Capabilities.Capabilities caps = Capabilities.Capabilities
-    {
-        isTty: false,
-        colorDisabled: false,
-        colorForced: false,
-        model: Capabilities.ColorModel::TrueColor,
-    };
-    Assert.True(Capabilities.ShouldStripColor(caps), "non-TTY without FORCE_COLOR should strip");
-}
-
-test ShouldNotStripWhenForceColorOnPipe
-{
-    Capabilities.Capabilities caps = Capabilities.Capabilities
-    {
-        isTty: false,
-        colorDisabled: false,
-        colorForced: true,
-        model: Capabilities.ColorModel::Indexed256,
-    };
-    Assert.False(Capabilities.ShouldStripColor(caps), "FORCE_COLOR should allow ANSI on non-TTY");
-}
-
-// ---- Terminal platform ----
-
-// Platform terminal probes. The test harness runs every test with stdin at EOF and stdout and
-// stderr redirected, so neither output stream is a terminal.
-
-test ParseEnvColumnsKnownValues
-{
-    Assert.Equal(Platform.Terminal.ParseEnvColumns("120", 80), 120, "expected 120 columns");
-    Assert.Equal(Platform.Terminal.ParseEnvColumns("unknown", 80), 80, "unknown columns should keep default");
-}
-
-test ParseEnvRowsKnownValues
-{
-    Assert.Equal(Platform.Terminal.ParseEnvRows("40", 24), 40, "expected 40 rows");
-    Assert.Equal(Platform.Terminal.ParseEnvRows("", 24), 24, "empty rows should keep default");
-}
-
-// ---- Format attributes ----
-
-// Attribute span color parsing for `Console.Format.Attributes`.
-
-test ParseNamedRed
-{
-    Console.Format.Attributes.ParsedRgb rgb = Console.Format.Attributes.ParseColor("red");
-    Assert.True(rgb.ok && rgb.r == 205, "named red");
-}
-
-test ParseHexSixDigits
-{
-    Console.Format.Attributes.ParsedRgb rgb = Console.Format.Attributes.ParseColor("#ff0000");
-    Assert.True(rgb.ok && rgb.r == 255 && rgb.g == 0 && rgb.b == 0, "hex #ff0000");
-}
-
-test ParseRgbTriplet
-{
-    Console.Format.Attributes.ParsedRgb rgb = Console.Format.Attributes.ParseColor("rgb(10,20,30)");
-    Assert.True(rgb.ok && rgb.r == 10 && rgb.g == 20 && rgb.b == 30, "rgb(10,20,30)");
-}
-
-test ApplyAttrListFgAndBg
-{
-    Ansi.StyleChain chain = Console.Format.Attributes.ApplyAttrList(Ansi.StyleChain.New(), "fg=red, bg=blue");
-    string expected = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.BgRgb(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 205, 0, 0), 0, 0, 238));
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(chain), expected, "fg then bg, in list order");
-}
-
-test FormatAttrSpanPlainStrip
-{
-    string text = Console.Format.StripMarkup("&[fg=red, bg=blue](hi)");
-    Assert.Equal(text, "hi", "attr span strip");
-}
-
-test FormatAttrSpanFollowsAnsiCapability
-{
-    string text = Console.Format.Format("&[fg=red](x)");
-    string styled = Ansi.StyleChain.Apply(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 205, 0, 0), "x");
-    if (Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(text, styled, "attr span applies its color when ANSI is enabled");
-    }
-    else
-    {
-        Assert.Equal(text, "x", "attr span is stripped to its text when ANSI is disabled");
-    }
-}
-
-// ---- Format scan ----
-
-// Markup scanner helpers (`Console.Format.Scan`).
-
-test SliceReturnsSubstring
-{
-    string part = Console.Format.Scan.Slice("abcdef", 2, 3);
-    Assert.Equal(part, "cde", "Slice middle segment");
-}
-
-test IndexOfFindsNeedle
-{
-    i64 idx = Console.Format.Scan.IndexOfFrom("foo-bar", 0, "bar");
-    Assert.Equal(idx, 4, "IndexOfFrom bar");
-}
-
-test TrimStripsSpaces
-{
-    string t = Console.Format.Scan.Trim("  hi  ");
-    Assert.Equal(t, "hi", "Trim spaces");
-}
-
-test ScanStartsWithAttrOpener
-{
-    Assert.True(Console.Format.Scan.StartsWith("&[fg=", "&["), "StartsWith attr opener");
-}
-
-test ContainsSubstring
-{
-    Assert.True(Console.Format.Scan.ContainsSubstring("abc[1m", "[1m"), "ContainsSubstring CSI");
-}
-
-// ---- Console style ----
-
-// Layout enums for console controls (`Console.Style`).
-
-test ResolveSizeSmallMediumLarge
-{
-    i64 small = Style.ResolveSize(Style.Size::Small, 80);
-    i64 medium = Style.ResolveSize(Style.Size::Medium, 80);
-    i64 large = Style.ResolveSize(Style.Size::Large, 80);
-    Assert.Equal(small, 1, "small size");
-    Assert.Equal(medium, 2, "medium size");
-    Assert.Equal(large, 4, "large size");
-}
-
-test ResolvePaddingSizedAndValue
-{
-    i64 none = Style.ResolvePadding(Style.Padding::None, 80);
-    i64 sized = Style.ResolvePadding(Style.Padding::Sized(Style.Size::Medium), 80);
-    i64 explicit = Style.ResolvePadding(Style.Padding::Value(5), 80);
-    Assert.Equal(none, 0, "none padding");
-    Assert.Equal(sized, 2, "sized padding");
-    Assert.Equal(explicit, 5, "explicit padding");
-}
-
-test ResolveMarginValue
-{
-    i64 margin = Style.ResolveMargin(Style.Margin::Value(3), 100);
-    Assert.Equal(margin, 3, "explicit margin");
-}
-
-test ClampWidthBounds
-{
-    i64 min = Style.ClampWidth(0, 1, 10);
-    i64 max = Style.ClampWidth(99, 1, 10);
-    i64 passthrough = Style.ClampWidth(5, 1, 10);
-    Assert.Equal(min, 1, "clamp min");
-    Assert.Equal(max, 10, "clamp max");
-    Assert.Equal(passthrough, 5, "clamp passthrough");
-}
-
-// ---- Controls frame ----
-
-// Frame glyphs and repeat helper for bordered controls.
-
-test UnicodeFrameCorners
-{
-    Console.Controls.Frame.FrameChars chars = Console.Controls.Frame.Unicode();
-    Assert.Equal(chars.topLeft, "┌", "unicode top-left");
-    Assert.Equal(chars.side, "│", "unicode side");
-}
-
-test AsciiFrameCorners
-{
-    Console.Controls.Frame.FrameChars chars = Console.Controls.Frame.Ascii();
-    Assert.Equal(chars.topLeft, "+", "ascii top-left");
-    Assert.Equal(chars.top, "-", "ascii horizontal");
-}
-
-test RepeatBuildsString
-{
-    string line = Console.Controls.Frame.Repeat("-", 4);
-    Assert.Equal(line, "----", "Repeat four dashes");
-}
-
-test PreferUnicodeFollowsAnsiCapability
-{
-    bool prefer = Console.Controls.Frame.PreferUnicodeFrame();
-    bool emit = Console.Capabilities.ShouldEmitAnsi();
-    Assert.True(prefer == emit, "PreferUnicodeFrame should track ShouldEmitAnsi");
-}
-
-test PanelFrameFollowsAnsiCapability
-{
-    Console.Controls.Panel.Panel p = Console.Controls.Panel.Panel.WithTitle(Console.Controls.Panel.Panel.New("body"), "T");
-    ConsoleSize size = ConsoleSize
-    {
-        columns: 24,
-        rows: 8,
-    };
-    string rendered = Console.Controls.Panel.Panel.Render(p, size);
-    if (Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Contains(rendered, "┌", "unicode panel uses box drawing when ANSI is enabled");
-    }
-    else
-    {
-        Assert.Contains(rendered, "+", "panel uses the ASCII frame when ANSI is disabled");
-        Assert.False(Console.Format.Scan.ContainsSubstring(rendered, "┌"), "no box drawing when ANSI is disabled");
-    }
-}
-
-// ---- ANSI builders ----
-
-// Golden sequences for cursor, screen, erase, and input-mode builders.
-
-test AnsiCursorPositionGolden
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Cursor.IntoSequence(Ansi.Cursor.Position(Ansi.Cursor.Start(), 3, 5));
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "cursor position empty when disabled");
-        return;
-    }
-    string expected = "${esc}[3;5H";
-    Assert.Equal(seq, expected, "cursor position CSI");
-}
-
-test AnsiCursorBuilderHome
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Cursor.IntoSequence(Ansi.Cursor.Home(Ansi.Cursor.Start()));
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "cursor home should be empty when ANSI disabled");
-        return;
-    }
-    string expected = "${esc}[H";
-    Assert.Equal(seq, expected, "expected cursor home CSI");
-}
-
-test AnsiCursorUpGolden
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Cursor.IntoSequence(Ansi.Cursor.Up(Ansi.Cursor.Start(), 2));
-    Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[2A"), "cursor up CSI, empty when ANSI is disabled");
-}
-
-test AnsiScreenHideCursor
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Screen.IntoSequence(Ansi.Screen.HideCursor(Ansi.Screen.Start()));
-    Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[?25l"), "hide cursor private mode, empty when ANSI is disabled");
-}
-
-test AnsiScreenScrollRegion
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Screen.IntoSequence(Ansi.Screen.ScrollRegion(Ansi.Screen.Start(), 2, 10));
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "scroll region should be empty when ANSI disabled");
-        return;
-    }
-    string expected = "${esc}[2;10r";
-    Assert.Equal(seq, expected, "expected scroll region CSI");
-}
-
-test AnsiEraseLineAll
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Erase.IntoSequence(Ansi.Erase.LineAll(Ansi.Erase.Start()));
-    Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[2K"), "erase line all CSI, empty when ANSI is disabled");
-}
-
-test AnsiEraseDisplayAll
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.Erase.IntoSequence(Ansi.Erase.DisplayAll(Ansi.Erase.Start()));
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "erase should be empty when ANSI disabled");
-        return;
-    }
-    string expected = "${esc}[2J";
-    Assert.Equal(seq, expected, "expected erase display all");
-}
-
-test AnsiInputMouseDragEnable
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.InputMode.IntoSequence(Ansi.InputMode.EnableMouseDrag(Ansi.InputMode.Start()));
-    Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[?1002h"), "mouse drag enable, empty when ANSI is disabled");
-}
-
-test AnsiInputMouseEnable
-{
-    string esc = Ansi.Escape.Esc();
-    string seq = Ansi.InputMode.IntoSequence(Ansi.InputMode.EnableMouseClick(Ansi.InputMode.Start()));
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "mouse enable should be empty when ANSI disabled");
-        return;
-    }
-    string expected = "${esc}[?1000h";
-    Assert.Equal(seq, expected, "expected mouse click enable");
-}
-
-test AnsiStyleChainDimStrike
-{
-    string esc = Ansi.Escape.Esc();
-    Ansi.StyleChain chain = Ansi.StyleChain.Strike(Ansi.StyleChain.Dim(Ansi.StyleChain.New()));
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(chain), "${esc}[2;9m", "dim and strike share one SGR prefix");
-    string styled = Ansi.StyleChain.Apply(chain, "t");
-    if (Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(styled, "${esc}[2;9mt${esc}[0m", "styled text is prefix, text, reset");
-    }
-    else
-    {
-        Assert.Equal(styled, "t", "Apply returns the bare text when ANSI is disabled");
-    }
-}
-
-// ---- ANSI style step conformance ----
-
-// `StyleChain` conformance to `Ansi.Contracts.AnsiStyleStep`, called with method syntax and
-// chained (`chain.Bold().Dim()`). Each result must equal the free-function form covered by
-// `AnsiStyleChainTests.bd` byte for byte.
-
-test StyleChainConformsToAnsiStyleStepBoldViaMethodDispatch
-{
-    string esc = Ansi.Escape.Esc();
-    StyleChain chain = Ansi.StyleChain.New();
-    StyleChain bold = chain.Bold();
-    string prefix = bold.IntoPrefix();
-    string expected = "${esc}[1m";
-    Assert.Equal(prefix, expected, "AnsiStyleStep conformance: Bold() via method dispatch matches the free-function golden");
-}
-
-test StyleChainConformsToAnsiStyleStepChainsMultipleThisReturningMethods
-{
-    StyleChain chain = Ansi.StyleChain.New();
-    string prefix = chain.Bold().Dim().IntoPrefix();
-    string expected = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Dim(Ansi.StyleChain.Bold(Ansi.StyleChain.New())));
-    Assert.Equal(prefix, expected, "chained Bold().Dim() matches the free-function chain");
-}
-
-test StyleChainConformsToAnsiStyleStepApplyToMatchesFreeFunction
-{
-    StyleChain chain = Ansi.StyleChain.New();
-    string styled = chain.FgRgb(10, 20, 30).Underline().ApplyTo("text");
-    string expected = Ansi.StyleChain.ApplyTo(Ansi.StyleChain.Underline(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 10, 20, 30)), "text");
-    Assert.Equal(styled, expected, "FgRgb().Underline().ApplyTo() matches the free-function chain");
-}
-
-// ---- ANSI fluent step conformance ----
-
-// Conformance of `CursorBuilder`, `EraseBuilder`, `ScreenBuilder`, `OscBuilder`, and
-// `InputModeBuilder` to their `Ansi.Contracts` step contracts, called with method syntax. The
-// golden strings are those of `AnsiBuildersTests.bd`.
-
-test CursorBuilderConformsToAnsiCursorStepViaMethodDispatch
-{
-    string esc = Ansi.Escape.Esc();
-    CursorBuilder cursor = Ansi.Cursor.Start();
-    string seq = cursor.Position(3, 5).IntoSequence();
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "cursor position empty when ANSI disabled");
-        return;
-    }
-    Assert.Equal(seq, "${esc}[3;5H", "AnsiCursorStep conformance: Position() via method dispatch");
-}
-
-test EraseBuilderConformsToAnsiEraseStepViaMethodDispatch
-{
-    string esc = Ansi.Escape.Esc();
-    EraseBuilder erase = Ansi.Erase.Start();
-    string seq = erase.DisplayAll().IntoSequence();
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "erase display-all empty when ANSI disabled");
-        return;
-    }
-    Assert.Equal(seq, "${esc}[2J", "AnsiEraseStep conformance: DisplayAll() via method dispatch");
-}
-
-test ScreenBuilderConformsToAnsiScreenStepViaMethodDispatch
-{
-    ScreenBuilder screen = Ansi.Screen.Start();
-    string seq = screen.EnableAltScreen().IntoSequence();
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "screen alt-screen empty when ANSI disabled");
-        return;
-    }
-    Assert.Contains(seq, "1049", "AnsiScreenStep conformance: EnableAltScreen() via method dispatch");
-}
-
-test OscBuilderConformsToAnsiOscStepHyperlinkViaMethodDispatch
-{
-    OscBuilder osc = Ansi.Osc.Start();
-    string label = osc.Hyperlink("https://example.invalid", "click me");
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(label, "click me", "hyperlink label passthrough when ANSI disabled");
-        return;
-    }
-    string expected = Ansi.Osc.Hyperlink("https://example.invalid", "click me");
-    Assert.Equal(label, expected, "AnsiOscStep conformance: Hyperlink() method matches the free function");
-}
-
-test InputModeBuilderConformsToAnsiInputModeStepViaMethodDispatch
-{
-    InputModeBuilder input = Ansi.InputMode.Start();
-    string seq = input.EnableMouseClick().IntoSequence();
-    if (!Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(seq, "", "input mode empty when ANSI disabled");
-        return;
-    }
-    Assert.Contains(seq, "1000", "AnsiInputModeStep conformance: EnableMouseClick() via method dispatch");
-}
-
-// ---- Render context ----
-
-// Incremental render context cursor/erase prefixes.
-
-test RenderContextMoveToEmitsCsi
-{
-    string esc = Ansi.Escape.Esc();
-    RenderContext.RenderContext ctx = RenderContext.New(2, 4);
-    string seq = RenderContext.MoveTo(ctx, 2, 4);
-    Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[2;4H"), "MoveTo positions the cursor, empty when ANSI is disabled");
-    Assert.Equal(RenderContext.MoveTo(RenderContext.WithoutIncremental(2, 4), 2, 4), "", "a non-incremental context never moves the cursor");
-}
-
-test RenderContextWithoutIncrementalIsPlain
-{
-    RenderContext.RenderContext ctx = RenderContext.WithoutIncremental(1, 1);
-    string rendered = RenderContext.RenderAt(ctx, "line");
-    Assert.Equal(rendered, "line", "non-incremental RenderAt should return text only");
-}
-
-test RenderContextEraseLineAndRender
-{
-    string esc = Ansi.Escape.Esc();
-    RenderContext.RenderContext ctx = RenderContext.New(1, 1);
-    string rendered = RenderContext.EraseLineAndRender(ctx, "x");
-    Assert.Equal(rendered, Ansi.Escape.WhenEnabled("${esc}[1;1H${esc}[2K") + "x", "position, erase line, then the text");
-    Assert.Equal(RenderContext.EraseLineAndRender(RenderContext.WithoutIncremental(1, 1), "x"), "x", "a non-incremental context renders the text only");
-}
-
-test RenderContextAdvanceRow
-{
-    string esc = Ansi.Escape.Esc();
-    Console.Controls.RenderContext.RenderContext ctx = Console.Controls.RenderContext.New(3, 7);
-    Console.Controls.RenderContext.RenderContext next = Console.Controls.RenderContext.AdvanceRow(ctx);
-    string rendered = Console.Controls.RenderContext.RenderAt(next, "x");
-    Assert.Equal(rendered, Ansi.Escape.WhenEnabled("${esc}[4;7H") + "x", "AdvanceRow moves one row down at the origin column");
-}
-
-// ---- Capability probes under the test harness ----
-
-// The harness redirects stdout and stderr, so neither is a terminal. Color policy then depends only
-// on `NO_COLOR` and `FORCE_COLOR`, which these tests read rather than assume.
-
-test StandardOutputAndErrorAreNotTerminalsUnderTheHarness
-{
-    Assert.Equal(Platform.Terminal.IsAtty(1), 0_i64, "stdout is redirected");
-    Assert.Equal(Platform.Terminal.IsAtty(2), 0_i64, "stderr is redirected");
-    Assert.False(Console.Capabilities.IsStreamTty(1), "IsStreamTty agrees with IsAtty for stdout");
-    Assert.False(Console.Capabilities.IsStreamTty(2), "IsStreamTty agrees with IsAtty for stderr");
-}
-
-test ProbeStdoutReportsTheEnvironmentFlags
-{
-    Capabilities.Capabilities caps = Console.Capabilities.ProbeStdout();
-    Assert.False(caps.isTty, "stdout is not a terminal");
-    Assert.True(caps.colorDisabled == Platform.Terminal.EnvFlagSet("NO_COLOR"), "colorDisabled is NO_COLOR");
-    Assert.True(caps.colorForced == Platform.Terminal.EnvFlagSet("FORCE_COLOR"), "colorForced is FORCE_COLOR");
-    Assert.True(caps.model == Platform.Terminal.ProbeColorModel(), "the probed color model");
-}
-
-test ShouldEmitAnsiAndShouldStyleFollowTheProbe
-{
-    bool expected = !Console.Capabilities.ShouldStripColor(Console.Capabilities.ProbeStdout());
-    Assert.True(Console.Capabilities.ShouldEmitAnsi() == expected, "ShouldEmitAnsi is the inverse of ShouldStripColor of the probe");
-    Assert.True(Console.ShouldStyle() == expected, "the facade ShouldStyle matches ShouldEmitAnsi");
-    bool forced = Platform.Terminal.EnvFlagSet("FORCE_COLOR") && !Platform.Terminal.EnvFlagSet("NO_COLOR");
-    Assert.True(expected == forced, "a redirected stdout emits ANSI only when FORCE_COLOR is set and NO_COLOR is not");
-}
-
-test EffectiveColorModelIsBasic16WhenColorIsStripped
-{
-    Capabilities.Capabilities stripped = Capabilities.Capabilities
-    {
-        isTty: true,
-        colorDisabled: true,
-        colorForced: false,
-        model: Capabilities.ColorModel::TrueColor,
-    };
-    Assert.True(Console.Capabilities.EffectiveColorModel(stripped) == Capabilities.ColorModel::Basic16, "stripped color falls back to Basic16");
-    Capabilities.Capabilities forced = Capabilities.Capabilities
-    {
-        isTty: false,
-        colorDisabled: false,
-        colorForced: true,
-        model: Capabilities.ColorModel::Indexed256,
-    };
-    Assert.True(Console.Capabilities.EffectiveColorModel(forced) == Capabilities.ColorModel::Indexed256, "forced color keeps the probed model");
-    Capabilities.Capabilities terminal = Capabilities.Capabilities
-    {
-        isTty: true,
-        colorDisabled: false,
-        colorForced: false,
-        model: Capabilities.ColorModel::TrueColor,
-    };
-    Assert.True(Console.Capabilities.EffectiveColorModel(terminal) == Capabilities.ColorModel::TrueColor, "a terminal keeps the probed model");
-}
-
-test ForcePlainTextAndProbeColorModelOnARedirectedStdout
-{
-    bool expected = Platform.Terminal.EnvFlagSet("NO_COLOR") || !Platform.Terminal.EnvFlagSet("FORCE_COLOR") || Platform.Terminal.EnvEquals("TERM", "dumb");
-    Assert.True(Platform.Terminal.ForcePlainText() == expected, "plain text unless FORCE_COLOR is set, NO_COLOR is not, and TERM is not dumb");
-    if (Platform.Terminal.ForcePlainText())
-    {
-        Assert.True(Platform.Terminal.ProbeColorModel() == Capabilities.ColorModel::Basic16, "plain text probes as Basic16");
-    }
-}
-
-test ParsePositiveIntRejectsZeroSignsDigitsOverflowAndKeepsLeadingZeros
-{
-    Assert.Equal(Platform.Terminal.ParsePositiveInt("007", 80), 7, "leading zeros parse");
-    Assert.Equal(Platform.Terminal.ParsePositiveInt("0", 80), 80, "zero keeps the default");
-    Assert.Equal(Platform.Terminal.ParsePositiveInt("-5", 80), 80, "a sign keeps the default");
-    Assert.Equal(Platform.Terminal.ParsePositiveInt("12a", 80), 80, "a non-digit keeps the default");
-    Assert.Equal(Platform.Terminal.ParsePositiveInt("2147483647", 80), 2147483647, "i32 maximum parses");
-    Assert.Equal(Platform.Terminal.ParsePositiveInt("2147483648", 80), 80, "beyond i32 keeps the default");
-}
-
 i32 EnvSizeOr(string name, i32 fallback)
 {
     return match (Environment.Get(name))
@@ -761,239 +56,6 @@ i32 EnvSizeOr(string name, i32 fallback)
         Result::Error(_) => fallback,
     };
 }
-
-test EnvFallbackSizeReadsColumnsAndLines
-{
-    ConsoleSize size = Platform.Terminal.EnvFallbackSize();
-    Assert.Equal(size.columns, EnvSizeOr("COLUMNS", 80), "columns from COLUMNS, else 80");
-    Assert.Equal(size.rows, EnvSizeOr("LINES", 24), "rows from LINES, else 24");
-}
-
-test QuerySizeFallsBackToTheEnvironmentWithoutATerminal
-{
-    ConsoleSize fallback = Platform.Terminal.EnvFallbackSize();
-    ConsoleSize platform = Platform.Terminal.QuerySize();
-    ConsoleSize facade = Console.QuerySize();
-    Assert.Equal(platform.columns, fallback.columns, "no terminal: the platform size is the environment size");
-    Assert.Equal(platform.rows, fallback.rows, "no terminal: the platform rows are the environment rows");
-    Assert.Equal(facade.columns, platform.columns, "the facade returns the platform size");
-    Assert.Equal(facade.rows, platform.rows, "the facade returns the platform rows");
-}
-
-// ---- Console facade: resize messages and the resize hub ----
-
-test RunTickSendsAResizeOnlyWhenTheSizeDiffers
-{
-    Concurrency.Channel<ConsoleMessage> messages = Console.MessagesChannel();
-    ConsoleSize now = Console.QuerySize();
-    mut ConsoleSize same = Console.QuerySize();
-    Console.RunTick(messages, same);
-    match (Channel.TryReceive(messages))
-    {
-        TryResult::Ok(_) => Assert.Fail("an unchanged size sends nothing"),
-        TryResult::Err(_) => Assert.Fail("channel is open"),
-        TryResult::WouldBlock => { },
-    };
-    mut ConsoleSize stale = ConsoleSize
-    {
-        columns: 0,
-        rows: 0,
-    };
-    Console.RunTick(messages, stale);
-    match (Channel.TryReceive(messages))
-    {
-        TryResult::Ok(message) => match (message)
-        {
-            ConsoleMessage::Resize(size) => {
-                Assert.Equal(size.columns, now.columns, "the message carries the new columns");
-                Assert.Equal(size.rows, now.rows, "the message carries the new rows");
-            },
-            ConsoleMessage::Tick => Assert.Fail("RunTick sends no tick"),
-        },
-        TryResult::Err(_) => Assert.Fail("channel is open"),
-        TryResult::WouldBlock => Assert.Fail("a changed size sends a resize"),
-    };
-    match (Channel.TryReceive(messages))
-    {
-        TryResult::Ok(_) => Assert.Fail("one change sends one resize"),
-        TryResult::Err(_) => Assert.Fail("channel is open"),
-        TryResult::WouldBlock => { },
-    };
-}
-
-test RunTickLiveSendsATickEveryCall
-{
-    Concurrency.Channel<ConsoleMessage> messages = Console.MessagesChannel();
-    mut ConsoleSize last = Console.QuerySize();
-    Console.Controls.LiveTick.LiveTickState live = Console.Controls.LiveTick.New();
-    Console.Controls.LiveTick.LiveTickState next = Console.RunTickLive(messages, last, live);
-    match (Channel.TryReceive(messages))
-    {
-        TryResult::Ok(message) => match (message)
-        {
-            ConsoleMessage::Tick => { },
-            ConsoleMessage::Resize(_) => Assert.Fail("an unchanged size sends no resize"),
-        },
-        TryResult::Err(_) => Assert.Fail("channel is open"),
-        TryResult::WouldBlock => Assert.Fail("RunTickLive sends a tick"),
-    };
-}
-
-test SubscribeOnResizeCallsTheHandlerOnceWithTheCurrentSize
-{
-    Concurrency.Channel<ConsoleMessage> seen = Console.MessagesChannel();
-    mut OnResize hub = OnResize
-    {
-        lastSize: ConsoleSize
-        {
-            columns: 0,
-            rows: 0,
-        },
-    };
-    unit(ConsoleSize) handler = (ConsoleSize size) => {
-        match (Channel.TrySend(seen, ConsoleMessage::Resize(size)))
-        {
-            TryResult::Ok(_) => { },
-            TryResult::Err(_) => Assert.Fail("handler channel is open"),
-            TryResult::WouldBlock => Assert.Fail("unbounded handler channel accepts"),
-        };
-    };
-    Console.SubscribeOnResize(hub, handler);
-    ConsoleSize now = Console.QuerySize();
-    Assert.Equal(hub.lastSize.columns, now.columns, "the hub records the current size");
-    match (Channel.TryReceive(seen))
-    {
-        TryResult::Ok(message) => match (message)
-        {
-            ConsoleMessage::Resize(size) => Assert.Equal(size.rows, now.rows, "the handler sees the current size"),
-            ConsoleMessage::Tick => Assert.Fail("handler records resizes only"),
-        },
-        TryResult::Err(_) => Assert.Fail("handler channel is open"),
-        TryResult::WouldBlock => Assert.Fail("subscribing raises once"),
-    };
-    hub.Raise(ConsoleSize
-    {
-        columns: 7,
-        rows: 3,
-    });
-    match (Channel.TryReceive(seen))
-    {
-        TryResult::Ok(message) => match (message)
-        {
-            ConsoleMessage::Resize(size) => Assert.Equal(size.columns, 7, "Raise passes its size to the handler"),
-            ConsoleMessage::Tick => Assert.Fail("handler records resizes only"),
-        },
-        TryResult::Err(_) => Assert.Fail("handler channel is open"),
-        TryResult::WouldBlock => Assert.Fail("Raise calls the subscribed handler"),
-    };
-}
-
-// ---- Markdown rendering ----
-
-test RenderPlainStripsEveryMarkupKind
-{
-    Assert.Equal(Console.Format.Markdown.RenderPlain("**b** *i* __u__ ~~s~~"), "b i u s", "emphasis delimiters are removed");
-    Assert.Equal(Console.Format.Markdown.RenderPlain("[docs](https://beskid.dev)"), "docs", "a link keeps its label");
-    Assert.Equal(Console.Format.Markdown.RenderPlain("[green]ok[/]"), "ok", "a palette tag keeps its body");
-    Assert.Equal(Console.Format.Markdown.RenderPlain("&[fg=red](x)y"), "xy", "an attribute span keeps its body");
-    Assert.Equal(Console.Format.Markdown.RenderPlain("\\*not italic\\*"), "*not italic*", "an escaped sigil is literal");
-    Assert.Equal(Console.Format.Markdown.RenderPlain("**outer *inner***"), "outer *inner*", "the first closing delimiter ends bold");
-    Assert.Equal(Console.Format.Markdown.RenderPlain(""), "", "empty input");
-}
-
-test RenderStyledWrapsEachSpanInItsStyle
-{
-    string bold = Ansi.StyleChain.Apply(Ansi.StyleChain.Bold(Ansi.StyleChain.New()), "b");
-    string italic = Ansi.StyleChain.Apply(Ansi.StyleChain.Italic(Ansi.StyleChain.New()), "i");
-    Assert.Equal(Console.Format.Markdown.RenderStyled("**b** *i*"), "${bold} ${italic}", "bold and italic spans are styled separately");
-    string green = Ansi.StyleChain.Apply(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 0, 205, 0), "ok");
-    Assert.Equal(Console.Format.Markdown.RenderStyled("[green]ok[/]"), green, "a palette tag colors its body");
-    Assert.Equal(Console.Format.Markdown.RenderStyled("plain"), "plain", "literal text is unchanged");
-}
-
-test RenderInnerSelectsPlainOrStyled
-{
-    string source = "**b** [docs](https://beskid.dev)";
-    Assert.Equal(Console.Format.Markdown.RenderInner(source, false), Console.Format.Markdown.RenderPlain(source), "ansi false is RenderPlain");
-    Assert.Equal(Console.Format.Markdown.RenderInner(source, true), Console.Format.Markdown.RenderStyled(source), "ansi true is RenderStyled");
-}
-
-test FormatIsStyledOnlyWhenAnsiIsEmitted
-{
-    string source = "**b**";
-    if (Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(Console.Format.Format(source), Console.Format.Markdown.RenderStyled(source), "ANSI enabled: styled");
-    }
-    else
-    {
-        Assert.Equal(Console.Format.Format(source), "b", "ANSI disabled: stripped");
-    }
-}
-
-// ---- Attribute and color parsing ----
-
-test ParseNamedColorKnowsTheEightBasicColors
-{
-    Console.Format.Attributes.ParsedRgb blue = Console.Format.Attributes.ParseNamedColor("blue");
-    Assert.True(blue.ok && blue.r == 0 && blue.g == 0 && blue.b == 238, "blue");
-    Console.Format.Attributes.ParsedRgb white = Console.Format.Attributes.ParseNamedColor("white");
-    Assert.True(white.ok && white.r == 229 && white.g == 229 && white.b == 229, "white");
-    Console.Format.Attributes.ParsedRgb black = Console.Format.Attributes.ParseNamedColor("black");
-    Assert.True(black.ok && black.r == 0 && black.g == 0 && black.b == 0, "black");
-    Assert.False(Console.Format.Attributes.ParseNamedColor("orange").ok, "an unknown name is rejected");
-    Assert.False(Console.Format.Attributes.ParseNamedColor("Red").ok, "names are case sensitive");
-}
-
-test ParseRgbTripletTrimsAndRejectsOutOfRangeOrShortInput
-{
-    Console.Format.Attributes.ParsedRgb spaced = Console.Format.Attributes.ParseRgbTriplet(" 1, 2 ,3 ");
-    Assert.True(spaced.ok && spaced.r == 1 && spaced.g == 2 && spaced.b == 3, "components are trimmed");
-    Console.Format.Attributes.ParsedRgb top = Console.Format.Attributes.ParseRgbTriplet("255,255,255");
-    Assert.True(top.ok && top.r == 255, "255 is in range");
-    Assert.False(Console.Format.Attributes.ParseRgbTriplet("256,0,0").ok, "256 is out of range");
-    Assert.False(Console.Format.Attributes.ParseRgbTriplet("1,2").ok, "two components are rejected");
-    Assert.False(Console.Format.Attributes.ParseRgbTriplet("1,,3").ok, "an empty component is rejected");
-    Assert.False(Console.Format.Attributes.ParseRgbTriplet("1,-2,3").ok, "a sign is rejected");
-}
-
-test ParseHexColorAcceptsThreeAndSixDigitsInEitherCase
-{
-    Console.Format.Attributes.ParsedRgb shortForm = Console.Format.Attributes.ParseHexColor("0f8");
-    Assert.True(shortForm.ok && shortForm.r == 0 && shortForm.g == 255 && shortForm.b == 136, "#0f8 doubles each digit");
-    Console.Format.Attributes.ParsedRgb longForm = Console.Format.Attributes.ParseHexColor("A0b1C2");
-    Assert.True(longForm.ok && longForm.r == 160 && longForm.g == 177 && longForm.b == 194, "mixed case six digits");
-    Assert.False(Console.Format.Attributes.ParseHexColor("ffff").ok, "four digits are rejected");
-    Assert.False(Console.Format.Attributes.ParseHexColor("zz0000").ok, "a non-hex digit is rejected");
-    Assert.False(Console.Format.Attributes.ParseHexColor("").ok, "empty is rejected");
-}
-
-test ParseColorRejectsEmptyAndUnclosedRgb
-{
-    Assert.False(Console.Format.Attributes.ParseColor("").ok, "empty");
-    Assert.False(Console.Format.Attributes.ParseColor("rgb(1,2,3").ok, "rgb( without )");
-    Console.Format.Attributes.ParsedRgb bare = Console.Format.Attributes.ParseColor("4,5,6");
-    Assert.True(bare.ok && bare.r == 4 && bare.b == 6, "a bare triplet is accepted");
-}
-
-test ApplyAttrTokenSetsForegroundOrBackgroundAndIgnoresTheRest
-{
-    string fg = Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "fg=#010203"));
-    Assert.Equal(fg, Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 1, 2, 3)), "fg= sets the foreground");
-    string bg = Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "bg= rgb(4,5,6)"));
-    Assert.Equal(bg, Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.BgRgb(Ansi.StyleChain.New(), 4, 5, 6)), "bg= sets the background");
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "size=3")), "", "an unknown key changes nothing");
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "fg=nope")), "", "an invalid color changes nothing");
-}
-
-test ApplyPaletteTagColorsKnownNamesOnly
-{
-    string green = Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyPaletteTag(Ansi.StyleChain.New(), "green"));
-    Assert.Equal(green, Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 0, 205, 0)), "green palette tag");
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyPaletteTag(Ansi.StyleChain.New(), "teal")), "", "unknown tag");
-}
-
-// ---- Controls: panel, progress bar and stacks ----
 
 ConsoleSize Cells(i32 columns, i32 rows)
 {
@@ -1004,166 +66,1088 @@ ConsoleSize Cells(i32 columns, i32 rows)
     };
 }
 
-test PanelAsciiFrameRendersBorderBodyAndBottom
+// ANSI escape
+mod AnsiTests
 {
-    Console.Controls.Panel.Panel p = Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("body"));
-    Assert.False(Console.Controls.Panel.UseUnicodeFrame(p), "an ASCII panel never uses box drawing");
-    string rendered = Console.Controls.Panel.Render(p, Cells(10, 3));
-    Assert.Equal(rendered, "+--------+
+    // Golden CSI framing checks for `Ansi.Escape` only (builders live in AnsiBuildersTests.bd).
+    test CsiBoldRed
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Escape.CsiSequence("1;31", "m");
+        string expected = "${esc}[1;31m";
+        Assert.Equal(seq, expected, "expected CSI bold red sequence");
+    }
+
+    test Reset
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Escape.CsiSequence("0", "m");
+        string expected = "${esc}[0m";
+        Assert.Equal(seq, expected, "expected CSI reset sequence");
+    }
+
+    test PrivateAltScreen
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Escape.PrivateMode("1049", true);
+        string expected = "${esc}[?1049h";
+        Assert.Equal(seq, expected, "expected alt-screen enable sequence");
+    }
+
+    test DecSaveCursor
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Escape.DecSaveCursor();
+        Assert.Equal(seq, "${esc}7", "expected DEC save cursor");
+    }
+
+    // Golden tests for SGR and OSC escape sequences (ungated CSI/OSC builders).
+    test BoldGolden
+    {
+        string esc = Ansi.Escape.Esc();
+        string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Bold(Ansi.StyleChain.New()));
+        Assert.Contains(prefix, "${esc}[1m", "bold SGR should contain [1m");
+    }
+
+    test Fg256Golden
+    {
+        string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Fg256(Ansi.StyleChain.New(), 196));
+        Assert.Contains(prefix, "38;5;196", "256-color fg should contain 38;5;196");
+    }
+
+    test SgrBoldPrefixGolden
+    {
+        string esc = Ansi.Escape.Esc();
+        string reset = Ansi.Escape.Csi("0", "m");
+        Assert.Contains(Ansi.Sgr.IntoPrefix(Ansi.Sgr.Bold(Ansi.Sgr.Start())), "[1m", "Sgr bold prefix should contain [1m");
+        Assert.Contains(reset, "${esc}[0m", "reset CSI should contain [0m");
+    }
+
+    test OscTitleGolden
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Escape.OscSequence("0;beskid");
+        Assert.Contains(seq, "${esc}]0;beskid", "OSC title should contain ]0;beskid");
+    }
+
+    test OscHyperlinkContainsUri
+    {
+        string open = Ansi.Escape.OscSequence("8;;https://beskid.dev");
+        string close = Ansi.Escape.OscSequence("8;;");
+        string linked = "${open}link${close}";
+        Assert.Contains(linked, "8;;https://beskid.dev", "hyperlink open should embed uri");
+        Assert.Contains(linked, "link", "hyperlink should preserve label");
+    }
+
+    // Golden sequences for cursor, screen, erase, and input-mode builders.
+    test CursorPositionGolden
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Cursor.IntoSequence(Ansi.Cursor.Position(Ansi.Cursor.Start(), 3, 5));
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "cursor position empty when disabled");
+            return;
+        }
+        string expected = "${esc}[3;5H";
+        Assert.Equal(seq, expected, "cursor position CSI");
+    }
+
+    test CursorBuilderHome
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Cursor.IntoSequence(Ansi.Cursor.Home(Ansi.Cursor.Start()));
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "cursor home should be empty when ANSI disabled");
+            return;
+        }
+        string expected = "${esc}[H";
+        Assert.Equal(seq, expected, "expected cursor home CSI");
+    }
+
+    test CursorUpGolden
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Cursor.IntoSequence(Ansi.Cursor.Up(Ansi.Cursor.Start(), 2));
+        Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[2A"), "cursor up CSI, empty when ANSI is disabled");
+    }
+
+    test ScreenHideCursor
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Screen.IntoSequence(Ansi.Screen.HideCursor(Ansi.Screen.Start()));
+        Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[?25l"), "hide cursor private mode, empty when ANSI is disabled");
+    }
+
+    test ScreenScrollRegion
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Screen.IntoSequence(Ansi.Screen.ScrollRegion(Ansi.Screen.Start(), 2, 10));
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "scroll region should be empty when ANSI disabled");
+            return;
+        }
+        string expected = "${esc}[2;10r";
+        Assert.Equal(seq, expected, "expected scroll region CSI");
+    }
+
+    test EraseLineAll
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Erase.IntoSequence(Ansi.Erase.LineAll(Ansi.Erase.Start()));
+        Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[2K"), "erase line all CSI, empty when ANSI is disabled");
+    }
+
+    test EraseDisplayAll
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.Erase.IntoSequence(Ansi.Erase.DisplayAll(Ansi.Erase.Start()));
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "erase should be empty when ANSI disabled");
+            return;
+        }
+        string expected = "${esc}[2J";
+        Assert.Equal(seq, expected, "expected erase display all");
+    }
+
+    test InputMouseDragEnable
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.InputMode.IntoSequence(Ansi.InputMode.EnableMouseDrag(Ansi.InputMode.Start()));
+        Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[?1002h"), "mouse drag enable, empty when ANSI is disabled");
+    }
+
+    test InputMouseEnable
+    {
+        string esc = Ansi.Escape.Esc();
+        string seq = Ansi.InputMode.IntoSequence(Ansi.InputMode.EnableMouseClick(Ansi.InputMode.Start()));
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "mouse enable should be empty when ANSI disabled");
+            return;
+        }
+        string expected = "${esc}[?1000h";
+        Assert.Equal(seq, expected, "expected mouse click enable");
+    }
+
+    test StyleChainDimStrike
+    {
+        string esc = Ansi.Escape.Esc();
+        Ansi.StyleChain chain = Ansi.StyleChain.Strike(Ansi.StyleChain.Dim(Ansi.StyleChain.New()));
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(chain), "${esc}[2;9m", "dim and strike share one SGR prefix");
+        string styled = Ansi.StyleChain.Apply(chain, "t");
+        if (Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(styled, "${esc}[2;9mt${esc}[0m", "styled text is prefix, text, reset");
+        }
+        else
+        {
+            Assert.Equal(styled, "t", "Apply returns the bare text when ANSI is disabled");
+        }
+    }
+
+    test CursorStepsEmitTheirCsiFinalBytes
+    {
+        string esc = Ansi.Escape.Esc();
+        mut CursorBuilder c = Ansi.Cursor.Down(Ansi.Cursor.Start(), 1);
+        c = Ansi.Cursor.Right(c, 2);
+        c = Ansi.Cursor.Left(c, 3);
+        c = Ansi.Cursor.NextLine(c, 4);
+        c = Ansi.Cursor.PrevLine(c, 5);
+        c = Ansi.Cursor.Column(c, 6);
+        c = Ansi.Cursor.SaveDec(c);
+        c = Ansi.Cursor.RestoreDec(c);
+        Assert.Equal(Ansi.Cursor.IntoSequence(c), Ansi.Escape.WhenEnabled("${esc}[1B${esc}[2C${esc}[3D${esc}[4E${esc}[5F${esc}[6G${esc}7${esc}8"), "down, right, left, next, previous, column, save, restore");
+    }
+
+    test ScreenStepsEmitTheirPrivateModes
+    {
+        string esc = Ansi.Escape.Esc();
+        mut ScreenBuilder s = Ansi.Screen.DisableAltScreen(Ansi.Screen.Start());
+        s = Ansi.Screen.ShowCursor(s);
+        s = Ansi.Screen.SaveScreen(s);
+        s = Ansi.Screen.RestoreScreen(s);
+        s = Ansi.Screen.EnableLineWrap(s);
+        s = Ansi.Screen.DisableLineWrap(s);
+        Assert.Equal(Ansi.Screen.IntoSequence(s), Ansi.Escape.WhenEnabled("${esc}[?1049l${esc}[?25h${esc}[?47h${esc}[?47l${esc}[?7h${esc}[?7l"), "alt screen off, cursor on, save, restore, wrap on, wrap off");
+    }
+
+    test EraseStepsEmitTheirModes
+    {
+        string esc = Ansi.Escape.Esc();
+        mut EraseBuilder e = Ansi.Erase.DisplayFromCursor(Ansi.Erase.Start());
+        e = Ansi.Erase.DisplayToCursor(e);
+        e = Ansi.Erase.DisplaySaved(e);
+        e = Ansi.Erase.LineFromCursor(e);
+        e = Ansi.Erase.LineToCursor(e);
+        Assert.Equal(Ansi.Erase.IntoSequence(e), Ansi.Escape.WhenEnabled("${esc}[0J${esc}[1J${esc}[3J${esc}[0K${esc}[1K"), "display from, to, saved; line from, to");
+    }
+
+    test InputModeStepsEmitTheirModes
+    {
+        string esc = Ansi.Escape.Esc();
+        mut InputModeBuilder i = Ansi.InputMode.DisableMouseClick(Ansi.InputMode.Start());
+        i = Ansi.InputMode.DisableMouseDrag(i);
+        i = Ansi.InputMode.EnableMouseMotion(i);
+        i = Ansi.InputMode.DisableMouseMotion(i);
+        i = Ansi.InputMode.EnableSgrMouse(i);
+        i = Ansi.InputMode.DisableSgrMouse(i);
+        i = Ansi.InputMode.RedefineKey(i, 65, "\"x\"");
+        Assert.Equal(Ansi.InputMode.IntoSequence(i), Ansi.Escape.WhenEnabled("${esc}[?1000l${esc}[?1002l${esc}[?1003h${esc}[?1003l${esc}[?1006h${esc}[?1006l${esc}[65;\"x\"p"), "mouse modes and key redefinition");
+    }
+
+    test StyleChainBackgroundAndItalicCodes
+    {
+        string esc = Ansi.Escape.Esc();
+        Ansi.StyleChain chain = Ansi.StyleChain.Bg256(Ansi.StyleChain.BgBasic(Ansi.StyleChain.Italic(Ansi.StyleChain.New()), 44), 17);
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(chain), "${esc}[3;44;48;5;17m", "italic, basic background, 256 background");
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.New()), "", "an empty chain has no prefix");
+        Assert.Equal(Ansi.StyleChain.Reset(), "${esc}[0m", "reset");
+    }
+
+    test EscapeEmitHelpersAreGatedOnTheCapability
+    {
+        string esc = Ansi.Escape.Esc();
+        Assert.Equal(Ansi.Escape.EmitCsi("1", "m"), Ansi.Escape.WhenEnabled("${esc}[1m"), "EmitCsi");
+        Assert.Equal(Ansi.Escape.EmitOsc("0;t"), Ansi.Escape.WhenEnabled("${esc}]0;t"), "EmitOsc");
+        Assert.Equal(Ansi.Escape.EmitDec("7"), Ansi.Escape.WhenEnabled("${esc}7"), "EmitDec");
+        if (Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(Ansi.Escape.WhenEnabled("q"), "q", "enabled: the sequence passes through");
+        }
+        else
+        {
+            Assert.Equal(Ansi.Escape.WhenEnabled("q"), "", "disabled: nothing is emitted");
+        }
+    }
+}
+
+// ANSI style chain
+mod BuildersTests
+{
+    // Golden prefix sequences for `Ansi.StyleChain` and `Ansi.Sgr` (ungated CSI builders).
+    test StyleChainBoldWraps
+    {
+        string esc = Ansi.Escape.Esc();
+        string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Bold(Ansi.StyleChain.New()));
+        string expected = "${esc}[1m";
+        Assert.Equal(prefix, expected, "bold style-chain prefix");
+    }
+
+    test StyleChainInversePrefix
+    {
+        string esc = Ansi.Escape.Esc();
+        string prefix = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Inverse(Ansi.StyleChain.New()));
+        Assert.Contains(prefix, "${esc}[7m", "inverse SGR should contain [7m");
+    }
+
+    test SgrBuilderFgBasicGolden
+    {
+        string esc = Ansi.Escape.Esc();
+        string prefix = Ansi.Sgr.IntoPrefix(Ansi.Sgr.FgBasic(Ansi.Sgr.Start(), 31));
+        Assert.Contains(prefix, "${esc}[31m", "basic red fg should contain [31m");
+    }
+
+    // `StyleChain` conformance to `Ansi.Contracts.AnsiStyleStep`, called with method syntax and
+    // chained (`chain.Bold().Dim()`). Each result must equal the free-function form covered by
+    // `AnsiStyleChainTests.bd` byte for byte.
+    test StyleChainConformsToAnsiStyleStepBoldViaMethodDispatch
+    {
+        string esc = Ansi.Escape.Esc();
+        StyleChain chain = Ansi.StyleChain.New();
+        StyleChain bold = chain.Bold();
+        string prefix = bold.IntoPrefix();
+        string expected = "${esc}[1m";
+        Assert.Equal(prefix, expected, "AnsiStyleStep conformance: Bold() via method dispatch matches the free-function golden");
+    }
+
+    test StyleChainConformsToAnsiStyleStepChainsMultipleThisReturningMethods
+    {
+        StyleChain chain = Ansi.StyleChain.New();
+        string prefix = chain.Bold().Dim().IntoPrefix();
+        string expected = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.Dim(Ansi.StyleChain.Bold(Ansi.StyleChain.New())));
+        Assert.Equal(prefix, expected, "chained Bold().Dim() matches the free-function chain");
+    }
+
+    test StyleChainConformsToAnsiStyleStepApplyToMatchesFreeFunction
+    {
+        StyleChain chain = Ansi.StyleChain.New();
+        string styled = chain.FgRgb(10, 20, 30).Underline().ApplyTo("text");
+        string expected = Ansi.StyleChain.ApplyTo(Ansi.StyleChain.Underline(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 10, 20, 30)), "text");
+        Assert.Equal(styled, expected, "FgRgb().Underline().ApplyTo() matches the free-function chain");
+    }
+
+    // Conformance of `CursorBuilder`, `EraseBuilder`, `ScreenBuilder`, `OscBuilder`, and
+    // `InputModeBuilder` to their `Ansi.Contracts` step contracts, called with method syntax. The
+    // golden strings are those of `AnsiBuildersTests.bd`.
+    test CursorBuilderConformsToAnsiCursorStepViaMethodDispatch
+    {
+        string esc = Ansi.Escape.Esc();
+        CursorBuilder cursor = Ansi.Cursor.Start();
+        string seq = cursor.Position(3, 5).IntoSequence();
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "cursor position empty when ANSI disabled");
+            return;
+        }
+        Assert.Equal(seq, "${esc}[3;5H", "AnsiCursorStep conformance: Position() via method dispatch");
+    }
+
+    test EraseBuilderConformsToAnsiEraseStepViaMethodDispatch
+    {
+        string esc = Ansi.Escape.Esc();
+        EraseBuilder erase = Ansi.Erase.Start();
+        string seq = erase.DisplayAll().IntoSequence();
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "erase display-all empty when ANSI disabled");
+            return;
+        }
+        Assert.Equal(seq, "${esc}[2J", "AnsiEraseStep conformance: DisplayAll() via method dispatch");
+    }
+
+    test ScreenBuilderConformsToAnsiScreenStepViaMethodDispatch
+    {
+        ScreenBuilder screen = Ansi.Screen.Start();
+        string seq = screen.EnableAltScreen().IntoSequence();
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "screen alt-screen empty when ANSI disabled");
+            return;
+        }
+        Assert.Contains(seq, "1049", "AnsiScreenStep conformance: EnableAltScreen() via method dispatch");
+    }
+
+    test OscBuilderConformsToAnsiOscStepHyperlinkViaMethodDispatch
+    {
+        OscBuilder osc = Ansi.Osc.Start();
+        string label = osc.Hyperlink("https://example.invalid", "click me");
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(label, "click me", "hyperlink label passthrough when ANSI disabled");
+            return;
+        }
+        string expected = Ansi.Osc.Hyperlink("https://example.invalid", "click me");
+        Assert.Equal(label, expected, "AnsiOscStep conformance: Hyperlink() method matches the free function");
+    }
+
+    test InputModeBuilderConformsToAnsiInputModeStepViaMethodDispatch
+    {
+        InputModeBuilder input = Ansi.InputMode.Start();
+        string seq = input.EnableMouseClick().IntoSequence();
+        if (!Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(seq, "", "input mode empty when ANSI disabled");
+            return;
+        }
+        Assert.Contains(seq, "1000", "AnsiInputModeStep conformance: EnableMouseClick() via method dispatch");
+    }
+}
+
+// Controls progress bar
+mod ControlsTests
+{
+    // Progress bar clamping, render, and incremental cursor output.
+    test ProgressBarClampsPercent
+    {
+        ProgressBar.ProgressBar bar = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 150);
+        Assert.Equal(bar.percent, 100_i64, "expected percent clamped to 100");
+        ProgressBar.ProgressBar low = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), -5_i64);
+        Assert.Equal(low.percent, 0_i64, "expected percent clamped to 0");
+    }
+
+    test ProgressBarRendersBodyWithExactFill
+    {
+        ProgressBar.ProgressBar bar = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 50_i64);
+        string rendered = ProgressBar.BarBody(bar, 10);
+        Assert.Equal(rendered, "[====    ] 50%", "expected progress bar fill to match the requested width");
+    }
+
+    test ProgressBarFormatsNumericInterpolation
+    {
+        string rendered = "${50_i64}";
+        Assert.Equal(rendered, "50", "expected numeric interpolation to preserve the integer value");
+    }
+
+    test ProgressBarConcatenatesAdjacentStringInterpolations
+    {
+        string filled = "====";
+        string empty = "    ";
+        string rendered = "[${filled}${empty}]";
+        Assert.Equal(rendered, "[====    ]", "expected adjacent string interpolation to preserve both values");
+    }
+
+    // Stack containers: child count, joined render and measure.
+    test VerticalStackChildCount
+    {
+        VerticalStack.VerticalStack stack = VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.New(), "a"), "b");
+        Assert.Equal(VerticalStack.VerticalStack.ChildCount(stack), 2, "expected two vertical stack children");
+    }
+
+    // Frame glyphs and repeat helper for bordered controls.
+    test UnicodeFrameCorners
+    {
+        Console.Controls.Frame.FrameChars chars = Console.Controls.Frame.Unicode();
+        Assert.Equal(chars.topLeft, "┌", "unicode top-left");
+        Assert.Equal(chars.side, "│", "unicode side");
+    }
+
+    test AsciiFrameCorners
+    {
+        Console.Controls.Frame.FrameChars chars = Console.Controls.Frame.Ascii();
+        Assert.Equal(chars.topLeft, "+", "ascii top-left");
+        Assert.Equal(chars.top, "-", "ascii horizontal");
+    }
+
+    test RepeatBuildsString
+    {
+        string line = Console.Controls.Frame.Repeat("-", 4);
+        Assert.Equal(line, "----", "Repeat four dashes");
+    }
+
+    test PreferUnicodeFollowsAnsiCapability
+    {
+        bool prefer = Console.Controls.Frame.PreferUnicodeFrame();
+        bool emit = Console.Capabilities.ShouldEmitAnsi();
+        Assert.True(prefer == emit, "PreferUnicodeFrame should track ShouldEmitAnsi");
+    }
+
+    test PanelFrameFollowsAnsiCapability
+    {
+        Console.Controls.Panel.Panel p = Console.Controls.Panel.Panel.WithTitle(Console.Controls.Panel.Panel.New("body"), "T");
+        ConsoleSize size = ConsoleSize
+        {
+            columns: 24,
+            rows: 8,
+        };
+        string rendered = Console.Controls.Panel.Panel.Render(p, size);
+        if (Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Contains(rendered, "┌", "unicode panel uses box drawing when ANSI is enabled");
+        }
+        else
+        {
+            Assert.Contains(rendered, "+", "panel uses the ASCII frame when ANSI is disabled");
+            Assert.False(Console.Format.Scan.ContainsSubstring(rendered, "┌"), "no box drawing when ANSI is disabled");
+        }
+    }
+
+    test PanelAsciiFrameRendersBorderBodyAndBottom
+    {
+        Console.Controls.Panel.Panel p = Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("body"));
+        Assert.False(Console.Controls.Panel.UseUnicodeFrame(p), "an ASCII panel never uses box drawing");
+        string rendered = Console.Controls.Panel.Render(p, Cells(10, 3));
+        Assert.Equal(rendered, "+--------+
 |body    |
 +--------+", "three lines at the given width");
-}
-
-test PanelTitleAlignmentPlacesTheTitle
-{
-    Console.Controls.Panel.Panel p = Console.Controls.Panel.WithTitle(Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("")), "T");
-    Console.Controls.Frame.FrameChars frame = Console.Controls.Frame.Ascii();
-    Assert.Equal(Console.Controls.Panel.TopBorder(p, frame, 10), "+- T ------+", "left: one fill before the title");
-    Console.Controls.Panel.Panel right = Console.Controls.Panel.WithAlignment(p, Style.TitleAlignment::Right);
-    Assert.Equal(Console.Controls.Panel.TopBorder(right, frame, 10), "+------ T -+", "right: one fill after the title");
-    Console.Controls.Panel.Panel center = Console.Controls.Panel.WithAlignment(p, Style.TitleAlignment::Center);
-    Assert.Equal(Console.Controls.Panel.TopBorder(center, frame, 10), "+--- T ----+", "center: fill split around the title");
-}
-
-test PanelPaddingIndentsTheBodyAndWidensTheMeasure
-{
-    Console.Controls.Panel.Panel p = Console.Controls.Panel.WithPadding(Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("ab")), Style.Padding::Value(2));
-    Assert.Equal(Style.ResolvePadding(Console.Controls.Panel.Padding(p), 80), 2, "the padding is stored");
-    Assert.Equal(Style.ResolveMargin(Console.Controls.Panel.Margin(p), 80), 0, "a new panel has no margin");
-    Assert.Equal(Console.Controls.Panel.BodyLine(p, Console.Controls.Frame.Ascii(), 8), "|  ab    |", "two spaces before the body");
-    ConsoleSize measured = Console.Controls.Panel.Measure(p, Cells(80, 24));
-    Assert.Equal(measured.columns, 8, "body 2 + padding 4 + frame 2");
-    Assert.Equal(measured.rows, 3, "untitled panel is three rows");
-    ConsoleSize titled = Console.Controls.Panel.Measure(Console.Controls.Panel.WithTitle(p, "T"), Cells(80, 24));
-    Assert.Equal(titled.rows, 4, "a title adds a row");
-    ConsoleSize narrow = Console.Controls.Panel.Measure(p, Cells(5, 24));
-    Assert.Equal(narrow.columns, 5, "the width is clamped to the available columns");
-}
-
-test PanelRenderWithContextPositionsTheBlock
-{
-    string esc = Ansi.Escape.Esc();
-    Console.Controls.Panel.Panel p = Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("x"));
-    string block = Console.Controls.Panel.Render(p, Cells(5, 3));
-    string positioned = Console.Controls.Panel.RenderWithContext(p, Cells(5, 3), RenderContext.New(2, 3));
-    Assert.Equal(positioned, Ansi.Escape.WhenEnabled("${esc}[2;3H") + block, "the block follows the cursor position");
-}
-
-test ProgressBarMeasureRenderTickAndAnchor
-{
-    ProgressBar.ProgressBar bar = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 30_i64);
-    ConsoleSize measured = ProgressBar.Measure(bar, Cells(2, 9));
-    Assert.Equal(measured.columns, 4, "the bar is at least four columns");
-    Assert.Equal(measured.rows, 1, "the bar is one row");
-    Assert.Equal(ProgressBar.Render(bar, Cells(12, 1)), ProgressBar.BarBody(bar, 12), "Render is the bar body at the given width");
-    Assert.Equal(ProgressBar.BarBody(bar, 12), "[===       ] 30%", "30 percent of ten cells");
-    Assert.Equal(ProgressBar.Tick(bar).percent, 30_i64, "a tick keeps the percent");
-    ProgressBar.ProgressBar anchored = ProgressBar.WithAnchor(bar, 5, 2);
-    Assert.Equal(anchored.percent, 30_i64, "anchoring keeps the percent");
-}
-
-test ProgressBarRenderIncrementalErasesTheAnchorLine
-{
-    string esc = Ansi.Escape.Esc();
-    ProgressBar.ProgressBar bar = ProgressBar.WithAnchor(ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 100_i64), 5, 2);
-    string rendered = ProgressBar.RenderIncremental(bar, Cells(6, 1));
-    Assert.Equal(rendered, Ansi.Escape.WhenEnabled("${esc}[5;2H${esc}[2K") + "[====] 100%", "position at the anchor, erase the line, draw");
-}
-
-test HorizontalStackJoinsChildrenWithSpaces
-{
-    HorizontalStack.HorizontalStack stack = HorizontalStack.WithChild(HorizontalStack.WithChild(HorizontalStack.New(), "ab"), "cd");
-    Assert.Equal(HorizontalStack.ChildCount(stack), 2_i64, "two children");
-    Assert.Equal(HorizontalStack.Render(stack, Cells(80, 1)), "ab cd", "children joined by one space");
-    Assert.Equal(HorizontalStack.Measure(stack, Cells(80, 1)).columns, 5, "width of the joined text");
-    Assert.Equal(HorizontalStack.Measure(stack, Cells(3, 1)).columns, 3, "width clamped to the available columns");
-    Assert.Equal(HorizontalStack.Measure(HorizontalStack.New(), Cells(80, 1)).columns, 1, "an empty stack is one column wide");
-}
-
-test VerticalStackRendersOneChildPerLine
-{
-    VerticalStack.VerticalStack stack = VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.New(), "a"), "b");
-    Assert.Equal(VerticalStack.Render(stack, Cells(80, 24)), "a
-b", "children on separate lines");
-    ConsoleSize measured = VerticalStack.Measure(stack, Cells(40, 24));
-    Assert.Equal(measured.rows, 2, "one row per child");
-    Assert.Equal(measured.columns, 40, "full available width");
-    Assert.Equal(VerticalStack.Measure(VerticalStack.New(), Cells(40, 24)).rows, 1, "an empty stack is one row");
-}
-
-// ---- ANSI builders: every step, gated on the capability ----
-
-test AnsiCursorStepsEmitTheirCsiFinalBytes
-{
-    string esc = Ansi.Escape.Esc();
-    mut CursorBuilder c = Ansi.Cursor.Down(Ansi.Cursor.Start(), 1);
-    c = Ansi.Cursor.Right(c, 2);
-    c = Ansi.Cursor.Left(c, 3);
-    c = Ansi.Cursor.NextLine(c, 4);
-    c = Ansi.Cursor.PrevLine(c, 5);
-    c = Ansi.Cursor.Column(c, 6);
-    c = Ansi.Cursor.SaveDec(c);
-    c = Ansi.Cursor.RestoreDec(c);
-    Assert.Equal(Ansi.Cursor.IntoSequence(c), Ansi.Escape.WhenEnabled("${esc}[1B${esc}[2C${esc}[3D${esc}[4E${esc}[5F${esc}[6G${esc}7${esc}8"), "down, right, left, next, previous, column, save, restore");
-}
-
-test AnsiScreenStepsEmitTheirPrivateModes
-{
-    string esc = Ansi.Escape.Esc();
-    mut ScreenBuilder s = Ansi.Screen.DisableAltScreen(Ansi.Screen.Start());
-    s = Ansi.Screen.ShowCursor(s);
-    s = Ansi.Screen.SaveScreen(s);
-    s = Ansi.Screen.RestoreScreen(s);
-    s = Ansi.Screen.EnableLineWrap(s);
-    s = Ansi.Screen.DisableLineWrap(s);
-    Assert.Equal(Ansi.Screen.IntoSequence(s), Ansi.Escape.WhenEnabled("${esc}[?1049l${esc}[?25h${esc}[?47h${esc}[?47l${esc}[?7h${esc}[?7l"), "alt screen off, cursor on, save, restore, wrap on, wrap off");
-}
-
-test AnsiEraseStepsEmitTheirModes
-{
-    string esc = Ansi.Escape.Esc();
-    mut EraseBuilder e = Ansi.Erase.DisplayFromCursor(Ansi.Erase.Start());
-    e = Ansi.Erase.DisplayToCursor(e);
-    e = Ansi.Erase.DisplaySaved(e);
-    e = Ansi.Erase.LineFromCursor(e);
-    e = Ansi.Erase.LineToCursor(e);
-    Assert.Equal(Ansi.Erase.IntoSequence(e), Ansi.Escape.WhenEnabled("${esc}[0J${esc}[1J${esc}[3J${esc}[0K${esc}[1K"), "display from, to, saved; line from, to");
-}
-
-test AnsiInputModeStepsEmitTheirModes
-{
-    string esc = Ansi.Escape.Esc();
-    mut InputModeBuilder i = Ansi.InputMode.DisableMouseClick(Ansi.InputMode.Start());
-    i = Ansi.InputMode.DisableMouseDrag(i);
-    i = Ansi.InputMode.EnableMouseMotion(i);
-    i = Ansi.InputMode.DisableMouseMotion(i);
-    i = Ansi.InputMode.EnableSgrMouse(i);
-    i = Ansi.InputMode.DisableSgrMouse(i);
-    i = Ansi.InputMode.RedefineKey(i, 65, "\"x\"");
-    Assert.Equal(Ansi.InputMode.IntoSequence(i), Ansi.Escape.WhenEnabled("${esc}[?1000l${esc}[?1002l${esc}[?1003h${esc}[?1003l${esc}[?1006h${esc}[?1006l${esc}[65;\"x\"p"), "mouse modes and key redefinition");
-}
-
-test AnsiStyleChainBackgroundAndItalicCodes
-{
-    string esc = Ansi.Escape.Esc();
-    Ansi.StyleChain chain = Ansi.StyleChain.Bg256(Ansi.StyleChain.BgBasic(Ansi.StyleChain.Italic(Ansi.StyleChain.New()), 44), 17);
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(chain), "${esc}[3;44;48;5;17m", "italic, basic background, 256 background");
-    Assert.Equal(Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.New()), "", "an empty chain has no prefix");
-    Assert.Equal(Ansi.StyleChain.Reset(), "${esc}[0m", "reset");
-}
-
-test EscapeEmitHelpersAreGatedOnTheCapability
-{
-    string esc = Ansi.Escape.Esc();
-    Assert.Equal(Ansi.Escape.EmitCsi("1", "m"), Ansi.Escape.WhenEnabled("${esc}[1m"), "EmitCsi");
-    Assert.Equal(Ansi.Escape.EmitOsc("0;t"), Ansi.Escape.WhenEnabled("${esc}]0;t"), "EmitOsc");
-    Assert.Equal(Ansi.Escape.EmitDec("7"), Ansi.Escape.WhenEnabled("${esc}7"), "EmitDec");
-    if (Console.Capabilities.ShouldEmitAnsi())
-    {
-        Assert.Equal(Ansi.Escape.WhenEnabled("q"), "q", "enabled: the sequence passes through");
     }
-    else
+
+    test PanelTitleAlignmentPlacesTheTitle
     {
-        Assert.Equal(Ansi.Escape.WhenEnabled("q"), "", "disabled: nothing is emitted");
+        Console.Controls.Panel.Panel p = Console.Controls.Panel.WithTitle(Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("")), "T");
+        Console.Controls.Frame.FrameChars frame = Console.Controls.Frame.Ascii();
+        Assert.Equal(Console.Controls.Panel.TopBorder(p, frame, 10), "+- T ------+", "left: one fill before the title");
+        Console.Controls.Panel.Panel right = Console.Controls.Panel.WithAlignment(p, Style.TitleAlignment::Right);
+        Assert.Equal(Console.Controls.Panel.TopBorder(right, frame, 10), "+------ T -+", "right: one fill after the title");
+        Console.Controls.Panel.Panel center = Console.Controls.Panel.WithAlignment(p, Style.TitleAlignment::Center);
+        Assert.Equal(Console.Controls.Panel.TopBorder(center, frame, 10), "+--- T ----+", "center: fill split around the title");
+    }
+
+    test PanelPaddingIndentsTheBodyAndWidensTheMeasure
+    {
+        Console.Controls.Panel.Panel p = Console.Controls.Panel.WithPadding(Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("ab")), Style.Padding::Value(2));
+        Assert.Equal(Style.ResolvePadding(Console.Controls.Panel.Padding(p), 80), 2, "the padding is stored");
+        Assert.Equal(Style.ResolveMargin(Console.Controls.Panel.Margin(p), 80), 0, "a new panel has no margin");
+        Assert.Equal(Console.Controls.Panel.BodyLine(p, Console.Controls.Frame.Ascii(), 8), "|  ab    |", "two spaces before the body");
+        ConsoleSize measured = Console.Controls.Panel.Measure(p, Cells(80, 24));
+        Assert.Equal(measured.columns, 8, "body 2 + padding 4 + frame 2");
+        Assert.Equal(measured.rows, 3, "untitled panel is three rows");
+        ConsoleSize titled = Console.Controls.Panel.Measure(Console.Controls.Panel.WithTitle(p, "T"), Cells(80, 24));
+        Assert.Equal(titled.rows, 4, "a title adds a row");
+        ConsoleSize narrow = Console.Controls.Panel.Measure(p, Cells(5, 24));
+        Assert.Equal(narrow.columns, 5, "the width is clamped to the available columns");
+    }
+
+    test PanelRenderWithContextPositionsTheBlock
+    {
+        string esc = Ansi.Escape.Esc();
+        Console.Controls.Panel.Panel p = Console.Controls.Panel.WithAsciiFrame(Console.Controls.Panel.New("x"));
+        string block = Console.Controls.Panel.Render(p, Cells(5, 3));
+        string positioned = Console.Controls.Panel.RenderWithContext(p, Cells(5, 3), RenderContext.New(2, 3));
+        Assert.Equal(positioned, Ansi.Escape.WhenEnabled("${esc}[2;3H") + block, "the block follows the cursor position");
+    }
+
+    test ProgressBarMeasureRenderTickAndAnchor
+    {
+        ProgressBar.ProgressBar bar = ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 30_i64);
+        ConsoleSize measured = ProgressBar.Measure(bar, Cells(2, 9));
+        Assert.Equal(measured.columns, 4, "the bar is at least four columns");
+        Assert.Equal(measured.rows, 1, "the bar is one row");
+        Assert.Equal(ProgressBar.Render(bar, Cells(12, 1)), ProgressBar.BarBody(bar, 12), "Render is the bar body at the given width");
+        Assert.Equal(ProgressBar.BarBody(bar, 12), "[===       ] 30%", "30 percent of ten cells");
+        Assert.Equal(ProgressBar.Tick(bar).percent, 30_i64, "a tick keeps the percent");
+        ProgressBar.ProgressBar anchored = ProgressBar.WithAnchor(bar, 5, 2);
+        Assert.Equal(anchored.percent, 30_i64, "anchoring keeps the percent");
+    }
+
+    test ProgressBarRenderIncrementalErasesTheAnchorLine
+    {
+        string esc = Ansi.Escape.Esc();
+        ProgressBar.ProgressBar bar = ProgressBar.WithAnchor(ProgressBar.ProgressBar.WithPercent(ProgressBar.ProgressBar.New(), 100_i64), 5, 2);
+        string rendered = ProgressBar.RenderIncremental(bar, Cells(6, 1));
+        Assert.Equal(rendered, Ansi.Escape.WhenEnabled("${esc}[5;2H${esc}[2K") + "[====] 100%", "position at the anchor, erase the line, draw");
+    }
+
+    test HorizontalStackJoinsChildrenWithSpaces
+    {
+        HorizontalStack.HorizontalStack stack = HorizontalStack.WithChild(HorizontalStack.WithChild(HorizontalStack.New(), "ab"), "cd");
+        Assert.Equal(HorizontalStack.ChildCount(stack), 2_i64, "two children");
+        Assert.Equal(HorizontalStack.Render(stack, Cells(80, 1)), "ab cd", "children joined by one space");
+        Assert.Equal(HorizontalStack.Measure(stack, Cells(80, 1)).columns, 5, "width of the joined text");
+        Assert.Equal(HorizontalStack.Measure(stack, Cells(3, 1)).columns, 3, "width clamped to the available columns");
+        Assert.Equal(HorizontalStack.Measure(HorizontalStack.New(), Cells(80, 1)).columns, 1, "an empty stack is one column wide");
+    }
+
+    test VerticalStackRendersOneChildPerLine
+    {
+        VerticalStack.VerticalStack stack = VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.WithChild(VerticalStack.VerticalStack.New(), "a"), "b");
+        Assert.Equal(VerticalStack.Render(stack, Cells(80, 24)), "a
+b", "children on separate lines");
+        ConsoleSize measured = VerticalStack.Measure(stack, Cells(40, 24));
+        Assert.Equal(measured.rows, 2, "one row per child");
+        Assert.Equal(measured.columns, 40, "full available width");
+        Assert.Equal(VerticalStack.Measure(VerticalStack.New(), Cells(40, 24)).rows, 1, "an empty stack is one row");
+    }
+}
+
+mod CapabilitiesTests
+{
+    // `Console.Capabilities` color/TTY policy helpers.
+    test ShouldStripWhenNoColorSet
+    {
+        Capabilities.Capabilities caps = Capabilities.Capabilities
+        {
+            isTty: true,
+            colorDisabled: true,
+            colorForced: false,
+            model: Capabilities.ColorModel::Indexed256,
+        };
+        Assert.True(Capabilities.ShouldStripColor(caps), "NO_COLOR should force strip");
+    }
+
+    test ShouldStripWhenNotTtyAndNotForced
+    {
+        Capabilities.Capabilities caps = Capabilities.Capabilities
+        {
+            isTty: false,
+            colorDisabled: false,
+            colorForced: false,
+            model: Capabilities.ColorModel::TrueColor,
+        };
+        Assert.True(Capabilities.ShouldStripColor(caps), "non-TTY without FORCE_COLOR should strip");
+    }
+
+    test ShouldNotStripWhenForceColorOnPipe
+    {
+        Capabilities.Capabilities caps = Capabilities.Capabilities
+        {
+            isTty: false,
+            colorDisabled: false,
+            colorForced: true,
+            model: Capabilities.ColorModel::Indexed256,
+        };
+        Assert.False(Capabilities.ShouldStripColor(caps), "FORCE_COLOR should allow ANSI on non-TTY");
+    }
+
+    // The harness redirects stdout and stderr, so neither is a terminal. Color policy then depends only
+    // on `NO_COLOR` and `FORCE_COLOR`, which these tests read rather than assume.
+    test StandardOutputAndErrorAreNotTerminalsUnderTheHarness
+    {
+        Assert.Equal(Platform.Terminal.IsAtty(1), 0_i64, "stdout is redirected");
+        Assert.Equal(Platform.Terminal.IsAtty(2), 0_i64, "stderr is redirected");
+        Assert.False(Console.Capabilities.IsStreamTty(1), "IsStreamTty agrees with IsAtty for stdout");
+        Assert.False(Console.Capabilities.IsStreamTty(2), "IsStreamTty agrees with IsAtty for stderr");
+    }
+
+    test ProbeStdoutReportsTheEnvironmentFlags
+    {
+        Capabilities.Capabilities caps = Console.Capabilities.ProbeStdout();
+        Assert.False(caps.isTty, "stdout is not a terminal");
+        Assert.True(caps.colorDisabled == Platform.Terminal.EnvFlagSet("NO_COLOR"), "colorDisabled is NO_COLOR");
+        Assert.True(caps.colorForced == Platform.Terminal.EnvFlagSet("FORCE_COLOR"), "colorForced is FORCE_COLOR");
+        Assert.True(caps.model == Platform.Terminal.ProbeColorModel(), "the probed color model");
+    }
+
+    test ShouldEmitAnsiAndShouldStyleFollowTheProbe
+    {
+        bool expected = !Console.Capabilities.ShouldStripColor(Console.Capabilities.ProbeStdout());
+        Assert.True(Console.Capabilities.ShouldEmitAnsi() == expected, "ShouldEmitAnsi is the inverse of ShouldStripColor of the probe");
+        Assert.True(Console.ShouldStyle() == expected, "the facade ShouldStyle matches ShouldEmitAnsi");
+        bool forced = Platform.Terminal.EnvFlagSet("FORCE_COLOR") && !Platform.Terminal.EnvFlagSet("NO_COLOR");
+        Assert.True(expected == forced, "a redirected stdout emits ANSI only when FORCE_COLOR is set and NO_COLOR is not");
+    }
+
+    test EffectiveColorModelIsBasic16WhenColorIsStripped
+    {
+        Capabilities.Capabilities stripped = Capabilities.Capabilities
+        {
+            isTty: true,
+            colorDisabled: true,
+            colorForced: false,
+            model: Capabilities.ColorModel::TrueColor,
+        };
+        Assert.True(Console.Capabilities.EffectiveColorModel(stripped) == Capabilities.ColorModel::Basic16, "stripped color falls back to Basic16");
+        Capabilities.Capabilities forced = Capabilities.Capabilities
+        {
+            isTty: false,
+            colorDisabled: false,
+            colorForced: true,
+            model: Capabilities.ColorModel::Indexed256,
+        };
+        Assert.True(Console.Capabilities.EffectiveColorModel(forced) == Capabilities.ColorModel::Indexed256, "forced color keeps the probed model");
+        Capabilities.Capabilities terminal = Capabilities.Capabilities
+        {
+            isTty: true,
+            colorDisabled: false,
+            colorForced: false,
+            model: Capabilities.ColorModel::TrueColor,
+        };
+        Assert.True(Console.Capabilities.EffectiveColorModel(terminal) == Capabilities.ColorModel::TrueColor, "a terminal keeps the probed model");
+    }
+
+    test ForcePlainTextAndProbeColorModelOnARedirectedStdout
+    {
+        bool expected = Platform.Terminal.EnvFlagSet("NO_COLOR") || !Platform.Terminal.EnvFlagSet("FORCE_COLOR") || Platform.Terminal.EnvEquals("TERM", "dumb");
+        Assert.True(Platform.Terminal.ForcePlainText() == expected, "plain text unless FORCE_COLOR is set, NO_COLOR is not, and TERM is not dumb");
+        if (Platform.Terminal.ForcePlainText())
+        {
+            Assert.True(Platform.Terminal.ProbeColorModel() == Capabilities.ColorModel::Basic16, "plain text probes as Basic16");
+        }
+    }
+
+    test ParsePositiveIntRejectsZeroSignsDigitsOverflowAndKeepsLeadingZeros
+    {
+        Assert.Equal(Platform.Terminal.ParsePositiveInt("007", 80), 7, "leading zeros parse");
+        Assert.Equal(Platform.Terminal.ParsePositiveInt("0", 80), 80, "zero keeps the default");
+        Assert.Equal(Platform.Terminal.ParsePositiveInt("-5", 80), 80, "a sign keeps the default");
+        Assert.Equal(Platform.Terminal.ParsePositiveInt("12a", 80), 80, "a non-digit keeps the default");
+        Assert.Equal(Platform.Terminal.ParsePositiveInt("2147483647", 80), 2147483647, "i32 maximum parses");
+        Assert.Equal(Platform.Terminal.ParsePositiveInt("2147483648", 80), 80, "beyond i32 keeps the default");
+    }
+
+    test EnvFallbackSizeReadsColumnsAndLines
+    {
+        ConsoleSize size = Platform.Terminal.EnvFallbackSize();
+        Assert.Equal(size.columns, EnvSizeOr("COLUMNS", 80), "columns from COLUMNS, else 80");
+        Assert.Equal(size.rows, EnvSizeOr("LINES", 24), "rows from LINES, else 24");
+    }
+
+    test QuerySizeFallsBackToTheEnvironmentWithoutATerminal
+    {
+        ConsoleSize fallback = Platform.Terminal.EnvFallbackSize();
+        ConsoleSize platform = Platform.Terminal.QuerySize();
+        ConsoleSize facade = Console.QuerySize();
+        Assert.Equal(platform.columns, fallback.columns, "no terminal: the platform size is the environment size");
+        Assert.Equal(platform.rows, fallback.rows, "no terminal: the platform rows are the environment rows");
+        Assert.Equal(facade.columns, platform.columns, "the facade returns the platform size");
+        Assert.Equal(facade.rows, platform.rows, "the facade returns the platform rows");
+    }
+}
+
+// Terminal platform
+mod TerminalTests
+{
+    // Platform terminal probes. The test harness runs every test with stdin at EOF and stdout and
+    // stderr redirected, so neither output stream is a terminal.
+    test ParseEnvColumnsKnownValues
+    {
+        Assert.Equal(Platform.Terminal.ParseEnvColumns("120", 80), 120, "expected 120 columns");
+        Assert.Equal(Platform.Terminal.ParseEnvColumns("unknown", 80), 80, "unknown columns should keep default");
+    }
+
+    test ParseEnvRowsKnownValues
+    {
+        Assert.Equal(Platform.Terminal.ParseEnvRows("40", 24), 40, "expected 40 rows");
+        Assert.Equal(Platform.Terminal.ParseEnvRows("", 24), 24, "empty rows should keep default");
+    }
+}
+
+// Format attributes
+mod FormatTests
+{
+    // Attribute span color parsing for `Console.Format.Attributes`.
+    test ParseNamedRed
+    {
+        Console.Format.Attributes.ParsedRgb rgb = Console.Format.Attributes.ParseColor("red");
+        Assert.True(rgb.ok && rgb.r == 205, "named red");
+    }
+
+    test ParseHexSixDigits
+    {
+        Console.Format.Attributes.ParsedRgb rgb = Console.Format.Attributes.ParseColor("#ff0000");
+        Assert.True(rgb.ok && rgb.r == 255 && rgb.g == 0 && rgb.b == 0, "hex #ff0000");
+    }
+
+    test ParseRgbTriplet
+    {
+        Console.Format.Attributes.ParsedRgb rgb = Console.Format.Attributes.ParseColor("rgb(10,20,30)");
+        Assert.True(rgb.ok && rgb.r == 10 && rgb.g == 20 && rgb.b == 30, "rgb(10,20,30)");
+    }
+
+    test ApplyAttrListFgAndBg
+    {
+        Ansi.StyleChain chain = Console.Format.Attributes.ApplyAttrList(Ansi.StyleChain.New(), "fg=red, bg=blue");
+        string expected = Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.BgRgb(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 205, 0, 0), 0, 0, 238));
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(chain), expected, "fg then bg, in list order");
+    }
+
+    test AttrSpanPlainStrip
+    {
+        string text = Console.Format.StripMarkup("&[fg=red, bg=blue](hi)");
+        Assert.Equal(text, "hi", "attr span strip");
+    }
+
+    test AttrSpanFollowsAnsiCapability
+    {
+        string text = Console.Format.Format("&[fg=red](x)");
+        string styled = Ansi.StyleChain.Apply(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 205, 0, 0), "x");
+        if (Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(text, styled, "attr span applies its color when ANSI is enabled");
+        }
+        else
+        {
+            Assert.Equal(text, "x", "attr span is stripped to its text when ANSI is disabled");
+        }
+    }
+
+    // Markup scanner helpers (`Console.Format.Scan`).
+    test SliceReturnsSubstring
+    {
+        string part = Console.Format.Scan.Slice("abcdef", 2, 3);
+        Assert.Equal(part, "cde", "Slice middle segment");
+    }
+
+    test IndexOfFindsNeedle
+    {
+        i64 idx = Console.Format.Scan.IndexOfFrom("foo-bar", 0, "bar");
+        Assert.Equal(idx, 4, "IndexOfFrom bar");
+    }
+
+    test TrimStripsSpaces
+    {
+        string t = Console.Format.Scan.Trim("  hi  ");
+        Assert.Equal(t, "hi", "Trim spaces");
+    }
+
+    test ScanStartsWithAttrOpener
+    {
+        Assert.True(Console.Format.Scan.StartsWith("&[fg=", "&["), "StartsWith attr opener");
+    }
+
+    test ContainsSubstring
+    {
+        Assert.True(Console.Format.Scan.ContainsSubstring("abc[1m", "[1m"), "ContainsSubstring CSI");
+    }
+}
+
+// Console style
+mod StyleTests
+{
+    // Layout enums for console controls (`Console.Style`).
+    test ResolveSizeSmallMediumLarge
+    {
+        i64 small = Style.ResolveSize(Style.Size::Small, 80);
+        i64 medium = Style.ResolveSize(Style.Size::Medium, 80);
+        i64 large = Style.ResolveSize(Style.Size::Large, 80);
+        Assert.Equal(small, 1, "small size");
+        Assert.Equal(medium, 2, "medium size");
+        Assert.Equal(large, 4, "large size");
+    }
+
+    test ResolvePaddingSizedAndValue
+    {
+        i64 none = Style.ResolvePadding(Style.Padding::None, 80);
+        i64 sized = Style.ResolvePadding(Style.Padding::Sized(Style.Size::Medium), 80);
+        i64 explicit = Style.ResolvePadding(Style.Padding::Value(5), 80);
+        Assert.Equal(none, 0, "none padding");
+        Assert.Equal(sized, 2, "sized padding");
+        Assert.Equal(explicit, 5, "explicit padding");
+    }
+
+    test ResolveMarginValue
+    {
+        i64 margin = Style.ResolveMargin(Style.Margin::Value(3), 100);
+        Assert.Equal(margin, 3, "explicit margin");
+    }
+
+    test ClampWidthBounds
+    {
+        i64 min = Style.ClampWidth(0, 1, 10);
+        i64 max = Style.ClampWidth(99, 1, 10);
+        i64 passthrough = Style.ClampWidth(5, 1, 10);
+        Assert.Equal(min, 1, "clamp min");
+        Assert.Equal(max, 10, "clamp max");
+        Assert.Equal(passthrough, 5, "clamp passthrough");
+    }
+}
+
+mod RenderContextTests
+{
+    // Incremental render context cursor/erase prefixes.
+    test MoveToEmitsCsi
+    {
+        string esc = Ansi.Escape.Esc();
+        RenderContext.RenderContext ctx = RenderContext.New(2, 4);
+        string seq = RenderContext.MoveTo(ctx, 2, 4);
+        Assert.Equal(seq, Ansi.Escape.WhenEnabled("${esc}[2;4H"), "MoveTo positions the cursor, empty when ANSI is disabled");
+        Assert.Equal(RenderContext.MoveTo(RenderContext.WithoutIncremental(2, 4), 2, 4), "", "a non-incremental context never moves the cursor");
+    }
+
+    test WithoutIncrementalIsPlain
+    {
+        RenderContext.RenderContext ctx = RenderContext.WithoutIncremental(1, 1);
+        string rendered = RenderContext.RenderAt(ctx, "line");
+        Assert.Equal(rendered, "line", "non-incremental RenderAt should return text only");
+    }
+
+    test EraseLineAndRender
+    {
+        string esc = Ansi.Escape.Esc();
+        RenderContext.RenderContext ctx = RenderContext.New(1, 1);
+        string rendered = RenderContext.EraseLineAndRender(ctx, "x");
+        Assert.Equal(rendered, Ansi.Escape.WhenEnabled("${esc}[1;1H${esc}[2K") + "x", "position, erase line, then the text");
+        Assert.Equal(RenderContext.EraseLineAndRender(RenderContext.WithoutIncremental(1, 1), "x"), "x", "a non-incremental context renders the text only");
+    }
+
+    test AdvanceRow
+    {
+        string esc = Ansi.Escape.Esc();
+        Console.Controls.RenderContext.RenderContext ctx = Console.Controls.RenderContext.New(3, 7);
+        Console.Controls.RenderContext.RenderContext next = Console.Controls.RenderContext.AdvanceRow(ctx);
+        string rendered = Console.Controls.RenderContext.RenderAt(next, "x");
+        Assert.Equal(rendered, Ansi.Escape.WhenEnabled("${esc}[4;7H") + "x", "AdvanceRow moves one row down at the origin column");
+    }
+}
+
+// Console facade: resize messages and the resize hub
+mod FacadeTests
+{
+    test RunTickSendsAResizeOnlyWhenTheSizeDiffers
+    {
+        Concurrency.Channel<ConsoleMessage> messages = Console.MessagesChannel();
+        ConsoleSize now = Console.QuerySize();
+        mut ConsoleSize same = Console.QuerySize();
+        Console.RunTick(messages, same);
+        match (Channel.TryReceive(messages))
+        {
+            TryResult::Ok(_) => Assert.Fail("an unchanged size sends nothing"),
+            TryResult::Err(_) => Assert.Fail("channel is open"),
+            TryResult::WouldBlock => { },
+        };
+        mut ConsoleSize stale = ConsoleSize
+        {
+            columns: 0,
+            rows: 0,
+        };
+        Console.RunTick(messages, stale);
+        match (Channel.TryReceive(messages))
+        {
+            TryResult::Ok(message) => match (message)
+            {
+                ConsoleMessage::Resize(size) => {
+                    Assert.Equal(size.columns, now.columns, "the message carries the new columns");
+                    Assert.Equal(size.rows, now.rows, "the message carries the new rows");
+                },
+                ConsoleMessage::Tick => Assert.Fail("RunTick sends no tick"),
+            },
+            TryResult::Err(_) => Assert.Fail("channel is open"),
+            TryResult::WouldBlock => Assert.Fail("a changed size sends a resize"),
+        };
+        match (Channel.TryReceive(messages))
+        {
+            TryResult::Ok(_) => Assert.Fail("one change sends one resize"),
+            TryResult::Err(_) => Assert.Fail("channel is open"),
+            TryResult::WouldBlock => { },
+        };
+    }
+
+    test RunTickLiveSendsATickEveryCall
+    {
+        Concurrency.Channel<ConsoleMessage> messages = Console.MessagesChannel();
+        mut ConsoleSize last = Console.QuerySize();
+        Console.Controls.LiveTick.LiveTickState live = Console.Controls.LiveTick.New();
+        Console.Controls.LiveTick.LiveTickState next = Console.RunTickLive(messages, last, live);
+        match (Channel.TryReceive(messages))
+        {
+            TryResult::Ok(message) => match (message)
+            {
+                ConsoleMessage::Tick => { },
+                ConsoleMessage::Resize(_) => Assert.Fail("an unchanged size sends no resize"),
+            },
+            TryResult::Err(_) => Assert.Fail("channel is open"),
+            TryResult::WouldBlock => Assert.Fail("RunTickLive sends a tick"),
+        };
+    }
+
+    test SubscribeOnResizeCallsTheHandlerOnceWithTheCurrentSize
+    {
+        Concurrency.Channel<ConsoleMessage> seen = Console.MessagesChannel();
+        mut OnResize hub = OnResize
+        {
+            lastSize: ConsoleSize
+            {
+                columns: 0,
+                rows: 0,
+            },
+        };
+        unit(ConsoleSize) handler = (ConsoleSize size) => {
+            match (Channel.TrySend(seen, ConsoleMessage::Resize(size)))
+            {
+                TryResult::Ok(_) => { },
+                TryResult::Err(_) => Assert.Fail("handler channel is open"),
+                TryResult::WouldBlock => Assert.Fail("unbounded handler channel accepts"),
+            };
+        };
+        Console.SubscribeOnResize(hub, handler);
+        ConsoleSize now = Console.QuerySize();
+        Assert.Equal(hub.lastSize.columns, now.columns, "the hub records the current size");
+        match (Channel.TryReceive(seen))
+        {
+            TryResult::Ok(message) => match (message)
+            {
+                ConsoleMessage::Resize(size) => Assert.Equal(size.rows, now.rows, "the handler sees the current size"),
+                ConsoleMessage::Tick => Assert.Fail("handler records resizes only"),
+            },
+            TryResult::Err(_) => Assert.Fail("handler channel is open"),
+            TryResult::WouldBlock => Assert.Fail("subscribing raises once"),
+        };
+        hub.Raise(ConsoleSize
+        {
+            columns: 7,
+            rows: 3,
+        });
+        match (Channel.TryReceive(seen))
+        {
+            TryResult::Ok(message) => match (message)
+            {
+                ConsoleMessage::Resize(size) => Assert.Equal(size.columns, 7, "Raise passes its size to the handler"),
+                ConsoleMessage::Tick => Assert.Fail("handler records resizes only"),
+            },
+            TryResult::Err(_) => Assert.Fail("handler channel is open"),
+            TryResult::WouldBlock => Assert.Fail("Raise calls the subscribed handler"),
+        };
+    }
+}
+
+// Markdown rendering
+mod MarkdownTests
+{
+    test RenderPlainStripsEveryMarkupKind
+    {
+        Assert.Equal(Console.Format.Markdown.RenderPlain("**b** *i* __u__ ~~s~~"), "b i u s", "emphasis delimiters are removed");
+        Assert.Equal(Console.Format.Markdown.RenderPlain("[docs](https://beskid.dev)"), "docs", "a link keeps its label");
+        Assert.Equal(Console.Format.Markdown.RenderPlain("[green]ok[/]"), "ok", "a palette tag keeps its body");
+        Assert.Equal(Console.Format.Markdown.RenderPlain("&[fg=red](x)y"), "xy", "an attribute span keeps its body");
+        Assert.Equal(Console.Format.Markdown.RenderPlain("\\*not italic\\*"), "*not italic*", "an escaped sigil is literal");
+        Assert.Equal(Console.Format.Markdown.RenderPlain("**outer *inner***"), "outer *inner*", "the first closing delimiter ends bold");
+        Assert.Equal(Console.Format.Markdown.RenderPlain(""), "", "empty input");
+    }
+
+    test RenderStyledWrapsEachSpanInItsStyle
+    {
+        string bold = Ansi.StyleChain.Apply(Ansi.StyleChain.Bold(Ansi.StyleChain.New()), "b");
+        string italic = Ansi.StyleChain.Apply(Ansi.StyleChain.Italic(Ansi.StyleChain.New()), "i");
+        Assert.Equal(Console.Format.Markdown.RenderStyled("**b** *i*"), "${bold} ${italic}", "bold and italic spans are styled separately");
+        string green = Ansi.StyleChain.Apply(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 0, 205, 0), "ok");
+        Assert.Equal(Console.Format.Markdown.RenderStyled("[green]ok[/]"), green, "a palette tag colors its body");
+        Assert.Equal(Console.Format.Markdown.RenderStyled("plain"), "plain", "literal text is unchanged");
+    }
+
+    test RenderInnerSelectsPlainOrStyled
+    {
+        string source = "**b** [docs](https://beskid.dev)";
+        Assert.Equal(Console.Format.Markdown.RenderInner(source, false), Console.Format.Markdown.RenderPlain(source), "ansi false is RenderPlain");
+        Assert.Equal(Console.Format.Markdown.RenderInner(source, true), Console.Format.Markdown.RenderStyled(source), "ansi true is RenderStyled");
+    }
+
+    test FormatIsStyledOnlyWhenAnsiIsEmitted
+    {
+        string source = "**b**";
+        if (Console.Capabilities.ShouldEmitAnsi())
+        {
+            Assert.Equal(Console.Format.Format(source), Console.Format.Markdown.RenderStyled(source), "ANSI enabled: styled");
+        }
+        else
+        {
+            Assert.Equal(Console.Format.Format(source), "b", "ANSI disabled: stripped");
+        }
+    }
+}
+
+// Attribute and color parsing
+mod ColorsTests
+{
+    test ParseNamedColorKnowsTheEightBasicColors
+    {
+        Console.Format.Attributes.ParsedRgb blue = Console.Format.Attributes.ParseNamedColor("blue");
+        Assert.True(blue.ok && blue.r == 0 && blue.g == 0 && blue.b == 238, "blue");
+        Console.Format.Attributes.ParsedRgb white = Console.Format.Attributes.ParseNamedColor("white");
+        Assert.True(white.ok && white.r == 229 && white.g == 229 && white.b == 229, "white");
+        Console.Format.Attributes.ParsedRgb black = Console.Format.Attributes.ParseNamedColor("black");
+        Assert.True(black.ok && black.r == 0 && black.g == 0 && black.b == 0, "black");
+        Assert.False(Console.Format.Attributes.ParseNamedColor("orange").ok, "an unknown name is rejected");
+        Assert.False(Console.Format.Attributes.ParseNamedColor("Red").ok, "names are case sensitive");
+    }
+
+    test ParseRgbTripletTrimsAndRejectsOutOfRangeOrShortInput
+    {
+        Console.Format.Attributes.ParsedRgb spaced = Console.Format.Attributes.ParseRgbTriplet(" 1, 2 ,3 ");
+        Assert.True(spaced.ok && spaced.r == 1 && spaced.g == 2 && spaced.b == 3, "components are trimmed");
+        Console.Format.Attributes.ParsedRgb top = Console.Format.Attributes.ParseRgbTriplet("255,255,255");
+        Assert.True(top.ok && top.r == 255, "255 is in range");
+        Assert.False(Console.Format.Attributes.ParseRgbTriplet("256,0,0").ok, "256 is out of range");
+        Assert.False(Console.Format.Attributes.ParseRgbTriplet("1,2").ok, "two components are rejected");
+        Assert.False(Console.Format.Attributes.ParseRgbTriplet("1,,3").ok, "an empty component is rejected");
+        Assert.False(Console.Format.Attributes.ParseRgbTriplet("1,-2,3").ok, "a sign is rejected");
+    }
+
+    test ParseHexColorAcceptsThreeAndSixDigitsInEitherCase
+    {
+        Console.Format.Attributes.ParsedRgb shortForm = Console.Format.Attributes.ParseHexColor("0f8");
+        Assert.True(shortForm.ok && shortForm.r == 0 && shortForm.g == 255 && shortForm.b == 136, "#0f8 doubles each digit");
+        Console.Format.Attributes.ParsedRgb longForm = Console.Format.Attributes.ParseHexColor("A0b1C2");
+        Assert.True(longForm.ok && longForm.r == 160 && longForm.g == 177 && longForm.b == 194, "mixed case six digits");
+        Assert.False(Console.Format.Attributes.ParseHexColor("ffff").ok, "four digits are rejected");
+        Assert.False(Console.Format.Attributes.ParseHexColor("zz0000").ok, "a non-hex digit is rejected");
+        Assert.False(Console.Format.Attributes.ParseHexColor("").ok, "empty is rejected");
+    }
+
+    test ParseColorRejectsEmptyAndUnclosedRgb
+    {
+        Assert.False(Console.Format.Attributes.ParseColor("").ok, "empty");
+        Assert.False(Console.Format.Attributes.ParseColor("rgb(1,2,3").ok, "rgb( without )");
+        Console.Format.Attributes.ParsedRgb bare = Console.Format.Attributes.ParseColor("4,5,6");
+        Assert.True(bare.ok && bare.r == 4 && bare.b == 6, "a bare triplet is accepted");
+    }
+
+    test ApplyAttrTokenSetsForegroundOrBackgroundAndIgnoresTheRest
+    {
+        string fg = Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "fg=#010203"));
+        Assert.Equal(fg, Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 1, 2, 3)), "fg= sets the foreground");
+        string bg = Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "bg= rgb(4,5,6)"));
+        Assert.Equal(bg, Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.BgRgb(Ansi.StyleChain.New(), 4, 5, 6)), "bg= sets the background");
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "size=3")), "", "an unknown key changes nothing");
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyAttrToken(Ansi.StyleChain.New(), "fg=nope")), "", "an invalid color changes nothing");
+    }
+
+    test ApplyPaletteTagColorsKnownNamesOnly
+    {
+        string green = Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyPaletteTag(Ansi.StyleChain.New(), "green"));
+        Assert.Equal(green, Ansi.StyleChain.IntoPrefix(Ansi.StyleChain.FgRgb(Ansi.StyleChain.New(), 0, 205, 0)), "green palette tag");
+        Assert.Equal(Ansi.StyleChain.IntoPrefix(Console.Format.Attributes.ApplyPaletteTag(Ansi.StyleChain.New(), "teal")), "", "unknown tag");
     }
 }

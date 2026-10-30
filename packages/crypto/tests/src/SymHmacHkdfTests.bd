@@ -16,77 +16,83 @@ u8[] Okm(Result<u8[], CryptoError> r)
     };
 }
 
-test HmacMatchesRfc4231
+mod HmacTests
 {
-    for v in HmacVectors()
+    test MatchesRfc4231
     {
-        Assert.True(Same(Prefix(Hmac.Compute(v.algorithm, Hex(v.key), Hex(v.message)), v.length), Hex(v.tag)), v.label);
+        for v in HmacVectors()
+        {
+            Assert.True(Same(Prefix(Hmac.Compute(v.algorithm, Hex(v.key), Hex(v.message)), v.length), Hex(v.tag)), v.label);
+        }
+    }
+
+    test IncrementalUpdatesMatchTheOneShotTag
+    {
+        u8[] data = Ascii("what do ya want for nothing?");
+        HmacState s = Hmac.New(HashAlgorithm::Sha384, Ascii("Jefe"));
+        Hmac.UpdateRange(s, data, 0_i64, 5_i64);
+        Hmac.UpdateRange(s, data, 5_i64, Slice.Len(data) - 5_i64);
+        Assert.True(Same(Hmac.Finish(s), Hmac.Compute(HashAlgorithm::Sha384, Ascii("Jefe"), data)), "incremental");
     }
 }
 
-test HmacIncrementalUpdatesMatchTheOneShotTag
+mod HkdfTests
 {
-    u8[] data = Ascii("what do ya want for nothing?");
-    HmacState s = Hmac.New(HashAlgorithm::Sha384, Ascii("Jefe"));
-    Hmac.UpdateRange(s, data, 0_i64, 5_i64);
-    Hmac.UpdateRange(s, data, 5_i64, Slice.Len(data) - 5_i64);
-    Assert.True(Same(Hmac.Finish(s), Hmac.Compute(HashAlgorithm::Sha384, Ascii("Jefe"), data)), "incremental");
-}
-
-test HkdfMatchesRfc5869Case1
-{
-    u8[] prk = Hkdf.Extract(HashAlgorithm::Sha256, Hex("000102030405060708090a0b0c"), Hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"));
-    Assert.True(Same(prk, Hex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")), "prk");
-    Assert.True(Same(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Hex("f0f1f2f3f4f5f6f7f8f9"), 42_i64)), Hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")), "okm");
-}
-
-test HkdfMatchesRfc5869Case2
-{
-    u8[] prk = Hkdf.Extract(HashAlgorithm::Sha256, Hex("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"), Hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"));
-    Assert.True(Same(prk, Hex("06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244")), "prk");
-    Assert.True(Same(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Hex("b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"), 82_i64)), Hex("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")), "okm");
-}
-
-test HkdfMatchesRfc5869Case3WithoutSaltOrInfo
-{
-    u8[] prk = Hkdf.Extract(HashAlgorithm::Sha256, Hex(""), Hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"));
-    Assert.True(Same(prk, Hex("19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")), "prk");
-    Assert.True(Same(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Hex(""), 42_i64)), Hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")), "okm");
-}
-
-test HkdfExpandRejectsOutputAbove255Blocks
-{
-    u8[] prk = Slice.New(32_i64);
-    bool rejected = match (Hkdf.Expand(HashAlgorithm::Sha256, prk, Slice.New(0_i64), 255_i64 * 32_i64 + 1_i64))
+    test MatchesRfc5869Case1
     {
-        Result::Ok(_) => false,
-        Result::Error(e) => match (e)
-        {
-            CryptoError::OutputTooLong => true,
-            _ => false,
-        },
-    };
-    Assert.True(rejected, "too long");
-    Assert.Equal<i64>(Slice.Len(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Slice.New(0_i64), 255_i64 * 32_i64))), 8160_i64, "max ok");
-}
+        u8[] prk = Hkdf.Extract(HashAlgorithm::Sha256, Hex("000102030405060708090a0b0c"), Hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"));
+        Assert.True(Same(prk, Hex("077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5")), "prk");
+        Assert.True(Same(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Hex("f0f1f2f3f4f5f6f7f8f9"), 42_i64)), Hex("3cb25f25faacd57a90434f64d0362f2a2d2d0a90cf1a5a4c5db02d56ecc4c5bf34007208d5b887185865")), "okm");
+    }
 
-test HkdfDerivesTheRfc8448Tls13KeySchedule
-{
-    HashAlgorithm h = HashAlgorithm::Sha256;
-    u8[] zeros = Slice.New(32_i64);
-    u8[] early = Hkdf.Extract(h, Slice.New(0_i64), zeros);
-    Assert.True(Same(early, Hex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")), "early secret");
-    u8[] derived = Okm(Hkdf.DeriveSecretFromMessages(h, early, "derived", Slice.New(0_i64)));
-    Assert.True(Same(derived, Hex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")), "derived");
-    u8[] hs = Hkdf.Extract(h, derived, Hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"));
-    Assert.True(Same(hs, Hex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")), "handshake secret");
-    u8[] th = Hex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
-    u8[] chts = Okm(Hkdf.DeriveSecret(h, hs, "c hs traffic", th));
-    Assert.True(Same(chts, Hex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")), "c hs traffic");
-    u8[] shts = Okm(Hkdf.DeriveSecret(h, hs, "s hs traffic", th));
-    Assert.True(Same(shts, Hex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")), "s hs traffic");
-    Assert.True(Same(Okm(Hkdf.ExpandLabel(h, shts, "key", Slice.New(0_i64), 16_i64)), Hex("3fce516009c21727d0f2e4e86ee403bc")), "server key");
-    Assert.True(Same(Okm(Hkdf.ExpandLabel(h, shts, "iv", Slice.New(0_i64), 12_i64)), Hex("5d313eb2671276ee13000b30")), "server iv");
-    Assert.True(Same(Okm(Hkdf.ExpandLabel(h, chts, "key", Slice.New(0_i64), 16_i64)), Hex("dbfaa693d1762c5b666af5d950258d01")), "client key");
-    Assert.True(Same(Okm(Hkdf.ExpandLabel(h, chts, "iv", Slice.New(0_i64), 12_i64)), Hex("5bd3c71b836e0b76bb73265f")), "client iv");
+    test MatchesRfc5869Case2
+    {
+        u8[] prk = Hkdf.Extract(HashAlgorithm::Sha256, Hex("606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeaf"), Hex("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f"));
+        Assert.True(Same(prk, Hex("06a6b88c5853361a06104c9ceb35b45cef760014904671014a193f40c15fc244")), "prk");
+        Assert.True(Same(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Hex("b0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"), 82_i64)), Hex("b11e398dc80327a1c8e7f78c596a49344f012eda2d4efad8a050cc4c19afa97c59045a99cac7827271cb41c65e590e09da3275600c2f09b8367793a9aca3db71cc30c58179ec3e87c14c01d5c1f3434f1d87")), "okm");
+    }
+
+    test MatchesRfc5869Case3WithoutSaltOrInfo
+    {
+        u8[] prk = Hkdf.Extract(HashAlgorithm::Sha256, Hex(""), Hex("0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b"));
+        Assert.True(Same(prk, Hex("19ef24a32c717b167f33a91d6f648bdf96596776afdb6377ac434c1c293ccb04")), "prk");
+        Assert.True(Same(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Hex(""), 42_i64)), Hex("8da4e775a563c18f715f802a063c5a31b8a11f5c5ee1879ec3454e5f3c738d2d9d201395faa4b61a96c8")), "okm");
+    }
+
+    test ExpandRejectsOutputAbove255Blocks
+    {
+        u8[] prk = Slice.New(32_i64);
+        bool rejected = match (Hkdf.Expand(HashAlgorithm::Sha256, prk, Slice.New(0_i64), 255_i64 * 32_i64 + 1_i64))
+        {
+            Result::Ok(_) => false,
+            Result::Error(e) => match (e)
+            {
+                CryptoError::OutputTooLong => true,
+                _ => false,
+            },
+        };
+        Assert.True(rejected, "too long");
+        Assert.Equal<i64>(Slice.Len(Okm(Hkdf.Expand(HashAlgorithm::Sha256, prk, Slice.New(0_i64), 255_i64 * 32_i64))), 8160_i64, "max ok");
+    }
+
+    test DerivesTheRfc8448Tls13KeySchedule
+    {
+        HashAlgorithm h = HashAlgorithm::Sha256;
+        u8[] zeros = Slice.New(32_i64);
+        u8[] early = Hkdf.Extract(h, Slice.New(0_i64), zeros);
+        Assert.True(Same(early, Hex("33ad0a1c607ec03b09e6cd9893680ce210adf300aa1f2660e1b22e10f170f92a")), "early secret");
+        u8[] derived = Okm(Hkdf.DeriveSecretFromMessages(h, early, "derived", Slice.New(0_i64)));
+        Assert.True(Same(derived, Hex("6f2615a108c702c5678f54fc9dbab69716c076189c48250cebeac3576c3611ba")), "derived");
+        u8[] hs = Hkdf.Extract(h, derived, Hex("8bd4054fb55b9d63fdfbacf9f04b9f0d35e6d63f537563efd46272900f89492d"));
+        Assert.True(Same(hs, Hex("1dc826e93606aa6fdc0aadc12f741b01046aa6b99f691ed221a9f0ca043fbeac")), "handshake secret");
+        u8[] th = Hex("860c06edc07858ee8e78f0e7428c58edd6b43f2ca3e6e95f02ed063cf0e1cad8");
+        u8[] chts = Okm(Hkdf.DeriveSecret(h, hs, "c hs traffic", th));
+        Assert.True(Same(chts, Hex("b3eddb126e067f35a780b3abf45e2d8f3b1a950738f52e9600746a0e27a55a21")), "c hs traffic");
+        u8[] shts = Okm(Hkdf.DeriveSecret(h, hs, "s hs traffic", th));
+        Assert.True(Same(shts, Hex("b67b7d690cc16c4e75e54213cb2d37b4e9c912bcded9105d42befd59d391ad38")), "s hs traffic");
+        Assert.True(Same(Okm(Hkdf.ExpandLabel(h, shts, "key", Slice.New(0_i64), 16_i64)), Hex("3fce516009c21727d0f2e4e86ee403bc")), "server key");
+        Assert.True(Same(Okm(Hkdf.ExpandLabel(h, shts, "iv", Slice.New(0_i64), 12_i64)), Hex("5d313eb2671276ee13000b30")), "server iv");
+        Assert.True(Same(Okm(Hkdf.ExpandLabel(h, chts, "key", Slice.New(0_i64), 16_i64)), Hex("dbfaa693d1762c5b666af5d950258d01")), "client key");
+        Assert.True(Same(Okm(Hkdf.ExpandLabel(h, chts, "iv", Slice.New(0_i64), 12_i64)), Hex("5bd3c71b836e0b76bb73265f")), "client iv");
+    }
 }

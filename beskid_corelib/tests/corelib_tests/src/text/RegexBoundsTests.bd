@@ -9,8 +9,6 @@ use Core.Text.Regex.Bounded;
 use Core.Text.Regex.Types;
 use Testing.Assert;
 
-// ---- Helpers ----
-
 /// `count` copies of `unit`, built by doubling.
 string Repeat(string unit, i64 count)
 {
@@ -70,158 +68,162 @@ string BoundedMatch(string pattern, string text)
     return MatchOf(Bounded.Matches(pattern, text, Bounded.NewBudget(Bounded.DefaultLimits())));
 }
 
-// ---- Core.Text.Regex subject cap ----
-
-test RegexMaxInputLenIsOneMebibyte
+mod SubjectCapTests
 {
-    Assert.Equal(Regex.MaxInputLen(), 1048576, "1 MiB");
-    Assert.False(Regex.InputTooLong(Repeat("a", 1048576)), "exactly 1 MiB is allowed");
-    Assert.True(Regex.InputTooLong(Repeat("a", 1048577)), "one byte over is too long");
-    Assert.False(Regex.InputTooLong(""), "empty is allowed");
-}
-
-test RegexRefusesASubjectOverTheCap
-{
-    string tooLong = Repeat("a", 1048577);
-    Assert.False(Regex.Matches("a", tooLong), "match refuses");
-    Assert.False(Regex.Finds("a", tooLong), "find refuses");
-    Assert.True(Regex.IsFindAllEmpty(Regex.FindAll("a", tooLong)), "find-all refuses");
-    Assert.True(Regex.Matches("a", "a" + Repeat("b", 1000)), "a short subject still matches");
-}
-
-test RegexFindReturnsTheLeftmostSpan
-{
-    Option<MatchSpan> found = Regex.Find("[0-9]+", "x42y");
-    i64 start = match (found)
+    test MaxInputLenIsOneMebibyte
     {
-        Option::Some(span) => span.start,
-        Option::None => -1,
-    };
-    i64 end = match (found)
+        Assert.Equal(Regex.MaxInputLen(), 1048576, "1 MiB");
+        Assert.False(Regex.InputTooLong(Repeat("a", 1048576)), "exactly 1 MiB is allowed");
+        Assert.True(Regex.InputTooLong(Repeat("a", 1048577)), "one byte over is too long");
+        Assert.False(Regex.InputTooLong(""), "empty is allowed");
+    }
+
+    test RefusesASubjectOverTheCap
     {
-        Option::Some(span) => span.end,
-        Option::None => -1,
-    };
-    Assert.Equal(start, 1, "span start");
-    Assert.Equal(end, 3, "span end");
+        string tooLong = Repeat("a", 1048577);
+        Assert.False(Regex.Matches("a", tooLong), "match refuses");
+        Assert.False(Regex.Finds("a", tooLong), "find refuses");
+        Assert.True(Regex.IsFindAllEmpty(Regex.FindAll("a", tooLong)), "find-all refuses");
+        Assert.True(Regex.Matches("a", "a" + Repeat("b", 1000)), "a short subject still matches");
+    }
+
+    test FindReturnsTheLeftmostSpan
+    {
+        Option<MatchSpan> found = Regex.Find("[0-9]+", "x42y");
+        i64 start = match (found)
+        {
+            Option::Some(span) => span.start,
+            Option::None => -1,
+        };
+        i64 end = match (found)
+        {
+            Option::Some(span) => span.end,
+            Option::None => -1,
+        };
+        Assert.Equal(start, 1, "span start");
+        Assert.Equal(end, 3, "span end");
+    }
 }
 
-// ---- Limits and budgets ----
-
-test DefaultLimitsAreValid
+mod BudgetsTests
 {
-    Bounded.PatternLimits limits = Bounded.DefaultLimits();
-    Assert.True(Bounded.ValidLimits(limits), "defaults are valid");
-    Assert.Equal(limits.maxSubjectBytes, 1048576, "subject cap");
-    Assert.Equal(limits.maxWork, 16777216, "work cap");
-    Assert.Equal(limits.maxDepth, 64, "depth cap");
+    test DefaultLimitsAreValid
+    {
+        Bounded.PatternLimits limits = Bounded.DefaultLimits();
+        Assert.True(Bounded.ValidLimits(limits), "defaults are valid");
+        Assert.Equal(limits.maxSubjectBytes, 1048576, "subject cap");
+        Assert.Equal(limits.maxWork, 16777216, "work cap");
+        Assert.Equal(limits.maxDepth, 64, "depth cap");
+    }
+
+    test ValidLimitsBoundsTheDepthAndRejectsNegativeCaps
+    {
+        Assert.True(Bounded.ValidLimits(Limits(0, 0, 1)), "zero caps and depth one");
+        Assert.True(Bounded.ValidLimits(Limits(10, 10, 64)), "depth 64");
+        Assert.False(Bounded.ValidLimits(Limits(10, 10, 0)), "depth zero");
+        Assert.False(Bounded.ValidLimits(Limits(10, 10, 65)), "depth over 64");
+        Assert.False(Bounded.ValidLimits(Limits(-1, 10, 8)), "negative subject cap");
+        Assert.False(Bounded.ValidLimits(Limits(10, -1, 8)), "negative work cap");
+    }
+
+    test NewBudgetStartsWithTheFullWorkAndNoError
+    {
+        Bounded.Budget budget = Bounded.NewBudget(Limits(100, 42, 8));
+        Assert.Equal(budget.remaining, 42, "remaining work");
+        Assert.Equal(budget.error, "", "no error");
+        Assert.Equal(budget.limits.maxSubjectBytes, 100, "limits kept");
+    }
 }
 
-test ValidLimitsBoundsTheDepthAndRejectsNegativeCaps
+mod ValidatePatternTests
 {
-    Assert.True(Bounded.ValidLimits(Limits(0, 0, 1)), "zero caps and depth one");
-    Assert.True(Bounded.ValidLimits(Limits(10, 10, 64)), "depth 64");
-    Assert.False(Bounded.ValidLimits(Limits(10, 10, 0)), "depth zero");
-    Assert.False(Bounded.ValidLimits(Limits(10, 10, 65)), "depth over 64");
-    Assert.False(Bounded.ValidLimits(Limits(-1, 10, 8)), "negative subject cap");
-    Assert.False(Bounded.ValidLimits(Limits(10, -1, 8)), "negative work cap");
+    test AcceptsTheBoundedSyntax
+    {
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("abc")), "ok", "literals");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("^(ab|c)*[x-z]+\\d?.$")), "ok", "groups, classes, escapes, anchors");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("[^0-9]\\W\\S\\.")), "ok", "negated class and escapes");
+    }
+
+    test RejectsMalformedPatterns
+    {
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("")), "InvalidPattern", "empty");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("[abc")), "InvalidPattern", "open class");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("[]")), "InvalidPattern", "empty class");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("(a")), "InvalidPattern", "open group");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("a)")), "InvalidPattern", "stray close");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("a|")), "InvalidPattern", "empty branch");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("*a")), "InvalidPattern", "leading quantifier");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern("\\q")), "InvalidPattern", "unknown escape");
+    }
+
+    test CapsGroupNestingAtSixtyFour
+    {
+        Assert.Equal(CheckOf(Bounded.ValidatePattern(Nested(64))), "ok", "64 nested groups");
+        Assert.Equal(CheckOf(Bounded.ValidatePattern(Nested(65))), "PatternDepthLimit", "65 nested groups");
+    }
 }
 
-test NewBudgetStartsWithTheFullWorkAndNoError
+mod MatchesTests
 {
-    Bounded.Budget budget = Bounded.NewBudget(Limits(100, 42, 8));
-    Assert.Equal(budget.remaining, 42, "remaining work");
-    Assert.Equal(budget.error, "", "no error");
-    Assert.Equal(budget.limits.maxSubjectBytes, 100, "limits kept");
-}
+    test FromTheStartOfTheSubject
+    {
+        Assert.Equal(BoundedMatch("ab", "abc"), "true", "prefix match");
+        Assert.Equal(BoundedMatch("b", "abc"), "false", "match is anchored at the start");
+        Assert.Equal(BoundedMatch("^ab$", "abc"), "false", "end anchor");
+        Assert.Equal(BoundedMatch("(x|ab)c", "abc"), "true", "alternation");
+    }
 
-// ---- ValidatePattern ----
+    test UnicodeScalars
+    {
+        Assert.Equal(BoundedMatch(".$", "é"), "true", "dot reads one two-byte scalar");
+        Assert.Equal(BoundedMatch("[à-ž]", "é"), "true", "class range over scalars");
+        Assert.Equal(BoundedMatch("[a-z]", "é"), "false", "non-ASCII outside an ASCII range");
+    }
 
-test ValidatePatternAcceptsTheBoundedSyntax
-{
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("abc")), "ok", "literals");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("^(ab|c)*[x-z]+\\d?.$")), "ok", "groups, classes, escapes, anchors");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("[^0-9]\\W\\S\\.")), "ok", "negated class and escapes");
-}
+    test RejectsAnInvalidPattern
+    {
+        Assert.Equal(BoundedMatch("(a", "a"), "InvalidPattern", "open group");
+    }
 
-test ValidatePatternRejectsMalformedPatterns
-{
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("")), "InvalidPattern", "empty");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("[abc")), "InvalidPattern", "open class");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("[]")), "InvalidPattern", "empty class");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("(a")), "InvalidPattern", "open group");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("a)")), "InvalidPattern", "stray close");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("a|")), "InvalidPattern", "empty branch");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("*a")), "InvalidPattern", "leading quantifier");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern("\\q")), "InvalidPattern", "unknown escape");
-}
+    test RejectsInvalidLimits
+    {
+        Bounded.Budget budget = Bounded.NewBudget(Limits(100, 100, 0));
+        Assert.Equal(MatchOf(Bounded.Matches("a", "a", budget)), "InvalidPatternLimits", "depth zero");
+    }
 
-test ValidatePatternCapsGroupNestingAtSixtyFour
-{
-    Assert.Equal(CheckOf(Bounded.ValidatePattern(Nested(64))), "ok", "64 nested groups");
-    Assert.Equal(CheckOf(Bounded.ValidatePattern(Nested(65))), "PatternDepthLimit", "65 nested groups");
-}
+    test RejectsASubjectOverTheLimit
+    {
+        Bounded.PatternLimits limits = Limits(4, 1000, 8);
+        Assert.Equal(MatchOf(Bounded.Matches("a+", "aaaa", Bounded.NewBudget(limits))), "true", "at the limit");
+        Assert.Equal(MatchOf(Bounded.Matches("a+", "aaaaa", Bounded.NewBudget(limits))), "PatternSubjectLimit", "one byte over");
+    }
 
-// ---- Matches ----
+    test HonoursACustomDepthLimit
+    {
+        Bounded.PatternLimits limits = Limits(100, 1000, 2);
+        Assert.Equal(MatchOf(Bounded.Matches(Nested(2), "a", Bounded.NewBudget(limits))), "true", "depth two");
+        Assert.Equal(MatchOf(Bounded.Matches(Nested(3), "a", Bounded.NewBudget(limits))), "PatternDepthLimit", "depth three");
+    }
 
-test BoundedMatchesFromTheStartOfTheSubject
-{
-    Assert.Equal(BoundedMatch("ab", "abc"), "true", "prefix match");
-    Assert.Equal(BoundedMatch("b", "abc"), "false", "match is anchored at the start");
-    Assert.Equal(BoundedMatch("^ab$", "abc"), "false", "end anchor");
-    Assert.Equal(BoundedMatch("(x|ab)c", "abc"), "true", "alternation");
-}
+    test StopsWhenTheWorkBudgetRunsOut
+    {
+        Assert.Equal(MatchOf(Bounded.Matches("abc", "abc", Bounded.NewBudget(Limits(100, 2, 8)))), "PatternWorkLimit", "pattern longer than the budget");
+        string subject = Repeat("a", 2000);
+        Assert.Equal(MatchOf(Bounded.Matches("(a*)*b", subject, Bounded.NewBudget(Limits(4096, 100, 8)))), "PatternWorkLimit", "nested repeat over a small budget");
+    }
 
-test BoundedMatchesUnicodeScalars
-{
-    Assert.Equal(BoundedMatch(".$", "é"), "true", "dot reads one two-byte scalar");
-    Assert.Equal(BoundedMatch("[à-ž]", "é"), "true", "class range over scalars");
-    Assert.Equal(BoundedMatch("[a-z]", "é"), "false", "non-ASCII outside an ASCII range");
-}
+    test NestedRepeatWithoutAMatchFinishesWithinTheDefaultBudget
+    {
+        Assert.Equal(BoundedMatch("(a*)*b", Repeat("a", 2000)), "false", "no catastrophic backtracking");
+        Assert.Equal(BoundedMatch("(a|aa)+$", Repeat("a", 2000)), "true", "overlapping alternation");
+    }
 
-test BoundedMatchesRejectsAnInvalidPattern
-{
-    Assert.Equal(BoundedMatch("(a", "a"), "InvalidPattern", "open group");
-}
-
-test BoundedMatchesRejectsInvalidLimits
-{
-    Bounded.Budget budget = Bounded.NewBudget(Limits(100, 100, 0));
-    Assert.Equal(MatchOf(Bounded.Matches("a", "a", budget)), "InvalidPatternLimits", "depth zero");
-}
-
-test BoundedMatchesRejectsASubjectOverTheLimit
-{
-    Bounded.PatternLimits limits = Limits(4, 1000, 8);
-    Assert.Equal(MatchOf(Bounded.Matches("a+", "aaaa", Bounded.NewBudget(limits))), "true", "at the limit");
-    Assert.Equal(MatchOf(Bounded.Matches("a+", "aaaaa", Bounded.NewBudget(limits))), "PatternSubjectLimit", "one byte over");
-}
-
-test BoundedMatchesHonoursACustomDepthLimit
-{
-    Bounded.PatternLimits limits = Limits(100, 1000, 2);
-    Assert.Equal(MatchOf(Bounded.Matches(Nested(2), "a", Bounded.NewBudget(limits))), "true", "depth two");
-    Assert.Equal(MatchOf(Bounded.Matches(Nested(3), "a", Bounded.NewBudget(limits))), "PatternDepthLimit", "depth three");
-}
-
-test BoundedMatchesStopsWhenTheWorkBudgetRunsOut
-{
-    Assert.Equal(MatchOf(Bounded.Matches("abc", "abc", Bounded.NewBudget(Limits(100, 2, 8)))), "PatternWorkLimit", "pattern longer than the budget");
-    string subject = Repeat("a", 2000);
-    Assert.Equal(MatchOf(Bounded.Matches("(a*)*b", subject, Bounded.NewBudget(Limits(4096, 100, 8)))), "PatternWorkLimit", "nested repeat over a small budget");
-}
-
-test NestedRepeatWithoutAMatchFinishesWithinTheDefaultBudget
-{
-    Assert.Equal(BoundedMatch("(a*)*b", Repeat("a", 2000)), "false", "no catastrophic backtracking");
-    Assert.Equal(BoundedMatch("(a|aa)+$", Repeat("a", 2000)), "true", "overlapping alternation");
-}
-
-test BoundedMatchesChargesTheCallersBudget
-{
-    Bounded.Budget budget = Bounded.NewBudget(Limits(100, 10000, 8));
-    Assert.Equal(MatchOf(Bounded.Matches("a+b", "aaab", budget)), "true", "match");
-    Assert.True(budget.remaining < 10000, "work was charged");
-    Assert.True(budget.remaining > 0, "work left");
-    Assert.Equal(budget.error, "", "no error");
+    test ChargesTheCallersBudget
+    {
+        Bounded.Budget budget = Bounded.NewBudget(Limits(100, 10000, 8));
+        Assert.Equal(MatchOf(Bounded.Matches("a+b", "aaab", budget)), "true", "match");
+        Assert.True(budget.remaining < 10000, "work was charged");
+        Assert.True(budget.remaining > 0, "work left");
+        Assert.Equal(budget.error, "", "no error");
+    }
 }

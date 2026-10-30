@@ -12,70 +12,6 @@ HashAlgorithm H()
     return HashAlgorithm::Sha256;
 }
 
-test Rfc8448EarlyHandshakeMasterSecrets
-{
-    u8[] early = KeySchedule.EarlySecret(H());
-    Assert.True(Same(early, EarlySecret()), "early secret");
-    u8[] hs = KeySchedule.HandshakeSecret(H(), early, SharedSecret());
-    Assert.True(Same(hs, HandshakeSecret()), "handshake secret");
-    u8[] th = Hmac.Digest(H(), Slice.SubSlice(ServerFlight(), 0_i64, 0_i64));
-    Assert.True(Same(KeySchedule.ClientHandshakeTraffic(H(), hs, TranscriptAfterSh()), ClientHsTraffic()), "c hs traffic");
-    Assert.True(Same(KeySchedule.ServerHandshakeTraffic(H(), hs, TranscriptAfterSh()), ServerHsTraffic()), "s hs traffic");
-    Assert.True(Same(KeySchedule.MasterSecret(H(), hs), MasterSecret()), "master secret");
-    Assert.Equal<i64>(Slice.Len(th), 32_i64, "empty hash length");
-}
-
-test Rfc8448TranscriptHashesFromMessages
-{
-    HashState t = Hmac.HashNew(H());
-    Hmac.HashUpdate(t, ClientHello());
-    Hmac.HashUpdate(t, ServerHello());
-    Assert.True(Same(Hmac.HashFinish(Hmac.HashClone(t)), TranscriptAfterSh()), "hash(CH..SH)");
-    Hmac.HashUpdate(t, ServerFlight());
-    Assert.True(Same(Hmac.HashFinish(Hmac.HashClone(t)), TranscriptAfterServerFinished()), "hash(CH..server Finished)");
-    Hmac.HashUpdate(t, ClientFinished());
-    Assert.True(Same(Hmac.HashFinish(t), TranscriptAfterClientFinished()), "hash(CH..client Finished)");
-}
-
-test Rfc8448ApplicationAndDerivedSecrets
-{
-    u8[] ms = MasterSecret();
-    u8[] th = TranscriptAfterServerFinished();
-    Assert.True(Same(KeySchedule.ClientApplicationTraffic(H(), ms, th), ClientApTraffic()), "c ap traffic");
-    Assert.True(Same(KeySchedule.ServerApplicationTraffic(H(), ms, th), ServerApTraffic()), "s ap traffic");
-    Assert.True(Same(KeySchedule.ExporterMaster(H(), ms, th), ExporterMaster()), "exp master");
-    Assert.True(Same(KeySchedule.ResumptionMaster(H(), ms, TranscriptAfterClientFinished()), TraceResumptionMaster()), "res master");
-}
-
-test Rfc8448TrafficKeysAndIvs
-{
-    CipherSuite s = Suites.Aes128();
-    Assert.True(Same(KeySchedule.TrafficKey(s, ServerHsTraffic()), ServerHsKey()), "server hs key");
-    Assert.True(Same(KeySchedule.TrafficIv(s, ServerHsTraffic()), ServerHsIv()), "server hs iv");
-    Assert.True(Same(KeySchedule.TrafficKey(s, ClientHsTraffic()), ClientHsKey()), "client hs key");
-    Assert.True(Same(KeySchedule.TrafficIv(s, ClientHsTraffic()), ClientHsIv()), "client hs iv");
-    Assert.True(Same(KeySchedule.TrafficKey(s, ServerApTraffic()), ServerApKey()), "server ap key");
-    Assert.True(Same(KeySchedule.TrafficIv(s, ServerApTraffic()), ServerApIv()), "server ap iv");
-    Assert.True(Same(KeySchedule.TrafficKey(s, ClientApTraffic()), ClientApKey()), "client ap key");
-    Assert.True(Same(KeySchedule.TrafficIv(s, ClientApTraffic()), ClientApIv()), "client ap iv");
-}
-
-test Rfc8448FinishedVerifyData
-{
-    HashState t = Hmac.HashNew(H());
-    Hmac.HashUpdate(t, ClientHello());
-    Hmac.HashUpdate(t, ServerHello());
-    Hmac.HashUpdate(t, EncryptedExtensions());
-    Hmac.HashUpdate(t, Certificate());
-    Hmac.HashUpdate(t, CertificateVerify());
-    u8[] serverTh = Hmac.HashFinish(Hmac.HashClone(t));
-    Assert.True(Same(KeySchedule.FinishedKey(H(), ServerHsTraffic()), ServerFinishedKey()), "server finished key");
-    Assert.True(Same(KeySchedule.FinishedVerifyData(H(), ServerHsTraffic(), serverTh), ServerVerifyData()), "server verify_data");
-    Hmac.HashUpdate(t, ServerFinished());
-    u8[] clientTh = Hmac.HashFinish(t);
-    Assert.True(Same(KeySchedule.FinishedVerifyData(H(), ClientHsTraffic(), clientTh), ClientVerifyData()), "client verify_data");
-}
-
 pub u8[] ClientHelloRecord()
 {
     string s = "16030100c4010000c00303cb34ecb1e78163ba1c38c6dacb196a6dffa21a8d9912ec18a2ef6283024dece7000006130113031302010000910000000b" + "0009000006736572766572ff01000100000a00140012001d0017001800190100010101020103010400230000003300260024001d002099381de560e4" + "bd43d23d8e435a7dbafeb3c06e51c13cae4d5413691e529aaf2c002b0003020304000d0020001e040305030603020308040805080604010501060102" + "010402050206020202002d00020101001c00024001";
@@ -206,4 +142,71 @@ pub u8[] ClientApIv()
 pub u8[] TranscriptAfterClientFinished()
 {
     return Hex.Of("209145a96ee8e2a122ff810047cc952684658d6049e86429426db87c54ad143d");
+}
+
+mod KeyScheduleTests
+{
+    test EarlyHandshakeMasterSecrets
+    {
+        u8[] early = KeySchedule.EarlySecret(H());
+        Assert.True(Same(early, EarlySecret()), "early secret");
+        u8[] hs = KeySchedule.HandshakeSecret(H(), early, SharedSecret());
+        Assert.True(Same(hs, HandshakeSecret()), "handshake secret");
+        u8[] th = Hmac.Digest(H(), Slice.SubSlice(ServerFlight(), 0_i64, 0_i64));
+        Assert.True(Same(KeySchedule.ClientHandshakeTraffic(H(), hs, TranscriptAfterSh()), ClientHsTraffic()), "c hs traffic");
+        Assert.True(Same(KeySchedule.ServerHandshakeTraffic(H(), hs, TranscriptAfterSh()), ServerHsTraffic()), "s hs traffic");
+        Assert.True(Same(KeySchedule.MasterSecret(H(), hs), MasterSecret()), "master secret");
+        Assert.Equal<i64>(Slice.Len(th), 32_i64, "empty hash length");
+    }
+
+    test TranscriptHashesFromMessages
+    {
+        HashState t = Hmac.HashNew(H());
+        Hmac.HashUpdate(t, ClientHello());
+        Hmac.HashUpdate(t, ServerHello());
+        Assert.True(Same(Hmac.HashFinish(Hmac.HashClone(t)), TranscriptAfterSh()), "hash(CH..SH)");
+        Hmac.HashUpdate(t, ServerFlight());
+        Assert.True(Same(Hmac.HashFinish(Hmac.HashClone(t)), TranscriptAfterServerFinished()), "hash(CH..server Finished)");
+        Hmac.HashUpdate(t, ClientFinished());
+        Assert.True(Same(Hmac.HashFinish(t), TranscriptAfterClientFinished()), "hash(CH..client Finished)");
+    }
+
+    test ApplicationAndDerivedSecrets
+    {
+        u8[] ms = MasterSecret();
+        u8[] th = TranscriptAfterServerFinished();
+        Assert.True(Same(KeySchedule.ClientApplicationTraffic(H(), ms, th), ClientApTraffic()), "c ap traffic");
+        Assert.True(Same(KeySchedule.ServerApplicationTraffic(H(), ms, th), ServerApTraffic()), "s ap traffic");
+        Assert.True(Same(KeySchedule.ExporterMaster(H(), ms, th), ExporterMaster()), "exp master");
+        Assert.True(Same(KeySchedule.ResumptionMaster(H(), ms, TranscriptAfterClientFinished()), TraceResumptionMaster()), "res master");
+    }
+
+    test TrafficKeysAndIvs
+    {
+        CipherSuite s = Suites.Aes128();
+        Assert.True(Same(KeySchedule.TrafficKey(s, ServerHsTraffic()), ServerHsKey()), "server hs key");
+        Assert.True(Same(KeySchedule.TrafficIv(s, ServerHsTraffic()), ServerHsIv()), "server hs iv");
+        Assert.True(Same(KeySchedule.TrafficKey(s, ClientHsTraffic()), ClientHsKey()), "client hs key");
+        Assert.True(Same(KeySchedule.TrafficIv(s, ClientHsTraffic()), ClientHsIv()), "client hs iv");
+        Assert.True(Same(KeySchedule.TrafficKey(s, ServerApTraffic()), ServerApKey()), "server ap key");
+        Assert.True(Same(KeySchedule.TrafficIv(s, ServerApTraffic()), ServerApIv()), "server ap iv");
+        Assert.True(Same(KeySchedule.TrafficKey(s, ClientApTraffic()), ClientApKey()), "client ap key");
+        Assert.True(Same(KeySchedule.TrafficIv(s, ClientApTraffic()), ClientApIv()), "client ap iv");
+    }
+
+    test FinishedVerifyData
+    {
+        HashState t = Hmac.HashNew(H());
+        Hmac.HashUpdate(t, ClientHello());
+        Hmac.HashUpdate(t, ServerHello());
+        Hmac.HashUpdate(t, EncryptedExtensions());
+        Hmac.HashUpdate(t, Certificate());
+        Hmac.HashUpdate(t, CertificateVerify());
+        u8[] serverTh = Hmac.HashFinish(Hmac.HashClone(t));
+        Assert.True(Same(KeySchedule.FinishedKey(H(), ServerHsTraffic()), ServerFinishedKey()), "server finished key");
+        Assert.True(Same(KeySchedule.FinishedVerifyData(H(), ServerHsTraffic(), serverTh), ServerVerifyData()), "server verify_data");
+        Hmac.HashUpdate(t, ServerFinished());
+        u8[] clientTh = Hmac.HashFinish(t);
+        Assert.True(Same(KeySchedule.FinishedVerifyData(H(), ClientHsTraffic(), clientTh), ClientVerifyData()), "client verify_data");
+    }
 }

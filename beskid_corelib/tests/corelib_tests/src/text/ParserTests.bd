@@ -15,8 +15,6 @@ use Core.Text.Parser.Context;
 use Core.Text.Parser.Mapper;
 use Testing.Assert;
 
-// ---- Helpers ----
-
 /// The parsed value, or `<error>` when the result is an error.
 string ValueOf(TextParseResult<string> result)
 {
@@ -68,268 +66,275 @@ Cursor.TextCursor At(string source, i64 position)
     return Cursor.Advance(Cursor.From(source), position);
 }
 
-// ---- Literals ----
-
-test LiteralConsumesTheMatchedPrefix
+mod LiteralsTests
 {
-    TextParseResult<string> parsed = Literals.Text(Cursor.From("abc"), "ab", "ab");
-    Assert.Equal(ValueOf(parsed), "ab", "value is the literal");
-    Assert.Equal(RestAt(parsed), 2, "rest follows the literal");
-}
-
-test LiteralMismatchFailsAtTheCursor
-{
-    TextParseResult<string> parsed = Literals.Text(At("xyz", 1), "q", "q_rule");
-    Assert.Equal(ErrorAt(parsed), 1, "error offset is the cursor position");
-    Assert.Equal(ErrorKindOf(parsed), "ExpectedLiteral q_rule", "error names the rule");
-}
-
-test AnyReadsOneUnicodeScalar
-{
-    TextParseResult<string> parsed = Literals.Any(Cursor.From("éa"), "any");
-    Assert.Equal(ValueOf(parsed), "é", "two-byte scalar is one unit");
-    Assert.Equal(RestAt(parsed), 2, "rest skips both bytes");
-    Assert.Equal(ErrorKindOf(Literals.Any(At("a", 1), "any")), "ExpectedRule any", "end of input fails");
-}
-
-test EofSucceedsOnlyAtTheEnd
-{
-    Assert.Equal(RestAt(Literals.Eof(At("ab", 2), "eof")), 2, "end of input succeeds");
-    Assert.Equal(ErrorAt(Literals.Eof(At("ab", 1), "eof")), 1, "remaining input fails");
-}
-
-test FacadeFailCarriesTheGivenKind
-{
-    TextParseResult<string> failed = Parser.Fail(At("abc", 2), ParseErrorKind::ExpectedRule("value"), "value");
-    Assert.Equal(ErrorAt(failed), 2, "offset");
-    Assert.Equal(ErrorKindOf(failed), "ExpectedRule value", "kind");
-}
-
-// ---- Terms ----
-
-test DigitAcceptsOnlyAsciiDigits
-{
-    Assert.Equal(ValueOf(Terms.Digit(Cursor.From("7x"), "digit")), "7", "digit");
-    Assert.Equal(ErrorKindOf(Terms.Digit(Cursor.From("x7"), "digit")), "ExpectedRule digit", "letter");
-    Assert.Equal(ErrorAt(Terms.Digit(At("1", 1), "digit")), 1, "end of input");
-}
-
-test LowerAndUpperSplitAsciiLettersByCase
-{
-    Assert.Equal(ValueOf(Terms.Lower(Cursor.From("q"), "lower")), "q", "lower accepts lower");
-    Assert.Equal(ErrorKindOf(Terms.Lower(Cursor.From("Q"), "lower")), "ExpectedRule lower", "lower rejects upper");
-    Assert.Equal(ValueOf(Terms.Upper(Cursor.From("Q"), "upper")), "Q", "upper accepts upper");
-    Assert.Equal(ErrorKindOf(Terms.Upper(Cursor.From("q"), "upper")), "ExpectedRule upper", "upper rejects lower");
-    Assert.Equal(ErrorKindOf(Terms.Lower(Cursor.From("1"), "lower")), "ExpectedRule lower", "lower rejects digit");
-}
-
-test WhiteSpaceAndNonWhiteSpaceAreComplements
-{
-    Assert.Equal(RestAt(Terms.WhiteSpace(Cursor.From(" a"), "ws")), 1, "space is whitespace");
-    Assert.Equal(ErrorKindOf(Terms.WhiteSpace(Cursor.From("a"), "ws")), "ExpectedLiteral ws", "letter is not whitespace");
-    Assert.Equal(ValueOf(Terms.NonWhiteSpace(Cursor.From("é "), "word")), "é", "non-whitespace reads one scalar");
-    Assert.Equal(ErrorKindOf(Terms.NonWhiteSpace(Cursor.From(" a"), "word")), "ExpectedRule word", "space is rejected");
-    Assert.Equal(ErrorAt(Terms.NonWhiteSpace(At("a", 1), "word")), 1, "end of input is rejected");
-}
-
-// ---- Combine ----
-
-test OrReturnsTheFirstSuccessfulBranch
-{
-    Cursor.TextCursor c = Cursor.From("ab");
-    TextParseResult<string> a = Literals.Text(c, "a", "a");
-    TextParseResult<string> ab = Literals.Text(c, "ab", "ab");
-    TextParseResult<string> z = Literals.Text(c, "z", "z");
-    Assert.Equal(ValueOf(Combine.Or(c, "pick", a, ab)), "a", "first success wins even when the second is longer");
-    Assert.Equal(ValueOf(Combine.Or(c, "pick", z, ab)), "ab", "second branch after a failed first");
-}
-
-test OrWithNoSuccessFailsAsChoiceAtTheCursor
-{
-    Cursor.TextCursor c = At("xyz", 1);
-    TextParseResult<string> failed = Combine.Or(c, "pick", Literals.Text(c, "a", "a"), Literals.Text(c, "b", "b"));
-    Assert.Equal(ErrorAt(failed), 1, "offset is the choice cursor");
-    Assert.Equal(ErrorKindOf(failed), "ChoiceFailed pick", "kind names the choice");
-}
-
-test AndKeepsTheSecondRestAndDropsTheValue
-{
-    Cursor.TextCursor c = Cursor.From("abc");
-    TextParseResult<string> first = Literals.Text(c, "a", "a");
-    TextParseResult<string> second = Literals.Text(Parser.RestOnOk(first, c), "b", "b");
-    TextParseResult<string> both = Combine.And(c, "ab", first, second);
-    Assert.Equal(ValueOf(both), "", "sequence value is empty");
-    Assert.Equal(RestAt(both), 2, "rest follows the second operand");
-}
-
-test AndReturnsTheFirstFailingOperand
-{
-    Cursor.TextCursor c = Cursor.From("abc");
-    TextParseResult<string> first = Literals.Text(c, "a", "a");
-    TextParseResult<string> missing = Literals.Text(At("abc", 1), "x", "x");
-    TextParseResult<string> wrongFirst = Literals.Text(c, "q", "q");
-    Assert.Equal(ErrorKindOf(Combine.And(c, "ax", first, missing)), "ExpectedLiteral x", "second failure");
-    Assert.Equal(ErrorAt(Combine.And(c, "ax", first, missing)), 1, "second failure offset");
-    Assert.Equal(ErrorKindOf(Combine.And(c, "qx", wrongFirst, missing)), "ExpectedLiteral q", "first failure wins");
-}
-
-test AndSkipKeepsTheFirstValueAndTheSecondRest
-{
-    Cursor.TextCursor c = Cursor.From("a;");
-    TextParseResult<string> first = Literals.Text(c, "a", "a");
-    TextParseResult<string> second = Literals.Text(Parser.RestOnOk(first, c), ";", "semi");
-    TextParseResult<string> kept = Combine.AndSkip(c, "stmt", first, second);
-    Assert.Equal(ValueOf(kept), "a", "first value");
-    Assert.Equal(RestAt(kept), 2, "second rest");
-    TextParseResult<string> noSemi = Literals.Text(Parser.RestOnOk(first, c), ",", "comma");
-    Assert.Equal(ErrorKindOf(Combine.AndSkip(c, "stmt", first, noSemi)), "ExpectedLiteral comma", "second failure");
-}
-
-test SkipAndKeepsTheSecondResult
-{
-    Cursor.TextCursor c = Cursor.From("-5");
-    TextParseResult<string> sign = Literals.Text(c, "-", "sign");
-    TextParseResult<string> digit = Terms.Digit(Parser.RestOnOk(sign, c), "digit");
-    TextParseResult<string> kept = Combine.SkipAnd(c, "negative", sign, digit);
-    Assert.Equal(ValueOf(kept), "5", "second value");
-    Assert.Equal(RestAt(kept), 2, "second rest");
-    TextParseResult<string> plus = Literals.Text(c, "+", "plus");
-    Assert.Equal(ErrorKindOf(Combine.SkipAnd(c, "positive", plus, digit)), "ExpectedLiteral plus", "first failure");
-}
-
-test ChoiceTwoOnTheFacadeIsOr
-{
-    Cursor.TextCursor c = Cursor.From("b");
-    TextParseResult<string> a = Literals.Text(c, "a", "a");
-    TextParseResult<string> b = Literals.Text(c, "b", "b");
-    Assert.Equal(ValueOf(Parser.Choice2(c, "pick", a, b)), "b", "second branch");
-    Assert.Equal(ErrorKindOf(Parser.Choice2(c, "pick", a, a)), "ChoiceFailed pick", "both fail");
-}
-
-// ---- Cardinality ----
-
-test ZeroOrOneSucceedsWithoutConsumingWhenTheInnerFails
-{
-    Cursor.TextCursor c = At("ab", 1);
-    TextParseResult<string> present = Cardinality.ZeroOrOne(c, "b?", Literals.Text(c, "b", "b"));
-    TextParseResult<string> absent = Cardinality.ZeroOrOne(c, "x?", Literals.Text(c, "x", "x"));
-    Assert.Equal(ValueOf(present), "b", "present inner is kept");
-    Assert.Equal(RestAt(present), 2, "present inner consumes");
-    Assert.Equal(ValueOf(absent), "", "absent inner is empty");
-    Assert.Equal(RestAt(absent), 1, "absent inner does not consume");
-}
-
-test ZeroOrManyLoopStopsAtTheLastMatch
-{
-    Cursor.TextCursor start = Cursor.From("abc1");
-    mut Cursor.TextCursor cur = start;
-    mut TextParseResult<string> step = Terms.Lower(cur, "lower");
-    mut i64 count = 0;
-    while (Parser.IsOk(step))
+    test LiteralConsumesTheMatchedPrefix
     {
-        cur = Parser.RestOnOk(step, cur);
-        count = count + 1;
-        step = Terms.Lower(cur, "lower");
+        TextParseResult<string> parsed = Literals.Text(Cursor.From("abc"), "ab", "ab");
+        Assert.Equal(ValueOf(parsed), "ab", "value is the literal");
+        Assert.Equal(RestAt(parsed), 2, "rest follows the literal");
     }
-    TextParseResult<string> done = Cardinality.ZeroOrMany(start, "lower*", step, cur);
-    Assert.Equal(count, 3, "three lower letters");
-    Assert.Equal(ValueOf(done), "", "repeat value is empty");
-    Assert.Equal(RestAt(done), 3, "repeat ends before the digit");
+
+    test LiteralMismatchFailsAtTheCursor
+    {
+        TextParseResult<string> parsed = Literals.Text(At("xyz", 1), "q", "q_rule");
+        Assert.Equal(ErrorAt(parsed), 1, "error offset is the cursor position");
+        Assert.Equal(ErrorKindOf(parsed), "ExpectedLiteral q_rule", "error names the rule");
+    }
+
+    test AnyReadsOneUnicodeScalar
+    {
+        TextParseResult<string> parsed = Literals.Any(Cursor.From("éa"), "any");
+        Assert.Equal(ValueOf(parsed), "é", "two-byte scalar is one unit");
+        Assert.Equal(RestAt(parsed), 2, "rest skips both bytes");
+        Assert.Equal(ErrorKindOf(Literals.Any(At("a", 1), "any")), "ExpectedRule any", "end of input fails");
+    }
+
+    test EofSucceedsOnlyAtTheEnd
+    {
+        Assert.Equal(RestAt(Literals.Eof(At("ab", 2), "eof")), 2, "end of input succeeds");
+        Assert.Equal(ErrorAt(Literals.Eof(At("ab", 1), "eof")), 1, "remaining input fails");
+    }
+
+    test FacadeFailCarriesTheGivenKind
+    {
+        TextParseResult<string> failed = Parser.Fail(At("abc", 2), ParseErrorKind::ExpectedRule("value"), "value");
+        Assert.Equal(ErrorAt(failed), 2, "offset");
+        Assert.Equal(ErrorKindOf(failed), "ExpectedRule value", "kind");
+    }
 }
 
-test ZeroOrManyPassesASuccessfulStepThrough
+mod TermsTests
 {
-    Cursor.TextCursor c = Cursor.From("a");
-    TextParseResult<string> step = Literals.Text(c, "a", "a");
-    TextParseResult<string> passed = Cardinality.ZeroOrMany(c, "a*", step, c);
-    Assert.Equal(ValueOf(passed), "a", "step value");
-    Assert.Equal(RestAt(passed), 1, "step rest");
+    test DigitAcceptsOnlyAsciiDigits
+    {
+        Assert.Equal(ValueOf(Terms.Digit(Cursor.From("7x"), "digit")), "7", "digit");
+        Assert.Equal(ErrorKindOf(Terms.Digit(Cursor.From("x7"), "digit")), "ExpectedRule digit", "letter");
+        Assert.Equal(ErrorAt(Terms.Digit(At("1", 1), "digit")), 1, "end of input");
+    }
+
+    test LowerAndUpperSplitAsciiLettersByCase
+    {
+        Assert.Equal(ValueOf(Terms.Lower(Cursor.From("q"), "lower")), "q", "lower accepts lower");
+        Assert.Equal(ErrorKindOf(Terms.Lower(Cursor.From("Q"), "lower")), "ExpectedRule lower", "lower rejects upper");
+        Assert.Equal(ValueOf(Terms.Upper(Cursor.From("Q"), "upper")), "Q", "upper accepts upper");
+        Assert.Equal(ErrorKindOf(Terms.Upper(Cursor.From("q"), "upper")), "ExpectedRule upper", "upper rejects lower");
+        Assert.Equal(ErrorKindOf(Terms.Lower(Cursor.From("1"), "lower")), "ExpectedRule lower", "lower rejects digit");
+    }
+
+    test WhiteSpaceAndNonWhiteSpaceAreComplements
+    {
+        Assert.Equal(RestAt(Terms.WhiteSpace(Cursor.From(" a"), "ws")), 1, "space is whitespace");
+        Assert.Equal(ErrorKindOf(Terms.WhiteSpace(Cursor.From("a"), "ws")), "ExpectedLiteral ws", "letter is not whitespace");
+        Assert.Equal(ValueOf(Terms.NonWhiteSpace(Cursor.From("é "), "word")), "é", "non-whitespace reads one scalar");
+        Assert.Equal(ErrorKindOf(Terms.NonWhiteSpace(Cursor.From(" a"), "word")), "ExpectedRule word", "space is rejected");
+        Assert.Equal(ErrorAt(Terms.NonWhiteSpace(At("a", 1), "word")), 1, "end of input is rejected");
+    }
 }
 
-test OneOrManyNeedsAtLeastOneStep
+mod CombineTests
 {
-    Cursor.TextCursor start = At("x1", 1);
-    TextParseResult<string> none = Cardinality.OneOrMany(start, "lower+", 0, start);
-    Assert.Equal(ErrorKindOf(none), "ExpectedRule lower+", "no step fails");
-    Assert.Equal(ErrorAt(none), 1, "failure is at the start cursor");
-    TextParseResult<string> some = Cardinality.OneOrMany(start, "lower+", 2, At("x1", 2));
-    Assert.Equal(RestAt(some), 2, "steps end at the given cursor");
+    test OrReturnsTheFirstSuccessfulBranch
+    {
+        Cursor.TextCursor c = Cursor.From("ab");
+        TextParseResult<string> a = Literals.Text(c, "a", "a");
+        TextParseResult<string> ab = Literals.Text(c, "ab", "ab");
+        TextParseResult<string> z = Literals.Text(c, "z", "z");
+        Assert.Equal(ValueOf(Combine.Or(c, "pick", a, ab)), "a", "first success wins even when the second is longer");
+        Assert.Equal(ValueOf(Combine.Or(c, "pick", z, ab)), "ab", "second branch after a failed first");
+    }
+
+    test OrWithNoSuccessFailsAsChoiceAtTheCursor
+    {
+        Cursor.TextCursor c = At("xyz", 1);
+        TextParseResult<string> failed = Combine.Or(c, "pick", Literals.Text(c, "a", "a"), Literals.Text(c, "b", "b"));
+        Assert.Equal(ErrorAt(failed), 1, "offset is the choice cursor");
+        Assert.Equal(ErrorKindOf(failed), "ChoiceFailed pick", "kind names the choice");
+    }
+
+    test AndKeepsTheSecondRestAndDropsTheValue
+    {
+        Cursor.TextCursor c = Cursor.From("abc");
+        TextParseResult<string> first = Literals.Text(c, "a", "a");
+        TextParseResult<string> second = Literals.Text(Parser.RestOnOk(first, c), "b", "b");
+        TextParseResult<string> both = Combine.And(c, "ab", first, second);
+        Assert.Equal(ValueOf(both), "", "sequence value is empty");
+        Assert.Equal(RestAt(both), 2, "rest follows the second operand");
+    }
+
+    test AndReturnsTheFirstFailingOperand
+    {
+        Cursor.TextCursor c = Cursor.From("abc");
+        TextParseResult<string> first = Literals.Text(c, "a", "a");
+        TextParseResult<string> missing = Literals.Text(At("abc", 1), "x", "x");
+        TextParseResult<string> wrongFirst = Literals.Text(c, "q", "q");
+        Assert.Equal(ErrorKindOf(Combine.And(c, "ax", first, missing)), "ExpectedLiteral x", "second failure");
+        Assert.Equal(ErrorAt(Combine.And(c, "ax", first, missing)), 1, "second failure offset");
+        Assert.Equal(ErrorKindOf(Combine.And(c, "qx", wrongFirst, missing)), "ExpectedLiteral q", "first failure wins");
+    }
+
+    test AndSkipKeepsTheFirstValueAndTheSecondRest
+    {
+        Cursor.TextCursor c = Cursor.From("a;");
+        TextParseResult<string> first = Literals.Text(c, "a", "a");
+        TextParseResult<string> second = Literals.Text(Parser.RestOnOk(first, c), ";", "semi");
+        TextParseResult<string> kept = Combine.AndSkip(c, "stmt", first, second);
+        Assert.Equal(ValueOf(kept), "a", "first value");
+        Assert.Equal(RestAt(kept), 2, "second rest");
+        TextParseResult<string> noSemi = Literals.Text(Parser.RestOnOk(first, c), ",", "comma");
+        Assert.Equal(ErrorKindOf(Combine.AndSkip(c, "stmt", first, noSemi)), "ExpectedLiteral comma", "second failure");
+    }
+
+    test SkipAndKeepsTheSecondResult
+    {
+        Cursor.TextCursor c = Cursor.From("-5");
+        TextParseResult<string> sign = Literals.Text(c, "-", "sign");
+        TextParseResult<string> digit = Terms.Digit(Parser.RestOnOk(sign, c), "digit");
+        TextParseResult<string> kept = Combine.SkipAnd(c, "negative", sign, digit);
+        Assert.Equal(ValueOf(kept), "5", "second value");
+        Assert.Equal(RestAt(kept), 2, "second rest");
+        TextParseResult<string> plus = Literals.Text(c, "+", "plus");
+        Assert.Equal(ErrorKindOf(Combine.SkipAnd(c, "positive", plus, digit)), "ExpectedLiteral plus", "first failure");
+    }
+
+    test ChoiceTwoOnTheFacadeIsOr
+    {
+        Cursor.TextCursor c = Cursor.From("b");
+        TextParseResult<string> a = Literals.Text(c, "a", "a");
+        TextParseResult<string> b = Literals.Text(c, "b", "b");
+        Assert.Equal(ValueOf(Parser.Choice2(c, "pick", a, b)), "b", "second branch");
+        Assert.Equal(ErrorKindOf(Parser.Choice2(c, "pick", a, a)), "ChoiceFailed pick", "both fail");
+    }
 }
 
-test NotIsANonConsumingNegativeLookahead
+mod CardinalityTests
 {
-    Cursor.TextCursor c = Cursor.From("ab");
-    TextParseResult<string> blocked = Cardinality.Not(c, "!a", Literals.Text(c, "a", "a"));
-    TextParseResult<string> allowed = Cardinality.Not(c, "!b", Literals.Text(c, "b", "b"));
-    Assert.Equal(ErrorKindOf(blocked), "ExpectedRule !a", "matching inner fails");
-    Assert.Equal(ErrorAt(blocked), 0, "failure at the cursor");
-    Assert.Equal(ValueOf(allowed), "", "failing inner succeeds empty");
-    Assert.Equal(RestAt(allowed), 0, "lookahead does not consume");
+    test ZeroOrOneSucceedsWithoutConsumingWhenTheInnerFails
+    {
+        Cursor.TextCursor c = At("ab", 1);
+        TextParseResult<string> present = Cardinality.ZeroOrOne(c, "b?", Literals.Text(c, "b", "b"));
+        TextParseResult<string> absent = Cardinality.ZeroOrOne(c, "x?", Literals.Text(c, "x", "x"));
+        Assert.Equal(ValueOf(present), "b", "present inner is kept");
+        Assert.Equal(RestAt(present), 2, "present inner consumes");
+        Assert.Equal(ValueOf(absent), "", "absent inner is empty");
+        Assert.Equal(RestAt(absent), 1, "absent inner does not consume");
+    }
+
+    test ZeroOrManyLoopStopsAtTheLastMatch
+    {
+        Cursor.TextCursor start = Cursor.From("abc1");
+        mut Cursor.TextCursor cur = start;
+        mut TextParseResult<string> step = Terms.Lower(cur, "lower");
+        mut i64 count = 0;
+        while (Parser.IsOk(step))
+        {
+            cur = Parser.RestOnOk(step, cur);
+            count = count + 1;
+            step = Terms.Lower(cur, "lower");
+        }
+        TextParseResult<string> done = Cardinality.ZeroOrMany(start, "lower*", step, cur);
+        Assert.Equal(count, 3, "three lower letters");
+        Assert.Equal(ValueOf(done), "", "repeat value is empty");
+        Assert.Equal(RestAt(done), 3, "repeat ends before the digit");
+    }
+
+    test ZeroOrManyPassesASuccessfulStepThrough
+    {
+        Cursor.TextCursor c = Cursor.From("a");
+        TextParseResult<string> step = Literals.Text(c, "a", "a");
+        TextParseResult<string> passed = Cardinality.ZeroOrMany(c, "a*", step, c);
+        Assert.Equal(ValueOf(passed), "a", "step value");
+        Assert.Equal(RestAt(passed), 1, "step rest");
+    }
+
+    test OneOrManyNeedsAtLeastOneStep
+    {
+        Cursor.TextCursor start = At("x1", 1);
+        TextParseResult<string> none = Cardinality.OneOrMany(start, "lower+", 0, start);
+        Assert.Equal(ErrorKindOf(none), "ExpectedRule lower+", "no step fails");
+        Assert.Equal(ErrorAt(none), 1, "failure is at the start cursor");
+        TextParseResult<string> some = Cardinality.OneOrMany(start, "lower+", 2, At("x1", 2));
+        Assert.Equal(RestAt(some), 2, "steps end at the given cursor");
+    }
+
+    test NotIsANonConsumingNegativeLookahead
+    {
+        Cursor.TextCursor c = Cursor.From("ab");
+        TextParseResult<string> blocked = Cardinality.Not(c, "!a", Literals.Text(c, "a", "a"));
+        TextParseResult<string> allowed = Cardinality.Not(c, "!b", Literals.Text(c, "b", "b"));
+        Assert.Equal(ErrorKindOf(blocked), "ExpectedRule !a", "matching inner fails");
+        Assert.Equal(ErrorAt(blocked), 0, "failure at the cursor");
+        Assert.Equal(ValueOf(allowed), "", "failing inner succeeds empty");
+        Assert.Equal(RestAt(allowed), 0, "lookahead does not consume");
+    }
 }
 
-// ---- Flow ----
-
-test PureAndAlwaysSucceedWithoutConsuming
+mod FlowTests
 {
-    Cursor.TextCursor c = At("abc", 2);
-    Assert.Equal(ValueOf(Flow.Pure("v", c)), "v", "pure value");
-    Assert.Equal(RestAt(Flow.Pure("v", c)), 2, "pure keeps the cursor");
-    Assert.Equal(ValueOf(Flow.Always("w", c)), "w", "always value");
-    Assert.Equal(RestAt(Parser.Pure("", c)), 2, "facade pure keeps the cursor");
+    test PureAndAlwaysSucceedWithoutConsuming
+    {
+        Cursor.TextCursor c = At("abc", 2);
+        Assert.Equal(ValueOf(Flow.Pure("v", c)), "v", "pure value");
+        Assert.Equal(RestAt(Flow.Pure("v", c)), 2, "pure keeps the cursor");
+        Assert.Equal(ValueOf(Flow.Always("w", c)), "w", "always value");
+        Assert.Equal(RestAt(Parser.Pure("", c)), 2, "facade pure keeps the cursor");
+    }
+
+    test ThenReturnsTheSecondResultAfterAFirstSuccess
+    {
+        Cursor.TextCursor c = Cursor.From("ab");
+        TextParseResult<string> a = Literals.Text(c, "a", "a");
+        TextParseResult<string> b = Literals.Text(Parser.RestOnOk(a, c), "b", "b");
+        TextParseResult<string> q = Literals.Text(c, "q", "q");
+        Assert.Equal(ValueOf(Flow.Then(a, b)), "b", "second value");
+        Assert.Equal(RestAt(Flow.Then(a, b)), 2, "second rest");
+        Assert.Equal(ErrorKindOf(Flow.Then(q, b)), "ExpectedLiteral q", "first failure");
+    }
+
+    test DiscardKeepsTheSecondRestWithAnEmptyValue
+    {
+        Cursor.TextCursor c = Cursor.From("ab");
+        TextParseResult<string> a = Literals.Text(c, "a", "a");
+        TextParseResult<string> b = Literals.Text(Parser.RestOnOk(a, c), "b", "b");
+        TextParseResult<string> x = Literals.Text(Parser.RestOnOk(a, c), "x", "x");
+        Assert.Equal(ValueOf(Flow.Discard(a, b)), "", "empty value");
+        Assert.Equal(RestAt(Flow.Discard(a, b)), 2, "second rest");
+        Assert.Equal(ErrorKindOf(Flow.Discard(a, x)), "ExpectedLiteral x", "second failure");
+    }
 }
 
-test ThenReturnsTheSecondResultAfterAFirstSuccess
+mod CoordinationTests
 {
-    Cursor.TextCursor c = Cursor.From("ab");
-    TextParseResult<string> a = Literals.Text(c, "a", "a");
-    TextParseResult<string> b = Literals.Text(Parser.RestOnOk(a, c), "b", "b");
-    TextParseResult<string> q = Literals.Text(c, "q", "q");
-    Assert.Equal(ValueOf(Flow.Then(a, b)), "b", "second value");
-    Assert.Equal(RestAt(Flow.Then(a, b)), 2, "second rest");
-    Assert.Equal(ErrorKindOf(Flow.Then(q, b)), "ExpectedLiteral q", "first failure");
+    test BetweenReturnsTheCloseResultAfterOpenAndInner
+    {
+        Cursor.TextCursor c = Cursor.From("(a)");
+        TextParseResult<string> open = Literals.Text(c, "(", "open");
+        TextParseResult<string> inner = Terms.Lower(Parser.RestOnOk(open, c), "lower");
+        TextParseResult<string> close = Literals.Text(Parser.RestOnOk(inner, c), ")", "close");
+        Assert.Equal(RestAt(Coordination.Between(c, "group", open, inner, close)), 3, "rest after the close");
+        TextParseResult<string> bad = Literals.Text(Parser.RestOnOk(open, c), "(", "nested");
+        Assert.Equal(ErrorKindOf(Coordination.Between(c, "group", open, bad, close)), "ExpectedLiteral nested", "inner failure");
+        TextParseResult<string> noOpen = Literals.Text(c, "[", "open");
+        Assert.Equal(ErrorAt(Coordination.Between(c, "group", noOpen, inner, close)), 0, "open failure");
+    }
 }
 
-test DiscardKeepsTheSecondRestWithAnEmptyValue
+mod ContextAndMapperTests
 {
-    Cursor.TextCursor c = Cursor.From("ab");
-    TextParseResult<string> a = Literals.Text(c, "a", "a");
-    TextParseResult<string> b = Literals.Text(Parser.RestOnOk(a, c), "b", "b");
-    TextParseResult<string> x = Literals.Text(Parser.RestOnOk(a, c), "x", "x");
-    Assert.Equal(ValueOf(Flow.Discard(a, b)), "", "empty value");
-    Assert.Equal(RestAt(Flow.Discard(a, b)), 2, "second rest");
-    Assert.Equal(ErrorKindOf(Flow.Discard(a, x)), "ExpectedLiteral x", "second failure");
-}
+    test DefaultContextDoesNotSkipWhiteSpace
+    {
+        Cursor.TextCursor c = Cursor.From("  a");
+        Assert.Equal(Cursor.Position(Context.WithWhiteSpaceParser(c, Context.DefaultContext())), 0, "cursor unchanged");
+    }
 
-// ---- Coordination ----
-
-test BetweenReturnsTheCloseResultAfterOpenAndInner
-{
-    Cursor.TextCursor c = Cursor.From("(a)");
-    TextParseResult<string> open = Literals.Text(c, "(", "open");
-    TextParseResult<string> inner = Terms.Lower(Parser.RestOnOk(open, c), "lower");
-    TextParseResult<string> close = Literals.Text(Parser.RestOnOk(inner, c), ")", "close");
-    Assert.Equal(RestAt(Coordination.Between(c, "group", open, inner, close)), 3, "rest after the close");
-    TextParseResult<string> bad = Literals.Text(Parser.RestOnOk(open, c), "(", "nested");
-    Assert.Equal(ErrorKindOf(Coordination.Between(c, "group", open, bad, close)), "ExpectedLiteral nested", "inner failure");
-    TextParseResult<string> noOpen = Literals.Text(c, "[", "open");
-    Assert.Equal(ErrorAt(Coordination.Between(c, "group", noOpen, inner, close)), 0, "open failure");
-}
-
-// ---- Context and Mapper ----
-
-test DefaultContextDoesNotSkipWhiteSpace
-{
-    Cursor.TextCursor c = Cursor.From("  a");
-    Assert.Equal(Cursor.Position(Context.WithWhiteSpaceParser(c, Context.DefaultContext())), 0, "cursor unchanged");
-}
-
-test MapReplacesTheValueAndKeepsTheRest
-{
-    Cursor.TextCursor c = Cursor.From("true");
-    TextParseResult<string> parsed = Literals.Text(c, "true", "bool");
-    Assert.Equal(ValueOf(Mapper.Map(parsed, "1")), "1", "mapped value");
-    Assert.Equal(RestAt(Parser.Map(parsed, "1")), 4, "rest kept");
-    TextParseResult<string> failed = Literals.Text(c, "false", "bool");
-    Assert.Equal(ErrorKindOf(Mapper.Map(failed, "0")), "ExpectedLiteral bool", "error kept");
-    Assert.Equal(ValueOf(Parser.Tap(parsed)), "true", "tap is the identity");
+    test MapReplacesTheValueAndKeepsTheRest
+    {
+        Cursor.TextCursor c = Cursor.From("true");
+        TextParseResult<string> parsed = Literals.Text(c, "true", "bool");
+        Assert.Equal(ValueOf(Mapper.Map(parsed, "1")), "1", "mapped value");
+        Assert.Equal(RestAt(Parser.Map(parsed, "1")), 4, "rest kept");
+        TextParseResult<string> failed = Literals.Text(c, "false", "bool");
+        Assert.Equal(ErrorKindOf(Mapper.Map(failed, "0")), "ExpectedLiteral bool", "error kept");
+        Assert.Equal(ValueOf(Parser.Tap(parsed)), "true", "tap is the identity");
+    }
 }

@@ -14,7 +14,6 @@ use Testing.Assert;
 // Structural cases. Fixture paths replace the host's canonical
 // path planner; these tests prove shape and policy handling of the generated
 // typed AST, not execution of installed adapters.
-
 Syntax.CanonicalPath Route(string logical, string leaf) {
     return Syntax.CanonicalPath { logicalName: logical, segments: ["Fixture", leaf] };
 }
@@ -286,169 +285,6 @@ string RecordErrorWith(Syntax.Builder builder, SpannedPath receiver, SpannedIden
     };
 }
 
-// Generic record with a parameter field and a primitive field.
-test SerializationGenericRecordEmitsEncoderThenDecoderGroup {
-    Syntax.Builder builder = NewBuilder();
-    SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
-    SpannedField[] fields = [Syntax.DataField(builder, "value", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
-    Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["GenericRecord"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [Plain("value"), Plain("count")]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "encoder impl + decoder type/field decoder factory/impl + field encoder factory");
-    Assert.Equal<u32>(target.encoderIndex, 0_u32, "encoder is the first contribution");
-    Assert.Equal<u32>(target.decoderIndex, 3_u32, "decoder impl is the fourth contribution");
-    Assert.Equal<i64>(Array.Len(target.decoderMembers), 2_i64, "adapter type and field decoder factory are the group members");
-    Assert.Equal<u32>(target.decoderMembers[0_i64], 1_u32, "adapter type member");
-    Assert.Equal<u32>(target.decoderMembers[1_i64], 2_u32, "field decoder factory member");
-    Assert.True(IsImpl(target.items[0_i64]), "item 0 is the Serializable impl");
-    Assert.True(IsType(target.items[1_i64]), "item 1 is the decoder adapter type");
-    Assert.True(IsFunction(target.items[2_i64]), "item 2 is the field decoder factory");
-    Assert.True(IsImpl(target.items[3_i64]), "item 3 is the Decoder impl");
-    Assert.True(IsFunction(target.items[4_i64]), "item 4 is the field encoder factory");
-    Assert.Equal<i64>(Array.Len(target.encoderMembers), 1_i64, "the field encoder factory is the encoder group member");
-    Assert.Equal<u32>(target.encoderMembers[0_i64], 4_u32, "field encoder factory member");
-    Assert.Equal<i64>(FunctionParameters(target.items[4_i64]), 3_i64, "the encoder factory writes (value, encoder, limits)");
-    Assert.Equal<i64>(FunctionParameters(target.items[2_i64]), 2_i64, "the factory reads from (reader, limits) like FieldDecoder.Read");
-    Assert.Equal<i64>(ImplGenerics(target.items[0_i64]), 2_i64, "encoder impl generics are T plus the encoder");
-    Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "the encoder impl bounds only E; T is revalidated per application");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and the reader; no binding parameter");
-    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "the adapter holds only its reader");
-    Assert.Equal<i64>(ImplBounds(target.items[3_i64]), 1_i64, "the Decoder impl bounds only the reader; T is revalidated per application");
-    Assert.Equal<i64>(ReadSites(fields, [Plain("value"), Plain("count")], []), 1_i64, "the T field reads through the issued correspondence");
-}
-
-// Nested GenericRecord<i32> and GenericRecord<string> keep distinct decoder bindings.
-test SerializationNestedGenericInstantiationsGetDistinctFieldDecoders {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType ofInt = GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedType ofText = GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::String));
-    SpannedField[] fields = [Syntax.DataField(builder, "count", ofInt), Syntax.DataField(builder, "label", ofText)];
-    Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Outer"], []), [], fields, [Plain("count"), Plain("label")]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "non generic record contribution group");
-    Assert.Equal<i64>(ImplGenerics(target.items[0_i64]), 1_i64, "encoder impl only has the encoder parameter");
-    Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "no receiver parameter gets an unused bound");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
-    Assert.Equal<i64>(ReadSites(fields, [Plain("count"), Plain("label")], []), 2_i64, "each instantiation is its own ReadField site");
-}
-
-// Scalar profile including every explicit word width.
-test SerializationWordScalarRequiresExactDeclaredWidthOnBothDirections {
-    Syntax.Builder builder = NewBuilder();
-    SpannedExpression value = Syntax.Local(builder, "value");
-    u8[] widths = [8_u8, 16_u8, 32_u8, 64_u8];
-    mut i64 index = 0_i64;
-    while (index < 4_i64) {
-        Assert.True(Results.IsOk(Scalars.Write(builder, PrimitiveType::Word, value, widths[index])), "word write width admitted");
-        Assert.True(Results.IsOk(Scalars.Read(builder, PrimitiveType::Word, widths[index])), "word read width admitted");
-        index = index + 1_i64;
-    }
-    u8[] invalid = [0_u8, 7_u8, 24_u8, 128_u8];
-    index = 0_i64;
-    while (index < 4_i64) {
-        Assert.True(Results.IsError(Scalars.Write(builder, PrimitiveType::Word, value, invalid[index])), "invalid word write width rejects");
-        Assert.True(Results.IsError(Scalars.Read(builder, PrimitiveType::Word, invalid[index])), "invalid word read width rejects");
-        index = index + 1_i64;
-    }
-}
-
-test SerializationEverySupportedPrimitiveReadsAndIneligibleOnesFailClosed {
-    Syntax.Builder builder = NewBuilder();
-    PrimitiveType[] supported = [PrimitiveType::Bool, PrimitiveType::I8, PrimitiveType::I16, PrimitiveType::I32, PrimitiveType::I64, PrimitiveType::U8, PrimitiveType::U16, PrimitiveType::U32, PrimitiveType::U64, PrimitiveType::F32, PrimitiveType::F64, PrimitiveType::Char, PrimitiveType::String, PrimitiveType::Unit];
-    mut i64 index = 0_i64;
-    while (index < 14_i64) {
-        Assert.True(Results.IsOk(Scalars.Read(builder, supported[index], 0_u8)), "supported primitive read generates");
-        index = index + 1_i64;
-    }
-    match Scalars.Read(builder, PrimitiveType::Pointer, 0_u8) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationPointer", "raw pointer read rejects"); },
-        Result::Ok(_) => { Assert.Fail("pointer read must not generate"); },
-    };
-    match Scalars.Read(builder, PrimitiveType::Never, 0_u8) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationNever", "never read rejects"); },
-        Result::Ok(_) => { Assert.Fail("never read must not generate"); },
-    };
-    match Scalars.Write(builder, PrimitiveType::Never, Syntax.Local(builder, "value"), 0_u8) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationNever", "never write rejects"); },
-        Result::Ok(_) => { Assert.Fail("never write must not generate"); },
-    };
-}
-
-// The bytes policy is exactly u8[] and never silently reinterprets other arrays.
-test SerializationBytesPolicyRequiresExactU8Array {
-    Syntax.Builder builder = NewBuilder();
-    match Read.Value(builder, Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::U8)), 0_u8, true, PlanFor(builder, []), 0_i64) {
-        Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 0_i64, "bytes read is a single ReadBytes call"); },
-        Result::Error(_) => { Assert.Fail("u8[] bytes policy must generate"); },
-    };
-    SpannedType[] wrong = [Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::I8)), Syntax.Primitive(builder, PrimitiveType::U8), Syntax.Primitive(builder, PrimitiveType::String)];
-    mut i64 index = 0_i64;
-    while (index < 3_i64) {
-        match Read.Value(builder, wrong[index], 0_u8, true, PlanFor(builder, []), 0_i64) {
-            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationBytesType", "non u8[] bytes policy rejects"); },
-            Result::Ok(_) => { Assert.Fail("bytes policy must not apply to other types"); },
-        };
-        index = index + 1_i64;
-    }
-}
-
-// A payload enum emits the same encoder/decoder group shape as a record.
-test SerializationPayloadEnumEmitsEncoderAndDecoderGroup {
-    Syntax.Builder builder = NewBuilder();
-    SpannedEnumVariant[] variants = [
-        Variant(builder, "Circle", [Syntax.DataField(builder, "radius", Syntax.Primitive(builder, PrimitiveType::F64))]),
-        Variant(builder, "Wrapped", [Syntax.DataField(builder, "inner", GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32)))]),
-        Variant(builder, "Empty", []),
-    ];
-    match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Shape"], []), [], variants, Payloads(variants), []) {
-        Result::Error(error) => { Assert.Fail(error.message); },
-        Result::Ok(target) => {
-            Assert.Equal<i64>(Array.Len(target.items), 5_i64, "enum encoder impl, three decoder items, field encoder factory");
-            Assert.Equal<u32>(target.encoderIndex, 0_u32, "encoder first");
-            Assert.Equal<u32>(target.decoderIndex, 3_u32, "decoder impl fourth");
-            Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
-            Assert.Equal<i64>(VariantReadSites(variants, Payloads(variants)), 1_i64, "one nominal payload reads through ReadField");
-        },
-    };
-}
-
-test SerializationPayloadEnumRejectsUnreadablePayloadType {
-    Syntax.Builder builder = NewBuilder();
-    SpannedEnumVariant[] variants = [Variant(builder, "Raw", [Syntax.DataField(builder, "address", Syntax.Primitive(builder, PrimitiveType::Pointer))])];
-    match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Handle"], []), [], variants, Payloads(variants), []) {
-        Result::Error(_) => { },
-        Result::Ok(_) => { Assert.Fail("raw pointer payload must fail before contribution"); },
-    };
-}
-
-// Every field is read into a typed Option slot; absence is resolved after the full record read.
-test SerializationRecordWithoutDefaultGeneratesCompleteDecoderGroup {
-    Syntax.Builder builder = NewBuilder();
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
-    Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "present or absent, the contribution group is complete");
-}
-
-test SerializationSkipDeserializeWithoutTypedDefaultFailsBeforeGeneration {
-    Syntax.Builder builder = NewBuilder();
-    SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32))];
-    mut Read.FieldPolicy policy = Plain("cache");
-    policy.skipRead = true;
-    Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Holder"], []), [], fields, [policy]), "SerializationSkippedDefault", "skipped read requires typed default factory");
-}
-
-/// A field skipped in both directions with a default needs no decoder binding.
-test SerializationSkipBothDirectionsNeedsNoDecoderBinding {
-    Syntax.Builder builder = NewBuilder();
-    SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
-    SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
-    mut Read.FieldPolicy skipped = Plain("cache");
-    skipped.skipRead = true;
-    skipped.skipWrite = true;
-    skipped.defaultFactory = OptionalSpannedPath::Some(Syntax.PathValue(builder, ["Defaults", "MakeCache"], []));
-    Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Holder"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [skipped, Plain("count")]);
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and reader only");
-    Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "only reader is a member");
-    Assert.Equal<i64>(ReadSites(fields, [skipped, Plain("count")], []), 0_i64, "a field skipped in both directions has no read site");
-}
-
 SpannedStatement[] IfBody(SpannedStatement statement) {
     match statement.node {
         Statement::If(value) => { return value.node.thenBlock.node.statements.items; },
@@ -484,135 +320,6 @@ Read.FieldPolicy SkippedRead(Syntax.Builder builder, string name, bool written) 
     return policy;
 }
 
-// A written skip-read field is recognised by wire name: duplicate check, read, discard, default later.
-test SerializationSkipDeserializeWrittenFieldIsConsumedAndDiscarded {
-    Syntax.Builder builder = NewBuilder();
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32))];
-    SpannedStatement[] loop = ReadLoop(builder, fields, [Plain("count"), SkippedRead(builder, "cache", true)], []);
-    Assert.Equal<i64>(Array.Len(loop), 7_i64, "name, found, count branch, cache branch, unknown check, end field, advance");
-    SpannedStatement[] branch = IfBody(loop[3_i64]);
-    Assert.Equal<i64>(Array.Len(branch), 4_i64, "duplicate check, discarded read, seen, found");
-    Assert.True(IsIf(branch[0_i64]), "present twice is DuplicateField");
-    Assert.True(IsExpressionStatement(branch[1_i64]), "the value is read and dropped, never stored in a slot");
-    Assert.True(IsExpressionStatement(IfBody(loop[2_i64])[0_i64]) == false, "ordinary field branch starts with its duplicate check");
-}
-
-// Absent: no wire branch exists for a field the encoder does not write; the default factory initialises it.
-test SerializationSkipBothDirectionsHasNoWireBranch {
-    Syntax.Builder builder = NewBuilder();
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32))];
-    SpannedStatement[] loop = ReadLoop(builder, fields, [Plain("count"), SkippedRead(builder, "cache", false)], []);
-    Assert.Equal<i64>(Array.Len(loop), 6_i64, "unwritten skipped field adds no wire branch");
-}
-
-test SerializationSkipDeserializeWrittenFieldIsNotCapturedByCatchall {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
-    SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "extra", map)];
-    mut Read.FieldPolicy catchall = Plain("extra");
-    catchall.catchall = true;
-    SpannedStatement[] loop = ReadLoop(builder, fields, [SkippedRead(builder, "cache", true), catchall], sites);
-    Assert.Equal<i64>(Array.Len(loop), 8_i64, "name, found, cache branch, collision guard, catchall capture, unknown check, end field, advance");
-    Assert.True(IsExpressionStatement(IfBody(loop[2_i64])[1_i64]), "cache is discarded before the catchall can see it");
-}
-
-/// A written field skipped on deserialize still needs the decoder binding of its nominal type.
-test SerializationSkipDeserializeStillBindsTheDecoder {
-    Syntax.Builder builder = NewBuilder();
-    SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
-    SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], []))];
-    Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Holder"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [SkippedRead(builder, "cache", true)]);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
-    Assert.Equal<i64>(ReadSites(fields, [SkippedRead(builder, "cache", true)], []), 1_i64, "a consumed nominal value reads through ReadField like any read");
-}
-
-test SerializationSkipSerializeRemovesParameterBoundFromEncoder {
-    Syntax.Builder builder = NewBuilder();
-    SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
-    SpannedField[] fields = [Syntax.DataField(builder, "secret", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
-    mut Read.FieldPolicy skipped = Plain("secret");
-    skipped.skipWrite = true;
-    Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Vault"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [skipped, Plain("count")]);
-    Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "unwritten T needs no Serializable bound");
-    Assert.Equal<i64>(ReadSites(fields, [skipped, Plain("count")], []), 1_i64, "decoder still reads T");
-}
-
-test SerializationPolicyCountMismatchFailsClosed {
-    Syntax.Builder builder = NewBuilder();
-    SpannedField[] fields = [Syntax.DataField(builder, "a", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "b", Syntax.Primitive(builder, PrimitiveType::I32))];
-    Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Pair"], []), [], fields, [Plain("a")]), "SerializationFieldPolicy", "one policy per field");
-}
-
-// Policy validation through the real Policies entry points.
-test SerializationPoliciesRejectConflictingWireNamesUnlessDirectionsDiffer {
-    Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
-    mut SpannedField first = Syntax.DataField(builder, "first", Syntax.Primitive(builder, PrimitiveType::I32));
-    mut SpannedField second = Syntax.DataField(builder, "second", Syntax.Primitive(builder, PrimitiveType::I32));
-    first.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "shared"))])] };
-    second.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "shared"))])] };
-    Assert.True(Results.IsError(Policies.Fields(builder, [first, second])), "same wire name in both directions conflicts");
-    second.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [
-        Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "shared")),
-        Syntax.AttributeArgumentValue(builder, "SkipSerialize", Syntax.LiteralValue(builder, Literal::Bool(true))),
-        Syntax.AttributeArgumentValue(builder, "SkipDeserialize", Syntax.LiteralValue(builder, Literal::Bool(true))),
-        Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.MakeSecond")),
-    ])] };
-    Assert.True(Results.IsOk(Policies.Fields(builder, [first, second])), "a field skipped in both directions cannot conflict");
-}
-
-test SerializationPoliciesRejectInvalidLiteralsAndUnknownArguments {
-    Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
-    mut SpannedField field = Syntax.DataField(builder, "value", Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedAttributeArgument[] cases = [
-        Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "")),
-        Syntax.AttributeArgumentValue(builder, "Name", Syntax.LiteralValue(builder, Literal::Bool(true))),
-        Syntax.AttributeArgumentValue(builder, "SkipSerialize", Syntax.Text(builder, "true")),
-        Syntax.AttributeArgumentValue(builder, "WordWidth", Syntax.LiteralValue(builder, Literal::Integer("7_u8"))),
-        Syntax.AttributeArgumentValue(builder, "WordWidth", Syntax.LiteralValue(builder, Literal::Integer("128_u8"))),
-        Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults..Make")),
-        Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "1Defaults.Make")),
-        Syntax.AttributeArgumentValue(builder, "Unknown", Syntax.Text(builder, "x")),
-    ];
-    mut i64 index = 0_i64;
-    while (index < 8_i64) {
-        field.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [cases[index]])] };
-        Assert.True(Results.IsError(Policies.Field(builder, field)), "invalid SerializeField policy rejects");
-        index = index + 1_i64;
-    }
-}
-
-test SerializationPolicyWordWidthLiteralAcceptsOnlyDeclaredWidths {
-    Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
-    mut SpannedField field = Syntax.DataField(builder, "value", Syntax.Primitive(builder, PrimitiveType::Word));
-    string[] literals = ["8_u8", "16_u8", "32_u8", "64_u8"];
-    u8[] widths = [8_u8, 16_u8, 32_u8, 64_u8];
-    mut i64 index = 0_i64;
-    while (index < 4_i64) {
-        field.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [Syntax.AttributeArgumentValue(builder, "WordWidth", Syntax.LiteralValue(builder, Literal::Integer(literals[index])))])] };
-        match Policies.Field(builder, field) {
-            Result::Ok(policy) => { Assert.Equal<u8>(policy.wordWidth, widths[index], "declared word width retained"); },
-            Result::Error(_) => { Assert.Fail("declared word width must parse"); },
-        };
-        index = index + 1_i64;
-    }
-}
-
-// Bounded recursion of generated source type descent.
-test SerializationGeneratedTypeDepthStopsAt128 {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType nested = Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    Assert.True(Results.IsOk(Write.Value(builder, nested, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, []), 127_i64)), "depth 128 still generates after one array level");
-    match Write.Value(builder, nested, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, []), 129_i64) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationTypeDepth", "write depth 129 rejects"); },
-        Result::Ok(_) => { Assert.Fail("write depth 129 must reject"); },
-    };
-    match Read.Value(builder, nested, 0_u8, false, PlanFor(builder, []), 129_i64) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationTypeDepth", "read depth 129 rejects"); },
-        Result::Ok(_) => { Assert.Fail("read depth 129 must reject"); },
-    };
-}
-
 SpannedField PolicyField(Syntax.Builder builder, string name, SpannedType ty, SpannedAttributeArgument[] arguments) {
     mut SpannedField field = Syntax.DataField(builder, name, ty);
     field.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", arguments)] };
@@ -642,316 +349,629 @@ string EnumError(Syntax.Builder builder, SpannedEnumVariant[] variants, Read.Var
     };
 }
 
-// Gap 2: proven Foundation containers are read and written by the generated
-// adapter itself; only their non-primitive elements need typed bindings.
-test SerializationContainerSitesDispatchListMapAndOptionalReads {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType list = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::String));
-    SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::I64));
-    Read.ContainerSite[] sites = [
-        Site(list, Read.ContainerKind::Sequence, Syntax.Primitive(builder, PrimitiveType::I32)),
-        Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::String)),
-        Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I64)),
-    ];
-    match Read.Value(builder, list, 0_u8, false, PlanFor(builder, sites), 0_i64) {
-        Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 6_i64, "list: count, limit, accumulator, index, loop, end"); },
-        Result::Error(error) => { Assert.Fail(error.code); },
-    };
-    match Read.Value(builder, map, 0_u8, false, PlanFor(builder, sites), 0_i64) {
-        Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 6_i64, "map: count, limit, accumulator, index, loop, end"); },
-        Result::Error(error) => { Assert.Fail(error.code); },
-    };
-    match Read.Value(builder, option, 0_u8, false, PlanFor(builder, sites), 0_i64) {
-        Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 4_i64, "optional: presence, slot, branch, end"); },
-        Result::Error(error) => { Assert.Fail(error.code); },
-    };
-}
+mod GenerationTests
+{
+    // Generic record with a parameter field and a primitive field.
+    test GenericRecordEmitsEncoderThenDecoderGroup {
+        Syntax.Builder builder = NewBuilder();
+        SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
+        SpannedField[] fields = [Syntax.DataField(builder, "value", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
+        Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["GenericRecord"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [Plain("value"), Plain("count")]);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "encoder impl + decoder type/field decoder factory/impl + field encoder factory");
+        Assert.Equal<u32>(target.encoderIndex, 0_u32, "encoder is the first contribution");
+        Assert.Equal<u32>(target.decoderIndex, 3_u32, "decoder impl is the fourth contribution");
+        Assert.Equal<i64>(Array.Len(target.decoderMembers), 2_i64, "adapter type and field decoder factory are the group members");
+        Assert.Equal<u32>(target.decoderMembers[0_i64], 1_u32, "adapter type member");
+        Assert.Equal<u32>(target.decoderMembers[1_i64], 2_u32, "field decoder factory member");
+        Assert.True(IsImpl(target.items[0_i64]), "item 0 is the Serializable impl");
+        Assert.True(IsType(target.items[1_i64]), "item 1 is the decoder adapter type");
+        Assert.True(IsFunction(target.items[2_i64]), "item 2 is the field decoder factory");
+        Assert.True(IsImpl(target.items[3_i64]), "item 3 is the Decoder impl");
+        Assert.True(IsFunction(target.items[4_i64]), "item 4 is the field encoder factory");
+        Assert.Equal<i64>(Array.Len(target.encoderMembers), 1_i64, "the field encoder factory is the encoder group member");
+        Assert.Equal<u32>(target.encoderMembers[0_i64], 4_u32, "field encoder factory member");
+        Assert.Equal<i64>(FunctionParameters(target.items[4_i64]), 3_i64, "the encoder factory writes (value, encoder, limits)");
+        Assert.Equal<i64>(FunctionParameters(target.items[2_i64]), 2_i64, "the factory reads from (reader, limits) like FieldDecoder.Read");
+        Assert.Equal<i64>(ImplGenerics(target.items[0_i64]), 2_i64, "encoder impl generics are T plus the encoder");
+        Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "the encoder impl bounds only E; T is revalidated per application");
+        Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and the reader; no binding parameter");
+        Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "the adapter holds only its reader");
+        Assert.Equal<i64>(ImplBounds(target.items[3_i64]), 1_i64, "the Decoder impl bounds only the reader; T is revalidated per application");
+        Assert.Equal<i64>(ReadSites(fields, [Plain("value"), Plain("count")], []), 1_i64, "the T field reads through the issued correspondence");
+    }
 
-test SerializationUnprovenContainerSpellingStaysATypedBinding {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType list = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    match Read.Value(builder, list, 0_u8, false, PlanFor(builder, []), 0_i64) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationReadBinding", "List spelling alone is not a container proof"); },
-        Result::Ok(_) => { Assert.Fail("an unproven List must not be read as a Foundation container"); },
-    };
-}
+    // Nested GenericRecord<i32> and GenericRecord<string> keep distinct decoder bindings.
+    test NestedGenericInstantiationsGetDistinctFieldDecoders {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType ofInt = GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedType ofText = GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::String));
+        SpannedField[] fields = [Syntax.DataField(builder, "count", ofInt), Syntax.DataField(builder, "label", ofText)];
+        Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Outer"], []), [], fields, [Plain("count"), Plain("label")]);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "non generic record contribution group");
+        Assert.Equal<i64>(ImplGenerics(target.items[0_i64]), 1_i64, "encoder impl only has the encoder parameter");
+        Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "no receiver parameter gets an unused bound");
+        Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
+        Assert.Equal<i64>(ReadSites(fields, [Plain("count"), Plain("label")], []), 2_i64, "each instantiation is its own ReadField site");
+    }
 
-test SerializationContainerFieldsBindOnlyTheirNominalElements {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType primitiveList = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedType item = Syntax.Named(builder, ["Item"], []);
-    SpannedType nominalList = ListOf(builder, item);
-    SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::Bool));
-    SpannedField[] fields = [Syntax.DataField(builder, "numbers", primitiveList), Syntax.DataField(builder, "items", nominalList), Syntax.DataField(builder, "flag", option)];
-    Read.ContainerSite[] sites = [
-        Site(primitiveList, Read.ContainerKind::Sequence, Syntax.Primitive(builder, PrimitiveType::I32)),
-        Site(nominalList, Read.ContainerKind::Sequence, item),
-        Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::Bool)),
-    ];
-    Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Bag"], []), [], fields, [Plain("numbers"), Plain("items"), Plain("flag")], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
-    Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
-    Assert.Equal<i64>(ReadSites(fields, [Plain("numbers"), Plain("items"), Plain("flag")], sites), 1_i64, "only the Item element reads through ReadField");
-}
+    // Scalar profile including every explicit word width.
+    test WordScalarRequiresExactDeclaredWidthOnBothDirections {
+        Syntax.Builder builder = NewBuilder();
+        SpannedExpression value = Syntax.Local(builder, "value");
+        u8[] widths = [8_u8, 16_u8, 32_u8, 64_u8];
+        mut i64 index = 0_i64;
+        while (index < 4_i64) {
+            Assert.True(Results.IsOk(Scalars.Write(builder, PrimitiveType::Word, value, widths[index])), "word write width admitted");
+            Assert.True(Results.IsOk(Scalars.Read(builder, PrimitiveType::Word, widths[index])), "word read width admitted");
+            index = index + 1_i64;
+        }
+        u8[] invalid = [0_u8, 7_u8, 24_u8, 128_u8];
+        index = 0_i64;
+        while (index < 4_i64) {
+            Assert.True(Results.IsError(Scalars.Write(builder, PrimitiveType::Word, value, invalid[index])), "invalid word write width rejects");
+            Assert.True(Results.IsError(Scalars.Read(builder, PrimitiveType::Word, invalid[index])), "invalid word read width rejects");
+            index = index + 1_i64;
+        }
+    }
 
-test SerializationContainerWritesListOptionalAndOrdinalMap {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType list = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    Read.ContainerSite[] sites = [
-        Site(list, Read.ContainerKind::Sequence, Syntax.Primitive(builder, PrimitiveType::I32)),
-        Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I32)),
-        Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32)),
-    ];
-    match Write.Value(builder, list, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, sites), 0_i64) {
-        Result::Ok(statements) => { Assert.Equal<i64>(Array.Len(statements), 5_i64, "count, begin, index, loop, end"); },
-        Result::Error(error) => { Assert.Fail(error.code); },
-    };
-    match Write.Value(builder, option, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, sites), 0_i64) {
-        Result::Ok(statements) => { Assert.Equal<i64>(Array.Len(statements), 1_i64, "one presence match"); },
-        Result::Error(error) => { Assert.Fail(error.code); },
-    };
-    match Write.Value(builder, map, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, sites), 0_i64) {
-        Result::Ok(statements) => {
-            Assert.Equal<i64>(Array.Len(statements), 6_i64, "sorted keys, count, begin, index, loop, end");
-            Assert.Equal<string>(LetCallee(statements[0_i64]), "SortOrdinal", "keys are sorted through the issued ordinal route");
-            Assert.Equal<string>(LetCallee(statements[1_i64]), "Len", "entry count is the sorted key count");
-            Assert.Equal<string>(OperationName(statements[2_i64]), "BeginMap", "map frame opens after the key snapshot");
-            Assert.Equal<string>(OperationName(statements[5_i64]), "EndMap", "map frame closes after the entries");
-            SpannedStatement[] entry = WhileBody(statements[4_i64]);
-            Assert.Equal<i64>(Array.Len(entry), 5_i64, "key, begin entry, value match, end entry, advance");
-            Assert.Equal<string>(OperationName(entry[1_i64]), "BeginMapEntry", "each entry is keyed");
-            Assert.Equal<string>(OperationName(entry[3_i64]), "EndMapEntry", "each entry is closed");
-        },
-        Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
-    };
-    Assert.True(Results.IsOk(Syntax.Status(builder)), "every map write path is planned");
-}
+    test EverySupportedPrimitiveReadsAndIneligibleOnesFailClosed {
+        Syntax.Builder builder = NewBuilder();
+        PrimitiveType[] supported = [PrimitiveType::Bool, PrimitiveType::I8, PrimitiveType::I16, PrimitiveType::I32, PrimitiveType::I64, PrimitiveType::U8, PrimitiveType::U16, PrimitiveType::U32, PrimitiveType::U64, PrimitiveType::F32, PrimitiveType::F64, PrimitiveType::Char, PrimitiveType::String, PrimitiveType::Unit];
+        mut i64 index = 0_i64;
+        while (index < 14_i64) {
+            Assert.True(Results.IsOk(Scalars.Read(builder, supported[index], 0_u8)), "supported primitive read generates");
+            index = index + 1_i64;
+        }
+        match Scalars.Read(builder, PrimitiveType::Pointer, 0_u8) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationPointer", "raw pointer read rejects"); },
+            Result::Ok(_) => { Assert.Fail("pointer read must not generate"); },
+        };
+        match Scalars.Read(builder, PrimitiveType::Never, 0_u8) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationNever", "never read rejects"); },
+            Result::Ok(_) => { Assert.Fail("never read must not generate"); },
+        };
+        match Scalars.Write(builder, PrimitiveType::Never, Syntax.Local(builder, "value"), 0_u8) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationNever", "never write rejects"); },
+            Result::Ok(_) => { Assert.Fail("never write must not generate"); },
+        };
+    }
 
-test SerializationRecordWithMapFieldGeneratesEncoder {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    Read.ContainerSite[] sites = [Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I32)), Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
-    SpannedField[] fields = [Syntax.DataField(builder, "maybe", option), Syntax.DataField(builder, "table", map)];
-    Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Holder"], []), [], fields, [Plain("maybe"), Plain("table")], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "written map field completes the contribution group");
-    Assert.Equal<i64>(ReadSites(fields, [Plain("maybe"), Plain("table")], sites), 0_i64, "option and map of primitives need no ReadField site");
-    SpannedStatement[] body = EncoderBody(target);
-    Assert.Equal<string>(OperationName(body[0_i64]), "BeginRecord", "no catchall: the record opens first");
-    Assert.Equal<string>(OperationName(body[4_i64]), "BeginField", "the map field follows the optional field");
-    Assert.Equal<string>(LetCallee(body[5_i64]), "SortOrdinal", "the map field sorts its keys");
-}
-
-// Gap 3: payload field policies.
-/// Asymmetric skip, a present default and a catch-all are rejected on variants.
-test SerializationVariantPoliciesRejectInvalidCombinations {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType number = Syntax.Primitive(builder, PrimitiveType::I32);
-    Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [Flag(builder, "SkipSerialize")])])), "skip in one direction breaks positional payloads");
-    Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.Make"))])])), "present positional payload has no missing-value default");
-    Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", MapOf(builder, number), [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")])])), "payload fields cannot be catchalls");
-    SpannedAttributeArgument shared = Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "x"));
-    Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [shared]), PolicyField(builder, "b", number, [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "x"))])])), "duplicate payload wire names reject");
-    match Policies.Variant(builder, [PolicyField(builder, "a", number, [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "renamed"))]), PolicyField(builder, "b", number, [Flag(builder, "SkipSerialize"), Flag(builder, "SkipDeserialize"), Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.Make"))])]) {
-        Result::Ok(policies) => {
-            Assert.Equal<string>(policies[0_i64].wireName, "renamed", "payload rename retained");
-            Assert.True(policies[1_i64].skipRead && policies[1_i64].skipWrite, "symmetric payload skip retained");
-        },
-        Result::Error(error) => { Assert.Fail(error.message); },
-    };
-}
-
-test SerializationPayloadWordWidthAndBytesPoliciesApply {
-    Syntax.Builder builder = NewBuilder();
-    SpannedEnumVariant[] variants = [Variant(builder, "Sized", [Syntax.DataField(builder, "size", Syntax.Primitive(builder, PrimitiveType::Word))])];
-    Assert.Equal<string>(EnumError(builder, variants, Payloads(variants)), "SerializationWordWidth", "word payload without width rejects");
-    mut Read.FieldPolicy sized = Plain("size");
-    sized.wordWidth = 32_u8;
-    Assert.Equal<string>(EnumError(builder, variants, [Read.VariantPolicy { fields: [sized] }]), "", "declared payload word width generates");
-    SpannedEnumVariant[] blobs = [Variant(builder, "Blob", [Syntax.DataField(builder, "data", Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::U8)))])];
-    mut Read.FieldPolicy bytes = Plain("data");
-    bytes.bytes = true;
-    Assert.Equal<string>(EnumError(builder, blobs, [Read.VariantPolicy { fields: [bytes] }]), "", "bytes payload generates");
-    SpannedEnumVariant[] wrong = [Variant(builder, "Blob", [Syntax.DataField(builder, "data", Syntax.Primitive(builder, PrimitiveType::I32))])];
-    mut Read.FieldPolicy wrongBytes = Plain("data");
-    wrongBytes.bytes = true;
-    Assert.Equal<string>(EnumError(builder, wrong, [Read.VariantPolicy { fields: [wrongBytes] }]), "SerializationBytesType", "bytes policy on a non u8[] payload rejects");
-}
-
-test SerializationPayloadSkippedBothWaysUsesDefaultAndNeedsNoBinding {
-    Syntax.Builder builder = NewBuilder();
-    SpannedEnumVariant[] variants = [Variant(builder, "Wrapped", [Syntax.DataField(builder, "inner", GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32)))])];
-    mut Read.FieldPolicy skipped = Plain("inner");
-    skipped.skipRead = true;
-    skipped.skipWrite = true;
-    skipped.defaultFactory = OptionalSpannedPath::Some(Syntax.PathValue(builder, ["Defaults", "MakeInner"], []));
-    Assert.Equal<i64>(VariantReadSites(variants, [Read.VariantPolicy { fields: [skipped] }]), 0_i64, "skipped payload has no read site");
-    match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Shape"], []), [], variants, [Read.VariantPolicy { fields: [skipped] }], []) {
-        Result::Ok(target) => { Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group"); },
-        Result::Error(error) => { Assert.Fail(error.message); },
-    };
-    mut Read.FieldPolicy missing = Plain("inner");
-    missing.skipRead = true;
-    missing.skipWrite = true;
-    Assert.Equal<string>(EnumError(builder, variants, [Read.VariantPolicy { fields: [missing] }]), "SerializationSkippedDefault", "skipped payload without factory rejects");
-    Assert.Equal<string>(EnumError(builder, variants, []), "SerializationFieldPolicy", "one policy group per variant");
-}
-
-// Gap 4: issued Map<string,V> catchall.
-test SerializationCatchallPolicyIsExclusiveAndNotAWireField {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    match Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")])) {
-        Result::Ok(policy) => { Assert.True(policy.catchall && policy.skipWrite && !policy.skipRead, "catchall captures on decode only"); },
-        Result::Error(error) => { Assert.Fail(error.message); },
-    };
-    match Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall")])) {
-        Result::Ok(policy) => { Assert.True(policy.catchall && !policy.skipWrite && !policy.skipRead, "catchall without SkipSerialize is encoded and decoded"); },
-        Result::Error(error) => { Assert.Fail(error.message); },
-    };
-    Assert.True(Results.IsError(Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "x"))]))), "catchall has no wire name");
-    Assert.True(Results.IsError(Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "Bytes")]))), "catchall has no bytes policy");
-    Assert.True(Results.IsError(Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "SkipDeserialize"), Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.Make"))]))), "a skipped catchall would silently close the record");
-    SpannedField first = PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")]);
-    SpannedField second = PolicyField(builder, "more", MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32)), [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")]);
-    Assert.True(Results.IsError(Policies.Fields(builder, [first, second])), "at most one catchall");
-    SpannedField declared = PolicyField(builder, "named", Syntax.Primitive(builder, PrimitiveType::I32), [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "extra"))]);
-    Assert.True(Results.IsOk(Policies.Fields(builder, [first, declared])), "catchall source name is not a wire name");
-}
-
-test SerializationCatchallRecordReadsUnknownFieldsAsItsValueType {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType item = Syntax.Named(builder, ["Item"], []);
-    SpannedType map = MapOf(builder, item);
-    Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, item)];
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "extra", map)];
-    mut Read.FieldPolicy catchall = Plain("extra");
-    catchall.catchall = true;
-    catchall.skipWrite = true;
-    Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
-    Assert.Equal<i64>(ReadSites(fields, [Plain("count"), catchall], sites), 1_i64, "unknown fields read their catchall value V through ReadField");
-}
-
-test SerializationCatchallFailsClosedWithoutMapProof {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    SpannedField[] fields = [Syntax.DataField(builder, "extra", map)];
-    mut Read.FieldPolicy catchall = Plain("extra");
-    catchall.catchall = true;
-    catchall.skipWrite = true;
-    Assert.Equal<string>(RecordErrorWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [catchall], []), "SerializationCatchallType", "Map spelling without semantic proof rejects");
-    mut Read.FieldPolicy flattened = Plain("extra");
-    flattened.catchall = true;
-    Assert.Equal<string>(RecordErrorWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [flattened], []), "SerializationCatchallType", "an encoded catchall also needs the Map proof");
-}
-
-test SerializationCatchallFlattensAfterDeclaredFieldsInOrdinalOrder {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
-    SpannedField[] fields = [
-        Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)),
-        Syntax.DataField(builder, "extra", map),
-        Syntax.DataField(builder, "hidden", Syntax.Primitive(builder, PrimitiveType::I32)),
-    ];
-    mut Read.FieldPolicy catchall = Plain("extra");
-    catchall.catchall = true;
-    mut Read.FieldPolicy hidden = Plain("hidden");
-    hidden.skipWrite = true;
-    Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall, hidden], sites);
-    Assert.Equal<i64>(Array.Len(target.items), 5_i64, "encoded catchall completes the contribution group");
-    SpannedStatement[] body = EncoderBody(target);
-    Assert.Equal<i64>(Array.Len(body), 10_i64, "keys, count, begin, declared field (3), index, catchall loop, end, return");
-    Assert.Equal<string>(LetCallee(body[0_i64]), "SortOrdinal", "catchall keys are sorted before the record opens");
-    Assert.Equal<string>(OperationName(body[2_i64]), "BeginRecord", "record opens after the key snapshot");
-    Assert.True(DynamicCount(body[2_i64]), "record field count adds the catchall entry count");
-    Assert.Equal<string>(OperationName(body[3_i64]), "BeginField", "declared field is written first");
-    Assert.Equal<string>(OperationName(body[8_i64]), "EndRecord", "catchall entries precede the record end");
-    SpannedStatement[] entry = WhileBody(body[7_i64]);
-    Assert.Equal<i64>(Array.Len(entry), 7_i64, "key, two collision checks, begin field, value match, end field, advance");
-    Assert.True(IsIf(entry[1_i64]) && IsIf(entry[2_i64]), "every declared wire name, written or skipped, is reserved");
-    Assert.Equal<string>(OperationName(entry[3_i64]), "BeginField", "catchall entry is a flattened record field");
-    Assert.Equal<string>(OperationName(entry[5_i64]), "EndField", "flattened field is closed");
-    Assert.True(Results.IsOk(Syntax.Status(builder)), "every catchall write path is planned");
-}
-
-test SerializationCatchallWithSkipSerializeStaysDecodeOnly {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
-    Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "extra", map)];
-    mut Read.FieldPolicy catchall = Plain("extra");
-    catchall.catchall = true;
-    catchall.skipWrite = true;
-    SpannedStatement[] body = EncoderBody(RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall], sites));
-    Assert.Equal<i64>(Array.Len(body), 6_i64, "begin, declared field (3), end, return: no catchall entries");
-    Assert.False(DynamicCount(body[0_i64]), "record field count is the declared count");
-}
-
-// Gap 6: missing canonical paths and node exhaustion are diagnostics, not panics.
-test SerializationMissingCanonicalPathPlanIsAGenerationError {
-    Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64));
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
-    Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "SerializationCanonicalPath", "no path plan is reported, not panicked");
-    Assert.True(Results.IsError(Syntax.Status(builder)), "failure is sticky until rebind");
-    Syntax.Rebind(builder, Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64), FixturePaths());
-    Assert.True(Results.IsOk(Syntax.Status(builder)), "rebind starts the next target clean");
-    Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "", "rebound builder generates");
-}
-
-test SerializationAmbiguousCanonicalPathPlanIsAGenerationError {
-    mut Syntax.CanonicalPath[] paths = FixturePaths();
-    paths = Array.Append<Syntax.CanonicalPath>(paths, Route("Core.Results.Result", "OtherResult"));
-    Syntax.Builder builder = Syntax.CreateWithPaths(Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64), paths);
-    SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
-    Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "SerializationCanonicalPath", "ambiguous plan is reported");
-}
-
-// Typed field decoder factory correspondence: a nominal field reads through ReadField<F, R>.
-test SerializationNominalFieldReadsThroughIssuedFieldDecoderCorrespondence {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType point = Syntax.Named(builder, ["Point"], []);
-    SpannedType reader = Syntax.Named(builder, ["R"], []);
-    Read.NominalBinding binding = Read.NominalBinding { ty: point, factory: Syntax.CorePath(builder, ["Serialization", "Reader", "ReadField"], [point, reader]) };
-    match Read.Value(builder, point, 0_u8, false, Read.Plan([binding], [], Syntax.PathValue(builder, ["Result"], [])), 0_i64) {
-        Result::Ok(body) => {
-            Assert.Equal<i64>(Array.Len(body.statements), 0_i64, "a nominal read is a single call");
-            Assert.Equal<string>(PropagatedCallee(body.value), "ReadField", "the read calls the canonical ReadField");
-            Assert.Equal<i64>(PropagatedCalleeTypeArguments(body.value), 2_i64, "ReadField is applied to the exact field type and reader");
-        },
-        Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
-    };
-    Assert.True(Results.IsOk(Syntax.Status(builder)), "ReadField has a compiler-issued canonical path plan");
-    match Read.Value(builder, Syntax.Named(builder, ["Other"], []), 0_u8, false, Read.Plan([binding], [], Syntax.PathValue(builder, ["Result"], [])), 0_i64) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationReadBinding", "a site without its own binding rejects"); },
-        Result::Ok(_) => { Assert.Fail("another declared site must not borrow a binding"); },
-    };
-}
-
-// Typed field codec correspondence: a nominal field writes through WriteField<F, E>.
-test SerializationNominalFieldWritesThroughIssuedFieldCodecCorrespondence {
-    Syntax.Builder builder = NewBuilder();
-    SpannedType point = Syntax.Named(builder, ["Point"], []);
-    SpannedType encoder = Syntax.Named(builder, ["E"], []);
-    match Write.Value(builder, point, Syntax.Local(builder, "value"), 0_u8, Read.EncoderPlan([], Syntax.PathValue(builder, ["Result"], []), encoder), 0_i64) {
-        Result::Ok(statements) => {
-            Assert.Equal<i64>(Array.Len(statements), 1_i64, "a nominal write is a single call");
-            match statements[0_i64].node {
-                Statement::Expression(expression) => {
-                    Assert.Equal<string>(PropagatedCallee(expression.node.expression), "WriteField", "the write calls the canonical WriteField");
-                    Assert.Equal<i64>(PropagatedCalleeTypeArguments(expression.node.expression), 2_i64, "WriteField is applied to the exact field type and encoder");
-                },
-                _ => { Assert.Fail("a nominal write is an expression statement"); },
+    // The bytes policy is exactly u8[] and never silently reinterprets other arrays.
+    test BytesPolicyRequiresExactU8Array {
+        Syntax.Builder builder = NewBuilder();
+        match Read.Value(builder, Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::U8)), 0_u8, true, PlanFor(builder, []), 0_i64) {
+            Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 0_i64, "bytes read is a single ReadBytes call"); },
+            Result::Error(_) => { Assert.Fail("u8[] bytes policy must generate"); },
+        };
+        SpannedType[] wrong = [Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::I8)), Syntax.Primitive(builder, PrimitiveType::U8), Syntax.Primitive(builder, PrimitiveType::String)];
+        mut i64 index = 0_i64;
+        while (index < 3_i64) {
+            match Read.Value(builder, wrong[index], 0_u8, true, PlanFor(builder, []), 0_i64) {
+                Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationBytesType", "non u8[] bytes policy rejects"); },
+                Result::Ok(_) => { Assert.Fail("bytes policy must not apply to other types"); },
             };
-        },
-        Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
-    };
-    match Write.Value(builder, point, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, []), 0_i64) {
-        Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationWriteBinding", "a read plan cannot write a nominal field"); },
-        Result::Ok(_) => { Assert.Fail("a nominal write requires its encoder"); },
-    };
+            index = index + 1_i64;
+        }
+    }
+
+    // Every field is read into a typed Option slot; absence is resolved after the full record read.
+    test RecordWithoutDefaultGeneratesCompleteDecoderGroup {
+        Syntax.Builder builder = NewBuilder();
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
+        Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "present or absent, the contribution group is complete");
+    }
+
+    // Bounded recursion of generated source type descent.
+    test GeneratedTypeDepthStopsAt128 {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType nested = Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        Assert.True(Results.IsOk(Write.Value(builder, nested, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, []), 127_i64)), "depth 128 still generates after one array level");
+        match Write.Value(builder, nested, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, []), 129_i64) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationTypeDepth", "write depth 129 rejects"); },
+            Result::Ok(_) => { Assert.Fail("write depth 129 must reject"); },
+        };
+        match Read.Value(builder, nested, 0_u8, false, PlanFor(builder, []), 129_i64) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationTypeDepth", "read depth 129 rejects"); },
+            Result::Ok(_) => { Assert.Fail("read depth 129 must reject"); },
+        };
+    }
+
+    test UnprovenContainerSpellingStaysATypedBinding {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType list = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        match Read.Value(builder, list, 0_u8, false, PlanFor(builder, []), 0_i64) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationReadBinding", "List spelling alone is not a container proof"); },
+            Result::Ok(_) => { Assert.Fail("an unproven List must not be read as a Foundation container"); },
+        };
+    }
+
+    test RecordWithMapFieldGeneratesEncoder {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        Read.ContainerSite[] sites = [Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I32)), Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
+        SpannedField[] fields = [Syntax.DataField(builder, "maybe", option), Syntax.DataField(builder, "table", map)];
+        Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Holder"], []), [], fields, [Plain("maybe"), Plain("table")], sites);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "written map field completes the contribution group");
+        Assert.Equal<i64>(ReadSites(fields, [Plain("maybe"), Plain("table")], sites), 0_i64, "option and map of primitives need no ReadField site");
+        SpannedStatement[] body = EncoderBody(target);
+        Assert.Equal<string>(OperationName(body[0_i64]), "BeginRecord", "no catchall: the record opens first");
+        Assert.Equal<string>(OperationName(body[4_i64]), "BeginField", "the map field follows the optional field");
+        Assert.Equal<string>(LetCallee(body[5_i64]), "SortOrdinal", "the map field sorts its keys");
+    }
+
+    // Gap 3: payload field policies.
+    /// Asymmetric skip, a present default and a catch-all are rejected on variants.
+    test VariantPoliciesRejectInvalidCombinations {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType number = Syntax.Primitive(builder, PrimitiveType::I32);
+        Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [Flag(builder, "SkipSerialize")])])), "skip in one direction breaks positional payloads");
+        Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.Make"))])])), "present positional payload has no missing-value default");
+        Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", MapOf(builder, number), [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")])])), "payload fields cannot be catchalls");
+        SpannedAttributeArgument shared = Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "x"));
+        Assert.True(Results.IsError(Policies.Variant(builder, [PolicyField(builder, "a", number, [shared]), PolicyField(builder, "b", number, [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "x"))])])), "duplicate payload wire names reject");
+        match Policies.Variant(builder, [PolicyField(builder, "a", number, [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "renamed"))]), PolicyField(builder, "b", number, [Flag(builder, "SkipSerialize"), Flag(builder, "SkipDeserialize"), Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.Make"))])]) {
+            Result::Ok(policies) => {
+                Assert.Equal<string>(policies[0_i64].wireName, "renamed", "payload rename retained");
+                Assert.True(policies[1_i64].skipRead && policies[1_i64].skipWrite, "symmetric payload skip retained");
+            },
+            Result::Error(error) => { Assert.Fail(error.message); },
+        };
+    }
+
+    // Gap 6: missing canonical paths and node exhaustion are diagnostics, not panics.
+    test MissingCanonicalPathPlanIsAGenerationError {
+        Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64));
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
+        Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "SerializationCanonicalPath", "no path plan is reported, not panicked");
+        Assert.True(Results.IsError(Syntax.Status(builder)), "failure is sticky until rebind");
+        Syntax.Rebind(builder, Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64), FixturePaths());
+        Assert.True(Results.IsOk(Syntax.Status(builder)), "rebind starts the next target clean");
+        Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "", "rebound builder generates");
+    }
+
+    test AmbiguousCanonicalPathPlanIsAGenerationError {
+        mut Syntax.CanonicalPath[] paths = FixturePaths();
+        paths = Array.Append<Syntax.CanonicalPath>(paths, Route("Core.Results.Result", "OtherResult"));
+        Syntax.Builder builder = Syntax.CreateWithPaths(Semantic.SpanValue(1_u64, 40_u64, 1_u64, 1_u64, 1_u64, 40_u64), paths);
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
+        Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Counter"], []), [], fields, [Plain("count")]), "SerializationCanonicalPath", "ambiguous plan is reported");
+    }
+}
+
+mod PayloadEnumsTests
+{
+    // A payload enum emits the same encoder/decoder group shape as a record.
+    test EnumEmitsEncoderAndDecoderGroup {
+        Syntax.Builder builder = NewBuilder();
+        SpannedEnumVariant[] variants = [
+            Variant(builder, "Circle", [Syntax.DataField(builder, "radius", Syntax.Primitive(builder, PrimitiveType::F64))]),
+            Variant(builder, "Wrapped", [Syntax.DataField(builder, "inner", GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32)))]),
+            Variant(builder, "Empty", []),
+        ];
+        match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Shape"], []), [], variants, Payloads(variants), []) {
+            Result::Error(error) => { Assert.Fail(error.message); },
+            Result::Ok(target) => {
+                Assert.Equal<i64>(Array.Len(target.items), 5_i64, "enum encoder impl, three decoder items, field encoder factory");
+                Assert.Equal<u32>(target.encoderIndex, 0_u32, "encoder first");
+                Assert.Equal<u32>(target.decoderIndex, 3_u32, "decoder impl fourth");
+                Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
+                Assert.Equal<i64>(VariantReadSites(variants, Payloads(variants)), 1_i64, "one nominal payload reads through ReadField");
+            },
+        };
+    }
+
+    test EnumRejectsUnreadablePayloadType {
+        Syntax.Builder builder = NewBuilder();
+        SpannedEnumVariant[] variants = [Variant(builder, "Raw", [Syntax.DataField(builder, "address", Syntax.Primitive(builder, PrimitiveType::Pointer))])];
+        match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Handle"], []), [], variants, Payloads(variants), []) {
+            Result::Error(_) => { },
+            Result::Ok(_) => { Assert.Fail("raw pointer payload must fail before contribution"); },
+        };
+    }
+
+    test WordWidthAndBytesPoliciesApply {
+        Syntax.Builder builder = NewBuilder();
+        SpannedEnumVariant[] variants = [Variant(builder, "Sized", [Syntax.DataField(builder, "size", Syntax.Primitive(builder, PrimitiveType::Word))])];
+        Assert.Equal<string>(EnumError(builder, variants, Payloads(variants)), "SerializationWordWidth", "word payload without width rejects");
+        mut Read.FieldPolicy sized = Plain("size");
+        sized.wordWidth = 32_u8;
+        Assert.Equal<string>(EnumError(builder, variants, [Read.VariantPolicy { fields: [sized] }]), "", "declared payload word width generates");
+        SpannedEnumVariant[] blobs = [Variant(builder, "Blob", [Syntax.DataField(builder, "data", Syntax.ArrayType(builder, Syntax.Primitive(builder, PrimitiveType::U8)))])];
+        mut Read.FieldPolicy bytes = Plain("data");
+        bytes.bytes = true;
+        Assert.Equal<string>(EnumError(builder, blobs, [Read.VariantPolicy { fields: [bytes] }]), "", "bytes payload generates");
+        SpannedEnumVariant[] wrong = [Variant(builder, "Blob", [Syntax.DataField(builder, "data", Syntax.Primitive(builder, PrimitiveType::I32))])];
+        mut Read.FieldPolicy wrongBytes = Plain("data");
+        wrongBytes.bytes = true;
+        Assert.Equal<string>(EnumError(builder, wrong, [Read.VariantPolicy { fields: [wrongBytes] }]), "SerializationBytesType", "bytes policy on a non u8[] payload rejects");
+    }
+
+    test SkippedBothWaysUsesDefaultAndNeedsNoBinding {
+        Syntax.Builder builder = NewBuilder();
+        SpannedEnumVariant[] variants = [Variant(builder, "Wrapped", [Syntax.DataField(builder, "inner", GenericRecordOf(builder, Syntax.Primitive(builder, PrimitiveType::I32)))])];
+        mut Read.FieldPolicy skipped = Plain("inner");
+        skipped.skipRead = true;
+        skipped.skipWrite = true;
+        skipped.defaultFactory = OptionalSpannedPath::Some(Syntax.PathValue(builder, ["Defaults", "MakeInner"], []));
+        Assert.Equal<i64>(VariantReadSites(variants, [Read.VariantPolicy { fields: [skipped] }]), 0_i64, "skipped payload has no read site");
+        match Generation.Enumeration(builder, Syntax.PathValue(builder, ["Shape"], []), [], variants, [Read.VariantPolicy { fields: [skipped] }], []) {
+            Result::Ok(target) => { Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group"); },
+            Result::Error(error) => { Assert.Fail(error.message); },
+        };
+        mut Read.FieldPolicy missing = Plain("inner");
+        missing.skipRead = true;
+        missing.skipWrite = true;
+        Assert.Equal<string>(EnumError(builder, variants, [Read.VariantPolicy { fields: [missing] }]), "SerializationSkippedDefault", "skipped payload without factory rejects");
+        Assert.Equal<string>(EnumError(builder, variants, []), "SerializationFieldPolicy", "one policy group per variant");
+    }
+}
+
+mod SkipTests
+{
+    test DeserializeWithoutTypedDefaultFailsBeforeGeneration {
+        Syntax.Builder builder = NewBuilder();
+        SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32))];
+        mut Read.FieldPolicy policy = Plain("cache");
+        policy.skipRead = true;
+        Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Holder"], []), [], fields, [policy]), "SerializationSkippedDefault", "skipped read requires typed default factory");
+    }
+
+    /// A field skipped in both directions with a default needs no decoder binding.
+    test BothDirectionsNeedsNoDecoderBinding {
+        Syntax.Builder builder = NewBuilder();
+        SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
+        SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
+        mut Read.FieldPolicy skipped = Plain("cache");
+        skipped.skipRead = true;
+        skipped.skipWrite = true;
+        skipped.defaultFactory = OptionalSpannedPath::Some(Syntax.PathValue(builder, ["Defaults", "MakeCache"], []));
+        Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Holder"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [skipped, Plain("count")]);
+        Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 2_i64, "T and reader only");
+        Assert.Equal<i64>(TypeMembers(target.items[1_i64]), 1_i64, "only reader is a member");
+        Assert.Equal<i64>(ReadSites(fields, [skipped, Plain("count")], []), 0_i64, "a field skipped in both directions has no read site");
+    }
+
+    // A written skip-read field is recognised by wire name: duplicate check, read, discard, default later.
+    test DeserializeWrittenFieldIsConsumedAndDiscarded {
+        Syntax.Builder builder = NewBuilder();
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32))];
+        SpannedStatement[] loop = ReadLoop(builder, fields, [Plain("count"), SkippedRead(builder, "cache", true)], []);
+        Assert.Equal<i64>(Array.Len(loop), 7_i64, "name, found, count branch, cache branch, unknown check, end field, advance");
+        SpannedStatement[] branch = IfBody(loop[3_i64]);
+        Assert.Equal<i64>(Array.Len(branch), 4_i64, "duplicate check, discarded read, seen, found");
+        Assert.True(IsIf(branch[0_i64]), "present twice is DuplicateField");
+        Assert.True(IsExpressionStatement(branch[1_i64]), "the value is read and dropped, never stored in a slot");
+        Assert.True(IsExpressionStatement(IfBody(loop[2_i64])[0_i64]) == false, "ordinary field branch starts with its duplicate check");
+    }
+
+    // Absent: no wire branch exists for a field the encoder does not write; the default factory initialises it.
+    test BothDirectionsHasNoWireBranch {
+        Syntax.Builder builder = NewBuilder();
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32))];
+        SpannedStatement[] loop = ReadLoop(builder, fields, [Plain("count"), SkippedRead(builder, "cache", false)], []);
+        Assert.Equal<i64>(Array.Len(loop), 6_i64, "unwritten skipped field adds no wire branch");
+    }
+
+    test DeserializeWrittenFieldIsNotCapturedByCatchall {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
+        SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "extra", map)];
+        mut Read.FieldPolicy catchall = Plain("extra");
+        catchall.catchall = true;
+        SpannedStatement[] loop = ReadLoop(builder, fields, [SkippedRead(builder, "cache", true), catchall], sites);
+        Assert.Equal<i64>(Array.Len(loop), 8_i64, "name, found, cache branch, collision guard, catchall capture, unknown check, end field, advance");
+        Assert.True(IsExpressionStatement(IfBody(loop[2_i64])[1_i64]), "cache is discarded before the catchall can see it");
+    }
+
+    /// A written field skipped on deserialize still needs the decoder binding of its nominal type.
+    test DeserializeStillBindsTheDecoder {
+        Syntax.Builder builder = NewBuilder();
+        SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
+        SpannedField[] fields = [Syntax.DataField(builder, "cache", Syntax.Named(builder, ["T"], []))];
+        Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Holder"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [SkippedRead(builder, "cache", true)]);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
+        Assert.Equal<i64>(ReadSites(fields, [SkippedRead(builder, "cache", true)], []), 1_i64, "a consumed nominal value reads through ReadField like any read");
+    }
+
+    test SerializeRemovesParameterBoundFromEncoder {
+        Syntax.Builder builder = NewBuilder();
+        SpannedIdentifier t = Syntax.IdentifierValue(builder, "T");
+        SpannedField[] fields = [Syntax.DataField(builder, "secret", Syntax.Named(builder, ["T"], [])), Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32))];
+        mut Read.FieldPolicy skipped = Plain("secret");
+        skipped.skipWrite = true;
+        Generation.GeneratedTarget target = Record(builder, Syntax.PathValue(builder, ["Vault"], [Syntax.Named(builder, ["T"], [])]), [t], fields, [skipped, Plain("count")]);
+        Assert.Equal<i64>(ImplBounds(target.items[0_i64]), 1_i64, "unwritten T needs no Serializable bound");
+        Assert.Equal<i64>(ReadSites(fields, [skipped, Plain("count")], []), 1_i64, "decoder still reads T");
+    }
+}
+
+mod PoliciesTests
+{
+    test PolicyCountMismatchFailsClosed {
+        Syntax.Builder builder = NewBuilder();
+        SpannedField[] fields = [Syntax.DataField(builder, "a", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "b", Syntax.Primitive(builder, PrimitiveType::I32))];
+        Assert.Equal<string>(RecordError(builder, Syntax.PathValue(builder, ["Pair"], []), [], fields, [Plain("a")]), "SerializationFieldPolicy", "one policy per field");
+    }
+
+    // Policy validation through the real Policies entry points.
+    test PoliciesRejectConflictingWireNamesUnlessDirectionsDiffer {
+        Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
+        mut SpannedField first = Syntax.DataField(builder, "first", Syntax.Primitive(builder, PrimitiveType::I32));
+        mut SpannedField second = Syntax.DataField(builder, "second", Syntax.Primitive(builder, PrimitiveType::I32));
+        first.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "shared"))])] };
+        second.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "shared"))])] };
+        Assert.True(Results.IsError(Policies.Fields(builder, [first, second])), "same wire name in both directions conflicts");
+        second.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [
+            Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "shared")),
+            Syntax.AttributeArgumentValue(builder, "SkipSerialize", Syntax.LiteralValue(builder, Literal::Bool(true))),
+            Syntax.AttributeArgumentValue(builder, "SkipDeserialize", Syntax.LiteralValue(builder, Literal::Bool(true))),
+            Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.MakeSecond")),
+        ])] };
+        Assert.True(Results.IsOk(Policies.Fields(builder, [first, second])), "a field skipped in both directions cannot conflict");
+    }
+
+    test PoliciesRejectInvalidLiteralsAndUnknownArguments {
+        Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
+        mut SpannedField field = Syntax.DataField(builder, "value", Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedAttributeArgument[] cases = [
+            Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "")),
+            Syntax.AttributeArgumentValue(builder, "Name", Syntax.LiteralValue(builder, Literal::Bool(true))),
+            Syntax.AttributeArgumentValue(builder, "SkipSerialize", Syntax.Text(builder, "true")),
+            Syntax.AttributeArgumentValue(builder, "WordWidth", Syntax.LiteralValue(builder, Literal::Integer("7_u8"))),
+            Syntax.AttributeArgumentValue(builder, "WordWidth", Syntax.LiteralValue(builder, Literal::Integer("128_u8"))),
+            Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults..Make")),
+            Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "1Defaults.Make")),
+            Syntax.AttributeArgumentValue(builder, "Unknown", Syntax.Text(builder, "x")),
+        ];
+        mut i64 index = 0_i64;
+        while (index < 8_i64) {
+            field.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [cases[index]])] };
+            Assert.True(Results.IsError(Policies.Field(builder, field)), "invalid SerializeField policy rejects");
+            index = index + 1_i64;
+        }
+    }
+
+    test PolicyWordWidthLiteralAcceptsOnlyDeclaredWidths {
+        Syntax.Builder builder = Syntax.Create(Semantic.SpanValue(1_u64, 9_u64, 1_u64, 1_u64, 1_u64, 9_u64));
+        mut SpannedField field = Syntax.DataField(builder, "value", Syntax.Primitive(builder, PrimitiveType::Word));
+        string[] literals = ["8_u8", "16_u8", "32_u8", "64_u8"];
+        u8[] widths = [8_u8, 16_u8, 32_u8, 64_u8];
+        mut i64 index = 0_i64;
+        while (index < 4_i64) {
+            field.node.attributes = SpannedAttributeList { items: [Syntax.AttributeValue(builder, "SerializeField", [Syntax.AttributeArgumentValue(builder, "WordWidth", Syntax.LiteralValue(builder, Literal::Integer(literals[index])))])] };
+            match Policies.Field(builder, field) {
+                Result::Ok(policy) => { Assert.Equal<u8>(policy.wordWidth, widths[index], "declared word width retained"); },
+                Result::Error(_) => { Assert.Fail("declared word width must parse"); },
+            };
+            index = index + 1_i64;
+        }
+    }
+}
+
+mod ContainersTests
+{
+    // Gap 2: proven Foundation containers are read and written by the generated
+    // adapter itself; only their non-primitive elements need typed bindings.
+    test SitesDispatchListMapAndOptionalReads {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType list = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::String));
+        SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::I64));
+        Read.ContainerSite[] sites = [
+            Site(list, Read.ContainerKind::Sequence, Syntax.Primitive(builder, PrimitiveType::I32)),
+            Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::String)),
+            Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I64)),
+        ];
+        match Read.Value(builder, list, 0_u8, false, PlanFor(builder, sites), 0_i64) {
+            Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 6_i64, "list: count, limit, accumulator, index, loop, end"); },
+            Result::Error(error) => { Assert.Fail(error.code); },
+        };
+        match Read.Value(builder, map, 0_u8, false, PlanFor(builder, sites), 0_i64) {
+            Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 6_i64, "map: count, limit, accumulator, index, loop, end"); },
+            Result::Error(error) => { Assert.Fail(error.code); },
+        };
+        match Read.Value(builder, option, 0_u8, false, PlanFor(builder, sites), 0_i64) {
+            Result::Ok(body) => { Assert.Equal<i64>(Array.Len(body.statements), 4_i64, "optional: presence, slot, branch, end"); },
+            Result::Error(error) => { Assert.Fail(error.code); },
+        };
+    }
+
+    test FieldsBindOnlyTheirNominalElements {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType primitiveList = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedType item = Syntax.Named(builder, ["Item"], []);
+        SpannedType nominalList = ListOf(builder, item);
+        SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::Bool));
+        SpannedField[] fields = [Syntax.DataField(builder, "numbers", primitiveList), Syntax.DataField(builder, "items", nominalList), Syntax.DataField(builder, "flag", option)];
+        Read.ContainerSite[] sites = [
+            Site(primitiveList, Read.ContainerKind::Sequence, Syntax.Primitive(builder, PrimitiveType::I32)),
+            Site(nominalList, Read.ContainerKind::Sequence, item),
+            Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::Bool)),
+        ];
+        Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Bag"], []), [], fields, [Plain("numbers"), Plain("items"), Plain("flag")], sites);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
+        Assert.Equal<i64>(TypeGenerics(target.items[1_i64]), 1_i64, "the adapter is generic only over its reader");
+        Assert.Equal<i64>(ReadSites(fields, [Plain("numbers"), Plain("items"), Plain("flag")], sites), 1_i64, "only the Item element reads through ReadField");
+    }
+
+    test WritesListOptionalAndOrdinalMap {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType list = ListOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedType option = OptionOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        Read.ContainerSite[] sites = [
+            Site(list, Read.ContainerKind::Sequence, Syntax.Primitive(builder, PrimitiveType::I32)),
+            Site(option, Read.ContainerKind::Optional, Syntax.Primitive(builder, PrimitiveType::I32)),
+            Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32)),
+        ];
+        match Write.Value(builder, list, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, sites), 0_i64) {
+            Result::Ok(statements) => { Assert.Equal<i64>(Array.Len(statements), 5_i64, "count, begin, index, loop, end"); },
+            Result::Error(error) => { Assert.Fail(error.code); },
+        };
+        match Write.Value(builder, option, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, sites), 0_i64) {
+            Result::Ok(statements) => { Assert.Equal<i64>(Array.Len(statements), 1_i64, "one presence match"); },
+            Result::Error(error) => { Assert.Fail(error.code); },
+        };
+        match Write.Value(builder, map, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, sites), 0_i64) {
+            Result::Ok(statements) => {
+                Assert.Equal<i64>(Array.Len(statements), 6_i64, "sorted keys, count, begin, index, loop, end");
+                Assert.Equal<string>(LetCallee(statements[0_i64]), "SortOrdinal", "keys are sorted through the issued ordinal route");
+                Assert.Equal<string>(LetCallee(statements[1_i64]), "Len", "entry count is the sorted key count");
+                Assert.Equal<string>(OperationName(statements[2_i64]), "BeginMap", "map frame opens after the key snapshot");
+                Assert.Equal<string>(OperationName(statements[5_i64]), "EndMap", "map frame closes after the entries");
+                SpannedStatement[] entry = WhileBody(statements[4_i64]);
+                Assert.Equal<i64>(Array.Len(entry), 5_i64, "key, begin entry, value match, end entry, advance");
+                Assert.Equal<string>(OperationName(entry[1_i64]), "BeginMapEntry", "each entry is keyed");
+                Assert.Equal<string>(OperationName(entry[3_i64]), "EndMapEntry", "each entry is closed");
+            },
+            Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
+        };
+        Assert.True(Results.IsOk(Syntax.Status(builder)), "every map write path is planned");
+    }
+}
+
+mod CatchallTests
+{
+    // Gap 4: issued Map<string,V> catchall.
+    test PolicyIsExclusiveAndNotAWireField {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        match Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")])) {
+            Result::Ok(policy) => { Assert.True(policy.catchall && policy.skipWrite && !policy.skipRead, "catchall captures on decode only"); },
+            Result::Error(error) => { Assert.Fail(error.message); },
+        };
+        match Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall")])) {
+            Result::Ok(policy) => { Assert.True(policy.catchall && !policy.skipWrite && !policy.skipRead, "catchall without SkipSerialize is encoded and decoded"); },
+            Result::Error(error) => { Assert.Fail(error.message); },
+        };
+        Assert.True(Results.IsError(Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "x"))]))), "catchall has no wire name");
+        Assert.True(Results.IsError(Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "Bytes")]))), "catchall has no bytes policy");
+        Assert.True(Results.IsError(Policies.Field(builder, PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "SkipDeserialize"), Syntax.AttributeArgumentValue(builder, "Default", Syntax.Text(builder, "Defaults.Make"))]))), "a skipped catchall would silently close the record");
+        SpannedField first = PolicyField(builder, "extra", map, [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")]);
+        SpannedField second = PolicyField(builder, "more", MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32)), [Flag(builder, "Catchall"), Flag(builder, "SkipSerialize")]);
+        Assert.True(Results.IsError(Policies.Fields(builder, [first, second])), "at most one catchall");
+        SpannedField declared = PolicyField(builder, "named", Syntax.Primitive(builder, PrimitiveType::I32), [Syntax.AttributeArgumentValue(builder, "Name", Syntax.Text(builder, "extra"))]);
+        Assert.True(Results.IsOk(Policies.Fields(builder, [first, declared])), "catchall source name is not a wire name");
+    }
+
+    test RecordReadsUnknownFieldsAsItsValueType {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType item = Syntax.Named(builder, ["Item"], []);
+        SpannedType map = MapOf(builder, item);
+        Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, item)];
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "extra", map)];
+        mut Read.FieldPolicy catchall = Plain("extra");
+        catchall.catchall = true;
+        catchall.skipWrite = true;
+        Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall], sites);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "complete contribution group");
+        Assert.Equal<i64>(ReadSites(fields, [Plain("count"), catchall], sites), 1_i64, "unknown fields read their catchall value V through ReadField");
+    }
+
+    test FailsClosedWithoutMapProof {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        SpannedField[] fields = [Syntax.DataField(builder, "extra", map)];
+        mut Read.FieldPolicy catchall = Plain("extra");
+        catchall.catchall = true;
+        catchall.skipWrite = true;
+        Assert.Equal<string>(RecordErrorWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [catchall], []), "SerializationCatchallType", "Map spelling without semantic proof rejects");
+        mut Read.FieldPolicy flattened = Plain("extra");
+        flattened.catchall = true;
+        Assert.Equal<string>(RecordErrorWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [flattened], []), "SerializationCatchallType", "an encoded catchall also needs the Map proof");
+    }
+
+    test FlattensAfterDeclaredFieldsInOrdinalOrder {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
+        SpannedField[] fields = [
+            Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)),
+            Syntax.DataField(builder, "extra", map),
+            Syntax.DataField(builder, "hidden", Syntax.Primitive(builder, PrimitiveType::I32)),
+        ];
+        mut Read.FieldPolicy catchall = Plain("extra");
+        catchall.catchall = true;
+        mut Read.FieldPolicy hidden = Plain("hidden");
+        hidden.skipWrite = true;
+        Generation.GeneratedTarget target = RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall, hidden], sites);
+        Assert.Equal<i64>(Array.Len(target.items), 5_i64, "encoded catchall completes the contribution group");
+        SpannedStatement[] body = EncoderBody(target);
+        Assert.Equal<i64>(Array.Len(body), 10_i64, "keys, count, begin, declared field (3), index, catchall loop, end, return");
+        Assert.Equal<string>(LetCallee(body[0_i64]), "SortOrdinal", "catchall keys are sorted before the record opens");
+        Assert.Equal<string>(OperationName(body[2_i64]), "BeginRecord", "record opens after the key snapshot");
+        Assert.True(DynamicCount(body[2_i64]), "record field count adds the catchall entry count");
+        Assert.Equal<string>(OperationName(body[3_i64]), "BeginField", "declared field is written first");
+        Assert.Equal<string>(OperationName(body[8_i64]), "EndRecord", "catchall entries precede the record end");
+        SpannedStatement[] entry = WhileBody(body[7_i64]);
+        Assert.Equal<i64>(Array.Len(entry), 7_i64, "key, two collision checks, begin field, value match, end field, advance");
+        Assert.True(IsIf(entry[1_i64]) && IsIf(entry[2_i64]), "every declared wire name, written or skipped, is reserved");
+        Assert.Equal<string>(OperationName(entry[3_i64]), "BeginField", "catchall entry is a flattened record field");
+        Assert.Equal<string>(OperationName(entry[5_i64]), "EndField", "flattened field is closed");
+        Assert.True(Results.IsOk(Syntax.Status(builder)), "every catchall write path is planned");
+    }
+
+    test WithSkipSerializeStaysDecodeOnly {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType map = MapOf(builder, Syntax.Primitive(builder, PrimitiveType::I32));
+        Read.ContainerSite[] sites = [Site(map, Read.ContainerKind::Mapping, Syntax.Primitive(builder, PrimitiveType::I32))];
+        SpannedField[] fields = [Syntax.DataField(builder, "count", Syntax.Primitive(builder, PrimitiveType::I32)), Syntax.DataField(builder, "extra", map)];
+        mut Read.FieldPolicy catchall = Plain("extra");
+        catchall.catchall = true;
+        catchall.skipWrite = true;
+        SpannedStatement[] body = EncoderBody(RecordWith(builder, Syntax.PathValue(builder, ["Open"], []), [], fields, [Plain("count"), catchall], sites));
+        Assert.Equal<i64>(Array.Len(body), 6_i64, "begin, declared field (3), end, return: no catchall entries");
+        Assert.False(DynamicCount(body[0_i64]), "record field count is the declared count");
+    }
+}
+
+mod NominalFieldsTests
+{
+    // Typed field decoder factory correspondence: a nominal field reads through ReadField<F, R>.
+    test ReadsThroughIssuedFieldDecoderCorrespondence {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType point = Syntax.Named(builder, ["Point"], []);
+        SpannedType reader = Syntax.Named(builder, ["R"], []);
+        Read.NominalBinding binding = Read.NominalBinding { ty: point, factory: Syntax.CorePath(builder, ["Serialization", "Reader", "ReadField"], [point, reader]) };
+        match Read.Value(builder, point, 0_u8, false, Read.Plan([binding], [], Syntax.PathValue(builder, ["Result"], [])), 0_i64) {
+            Result::Ok(body) => {
+                Assert.Equal<i64>(Array.Len(body.statements), 0_i64, "a nominal read is a single call");
+                Assert.Equal<string>(PropagatedCallee(body.value), "ReadField", "the read calls the canonical ReadField");
+                Assert.Equal<i64>(PropagatedCalleeTypeArguments(body.value), 2_i64, "ReadField is applied to the exact field type and reader");
+            },
+            Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
+        };
+        Assert.True(Results.IsOk(Syntax.Status(builder)), "ReadField has a compiler-issued canonical path plan");
+        match Read.Value(builder, Syntax.Named(builder, ["Other"], []), 0_u8, false, Read.Plan([binding], [], Syntax.PathValue(builder, ["Result"], [])), 0_i64) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationReadBinding", "a site without its own binding rejects"); },
+            Result::Ok(_) => { Assert.Fail("another declared site must not borrow a binding"); },
+        };
+    }
+
+    // Typed field codec correspondence: a nominal field writes through WriteField<F, E>.
+    test WritesThroughIssuedFieldCodecCorrespondence {
+        Syntax.Builder builder = NewBuilder();
+        SpannedType point = Syntax.Named(builder, ["Point"], []);
+        SpannedType encoder = Syntax.Named(builder, ["E"], []);
+        match Write.Value(builder, point, Syntax.Local(builder, "value"), 0_u8, Read.EncoderPlan([], Syntax.PathValue(builder, ["Result"], []), encoder), 0_i64) {
+            Result::Ok(statements) => {
+                Assert.Equal<i64>(Array.Len(statements), 1_i64, "a nominal write is a single call");
+                match statements[0_i64].node {
+                    Statement::Expression(expression) => {
+                        Assert.Equal<string>(PropagatedCallee(expression.node.expression), "WriteField", "the write calls the canonical WriteField");
+                        Assert.Equal<i64>(PropagatedCalleeTypeArguments(expression.node.expression), 2_i64, "WriteField is applied to the exact field type and encoder");
+                    },
+                    _ => { Assert.Fail("a nominal write is an expression statement"); },
+                };
+            },
+            Result::Error(error) => { Assert.Fail(error.code + ": " + error.message); },
+        };
+        match Write.Value(builder, point, Syntax.Local(builder, "value"), 0_u8, PlanFor(builder, []), 0_i64) {
+            Result::Error(error) => { Assert.Equal<string>(error.code, "SerializationWriteBinding", "a read plan cannot write a nominal field"); },
+            Result::Ok(_) => { Assert.Fail("a nominal write requires its encoder"); },
+        };
+    }
 }

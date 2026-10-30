@@ -14,8 +14,6 @@ use Core.Bsol.Syntax;
 use Core.String;
 use Core.Output;
 
-// ---- Schema Structured ----
-
 string ReadStructured(string name)
 {
     match (Environment.Get("BESKID_BSOL_CORPUS"))
@@ -90,108 +88,6 @@ unit RejectStructured(string name, string code, string field)
         },
     };
 }
-
-/// @native-only
-test BsolSchemaCompoundTypesHaveCheckedStructuralArena
-{
-    match (Schema.ParseProfile(ReadStructured("profile"), Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("parameterized profile compiles"),
-
-        Result::Ok(profile) => {
-            Schema.Rule config = profile.rules[profile.roots[0]];
-            Schema.TypeExpression list = profile.types[config.fields[1].typeIndex];
-            Assert.True(match (list.kind)
-            {
-                Schema.TypeKind::List => true,
-
-                _ => false,
-            }, "list type has structural kind");
-            Assert.Equal(Array.Len<i64>(list.children), 2_i64, "list union has two checked type alternatives");
-            Schema.TypeExpression map = profile.types[config.fields[2].typeIndex];
-            Assert.True(match (map.kind)
-            {
-                Schema.TypeKind::Map => true,
-
-                _ => false,
-            }, "map type has structural kind");
-            Assert.Equal(Array.Len<i64>(map.children), 2_i64, "map key/value types bound separately");
-            Assert.Equal(profile.types[config.fields[3].typeIndex].targetRule, "item", "inline binds declared rule");
-            Assert.Equal(profile.types[config.fields[4].typeIndex].targetRule, "item", "reference binds declared rule");
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaValidUnionMapInlineReferenceAndLocalAttributes
-{
-    match (CheckStructured("valid"))
-    {
-        Result::Error(_) => Assert.Fail("full structured valid fixture validates natively"),
-
-        Result::Ok(document) => {
-            Assert.Equal(document.profile, "structured.v2", "profile identity retained");
-            Assert.True(Array.Len<Schema.RuleBinding>(document.rules) >= 3_i64, "inline block also receives checked rule binding");
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaUnionListAndMapValuesCheckEachElement
-{
-    RejectStructured("bad-list", "TypeMismatch", "items");
-
-    RejectStructured("bad-map", "TypeMismatch", "scores");
-}
-
-/// @native-only
-test BsolSchemaInlineFieldsAndReferenceQualifierAreChecked
-{
-    RejectStructured("bad-inline", "TypeMismatch", "name");
-
-    RejectStructured("bad-ref-kind", "TypeMismatch", "target");
-}
-
-/// @native-only
-test BsolSchemaBlockAndFieldAttributeAllowlistsAreLocal
-{
-    RejectStructured("bad-block-attr", "UnknownAttribute", "");
-
-    RejectStructured("bad-field-attr", "UnknownAttribute", "title");
-}
-
-/// @native-only
-test BsolSchemaUnknownUnionAlternativeRejectsProfile
-{
-    match (Schema.ParseProfile(ReadStructured("bad-type"), Limits.DefaultLimits()))
-    {
-        Result::Ok(_) => Assert.Fail("unknown nested type cannot publish checked profile"),
-
-        Result::Error(errors) => {
-            mut bool found = false;
-            mut i64 i = 0_i64;
-            while (i < Array.Len<Schema.Diagnostic>(errors))
-            {
-                if (errors[i].code == "UnknownFieldType" && errors[i].field == "items")
-                {
-                    found = true;
-                }
-                i = i + 1_i64;
-            }
-            Assert.True(found, "unknown union type identified at profile boundary");
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaAbsentAttributeAllowlistsRejectUnlistedAttributes
-{
-    RejectStructured("bad-empty-block-attr", "UnknownAttribute", "");
-
-    RejectStructured("bad-empty-field-attr", "UnknownAttribute", "items");
-}
-
-// ---- Schema Constraint ----
 
 /// Shared native/Rust constraint cases. Runner supplies the common corpus root.
 string ReadCase(string name)
@@ -307,85 +203,6 @@ unit RejectCase(string name, string code, string field)
     };
 }
 
-/// @native-only
-test BsolSchemaMissingOnlyDefaultsRemainTyped
-{
-    match (CheckCase("defaults"))
-    {
-        Result::Error(_) => Assert.Fail("valid defaults satisfy declared required field and variant payload"),
-
-        Result::Ok(document) => {
-            CheckBoundValue(document, "count", "3", true, true);
-            CheckBoundValue(document, "name", "default-name", true, false);
-            CheckBoundValue(document, "rev", "head", true, false);
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaSuppliedValuesOverrideDefaultsAtNumericBoundary
-{
-    match (CheckCase("override"))
-    {
-        Result::Error(_) => Assert.Fail("declared max boundary and explicit values validate"),
-
-        Result::Ok(document) => {
-            CheckBoundValue(document, "count", "5", false, true);
-            CheckBoundValue(document, "name", "explicit", false, false);
-            CheckBoundValue(document, "rev", "exact", false, false);
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaNumericLimitsRejectOutsideBoundaries
-{
-    RejectCase("below-min", "BelowMinimum", "count");
-
-    RejectCase("above-max", "AboveMaximum", "count");
-}
-
-/// @native-only
-test BsolSchemaActualInlineMapConditionalConstraints
-{
-    RejectCase("required-if", "RequiredIf", "url");
-
-    RejectCase("forbid-if", "ForbiddenIf", "url");
-}
-
-/// @native-only
-test BsolSchemaVariantsRequirePayloadAndKnownDiscriminant
-{
-    RejectCase("variant-missing", "VariantRequiredField", "path");
-
-    RejectCase("variant-unknown", "UnknownVariant", "source");
-}
-
-/// @native-only
-test BsolSchemaInvalidTypedDefaultRejectsProfile
-{
-    match (Schema.ParseProfile(ReadCase("invalid-default"), Limits.DefaultLimits()))
-    {
-        Result::Ok(_) => Assert.Fail("default must type check before profile publication"),
-
-        Result::Error(errors) => {
-            mut bool found = false;
-            mut i64 i = 0_i64;
-            while (i < Array.Len<Schema.Diagnostic>(errors))
-            {
-                if (errors[i].code == "InvalidDefault" && errors[i].field == "name")
-                {
-                    found = true;
-                }
-                i = i + 1_i64;
-            }
-            Assert.True(found, "invalid typed default identified at profile boundary");
-        },
-    };
-}
-
-// ---- Schema Pattern ----
-
 string ReadPattern(string name, string part)
 {
     match (Environment.Get("BESKID_BSOL_CORPUS"))
@@ -494,155 +311,6 @@ unit CheckPatternPolicy(string pattern, string value, i64 subject, i64 work, i64
     };
 }
 
-/// @native-only
-test BsolPatternSharedAcceptedGrammar
-{
-    CheckPatternCase("anchored-match", "ok");
-
-    CheckPatternCase("prefix-match", "ok");
-
-    CheckPatternCase("alternation", "ok");
-
-    CheckPatternCase("group-plus", "ok");
-
-    CheckPatternCase("class-range", "ok");
-
-    CheckPatternCase("negated-class", "ok");
-
-    CheckPatternCase("escaped-digit", "ok");
-
-    CheckPatternCase("escaped-literal", "ok");
-
-    CheckPatternCase("grammar-escaped-brace", "ok");
-
-    CheckPatternCase("quantified-sequence-backtrack", "ok");
-
-    CheckPatternCase("optional-zero-occurrence", "ok");
-
-    CheckPatternCase("star-zero-occurrence", "ok");
-}
-
-/// @native-only
-test BsolPatternSharedNonemptyStartzeroRejections
-{
-    CheckPatternCase("anchored-reject", "PatternMismatch");
-
-    CheckPatternCase("substring-reject", "PatternMismatch");
-
-    CheckPatternCase("empty-match-reject", "PatternMismatch");
-}
-
-/// @native-only
-test BsolPatternSharedInvalidUnsupportedGrammar
-{
-    CheckPatternCase("invalid-open-group", "InvalidPattern");
-
-    CheckPatternCase("invalid-empty-alternative", "InvalidPattern");
-
-    CheckPatternCase("unsupported-lookaround", "InvalidPattern");
-
-    CheckPatternCase("unsupported-backreference", "InvalidPattern");
-
-    CheckPatternCase("unsupported-counted", "InvalidPattern");
-}
-
-/// @native-only
-test BsolPatternSharedSubjectExactLimit
-{
-    CheckPatternCase("subject-at-limit", "ok");
-}
-
-/// @native-only
-test BsolPatternSharedSubjectOverLimit
-{
-    CheckPatternCase("subject-over-limit", "PatternSubjectLimit");
-}
-
-/// @native-only
-test BsolPatternSharedNestedDefaultWorkLimit
-{
-    CheckPatternCase("nested-work-limit", "PatternWorkLimit");
-}
-
-/// @native-only
-test BsolPatternSharedUnicodeScalarGrammar
-{
-    CheckPatternCase("unicode-dot-accent", "ok");
-
-    CheckPatternCase("unicode-dot-astral", "ok");
-
-    CheckPatternCase("unicode-class-accent", "ok");
-
-    CheckPatternCase("unicode-class-range", "ok");
-
-    CheckPatternCase("unicode-class-astral-range", "ok");
-
-    CheckPatternCase("unicode-reject-two-scalars", "PatternMismatch");
-
-    CheckPatternCase("unicode-class-reject", "PatternMismatch");
-}
-
-/// @native-only
-test BsolPatternCallerWorkAndDepthLimits
-{
-    CheckPatternPolicy("^abc$", "abc", 1048576_i64, 2_i64, 64_i64, "PatternWorkLimit");
-
-    CheckPatternPolicy("^abc$", "abc", 1048576_i64, 100_i64, 64_i64, "ok");
-
-    CheckPatternPolicy("((abc))", "abc", 1048576_i64, 100_i64, 1_i64, "PatternDepthLimit");
-
-    CheckPatternPolicy("abc", "abc", 1048576_i64, 0_i64, 64_i64, "PatternWorkLimit");
-}
-
-/// @native-only
-test BsolPatternUnicodeSubjectLimitCountsBytes
-{
-    CheckPatternPolicy("^.$", "😀", 4_i64, 100_i64, 64_i64, "ok");
-
-    CheckPatternPolicy("^.$", "😀", 3_i64, 100_i64, 64_i64, "PatternSubjectLimit");
-
-    CheckPatternPolicy("^.$", "é", 2_i64, 100_i64, 64_i64, "ok");
-
-    CheckPatternPolicy("^.$", "é", 1_i64, 100_i64, 64_i64, "PatternSubjectLimit");
-}
-
-/// @native-only
-test BsolPatternUnicodeFailureHasExactUtf8AssignmentSpan
-{
-    string source = ReadPattern("unicode-reject-two-scalars", "input");
-
-    match (Schema.ParseProfile(ReadPattern("unicode-reject-two-scalars", "profile"), Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("Unicode pattern profile valid"),
-
-        Result::Ok(profile) => match (Parser.Parse(source, Limits.DefaultLimits()))
-        {
-            Result::Error(_) => Assert.Fail("Unicode subject parses"),
-
-            Result::Ok(document) => match (Schema.Validate(document, profile, Limits.DefaultLimits()))
-            {
-                Result::Ok(_) => Assert.Fail("two scalars rejected"),
-
-                Result::Error(errors) => {
-                    mut bool found = false;
-                    mut i64 i = 0_i64;
-                    while (i < Array.Len<Schema.Diagnostic>(errors))
-                    {
-                        Schema.Diagnostic error = errors[i];
-                        if (error.code == "PatternMismatch")
-                        {
-                            found = true;
-                            Assert.Equal(String.SubSlice(source, error.span.start, error.span.end - error.span.start), "value = \"é😀\"", "exact complete UTF8 assignment boundary");
-                        }
-                        i = i + 1_i64;
-                    }
-                    Assert.True(found, "Unicode mismatch diagnostic");
-                },
-            },
-        },
-    };
-}
-
 unit CheckPatternDocumentPolicy(string profileSource, string input, i64 work, string outcome)
 {
     match (Schema.ParseProfile(profileSource, Limits.DefaultLimits()))
@@ -675,45 +343,6 @@ unit CheckPatternDocumentPolicy(string profileSource, string input, i64 work, st
         },
     };
 }
-
-/// @native-only
-test BsolPatternCallerBudgetIsSharedThroughInlineAndDefaults
-{
-    CheckPatternPolicy("abcdefgh", "abcdefgh", 1048576_i64, 50_i64, 64_i64, "ok");
-
-    string profile = "profile \"limits.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"first\" { type = quoted pattern = \"abcdefgh\" required = true } field \"inside\" { type = inline(holder) required = true } } rule \"holder\" { match = keyword keyword = holder label = forbidden cardinality = many field \"second\" { type = quoted pattern = \"abcdefgh\" required = true } } }";
-
-    string input = "config { first = \"abcdefgh\" inside = holder { second = \"abcdefgh\" } }";
-
-    CheckPatternDocumentPolicy(profile, input, 50_i64, "PatternWorkLimit");
-
-    CheckPatternDocumentPolicy(profile, input, 1000_i64, "ok");
-
-    string defaults = "profile \"limits.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"first\" { type = quoted pattern = \"abcdefgh\" default = \"abcdefgh\" } field \"second\" { type = quoted pattern = \"abcdefgh\" default = \"abcdefgh\" } } }";
-
-    CheckPatternDocumentPolicy(defaults, "config {}", 50_i64, "PatternWorkLimit");
-}
-
-/// @native-only
-test BsolPatternInvalidCallerLimitsRejectChecked
-{
-    CheckPatternPolicy("abc", "abc", 1048576_i64, -1_i64, 64_i64, "InvalidPatternLimits");
-
-    CheckPatternPolicy("abc", "abc", 1048576_i64, 100_i64, 9223372036854775807_i64, "InvalidPatternLimits");
-}
-
-test BsolPatternClassWorkCountsInspectedRangesAndInitialAccept
-{
-    CheckPatternPolicy("[abc]", "a", 1048576_i64, 11_i64, 64_i64, "ok");
-
-    CheckPatternPolicy("[abc]", "a", 1048576_i64, 10_i64, 64_i64, "PatternWorkLimit");
-
-    CheckPatternPolicy("[abc]", "c", 1048576_i64, 13_i64, 64_i64, "ok");
-
-    CheckPatternPolicy("[abc]", "c", 1048576_i64, 12_i64, 64_i64, "PatternWorkLimit");
-}
-
-// ---- Schema Composition ----
 
 string ReadComposition(string name)
 {
@@ -831,262 +460,637 @@ unit RejectReference(string name, string code, bool related)
     };
 }
 
-/// @native-only
-test BsolSchemaIdenticalDiamondComposesOnce
+mod StructureTests
 {
-    match (Schema.ParseProfile(ReadComposition("diamond-profile"), Limits.DefaultLimits()))
+    /// @native-only
+    test CompoundTypesHaveCheckedStructuralArena
     {
-        Result::Error(_) => Assert.Fail("identical diamond composes"),
-
-        Result::Ok(profile) => match (Schema.Compose(profile, Limits.DefaultLimits()))
+        match (Schema.ParseProfile(ReadStructured("profile"), Limits.DefaultLimits()))
         {
-            Result::Error(_) => Assert.Fail("composition is checked and idempotent"),
+            Result::Error(_) => Assert.Fail("parameterized profile compiles"),
 
-            Result::Ok(composed) => {
-                Schema.Rule leaf = composed.rules[3];
-                Assert.Equal(Array.Len<Schema.Field>(leaf.fields), 2_i64, "diamond base field occurs once");
-                Assert.Equal(leaf.fields[0].name, "name", "base ordering precedes local fields");
-                Assert.Equal(leaf.fields[1].name, "count", "local field order retained");
-                Assert.True(leaf.fields[0].span.end > leaf.fields[0].span.start, "inherited field retains origin span");
+            Result::Ok(profile) => {
+                Schema.Rule config = profile.rules[profile.roots[0]];
+                Schema.TypeExpression list = profile.types[config.fields[1].typeIndex];
+                Assert.True(match (list.kind)
+                {
+                    Schema.TypeKind::List => true,
+
+                    _ => false,
+                }, "list type has structural kind");
+                Assert.Equal(Array.Len<i64>(list.children), 2_i64, "list union has two checked type alternatives");
+                Schema.TypeExpression map = profile.types[config.fields[2].typeIndex];
+                Assert.True(match (map.kind)
+                {
+                    Schema.TypeKind::Map => true,
+
+                    _ => false,
+                }, "map type has structural kind");
+                Assert.Equal(Array.Len<i64>(map.children), 2_i64, "map key/value types bound separately");
+                Assert.Equal(profile.types[config.fields[3].typeIndex].targetRule, "item", "inline binds declared rule");
+                Assert.Equal(profile.types[config.fields[4].typeIndex].targetRule, "item", "reference binds declared rule");
             },
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaCompositionCycleAndUnknownBaseReject
-{
-    RejectComposition("cycle-profile", "CompositionCycle", false);
-
-    RejectComposition("unknown-base-profile", "UnknownBaseRule", false);
-}
-
-/// @native-only
-test BsolSchemaIncompatibleOverlayRetainsBothDefinitions
-{
-    RejectComposition("conflict-profile", "CompositionConflict", true);
-
-    RejectComposition("label-conflict-profile", "CompositionConflict", true);
-}
-
-/// @native-only
-test BsolSchemaReferenceResolvesToDocumentOwnedIndex
-{
-    match (CheckReference("reference-valid"))
-    {
-        Result::Error(_) => Assert.Fail("qualified reference resolves"),
-
-        Result::Ok(document) => {
-            Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "one checked reference link");
-            Schema.ReferenceBinding link = document.references[0];
-            match (link.origin)
-            {
-                Schema.ReferenceOrigin::DocumentNode(index) => Assert.True(index >= 0_i64 && index < Array.Len<Syntax.Node>(document.document.nodes), "reference origin is document-owned"),
-
-                _ => Assert.Fail("supplied reference cannot claim default owner"),
-            };
-            Assert.Equal(document.document.nodes[link.target].label, "one", "target index addresses exact node");
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaSyntaxReferenceCyclesDoNotExpandOwnedValues
-{
-    match (CheckReference("reference-cycle"))
-    {
-        Result::Error(_) => Assert.Fail("syntax links may cycle"),
-
-        Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 2_i64, "two finite syntax links"),
-    };
-}
-
-/// @native-only
-test BsolSchemaReferenceMissingDuplicateAndAmbiguityReject
-{
-    RejectReference("reference-missing", "UnresolvedReference", false);
-
-    RejectReference("reference-duplicate", "DuplicateReferenceTarget", true);
-
-    RejectReference("reference-ambiguous", "AmbiguousReference", true);
-}
-
-/// @native-only
-test BsolSchemaOverlayRefinesButCannotLoosenConstraints
-{
-    RejectComposition("constraint-conflict-profile", "CompositionConflict", true);
-
-    match (Schema.ParseProfile(ReadComposition("refinement-profile"), Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("compatible constraint refinement allowed"),
-
-        Result::Ok(profile) => {
-            Schema.Field count = profile.rules[1].fields[0];
-            Assert.Equal(count.minimum, 2_i64, "overlay narrows minimum");
-            Assert.Equal(count.maximum, 8_i64, "overlay narrows maximum");
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaReferencesTraverseListsMapsAndInlineBlocks
-{
-    match (CheckReferenceWith("reference-nested-valid", "reference-nested-profile"))
-    {
-        Result::Error(_) => Assert.Fail("nested reference shapes resolve"),
-
-        Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 4_i64, "each nested reference resolves exactly once"),
-    };
-
-    match (CheckReferenceWith("reference-nested-missing", "reference-nested-profile"))
-    {
-        Result::Ok(_) => Assert.Fail("missing list reference rejected"),
-
-        Result::Error(errors) => {
-            mut bool found = false;
-            mut i64 i = 0_i64;
-            while (i < Array.Len<Schema.Diagnostic>(errors))
-            {
-                if (errors[i].code == "UnresolvedReference")
-                {
-                    found = true;
-                }
-                i = i + 1_i64;
-            }
-            Assert.True(found, "nested missing target diagnosed");
-        },
-    };
-
-    RejectReference("reference-wrong-kind", "TypeMismatch", false);
-}
-
-/// @native-only
-test BsolSchemaDefaultReferenceRetainsCheckedFieldOwner
-{
-    match (CheckReferenceWith("default-reference-valid", "default-reference-profile"))
-    {
-        Result::Error(_) => Assert.Fail("typed default reference resolves"),
-
-        Result::Ok(document) => {
-            Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "one default reference");
-            Schema.ReferenceBinding link = document.references[0];
-            match (link.origin)
-            {
-                Schema.ReferenceOrigin::DefaultNode(owner, index) => {
-                    Schema.FieldBinding field = document.fields[owner];
-                    Assert.True(field.fromDefault, "origin names actual missing-only default binding");
-                    Assert.True(index >= 0_i64 && index < Array.Len<Syntax.Node>(field.sourceDocument.nodes), "default index belongs to its owning source document");
-                    Assert.Equal(field.sourceDocument.nodes[index].text, "one", "default reference source retained");
-                },
-
-                _ => Assert.Fail("default cannot pretend to be an input node"),
-            };
-            Assert.Equal(document.document.nodes[link.target].label, "one", "target is always input document-owned");
-        },
-    };
-
-    match (CheckReferenceWith("default-reference-missing", "default-reference-profile"))
-    {
-        Result::Ok(_) => Assert.Fail("missing default target rejects"),
-
-        Result::Error(errors) => {
-            mut bool found = false;
-            mut i64 i = 0_i64;
-            while (i < Array.Len<Schema.Diagnostic>(errors))
-            {
-                if (errors[i].code == "UnresolvedReference")
-                {
-                    found = true;
-                }
-                i = i + 1_i64;
-            }
-            Assert.True(found, "default reference checked with its owner");
-        },
-    };
-}
-
-/// @native-only
-test BsolSchemaReferenceKindAndRuleAliasShareCanonicalTarget
-{
-    match (CheckReferenceWith("alias-reference-kind", "alias-reference-profile"))
-    {
-        Result::Error(_) => Assert.Fail("actual block kind resolves typed rule"),
-
-        Result::Ok(document) => {
-            Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "kind alias counts one target");
-            Assert.Equal(document.schema.rules[document.references[0].targetRule].name, "item_rule", "resolved rule binding is authority");
-        },
-    };
-
-    match (CheckReferenceWith("alias-reference-rule", "alias-reference-profile"))
-    {
-        Result::Error(_) => Assert.Fail("rule alias resolves same typed rule"),
-
-        Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "rule alias does not duplicate target identity"),
-    };
-}
-
-test BsolNativeCompositionValuesCanNarrowButNeverWiden
-{
-    match (Schema.ParseProfile(ReadComposition("values-narrow-profile"), Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("enum values may narrow"),
-
-        Result::Ok(profile) => {
-            Assert.Equal(Array.Len<string>(profile.rules[1_i64].fields[0_i64].values), 1_i64, "narrow values retained");
-        },
-    };
-
-    RejectComposition("values-widen-profile", "CompositionConflict", true);
-}
-
-test BsolNativeCompositionIncompatibleNestedSameNameRejects
-{
-    RejectComposition("nested-conflict-profile", "CompositionConflict", true);
-}
-
-test BsolNativeCompositionIdenticalNestedDefinitionsCoalesce
-{
-    match (Schema.ParseProfile(ReadComposition("nested-identical-profile"), Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("identical nested definitions coalesce"),
-
-        Result::Ok(profile) => {
-            Assert.Equal(Array.Len<i64>(profile.rules[4_i64].nested), 1_i64, "one nested definition");
-        },
-    };
-}
-
-test BsolNativeCompositionAggregateSearchWorkIsBounded
-{
-    mut string source = "profile \"work.v2\" { version = 2 rule \"wide\" { keyword = wide ";
-
-    mut i64 index = 0_i64;
-
-    while (index < 500_i64)
-    {
-        source = source + "field \"field" + index + "\" { type = quoted } ";
-        index = index + 1_i64;
+        };
     }
 
-    source = source + "} }";
-
-    match (Schema.ParseProfile(source, Limits.DefaultLimits()))
+    /// @native-only
+    test ValidUnionMapInlineReferenceAndLocalAttributes
     {
-        Result::Ok(_) => Assert.Fail("aggregate composition search budget must reject"),
+        match (CheckStructured("valid"))
+        {
+            Result::Error(_) => Assert.Fail("full structured valid fixture validates natively"),
 
-        Result::Error(errors) => {
-            mut bool found = false;
-            mut i64 i = 0_i64;
-            while (i < Array.Len<Schema.Diagnostic>(errors))
-            {
-                if (errors[i].code == "SchemaWorkLimit")
+            Result::Ok(document) => {
+                Assert.Equal(document.profile, "structured.v2", "profile identity retained");
+                Assert.True(Array.Len<Schema.RuleBinding>(document.rules) >= 3_i64, "inline block also receives checked rule binding");
+            },
+        };
+    }
+
+    /// @native-only
+    test UnionListAndMapValuesCheckEachElement
+    {
+        RejectStructured("bad-list", "TypeMismatch", "items");
+
+        RejectStructured("bad-map", "TypeMismatch", "scores");
+    }
+
+    /// @native-only
+    test InlineFieldsAndReferenceQualifierAreChecked
+    {
+        RejectStructured("bad-inline", "TypeMismatch", "name");
+
+        RejectStructured("bad-ref-kind", "TypeMismatch", "target");
+    }
+
+    /// @native-only
+    test BlockAndFieldAttributeAllowlistsAreLocal
+    {
+        RejectStructured("bad-block-attr", "UnknownAttribute", "");
+
+        RejectStructured("bad-field-attr", "UnknownAttribute", "title");
+    }
+
+    /// @native-only
+    test UnknownUnionAlternativeRejectsProfile
+    {
+        match (Schema.ParseProfile(ReadStructured("bad-type"), Limits.DefaultLimits()))
+        {
+            Result::Ok(_) => Assert.Fail("unknown nested type cannot publish checked profile"),
+
+            Result::Error(errors) => {
+                mut bool found = false;
+                mut i64 i = 0_i64;
+                while (i < Array.Len<Schema.Diagnostic>(errors))
                 {
-                    found = true;
+                    if (errors[i].code == "UnknownFieldType" && errors[i].field == "items")
+                    {
+                        found = true;
+                    }
+                    i = i + 1_i64;
                 }
-                i = i + 1_i64;
-            }
-            Assert.True(found, "checked composition work exhaustion diagnostic");
-        },
-    };
+                Assert.True(found, "unknown union type identified at profile boundary");
+            },
+        };
+    }
+
+    /// @native-only
+    test AbsentAttributeAllowlistsRejectUnlistedAttributes
+    {
+        RejectStructured("bad-empty-block-attr", "UnknownAttribute", "");
+
+        RejectStructured("bad-empty-field-attr", "UnknownAttribute", "items");
+    }
+}
+
+mod ConstraintsTests
+{
+    /// @native-only
+    test MissingOnlyDefaultsRemainTyped
+    {
+        match (CheckCase("defaults"))
+        {
+            Result::Error(_) => Assert.Fail("valid defaults satisfy declared required field and variant payload"),
+
+            Result::Ok(document) => {
+                CheckBoundValue(document, "count", "3", true, true);
+                CheckBoundValue(document, "name", "default-name", true, false);
+                CheckBoundValue(document, "rev", "head", true, false);
+            },
+        };
+    }
+
+    /// @native-only
+    test SuppliedValuesOverrideDefaultsAtNumericBoundary
+    {
+        match (CheckCase("override"))
+        {
+            Result::Error(_) => Assert.Fail("declared max boundary and explicit values validate"),
+
+            Result::Ok(document) => {
+                CheckBoundValue(document, "count", "5", false, true);
+                CheckBoundValue(document, "name", "explicit", false, false);
+                CheckBoundValue(document, "rev", "exact", false, false);
+            },
+        };
+    }
+
+    /// @native-only
+    test NumericLimitsRejectOutsideBoundaries
+    {
+        RejectCase("below-min", "BelowMinimum", "count");
+
+        RejectCase("above-max", "AboveMaximum", "count");
+    }
+
+    /// @native-only
+    test ActualInlineMapConditionalConstraints
+    {
+        RejectCase("required-if", "RequiredIf", "url");
+
+        RejectCase("forbid-if", "ForbiddenIf", "url");
+    }
+
+    /// @native-only
+    test VariantsRequirePayloadAndKnownDiscriminant
+    {
+        RejectCase("variant-missing", "VariantRequiredField", "path");
+
+        RejectCase("variant-unknown", "UnknownVariant", "source");
+    }
+
+    /// @native-only
+    test InvalidTypedDefaultRejectsProfile
+    {
+        match (Schema.ParseProfile(ReadCase("invalid-default"), Limits.DefaultLimits()))
+        {
+            Result::Ok(_) => Assert.Fail("default must type check before profile publication"),
+
+            Result::Error(errors) => {
+                mut bool found = false;
+                mut i64 i = 0_i64;
+                while (i < Array.Len<Schema.Diagnostic>(errors))
+                {
+                    if (errors[i].code == "InvalidDefault" && errors[i].field == "name")
+                    {
+                        found = true;
+                    }
+                    i = i + 1_i64;
+                }
+                Assert.True(found, "invalid typed default identified at profile boundary");
+            },
+        };
+    }
+}
+
+mod PatternsTests
+{
+    /// @native-only
+    test SharedAcceptedGrammar
+    {
+        CheckPatternCase("anchored-match", "ok");
+
+        CheckPatternCase("prefix-match", "ok");
+
+        CheckPatternCase("alternation", "ok");
+
+        CheckPatternCase("group-plus", "ok");
+
+        CheckPatternCase("class-range", "ok");
+
+        CheckPatternCase("negated-class", "ok");
+
+        CheckPatternCase("escaped-digit", "ok");
+
+        CheckPatternCase("escaped-literal", "ok");
+
+        CheckPatternCase("grammar-escaped-brace", "ok");
+
+        CheckPatternCase("quantified-sequence-backtrack", "ok");
+
+        CheckPatternCase("optional-zero-occurrence", "ok");
+
+        CheckPatternCase("star-zero-occurrence", "ok");
+    }
+
+    /// @native-only
+    test SharedNonemptyStartzeroRejections
+    {
+        CheckPatternCase("anchored-reject", "PatternMismatch");
+
+        CheckPatternCase("substring-reject", "PatternMismatch");
+
+        CheckPatternCase("empty-match-reject", "PatternMismatch");
+    }
+
+    /// @native-only
+    test SharedInvalidUnsupportedGrammar
+    {
+        CheckPatternCase("invalid-open-group", "InvalidPattern");
+
+        CheckPatternCase("invalid-empty-alternative", "InvalidPattern");
+
+        CheckPatternCase("unsupported-lookaround", "InvalidPattern");
+
+        CheckPatternCase("unsupported-backreference", "InvalidPattern");
+
+        CheckPatternCase("unsupported-counted", "InvalidPattern");
+    }
+
+    /// @native-only
+    test SharedSubjectExactLimit
+    {
+        CheckPatternCase("subject-at-limit", "ok");
+    }
+
+    /// @native-only
+    test SharedSubjectOverLimit
+    {
+        CheckPatternCase("subject-over-limit", "PatternSubjectLimit");
+    }
+
+    /// @native-only
+    test SharedNestedDefaultWorkLimit
+    {
+        CheckPatternCase("nested-work-limit", "PatternWorkLimit");
+    }
+
+    /// @native-only
+    test SharedUnicodeScalarGrammar
+    {
+        CheckPatternCase("unicode-dot-accent", "ok");
+
+        CheckPatternCase("unicode-dot-astral", "ok");
+
+        CheckPatternCase("unicode-class-accent", "ok");
+
+        CheckPatternCase("unicode-class-range", "ok");
+
+        CheckPatternCase("unicode-class-astral-range", "ok");
+
+        CheckPatternCase("unicode-reject-two-scalars", "PatternMismatch");
+
+        CheckPatternCase("unicode-class-reject", "PatternMismatch");
+    }
+
+    /// @native-only
+    test CallerWorkAndDepthLimits
+    {
+        CheckPatternPolicy("^abc$", "abc", 1048576_i64, 2_i64, 64_i64, "PatternWorkLimit");
+
+        CheckPatternPolicy("^abc$", "abc", 1048576_i64, 100_i64, 64_i64, "ok");
+
+        CheckPatternPolicy("((abc))", "abc", 1048576_i64, 100_i64, 1_i64, "PatternDepthLimit");
+
+        CheckPatternPolicy("abc", "abc", 1048576_i64, 0_i64, 64_i64, "PatternWorkLimit");
+    }
+
+    /// @native-only
+    test UnicodeSubjectLimitCountsBytes
+    {
+        CheckPatternPolicy("^.$", "😀", 4_i64, 100_i64, 64_i64, "ok");
+
+        CheckPatternPolicy("^.$", "😀", 3_i64, 100_i64, 64_i64, "PatternSubjectLimit");
+
+        CheckPatternPolicy("^.$", "é", 2_i64, 100_i64, 64_i64, "ok");
+
+        CheckPatternPolicy("^.$", "é", 1_i64, 100_i64, 64_i64, "PatternSubjectLimit");
+    }
+
+    /// @native-only
+    test UnicodeFailureHasExactUtf8AssignmentSpan
+    {
+        string source = ReadPattern("unicode-reject-two-scalars", "input");
+
+        match (Schema.ParseProfile(ReadPattern("unicode-reject-two-scalars", "profile"), Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("Unicode pattern profile valid"),
+
+            Result::Ok(profile) => match (Parser.Parse(source, Limits.DefaultLimits()))
+            {
+                Result::Error(_) => Assert.Fail("Unicode subject parses"),
+
+                Result::Ok(document) => match (Schema.Validate(document, profile, Limits.DefaultLimits()))
+                {
+                    Result::Ok(_) => Assert.Fail("two scalars rejected"),
+
+                    Result::Error(errors) => {
+                        mut bool found = false;
+                        mut i64 i = 0_i64;
+                        while (i < Array.Len<Schema.Diagnostic>(errors))
+                        {
+                            Schema.Diagnostic error = errors[i];
+                            if (error.code == "PatternMismatch")
+                            {
+                                found = true;
+                                Assert.Equal(String.SubSlice(source, error.span.start, error.span.end - error.span.start), "value = \"é😀\"", "exact complete UTF8 assignment boundary");
+                            }
+                            i = i + 1_i64;
+                        }
+                        Assert.True(found, "Unicode mismatch diagnostic");
+                    },
+                },
+            },
+        };
+    }
+
+    /// @native-only
+    test CallerBudgetIsSharedThroughInlineAndDefaults
+    {
+        CheckPatternPolicy("abcdefgh", "abcdefgh", 1048576_i64, 50_i64, 64_i64, "ok");
+
+        string profile = "profile \"limits.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"first\" { type = quoted pattern = \"abcdefgh\" required = true } field \"inside\" { type = inline(holder) required = true } } rule \"holder\" { match = keyword keyword = holder label = forbidden cardinality = many field \"second\" { type = quoted pattern = \"abcdefgh\" required = true } } }";
+
+        string input = "config { first = \"abcdefgh\" inside = holder { second = \"abcdefgh\" } }";
+
+        CheckPatternDocumentPolicy(profile, input, 50_i64, "PatternWorkLimit");
+
+        CheckPatternDocumentPolicy(profile, input, 1000_i64, "ok");
+
+        string defaults = "profile \"limits.v2\" { version = 2 rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"first\" { type = quoted pattern = \"abcdefgh\" default = \"abcdefgh\" } field \"second\" { type = quoted pattern = \"abcdefgh\" default = \"abcdefgh\" } } }";
+
+        CheckPatternDocumentPolicy(defaults, "config {}", 50_i64, "PatternWorkLimit");
+    }
+
+    /// @native-only
+    test InvalidCallerLimitsRejectChecked
+    {
+        CheckPatternPolicy("abc", "abc", 1048576_i64, -1_i64, 64_i64, "InvalidPatternLimits");
+
+        CheckPatternPolicy("abc", "abc", 1048576_i64, 100_i64, 9223372036854775807_i64, "InvalidPatternLimits");
+    }
+
+    test ClassWorkCountsInspectedRangesAndInitialAccept
+    {
+        CheckPatternPolicy("[abc]", "a", 1048576_i64, 11_i64, 64_i64, "ok");
+
+        CheckPatternPolicy("[abc]", "a", 1048576_i64, 10_i64, 64_i64, "PatternWorkLimit");
+
+        CheckPatternPolicy("[abc]", "c", 1048576_i64, 13_i64, 64_i64, "ok");
+
+        CheckPatternPolicy("[abc]", "c", 1048576_i64, 12_i64, 64_i64, "PatternWorkLimit");
+    }
+}
+
+mod CompositionTests
+{
+    /// @native-only
+    test IdenticalDiamondComposesOnce
+    {
+        match (Schema.ParseProfile(ReadComposition("diamond-profile"), Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("identical diamond composes"),
+
+            Result::Ok(profile) => match (Schema.Compose(profile, Limits.DefaultLimits()))
+            {
+                Result::Error(_) => Assert.Fail("composition is checked and idempotent"),
+
+                Result::Ok(composed) => {
+                    Schema.Rule leaf = composed.rules[3];
+                    Assert.Equal(Array.Len<Schema.Field>(leaf.fields), 2_i64, "diamond base field occurs once");
+                    Assert.Equal(leaf.fields[0].name, "name", "base ordering precedes local fields");
+                    Assert.Equal(leaf.fields[1].name, "count", "local field order retained");
+                    Assert.True(leaf.fields[0].span.end > leaf.fields[0].span.start, "inherited field retains origin span");
+                },
+            },
+        };
+    }
+
+    /// @native-only
+    test CompositionCycleAndUnknownBaseReject
+    {
+        RejectComposition("cycle-profile", "CompositionCycle", false);
+
+        RejectComposition("unknown-base-profile", "UnknownBaseRule", false);
+    }
+
+    /// @native-only
+    test IncompatibleOverlayRetainsBothDefinitions
+    {
+        RejectComposition("conflict-profile", "CompositionConflict", true);
+
+        RejectComposition("label-conflict-profile", "CompositionConflict", true);
+    }
+
+    /// @native-only
+    test ReferenceResolvesToDocumentOwnedIndex
+    {
+        match (CheckReference("reference-valid"))
+        {
+            Result::Error(_) => Assert.Fail("qualified reference resolves"),
+
+            Result::Ok(document) => {
+                Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "one checked reference link");
+                Schema.ReferenceBinding link = document.references[0];
+                match (link.origin)
+                {
+                    Schema.ReferenceOrigin::DocumentNode(index) => Assert.True(index >= 0_i64 && index < Array.Len<Syntax.Node>(document.document.nodes), "reference origin is document-owned"),
+
+                    _ => Assert.Fail("supplied reference cannot claim default owner"),
+                };
+                Assert.Equal(document.document.nodes[link.target].label, "one", "target index addresses exact node");
+            },
+        };
+    }
+
+    /// @native-only
+    test SyntaxReferenceCyclesDoNotExpandOwnedValues
+    {
+        match (CheckReference("reference-cycle"))
+        {
+            Result::Error(_) => Assert.Fail("syntax links may cycle"),
+
+            Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 2_i64, "two finite syntax links"),
+        };
+    }
+
+    /// @native-only
+    test ReferenceMissingDuplicateAndAmbiguityReject
+    {
+        RejectReference("reference-missing", "UnresolvedReference", false);
+
+        RejectReference("reference-duplicate", "DuplicateReferenceTarget", true);
+
+        RejectReference("reference-ambiguous", "AmbiguousReference", true);
+    }
+
+    /// @native-only
+    test OverlayRefinesButCannotLoosenConstraints
+    {
+        RejectComposition("constraint-conflict-profile", "CompositionConflict", true);
+
+        match (Schema.ParseProfile(ReadComposition("refinement-profile"), Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("compatible constraint refinement allowed"),
+
+            Result::Ok(profile) => {
+                Schema.Field count = profile.rules[1].fields[0];
+                Assert.Equal(count.minimum, 2_i64, "overlay narrows minimum");
+                Assert.Equal(count.maximum, 8_i64, "overlay narrows maximum");
+            },
+        };
+    }
+
+    /// @native-only
+    test ReferencesTraverseListsMapsAndInlineBlocks
+    {
+        match (CheckReferenceWith("reference-nested-valid", "reference-nested-profile"))
+        {
+            Result::Error(_) => Assert.Fail("nested reference shapes resolve"),
+
+            Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 4_i64, "each nested reference resolves exactly once"),
+        };
+
+        match (CheckReferenceWith("reference-nested-missing", "reference-nested-profile"))
+        {
+            Result::Ok(_) => Assert.Fail("missing list reference rejected"),
+
+            Result::Error(errors) => {
+                mut bool found = false;
+                mut i64 i = 0_i64;
+                while (i < Array.Len<Schema.Diagnostic>(errors))
+                {
+                    if (errors[i].code == "UnresolvedReference")
+                    {
+                        found = true;
+                    }
+                    i = i + 1_i64;
+                }
+                Assert.True(found, "nested missing target diagnosed");
+            },
+        };
+
+        RejectReference("reference-wrong-kind", "TypeMismatch", false);
+    }
+
+    /// @native-only
+    test DefaultReferenceRetainsCheckedFieldOwner
+    {
+        match (CheckReferenceWith("default-reference-valid", "default-reference-profile"))
+        {
+            Result::Error(_) => Assert.Fail("typed default reference resolves"),
+
+            Result::Ok(document) => {
+                Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "one default reference");
+                Schema.ReferenceBinding link = document.references[0];
+                match (link.origin)
+                {
+                    Schema.ReferenceOrigin::DefaultNode(owner, index) => {
+                        Schema.FieldBinding field = document.fields[owner];
+                        Assert.True(field.fromDefault, "origin names actual missing-only default binding");
+                        Assert.True(index >= 0_i64 && index < Array.Len<Syntax.Node>(field.sourceDocument.nodes), "default index belongs to its owning source document");
+                        Assert.Equal(field.sourceDocument.nodes[index].text, "one", "default reference source retained");
+                    },
+
+                    _ => Assert.Fail("default cannot pretend to be an input node"),
+                };
+                Assert.Equal(document.document.nodes[link.target].label, "one", "target is always input document-owned");
+            },
+        };
+
+        match (CheckReferenceWith("default-reference-missing", "default-reference-profile"))
+        {
+            Result::Ok(_) => Assert.Fail("missing default target rejects"),
+
+            Result::Error(errors) => {
+                mut bool found = false;
+                mut i64 i = 0_i64;
+                while (i < Array.Len<Schema.Diagnostic>(errors))
+                {
+                    if (errors[i].code == "UnresolvedReference")
+                    {
+                        found = true;
+                    }
+                    i = i + 1_i64;
+                }
+                Assert.True(found, "default reference checked with its owner");
+            },
+        };
+    }
+
+    /// @native-only
+    test ReferenceKindAndRuleAliasShareCanonicalTarget
+    {
+        match (CheckReferenceWith("alias-reference-kind", "alias-reference-profile"))
+        {
+            Result::Error(_) => Assert.Fail("actual block kind resolves typed rule"),
+
+            Result::Ok(document) => {
+                Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "kind alias counts one target");
+                Assert.Equal(document.schema.rules[document.references[0].targetRule].name, "item_rule", "resolved rule binding is authority");
+            },
+        };
+
+        match (CheckReferenceWith("alias-reference-rule", "alias-reference-profile"))
+        {
+            Result::Error(_) => Assert.Fail("rule alias resolves same typed rule"),
+
+            Result::Ok(document) => Assert.Equal(Array.Len<Schema.ReferenceBinding>(document.references), 1_i64, "rule alias does not duplicate target identity"),
+        };
+    }
+
+    test ValuesCanNarrowButNeverWiden
+    {
+        match (Schema.ParseProfile(ReadComposition("values-narrow-profile"), Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("enum values may narrow"),
+
+            Result::Ok(profile) => {
+                Assert.Equal(Array.Len<string>(profile.rules[1_i64].fields[0_i64].values), 1_i64, "narrow values retained");
+            },
+        };
+
+        RejectComposition("values-widen-profile", "CompositionConflict", true);
+    }
+
+    test IncompatibleNestedSameNameRejects
+    {
+        RejectComposition("nested-conflict-profile", "CompositionConflict", true);
+    }
+
+    test IdenticalNestedDefinitionsCoalesce
+    {
+        match (Schema.ParseProfile(ReadComposition("nested-identical-profile"), Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("identical nested definitions coalesce"),
+
+            Result::Ok(profile) => {
+                Assert.Equal(Array.Len<i64>(profile.rules[4_i64].nested), 1_i64, "one nested definition");
+            },
+        };
+    }
+
+    test AggregateSearchWorkIsBounded
+    {
+        mut string source = "profile \"work.v2\" { version = 2 rule \"wide\" { keyword = wide ";
+
+        mut i64 index = 0_i64;
+
+        while (index < 500_i64)
+        {
+            source = source + "field \"field" + index + "\" { type = quoted } ";
+            index = index + 1_i64;
+        }
+
+        source = source + "} }";
+
+        match (Schema.ParseProfile(source, Limits.DefaultLimits()))
+        {
+            Result::Ok(_) => Assert.Fail("aggregate composition search budget must reject"),
+
+            Result::Error(errors) => {
+                mut bool found = false;
+                mut i64 i = 0_i64;
+                while (i < Array.Len<Schema.Diagnostic>(errors))
+                {
+                    if (errors[i].code == "SchemaWorkLimit")
+                    {
+                        found = true;
+                    }
+                    i = i + 1_i64;
+                }
+                Assert.True(found, "checked composition work exhaustion diagnostic");
+            },
+        };
+    }
 }

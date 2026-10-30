@@ -3,7 +3,6 @@ use Core.Bytes.Slice;
 use Core.Collections.Array;
 use Core.Results;
 use Http2.Hpack;
-
 use Http2.HpackInteger;
 use HpackSupport;
 
@@ -77,82 +76,85 @@ bool IntTruncated(string hex, i64 prefix)
     return false;
 }
 
-test C11Encode10With5BitPrefix
+mod IntegersTests
 {
-    ExpectBytes(EncodeInt(0_u8, 5_i64, 10_i64), "0a", "10/5");
-    Decoded d = DecodeInt("0a", 5_i64, "10/5");
-    Assert.Equal<i64>(d.value, 10_i64, "value");
-    Assert.Equal<i64>(d.next, 1_i64, "next");
-}
-
-test C12Encode1337With5BitPrefix
-{
-    ExpectBytes(EncodeInt(0_u8, 5_i64, 1337_i64), "1f9a0a", "1337/5");
-    Decoded d = DecodeInt("1f9a0a", 5_i64, "1337/5");
-    Assert.Equal<i64>(d.value, 1337_i64, "value");
-    Assert.Equal<i64>(d.next, 3_i64, "next");
-}
-
-test C13Encode42AtOctetBoundary
-{
-    ExpectBytes(EncodeInt(0_u8, 8_i64, 42_i64), "2a", "42/8");
-    Assert.Equal<i64>(DecodedValue(DecodeInt("2a", 8_i64, "42/8")), 42_i64, "value");
-}
-
-test PrefixFlagsAreKeptAndIgnored
-{
-    ExpectBytes(EncodeInt(224_u8, 5_i64, 10_i64), "ea", "flags kept");
-    Assert.Equal<i64>(DecodedValue(DecodeInt("ea", 5_i64, "flags ignored")), 10_i64, "value");
-    ExpectBytes(EncodeInt(128_u8, 7_i64, 127_i64), "ff00", "exact mask needs a zero continuation");
-    Assert.Equal<i64>(DecodedValue(DecodeInt("ff00", 7_i64, "mask")), 127_i64, "mask value");
-}
-
-test PrefixIntegerBoundariesRoundTrip
-{
-    i64[] values = [0_i64, 1_i64, 30_i64, 31_i64, 32_i64, 127_i64, 128_i64, 158_i64, 16383_i64, 16384_i64, 2097151_i64, 268435455_i64, 2147483647_i64];
-    mut i64 prefix = 1_i64;
-    while (prefix <= 8_i64)
+    test C11Encode10With5BitPrefix
     {
-        mut i64 i = 0_i64;
-        while (i < Array.Len<i64>(values))
-        {
-            i64 v = Array.Get<i64>(values, i);
-            u8[] wire = EncodeInt(0_u8, prefix, v);
-            Decoded d = DecodeInt(HexText(wire), prefix, "round trip");
-            Assert.Equal<i64>(d.value, v, "round trip value");
-            Assert.Equal<i64>(d.next, Slice.Len(wire), "round trip length");
-            i = i + 1_i64;
-        }
-        prefix = prefix + 1_i64;
+        ExpectBytes(EncodeInt(0_u8, 5_i64, 10_i64), "0a", "10/5");
+        Decoded d = DecodeInt("0a", 5_i64, "10/5");
+        Assert.Equal<i64>(d.value, 10_i64, "value");
+        Assert.Equal<i64>(d.next, 1_i64, "next");
     }
-}
 
-test MaxIntegerIsAcceptedAndOneMoreOverflows
-{
-    u8[] wire = EncodeInt(0_u8, 5_i64, 2147483647_i64);
-    Assert.Equal<i64>(DecodedValue(DecodeInt(HexText(wire), 5_i64, "max")), 2147483647_i64, "max value");
-    // 2^31 with a 5-bit prefix: 31 + 2147483617.
-    Assert.True(IntOverflows("1fe1ffffff07", 5_i64), "2^31 overflows");
-}
+    test C12Encode1337With5BitPrefix
+    {
+        ExpectBytes(EncodeInt(0_u8, 5_i64, 1337_i64), "1f9a0a", "1337/5");
+        Decoded d = DecodeInt("1f9a0a", 5_i64, "1337/5");
+        Assert.Equal<i64>(d.value, 1337_i64, "value");
+        Assert.Equal<i64>(d.next, 3_i64, "next");
+    }
 
-test OverlongZeroContinuationsOverflow
-{
-    Assert.True(IntOverflows("1f8080808080808001", 5_i64), "too many continuation octets");
-}
+    test C13Encode42AtOctetBoundary
+    {
+        ExpectBytes(EncodeInt(0_u8, 8_i64, 42_i64), "2a", "42/8");
+        Assert.Equal<i64>(DecodedValue(DecodeInt("2a", 8_i64, "42/8")), 42_i64, "value");
+    }
 
-test HugeIntegerOverflows
-{
-    Assert.True(IntOverflows("1fffffffffffffffff7f", 5_i64), "huge value");
-}
+    test PrefixFlagsAreKeptAndIgnored
+    {
+        ExpectBytes(EncodeInt(224_u8, 5_i64, 10_i64), "ea", "flags kept");
+        Assert.Equal<i64>(DecodedValue(DecodeInt("ea", 5_i64, "flags ignored")), 10_i64, "value");
+        ExpectBytes(EncodeInt(128_u8, 7_i64, 127_i64), "ff00", "exact mask needs a zero continuation");
+        Assert.Equal<i64>(DecodedValue(DecodeInt("ff00", 7_i64, "mask")), 127_i64, "mask value");
+    }
 
-test TruncatedIntegersAreRejected
-{
-    Assert.True(IntTruncated("", 5_i64), "empty");
-    Assert.True(IntTruncated("1f", 5_i64), "missing continuation");
-    Assert.True(IntTruncated("1f9a", 5_i64), "continuation bit set at end");
-}
+    test PrefixIntegerBoundariesRoundTrip
+    {
+        i64[] values = [0_i64, 1_i64, 30_i64, 31_i64, 32_i64, 127_i64, 128_i64, 158_i64, 16383_i64, 16384_i64, 2097151_i64, 268435455_i64, 2147483647_i64];
+        mut i64 prefix = 1_i64;
+        while (prefix <= 8_i64)
+        {
+            mut i64 i = 0_i64;
+            while (i < Array.Len<i64>(values))
+            {
+                i64 v = Array.Get<i64>(values, i);
+                u8[] wire = EncodeInt(0_u8, prefix, v);
+                Decoded d = DecodeInt(HexText(wire), prefix, "round trip");
+                Assert.Equal<i64>(d.value, v, "round trip value");
+                Assert.Equal<i64>(d.next, Slice.Len(wire), "round trip length");
+                i = i + 1_i64;
+            }
+            prefix = prefix + 1_i64;
+        }
+    }
 
-test ZeroPadded8BitIntegerOverflows
-{
-    Assert.True(IntOverflows("ff808080808000", 8_i64), "zero padding past 28 bits");
+    test MaxIntegerIsAcceptedAndOneMoreOverflows
+    {
+        u8[] wire = EncodeInt(0_u8, 5_i64, 2147483647_i64);
+        Assert.Equal<i64>(DecodedValue(DecodeInt(HexText(wire), 5_i64, "max")), 2147483647_i64, "max value");
+        // 2^31 with a 5-bit prefix: 31 + 2147483617.
+        Assert.True(IntOverflows("1fe1ffffff07", 5_i64), "2^31 overflows");
+    }
+
+    test OverlongZeroContinuationsOverflow
+    {
+        Assert.True(IntOverflows("1f8080808080808001", 5_i64), "too many continuation octets");
+    }
+
+    test HugeIntegerOverflows
+    {
+        Assert.True(IntOverflows("1fffffffffffffffff7f", 5_i64), "huge value");
+    }
+
+    test TruncatedIntegersAreRejected
+    {
+        Assert.True(IntTruncated("", 5_i64), "empty");
+        Assert.True(IntTruncated("1f", 5_i64), "missing continuation");
+        Assert.True(IntTruncated("1f9a", 5_i64), "continuation bit set at end");
+    }
+
+    test ZeroPadded8BitIntegerOverflows
+    {
+        Assert.True(IntOverflows("ff808080808000", 8_i64), "zero padding past 28 bits");
+    }
 }

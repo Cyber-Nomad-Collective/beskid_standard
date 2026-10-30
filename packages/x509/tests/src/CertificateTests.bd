@@ -88,56 +88,11 @@ unit CheckNameConstraints()
     return;
 }
 
-test ParsePemReadsTheFieldsOfTheFixtureCertificates
-{
-    CheckRsaLeaf();
-    CheckCaAndEc();
-    CheckPssAndSha512();
-    CheckNameConstraints();
-}
-
 string Run(string leafName, Certificate[] intermediates, string serverName)
 {
     Certificate leaf = TestSupport.Cert(leafName);
     X509Error e = Verify.Check(leaf, intermediates, TestSupport.TestRoots(), Verify.ServerOptions(TestSupport.Now(), serverName));
     return X509Errors.Name(e);
-}
-
-test RsaChainsVerifyHostnamesSignaturesAndPathLength
-{
-    Certificate[] ints = TestSupport.One(TestSupport.Cert("rsa-int.pem"));
-    Assert.True(Run("rsa-leaf.pem", ints, "www.example.test") == "None", "valid RSA chain");
-    Assert.True(Run("rsa-leaf.pem", ints, "foo.api.example.test") == "None", "wildcard SAN");
-    Assert.True(Run("rsa-leaf.pem", ints, "192.0.2.10") == "None", "IP SAN");
-    Assert.True(Run("rsa-leaf.pem", ints, "wrong.example.test") == "HostnameMismatch", "wrong host");
-    Assert.True(Run("rsa-leaf.pem", ints, "192.0.2.11") == "HostnameMismatch", "wrong IP");
-    Assert.True(Run("rsa-leafpss.pem", ints, "leaf.example.test") == "None", "PSS signature");
-    Assert.True(Run("rsa-leaf512.pem", ints, "leaf.example.test") == "None", "sha512 signature");
-    Assert.True(Run("rsa-leaf.pem", TestSupport.One(TestSupport.Cert("ec-int.pem")), "") == "UnknownIssuer", "missing intermediate");
-    Certificate[] deep = TestSupport.Two(TestSupport.Cert("rsa-sub.pem"), TestSupport.Cert("rsa-int.pem"));
-    Assert.True(Run("rsa-subleaf.pem", deep, "leaf.example.test") == "PathLengthExceeded", "pathLen 0 below sub CA");
-}
-
-test EcChainsCheckExpiryKeyUsageCaAndNameConstraints
-{
-    Certificate[] ints = TestSupport.One(TestSupport.Cert("ec-int.pem"));
-    Assert.True(Run("ec-leaf.pem", ints, "www.example.test") == "None", "valid P-256 chain, SHA-384 intermediate");
-    Assert.True(Run("ec-leaf.pem", ints, "2001:db8::1") == "None", "IPv6 SAN");
-    Assert.True(Run("ec-expired.pem", ints, "leaf.example.test") == "Expired", "expired leaf");
-    Assert.True(Run("ec-client.pem", ints, "client.example.test") == "BadExtendedKeyUsage", "clientAuth only");
-    Certificate[] noca = TestSupport.Two(TestSupport.Cert("ec-noca.pem"), TestSupport.Cert("ec-int.pem"));
-    Assert.True(Run("ec-nocaleaf.pem", noca, "leaf.example.test") == "NotCa", "non-CA intermediate");
-    Certificate[] nc = TestSupport.One(TestSupport.Cert("ec-nc.pem"));
-    Assert.True(Run("ec-ncok.pem", nc, "www.allowed.test") == "None", "permitted subtree");
-    Assert.True(Run("ec-ncbad.pem", nc, "www.evil.test") == "NameConstraintViolation", "outside permitted");
-    Assert.True(Run("ec-ncexcl.pem", nc, "x.bad.allowed.test") == "NameConstraintViolation", "excluded subtree");
-    Assert.True(Run("ec-leaf.pem", Array.Empty<Certificate>(), "") == "UnknownIssuer", "no intermediate");
-    Certificate leaf = TestSupport.Cert("ec-leaf.pem");
-    VerifyOptions none = Verify.WithMaxIntermediates(Verify.ServerOptions(TestSupport.Now(), ""), 0_i64);
-    Assert.True(X509Errors.Name(Verify.Check(leaf, ints, TestSupport.TestRoots(), none)) == "ChainTooLong", "depth bound");
-    // After 2030-01-01 the leaf has expired.
-    VerifyOptions later = Verify.ServerOptions(1900000000_i64, "www.example.test");
-    Assert.True(X509Errors.Name(Verify.Check(leaf, ints, TestSupport.TestRoots(), later)) == "Expired", "time is a parameter");
 }
 
 string ParseError(u8[] der)
@@ -181,30 +136,78 @@ unit CheckCorruptedEncodings()
     return;
 }
 
-test ParsePemRejectsMalformedCertificates
+mod CertificatesTests
 {
-    CheckCriticalExtension();
-    CheckCorruptedEncodings();
-}
+    test ParsePemReadsTheFieldsOfTheFixtureCertificates
+    {
+        CheckRsaLeaf();
+        CheckCaAndEc();
+        CheckPssAndSha512();
+        CheckNameConstraints();
+    }
 
-test SystemTrustBundleLoadsMoreThanOneHundredRoots
-{
-    Result<TrustStore, X509Error> r = TrustStore.FromFile(TrustStore.SystemBundlePath());
-    bool ok = match (r)
+    test RsaChainsVerifyHostnamesSignaturesAndPathLength
     {
-        Result::Ok(_) => true,
-        Result::Error(_) => false,
-    };
-    Assert.True(ok, "bundle loads");
-    TrustStore store = match (r)
+        Certificate[] ints = TestSupport.One(TestSupport.Cert("rsa-int.pem"));
+        Assert.True(Run("rsa-leaf.pem", ints, "www.example.test") == "None", "valid RSA chain");
+        Assert.True(Run("rsa-leaf.pem", ints, "foo.api.example.test") == "None", "wildcard SAN");
+        Assert.True(Run("rsa-leaf.pem", ints, "192.0.2.10") == "None", "IP SAN");
+        Assert.True(Run("rsa-leaf.pem", ints, "wrong.example.test") == "HostnameMismatch", "wrong host");
+        Assert.True(Run("rsa-leaf.pem", ints, "192.0.2.11") == "HostnameMismatch", "wrong IP");
+        Assert.True(Run("rsa-leafpss.pem", ints, "leaf.example.test") == "None", "PSS signature");
+        Assert.True(Run("rsa-leaf512.pem", ints, "leaf.example.test") == "None", "sha512 signature");
+        Assert.True(Run("rsa-leaf.pem", TestSupport.One(TestSupport.Cert("ec-int.pem")), "") == "UnknownIssuer", "missing intermediate");
+        Certificate[] deep = TestSupport.Two(TestSupport.Cert("rsa-sub.pem"), TestSupport.Cert("rsa-int.pem"));
+        Assert.True(Run("rsa-subleaf.pem", deep, "leaf.example.test") == "PathLengthExceeded", "pathLen 0 below sub CA");
+    }
+
+    test EcChainsCheckExpiryKeyUsageCaAndNameConstraints
     {
-        Result::Ok(s) => s,
-        Result::Error(_) => TrustStore.Empty(),
-    };
-    Output.WriteLine("anchors=" + Der.Decimal(TrustStore.Count(store)) + " skipped=" + Der.Decimal(store.skipped));
-    Assert.True(store.skipped <= 2_i64, "few unparsable roots");
-    Assert.True(TrustStore.Count(store) > 100_i64, "more than 100 anchors");
-    Assert.True(TrustStore.FindByCommonName(store, "ISRG Root X1") >= 0_i64, "ISRG Root X1 present");
-    Assert.True(TrustStore.FindByCommonName(store, "DigiCert Global Root G2") >= 0_i64, "DigiCert Global Root G2 present");
-    Assert.True(TrustStore.FindByCommonName(store, "No Such Root") < 0_i64, "absent root");
+        Certificate[] ints = TestSupport.One(TestSupport.Cert("ec-int.pem"));
+        Assert.True(Run("ec-leaf.pem", ints, "www.example.test") == "None", "valid P-256 chain, SHA-384 intermediate");
+        Assert.True(Run("ec-leaf.pem", ints, "2001:db8::1") == "None", "IPv6 SAN");
+        Assert.True(Run("ec-expired.pem", ints, "leaf.example.test") == "Expired", "expired leaf");
+        Assert.True(Run("ec-client.pem", ints, "client.example.test") == "BadExtendedKeyUsage", "clientAuth only");
+        Certificate[] noca = TestSupport.Two(TestSupport.Cert("ec-noca.pem"), TestSupport.Cert("ec-int.pem"));
+        Assert.True(Run("ec-nocaleaf.pem", noca, "leaf.example.test") == "NotCa", "non-CA intermediate");
+        Certificate[] nc = TestSupport.One(TestSupport.Cert("ec-nc.pem"));
+        Assert.True(Run("ec-ncok.pem", nc, "www.allowed.test") == "None", "permitted subtree");
+        Assert.True(Run("ec-ncbad.pem", nc, "www.evil.test") == "NameConstraintViolation", "outside permitted");
+        Assert.True(Run("ec-ncexcl.pem", nc, "x.bad.allowed.test") == "NameConstraintViolation", "excluded subtree");
+        Assert.True(Run("ec-leaf.pem", Array.Empty<Certificate>(), "") == "UnknownIssuer", "no intermediate");
+        Certificate leaf = TestSupport.Cert("ec-leaf.pem");
+        VerifyOptions none = Verify.WithMaxIntermediates(Verify.ServerOptions(TestSupport.Now(), ""), 0_i64);
+        Assert.True(X509Errors.Name(Verify.Check(leaf, ints, TestSupport.TestRoots(), none)) == "ChainTooLong", "depth bound");
+        // After 2030-01-01 the leaf has expired.
+        VerifyOptions later = Verify.ServerOptions(1900000000_i64, "www.example.test");
+        Assert.True(X509Errors.Name(Verify.Check(leaf, ints, TestSupport.TestRoots(), later)) == "Expired", "time is a parameter");
+    }
+
+    test ParsePemRejectsMalformedCertificates
+    {
+        CheckCriticalExtension();
+        CheckCorruptedEncodings();
+    }
+
+    test SystemTrustBundleLoadsMoreThanOneHundredRoots
+    {
+        Result<TrustStore, X509Error> r = TrustStore.FromFile(TrustStore.SystemBundlePath());
+        bool ok = match (r)
+        {
+            Result::Ok(_) => true,
+            Result::Error(_) => false,
+        };
+        Assert.True(ok, "bundle loads");
+        TrustStore store = match (r)
+        {
+            Result::Ok(s) => s,
+            Result::Error(_) => TrustStore.Empty(),
+        };
+        Output.WriteLine("anchors=" + Der.Decimal(TrustStore.Count(store)) + " skipped=" + Der.Decimal(store.skipped));
+        Assert.True(store.skipped <= 2_i64, "few unparsable roots");
+        Assert.True(TrustStore.Count(store) > 100_i64, "more than 100 anchors");
+        Assert.True(TrustStore.FindByCommonName(store, "ISRG Root X1") >= 0_i64, "ISRG Root X1 present");
+        Assert.True(TrustStore.FindByCommonName(store, "DigiCert Global Root G2") >= 0_i64, "DigiCert Global Root G2 present");
+        Assert.True(TrustStore.FindByCommonName(store, "No Such Root") < 0_i64, "absent root");
+    }
 }

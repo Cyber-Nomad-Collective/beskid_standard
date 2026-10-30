@@ -1,4 +1,7 @@
-// In-memory client/server connections exchanging datagrams with a simulated clock.
+//! QUIC connections end to end: an in-memory handshake and stream echo, Retry, loss, flow control,
+//! key update and timeouts, lost credit frames, and client and server endpoints over UDP on
+//! 127.0.0.1 with and without the TLS 1.3 handshake.
+
 use Testing.Assert;
 use Core.Bytes.Slice;
 use Core.String;
@@ -6,6 +9,15 @@ use Quic.QuicConfig;
 use Quic.QuicConnection;
 use Quic.QuicPacket;
 use Quic.QuicWire;
+use Codec.Hex;
+use Quic.QuicErrors;
+use Quic.QuicProtection;
+use Concurrency.Fiber;
+use Core.Results;
+use Network.Types;
+use Quic.QuicEndpoint;
+use Tls.PeerKeys;
+use Tls.TlsConfig;
 
 string[] Protocols() { return ["hq-interop", "h3"]; }
 
@@ -44,39 +56,486 @@ u8[] Bytes(string text) {
     return out;
 }
 
-test HandshakeAndStreamEchoInMemory {
-    QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(Protocols(), 0_i64);
-    mut i64 now = 1000000000_i64;
-    Connection client = QuicConnection.NewClient(cfg, now);
-    Assert.Equal<i64>(QuicConnection.BuildDatagram(client, now), 1200_i64, "padded client Initial");
-    Connection server = Server(cfg, client, now);
-    QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, 1200_i64), 1200_i64, now);
-    Exchange(server, client, now);
-    Assert.True(QuicConnection.IsEstablished(client), "client established");
-    Assert.True(QuicConnection.IsEstablished(server), "server established");
-    Assert.True(QuicConnection.IsHandshakeConfirmed(client), "client confirmed by HANDSHAKE_DONE");
-    Assert.Equal<string>(QuicConnection.Alpn(client), "hq-interop", "ALPN");
-    i64 id = QuicConnection.OpenStream(client, true);
-    Assert.Equal<i64>(id, 0_i64, "first client bidi stream");
-    u8[] hello = Bytes("hello quic");
-    Assert.Equal<i64>(QuicConnection.StreamWrite(client, id, hello, 0_i64, 10_i64), 10_i64, "buffered");
-    Assert.True(QuicConnection.StreamFinish(client, id), "fin");
-    now = now + 1000000_i64;
-    Exchange(client, server, now);
-    i64 accepted = QuicConnection.AcceptStream(server);
-    Assert.Equal<i64>(accepted, 0_i64, "server accepts stream 0");
-    u8[] got = Slice.New(64_i64);
-    Assert.Equal<i64>(QuicConnection.StreamRead(server, accepted, got, 0_i64, 64_i64), 10_i64, "server reads");
-    Assert.True(QuicConnection.StreamAtEnd(server, accepted), "fin received");
-    Assert.Equal<i64>(QuicConnection.StreamWrite(server, accepted, got, 0_i64, 10_i64), 10_i64, "echo");
-    QuicConnection.StreamFinish(server, accepted);
-    now = now + 1000000_i64;
-    Exchange(server, client, now);
-    u8[] back = Slice.New(64_i64);
-    Assert.Equal<i64>(QuicConnection.StreamRead(client, id, back, 0_i64, 64_i64), 10_i64, "client reads echo");
-    Assert.True(QuicWire.Equal(QuicWire.CopyOf(back, 0_i64, 10_i64), hello), "echo matches");
-    Assert.True(QuicConnection.StreamAtEnd(client, id), "echo fin");
-    QuicConnection.Close(client, 0_i64, now);
-    Exchange(client, server, now);
-    Assert.True(QuicConnection.IsClosingOrClosed(server), "server draining after CONNECTION_CLOSE");
+// Moves datagrams from `from` to `to`; drops the first `drop` of them. Returns how many moved.
+i64 PumpDropping(Connection from, Connection to, i64 now, i64 drop) {
+    mut i64 moved = 0_i64;
+    mut i64 length = QuicConnection.BuildDatagram(from, now);
+    while length > 0_i64 && moved < 64_i64 {
+        if moved >= drop { QuicConnection.OnDatagram(to, QuicWire.CopyOf(from.out, 0_i64, length), length, now); }
+        moved = moved + 1_i64;
+        length = QuicConnection.BuildDatagram(from, now);
+    }
+    return moved;
+}
+
+i64 Earliest(Connection a, Connection b, i64 now) {
+    i64 x = QuicConnection.NextTimeout(a, now);
+    i64 y = QuicConnection.NextTimeout(b, now);
+    if x < 0_i64 { return y; }
+    if y < 0_i64 || x < y { return x; }
+    return y;
+}
+
+// Exchanges until quiet, advancing the clock to the next timer when nothing moves.
+// Returns the final clock.
+i64 Settle(Connection a, Connection b, i64 start, i64 rounds) {
+    mut i64 now = start;
+    mut i64 r = 0_i64;
+    while r < rounds {
+        i64 moved = PumpDropping(a, b, now, 0_i64) + PumpDropping(b, a, now, 0_i64);
+        if moved == 0_i64 {
+            i64 t = Earliest(a, b, now);
+            if t < 0_i64 || t - now > 2000000000_i64 { return now; }
+            if t > now { now = t; }
+            QuicConnection.OnTimeout(a, now);
+            QuicConnection.OnTimeout(b, now);
+        }
+        r = r + 1_i64;
+    }
+    return now;
+}
+
+// Moves the datagrams `from` has to send into `to`. With `dropAll` every datagram is lost;
+// otherwise each `dropEvery`-th datagram (counted in counter[0]) is lost (0 = none).
+// Returns how many datagrams were built.
+i64 PumpLosingCredit(Connection from, Connection to, i64 now, bool dropAll, i64 dropEvery, i64[] counter) {
+    mut i64 moved = 0_i64;
+    mut i64 length = QuicConnection.BuildDatagram(from, now);
+    while length > 0_i64 && moved < 64_i64 {
+        counter[0] = counter[0] + 1_i64;
+        bool lost = dropAll || (dropEvery > 0_i64 && counter[0] % dropEvery == 0_i64);
+        if lost { counter[1] = counter[1] + 1_i64; } else {
+            QuicConnection.OnDatagram(to, QuicWire.CopyOf(from.out, 0_i64, length), length, now);
+        }
+        moved = moved + 1_i64;
+        length = QuicConnection.BuildDatagram(from, now);
+    }
+    return moved;
+}
+
+i64 TotalBytes() { return 100000_i64; }
+
+u8 PatternAt(i64 i) { return u8((i * 7_i64 + 3_i64) & 255_i64); }
+
+SocketAddress LocalHost() {
+    return SocketAddress { address: IpAddress::V4(127_u8, 0_u8, 0_u8, 1_u8), port: Network.Types.PortBytes(0_u8, 0_u8) };
+}
+
+Endpoint Open(QuicConfig cfg, bool server) {
+    Result<Endpoint, QuicError> r = QuicEndpoint.Bind(LocalHost(), cfg, server);
+    return match r {
+        Result::Ok(ep) => ep,
+        Result::Error(_) => Fail(),
+    };
+}
+
+Endpoint Fail() {
+    Assert.Fail("bind");
+    return Fail();
+}
+
+SocketAddress AddressOf(Endpoint ep) {
+    return match QuicEndpoint.LocalAddress(ep) {
+        Result::Ok(a) => a,
+        Result::Error(_) => LocalHost(),
+    };
+}
+
+i64 Value(Result<i64, QuicError> r) {
+    return match r { Result::Ok(v) => v, Result::Error(e) => -1000_i64 - QuicErrors.WireCode(e), };
+}
+
+bool Done(Result<unit, QuicError> r) {
+    return match r { Result::Ok(_) => true, Result::Error(_) => false, };
+}
+
+// Server side: accept one connection and one stream, echo it back, then wait for the close.
+i64 Echo(Endpoint ep) {
+    i64 conn = Value(QuicEndpoint.Accept(ep, 10000_i64));
+    if conn < 0_i64 { return conn; }
+    i64 stream = Value(QuicEndpoint.AcceptStream(ep, conn, 10000_i64));
+    if stream < 0_i64 { return stream; }
+    u8[] buf = Slice.New(2048_i64);
+    mut i64 total = 0_i64;
+    mut bool reading = true;
+    while reading {
+        i64 n = Value(QuicEndpoint.Read(ep, conn, stream, buf, 0_i64, 2048_i64, 10000_i64));
+        if n < 0_i64 { return n; }
+        if n == 0_i64 { reading = false; } else {
+            if !Done(QuicEndpoint.Write(ep, conn, stream, buf, 0_i64, n, 10000_i64)) { return -2_i64; }
+            total = total + n;
+        }
+    }
+    if !Done(QuicEndpoint.Finish(ep, conn, stream)) { return -3_i64; }
+    return total;
+}
+
+// The scenario runs inside a fiber: the test root is not a fiber, so its sleeps and socket
+// waits would not let the driver fibers run. Returns 0 or the number of the failed step.
+i64 RetryScenario() {
+    QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(["echo/1"], 0_i64);
+    Endpoint server = Open(QuicConfig.WithRetry(cfg, true), true);
+    Endpoint client = Open(cfg, false);
+    SocketAddress target = AddressOf(server);
+    Fiber<unit> serverDriver = QuicEndpoint.Start(server);
+    Fiber<unit> clientDriver = QuicEndpoint.Start(client);
+    Fiber<i64> echo = spawn (() => Echo(server));
+    i64 step = RetryTalk(client, server, target);
+    i64 echoed = match echo.Join() { Result::Ok(v) => v, Result::Error(_) => -9_i64, };
+    QuicEndpoint.Stop(client);
+    QuicEndpoint.Stop(server);
+    bool c1 = match clientDriver.Join() { Result::Ok(_) => true, Result::Error(_) => false, };
+    bool c2 = match serverDriver.Join() { Result::Ok(_) => true, Result::Error(_) => false, };
+    if step != 0_i64 { return step; }
+    if echoed != 3000_i64 { return 20_i64; }
+    if !c1 || !c2 { return 21_i64; }
+    return 0_i64;
+}
+
+i64 RetryTalk(Endpoint client, Endpoint server, SocketAddress target) {
+    i64 conn = Value(QuicEndpoint.Connect(client, target, 10000_i64));
+    if conn < 0_i64 { return 1_i64; }
+    if QuicEndpoint.Alpn(client, conn) != "echo/1" { return 2_i64; }
+    if QuicEndpoint.RetriesSent(server) != 1_i64 { return 3_i64; }
+    i64 stream = Value(QuicEndpoint.OpenStream(client, conn, true, 5000_i64));
+    if stream != 0_i64 { return 4_i64; }
+    u8[] data = Slice.New(3000_i64);
+    mut i64 i = 0_i64;
+    while i < 3000_i64 { data[i] = u8((i * 7_i64) & 255_i64); i = i + 1_i64; }
+    if !Done(QuicEndpoint.Write(client, conn, stream, data, 0_i64, 3000_i64, 10000_i64)) { return 5_i64; }
+    if !Done(QuicEndpoint.Finish(client, conn, stream)) { return 6_i64; }
+    u8[] back = Slice.New(4096_i64);
+    mut i64 total = 0_i64;
+    mut bool reading = true;
+    while reading {
+        i64 n = Value(QuicEndpoint.Read(client, conn, stream, back, total, 4096_i64 - total, 10000_i64));
+        if n < 0_i64 { return 7_i64; }
+        if n == 0_i64 { reading = false; }
+        total = total + n;
+    }
+    if total != 3000_i64 { return 8_i64; }
+    i = 0_i64;
+    while i < 3000_i64 { if back[i] != data[i] { return 9_i64; } i = i + 1_i64; }
+    if !Done(QuicEndpoint.Close(client, conn, 7_i64, 3000_i64)) { return 10_i64; }
+    return 0_i64;
+}
+
+QuicConfig ServerQuic() {
+    u8[] key = match PeerKeys.P256PrivateKeyFromDer(ServerKeyPkcs8()) { Result::Ok(k) => k, Result::Error(_) => Slice.New(0_i64), };
+    return QuicConfig.TlsServerConfigFor(TlsConfig.Server(TlsConfig.Chain1(ServerCertDer()), key), ["echo/1"]);
+}
+
+QuicConfig ClientQuic() {
+    return QuicConfig.TlsClientConfigFor(TlsConfig.Client("localhost", TlsConfig.AcceptAnyCertificateForTestsOnly()), ["other", "echo/1"]);
+}
+
+// Runs inside a fiber (the test root is not a fiber). Returns 0 or the failed step.
+i64 TlsScenario() {
+    Endpoint server = Open(ServerQuic(), true);
+    Endpoint client = Open(ClientQuic(), false);
+    SocketAddress target = AddressOf(server);
+    Fiber<unit> serverDriver = QuicEndpoint.Start(server);
+    Fiber<unit> clientDriver = QuicEndpoint.Start(client);
+    Fiber<i64> echo = spawn (() => Echo(server));
+    i64 step = TlsTalk(client, target);
+    i64 echoed = match echo.Join() { Result::Ok(v) => v, Result::Error(_) => -9_i64, };
+    QuicEndpoint.Stop(client);
+    QuicEndpoint.Stop(server);
+    bool c1 = match clientDriver.Join() { Result::Ok(_) => true, Result::Error(_) => false, };
+    bool c2 = match serverDriver.Join() { Result::Ok(_) => true, Result::Error(_) => false, };
+    if step != 0_i64 { return step; }
+    if echoed != 1500_i64 { return 20_i64; }
+    if !c1 || !c2 { return 21_i64; }
+    return 0_i64;
+}
+
+i64 TlsTalk(Endpoint client, SocketAddress target) {
+    i64 conn = Value(QuicEndpoint.Connect(client, target, 20000_i64));
+    if conn < 0_i64 { return 100_i64 - conn; }
+    if QuicEndpoint.Alpn(client, conn) != "echo/1" { return 2_i64; }
+    i64 stream = Value(QuicEndpoint.OpenStream(client, conn, true, 5000_i64));
+    if stream != 0_i64 { return 4_i64; }
+    u8[] data = Slice.New(1500_i64);
+    mut i64 i = 0_i64;
+    while i < 1500_i64 { data[i] = u8((i * 13_i64) & 255_i64); i = i + 1_i64; }
+    if !Done(QuicEndpoint.Write(client, conn, stream, data, 0_i64, 1500_i64, 10000_i64)) { return 5_i64; }
+    if !Done(QuicEndpoint.Finish(client, conn, stream)) { return 6_i64; }
+    u8[] back = Slice.New(2048_i64);
+    mut i64 total = 0_i64;
+    mut bool reading = true;
+    while reading {
+        i64 n = Value(QuicEndpoint.Read(client, conn, stream, back, total, 2048_i64 - total, 10000_i64));
+        if n < 0_i64 { return 7_i64; }
+        if n == 0_i64 { reading = false; }
+        total = total + n;
+    }
+    if total != 1500_i64 { return 8_i64; }
+    i = 0_i64;
+    while i < 1500_i64 { if back[i] != data[i] { return 9_i64; } i = i + 1_i64; }
+    if !Done(QuicEndpoint.Close(client, conn, 0_i64, 3000_i64)) { return 10_i64; }
+    return 0_i64;
+}
+
+pub u8[] ServerCertDer() {
+    string s = "308201c130820167a003020102021466289dad903b1d139b33af2332f6418849a6cb80300a06082a8648ce3d040302301b3119301706035504030c104265736b6964205465737420526f6f74301e170d3236313030353131353130305a170d3336313030"
+        + "323131353130305a30143112301006035504030c096c6f63616c686f73743059301306072a8648ce3d020106082a8648ce3d030107034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31ae7c4e52e54479197471d96ab63d037113"
+        + "46e758d5ea25a534d7cd96c29c3ec8440a1614113fa3818f30818c301a0603551d110413301182096c6f63616c686f737487047f00000130090603551d1304023000300e0603551d0f0101ff04040302078030130603551d25040c300a06082b06010505"
+        + "070301301d0603551d0e0416041422f1b8335ef55a4e00dbeed6976d6a0d7885921c301f0603551d2304183016801446dda763d1978ccc27a6f76bd7519ff9619f4eb7300a06082a8648ce3d040302034800304502210095c8904fc2b23eb9741d202410"
+        + "19715627407ea05c74375ebf77c7955cb7acb20220443614e82b541313e53f3a72142c224de506b30a37f6456131962be082f8352c"
+        ;
+    return Hex.Of(s);
+}
+
+pub u8[] ServerKeyPkcs8() {
+    string s = "308187020100301306072a8648ce3d020106082a8648ce3d030107046d306b02010104206401f71fc7f7c46912909cb9b1034682d9c02315f9e150dac2c4f14b99090ba0a144034200041515d0f51755a9961cd28f5c80fe116ed30525b29cf62783ea31"
+        + "ae7c4e52e54479197471d96ab63d03711346e758d5ea25a534d7cd96c29c3ec8440a1614113f"
+        ;
+    return Hex.Of(s);
+}
+
+// In-memory client/server connections exchanging datagrams with a simulated clock.
+mod InMemoryTests
+{
+    test HandshakeAndStreamEchoInMemory {
+        QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(Protocols(), 0_i64);
+        mut i64 now = 1000000000_i64;
+        Connection client = QuicConnection.NewClient(cfg, now);
+        Assert.Equal<i64>(QuicConnection.BuildDatagram(client, now), 1200_i64, "padded client Initial");
+        Connection server = Server(cfg, client, now);
+        QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, 1200_i64), 1200_i64, now);
+        Exchange(server, client, now);
+        Assert.True(QuicConnection.IsEstablished(client), "client established");
+        Assert.True(QuicConnection.IsEstablished(server), "server established");
+        Assert.True(QuicConnection.IsHandshakeConfirmed(client), "client confirmed by HANDSHAKE_DONE");
+        Assert.Equal<string>(QuicConnection.Alpn(client), "hq-interop", "ALPN");
+        i64 id = QuicConnection.OpenStream(client, true);
+        Assert.Equal<i64>(id, 0_i64, "first client bidi stream");
+        u8[] hello = Bytes("hello quic");
+        Assert.Equal<i64>(QuicConnection.StreamWrite(client, id, hello, 0_i64, 10_i64), 10_i64, "buffered");
+        Assert.True(QuicConnection.StreamFinish(client, id), "fin");
+        now = now + 1000000_i64;
+        Exchange(client, server, now);
+        i64 accepted = QuicConnection.AcceptStream(server);
+        Assert.Equal<i64>(accepted, 0_i64, "server accepts stream 0");
+        u8[] got = Slice.New(64_i64);
+        Assert.Equal<i64>(QuicConnection.StreamRead(server, accepted, got, 0_i64, 64_i64), 10_i64, "server reads");
+        Assert.True(QuicConnection.StreamAtEnd(server, accepted), "fin received");
+        Assert.Equal<i64>(QuicConnection.StreamWrite(server, accepted, got, 0_i64, 10_i64), 10_i64, "echo");
+        QuicConnection.StreamFinish(server, accepted);
+        now = now + 1000000_i64;
+        Exchange(server, client, now);
+        u8[] back = Slice.New(64_i64);
+        Assert.Equal<i64>(QuicConnection.StreamRead(client, id, back, 0_i64, 64_i64), 10_i64, "client reads echo");
+        Assert.True(QuicWire.Equal(QuicWire.CopyOf(back, 0_i64, 10_i64), hello), "echo matches");
+        Assert.True(QuicConnection.StreamAtEnd(client, id), "echo fin");
+        QuicConnection.Close(client, 0_i64, now);
+        Exchange(client, server, now);
+        Assert.True(QuicConnection.IsClosingOrClosed(server), "server draining after CONNECTION_CLOSE");
+    }
+}
+
+// In-memory connections under Retry, loss, flow control, key update, version negotiation
+// and idle timeout, with a simulated clock. One test keeps codegen to one pass.
+mod RecoveryFlowTests
+{
+    test RetryLossFlowControlKeyUpdateAndTimeouts {
+        QuicConfig cfg = QuicConfig.WithIdleTimeout(QuicConfig.InsecureLoopbackForTestsOnly(["h3"], 2_i64), 3000_i64);
+        mut i64 now = 5000000000_i64;
+        // Retry (RFC 9000 section 8.1): the client restarts with the token and the new ID.
+        Connection client = QuicConnection.NewClient(cfg, now);
+        i64 first = QuicConnection.BuildDatagram(client, now);
+        Header h = QuicPacket.ParseHeader(client.out, 0_i64, first, 0_i64);
+        u8[] retryScid = Hex.Of("a1a2a3a4a5a6a7a8");
+        u8[] retry = QuicProtection.BuildRetry(h.dcid, h.scid, retryScid, Hex.Of("746f6b"));
+        QuicConnection.OnDatagram(client, retry, Slice.Len(retry), now);
+        Assert.True(QuicConnection.Retried(client), "Retry accepted");
+        i64 second = QuicConnection.BuildDatagram(client, now);
+        Assert.Equal<i64>(second, 1200_i64, "Initial resent");
+        Header h2 = QuicPacket.ParseHeader(client.out, 0_i64, second, 0_i64);
+        Assert.True(QuicWire.Equal(h2.dcid, retryScid), "new destination ID");
+        Assert.Equal<string>(Hex.Encode(h2.token), "746f6b", "token echoed");
+        Connection server = QuicConnection.NewServer(cfg, h2.dcid, h2.scid, h.dcid, retryScid, now);
+        QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, second), second, now);
+        // Loss: the server's first flight never arrives; the client's PTO recovers.
+        PumpDropping(server, client, now, 8_i64);
+        now = Settle(client, server, now, 60_i64);
+        Assert.True(QuicConnection.IsHandshakeConfirmed(client), "handshake completes after loss");
+        Assert.True(QuicConnection.IsEstablished(server), "server established");
+        Assert.True(QuicConnection.AddressValidated(server), "address validated by Retry");
+        // Flow control: 20000 bytes through 8 KiB stream windows.
+        i64 id = QuicConnection.OpenStream(client, true);
+        u8[] chunk = Slice.New(1000_i64);
+        u8[] sink = Slice.New(4096_i64);
+        mut i64 written = 0_i64;
+        mut i64 received = 0_i64;
+        mut i64 sid = -1_i64;
+        mut bool ok = true;
+        mut i64 guard = 0_i64;
+        while (written < 20000_i64 || received < 20000_i64) && guard < 400_i64 {
+            if written < 20000_i64 {
+                mut i64 k = 0_i64;
+                while k < 1000_i64 { chunk[k] = u8((written + k) & 255_i64); k = k + 1_i64; }
+                i64 n = QuicConnection.StreamWrite(client, id, chunk, 0_i64, 1000_i64);
+                if n > 0_i64 { written = written + n; }
+                if written == 20000_i64 { QuicConnection.StreamFinish(client, id); }
+            }
+            now = now + 1000000_i64;
+            PumpDropping(client, server, now, 0_i64);
+            PumpDropping(server, client, now, 0_i64);
+            if sid < 0_i64 { sid = QuicConnection.AcceptStream(server); }
+            if sid >= 0_i64 {
+                i64 got = QuicConnection.StreamRead(server, sid, sink, 0_i64, 4096_i64);
+                mut i64 j = 0_i64;
+                while j < got {
+                    if i64(sink[j]) != ((received + j) & 255_i64) { ok = false; }
+                    j = j + 1_i64;
+                }
+                if got > 0_i64 { received = received + got; }
+            }
+            guard = guard + 1_i64;
+        }
+        Assert.Equal<i64>(received, 20000_i64, "all bytes delivered");
+        Assert.True(ok, "bytes in order");
+        Assert.True(QuicConnection.StreamAtEnd(server, sid), "fin delivered");
+        // Key update initiated by the client, then data in both directions.
+        now = Settle(client, server, now, 20_i64);
+        Assert.True(QuicConnection.InitiateKeyUpdate(client), "key update allowed");
+        i64 id2 = QuicConnection.OpenStream(client, true);
+        QuicConnection.StreamWrite(client, id2, chunk, 0_i64, 100_i64);
+        QuicConnection.StreamFinish(client, id2);
+        now = Settle(client, server, now + 1000000_i64, 20_i64);
+        i64 sid2 = QuicConnection.AcceptStream(server);
+        Assert.Equal<i64>(QuicConnection.StreamRead(server, sid2, sink, 0_i64, 4096_i64), 100_i64, "data after key update");
+        Assert.Equal<i64>(QuicConnection.KeyUpdates(server), 1_i64, "server followed the key update");
+        Assert.Equal<i64>(QuicConnection.KeyUpdates(client), 1_i64, "client updated once");
+        // Idle timeout: no traffic for longer than 3 s closes both silently.
+        now = now + 10000000000_i64;
+        QuicConnection.OnTimeout(client, now);
+        QuicConnection.OnTimeout(server, now);
+        Assert.True(QuicConnection.IsClosed(client), "client idle-closed");
+        Assert.True(QuicConnection.IsClosed(server), "server idle-closed");
+        Assert.Equal<i64>(QuicErrors.WireCode(QuicConnection.Error(client)), 1_i64, "idle timeout is not a peer close");
+        // Version negotiation without version 1 ends a fresh client attempt.
+        Connection other = QuicConnection.NewClient(cfg, now);
+        i64 n3 = QuicConnection.BuildDatagram(other, now);
+        Header h3 = QuicPacket.ParseHeader(other.out, 0_i64, n3, 0_i64);
+        Writer w = QuicWire.NewWriter(Slice.New(64_i64), 0_i64, 64_i64);
+        QuicWire.PutByte(w, 128_i64);
+        QuicWire.PutUint(w, 4_i64, 0_i64);
+        QuicWire.PutByte(w, 8_i64);
+        QuicWire.PutAll(w, h3.scid);
+        QuicWire.PutByte(w, 8_i64);
+        QuicWire.PutAll(w, h3.dcid);
+        QuicWire.PutUint(w, 4_i64, 0xff00001d_i64);
+        QuicConnection.OnDatagram(other, w.buf, QuicWire.WPos(w), now);
+        Assert.True(QuicConnection.IsClosed(other), "version negotiation failure");
+    }
+}
+
+// Flow-control credit under loss, in memory with a simulated clock (WEB7).
+// RFC 9000 section 13.3: a lost MAX_DATA or MAX_STREAM_DATA is sent again with the current
+// limit. RFC 9002 section 6.2: a PTO sends an ack-eliciting probe, so a lost credit frame
+// that is the last packet in flight is still recovered. The receiver below loses the first
+// copy of every credit update it sends; the sender must not stall.
+mod CreditLossTests
+{
+    test LostCreditFramesDoNotStallTheSender {
+        // 8 KiB stream windows and a 64 KiB connection window: 100 KB needs both
+        // MAX_STREAM_DATA and MAX_DATA updates.
+        QuicConfig cfg = QuicConfig.InsecureLoopbackForTestsOnly(["h3"], 0_i64);
+        mut i64 now = 1000000000_i64;
+        i64 start = now;
+        Connection client = QuicConnection.NewClient(cfg, now);
+        i64 first = QuicConnection.BuildDatagram(client, now);
+        Header h = QuicPacket.ParseHeader(client.out, 0_i64, first, 0_i64);
+        Connection server = QuicConnection.NewServer(cfg, h.dcid, h.scid, h.dcid, Slice.New(0_i64), now);
+        QuicConnection.OnDatagram(server, QuicWire.CopyOf(client.out, 0_i64, first), first, now);
+        i64[] cs = [0_i64, 0_i64];
+        i64[] sc = [0_i64, 0_i64];
+        mut i64 r = 0_i64;
+        while r < 20_i64 {
+            now = now + 1000000_i64;
+            PumpLosingCredit(server, client, now, false, 0_i64, sc);
+            PumpLosingCredit(client, server, now, false, 0_i64, cs);
+            r = r + 1_i64;
+        }
+        Assert.True(QuicConnection.IsHandshakeConfirmed(client), "handshake confirmed");
+        i64 id = QuicConnection.OpenStream(client, true);
+        Assert.True(id >= 0_i64, "stream opened");
+        u8[] chunk = Slice.New(1500_i64);
+        u8[] sink = Slice.New(4096_i64);
+        mut i64 written = 0_i64;
+        mut i64 received = 0_i64;
+        mut i64 sid = -1_i64;
+        mut bool ordered = true;
+        mut bool dropCredit = false;
+        mut i64 guard = 0_i64;
+        while received < TotalBytes() && guard < 20000_i64 && now - start < 60000000000_i64 {
+            mut i64 progress = 0_i64;
+            if written < TotalBytes() {
+                mut i64 want = TotalBytes() - written;
+                if want > 1500_i64 { want = 1500_i64; }
+                mut i64 k = 0_i64;
+                while k < want { chunk[k] = PatternAt(written + k); k = k + 1_i64; }
+                i64 n = QuicConnection.StreamWrite(client, id, chunk, 0_i64, want);
+                if n > 0_i64 { written = written + n; progress = progress + n; }
+                if written == TotalBytes() { QuicConnection.StreamFinish(client, id); }
+            }
+            // Every 7th client datagram is lost as well (data and ACKs).
+            progress = progress + PumpLosingCredit(client, server, now, false, 7_i64, cs);
+            if sid < 0_i64 { sid = QuicConnection.AcceptStream(server); }
+            if sid >= 0_i64 {
+                i64 got = QuicConnection.StreamRead(server, sid, sink, 0_i64, 4096_i64);
+                mut i64 j = 0_i64;
+                while j < got {
+                    if sink[j] != PatternAt(received + j) { ordered = false; }
+                    j = j + 1_i64;
+                }
+                if got > 0_i64 { received = received + got; progress = progress + got; dropCredit = true; }
+            }
+            // The first flight after each read carries the credit update: it is lost.
+            i64 out = PumpLosingCredit(server, client, now, dropCredit, 0_i64, sc);
+            if out > 0_i64 { dropCredit = false; }
+            progress = progress + out;
+            if progress == 0_i64 {
+                i64 t = Earliest(client, server, now);
+                if t > now { now = t; }
+            } else {
+                now = now + 1000000_i64;
+            }
+            QuicConnection.OnTimeout(client, now);
+            QuicConnection.OnTimeout(server, now);
+            guard = guard + 1_i64;
+        }
+        Assert.Equal<i64>(received, TotalBytes(), "all bytes delivered despite lost credit frames");
+        Assert.True(ordered, "bytes in order");
+        Assert.True(sc[1] > 0_i64 && cs[1] > 0_i64, "datagrams were lost in both directions");
+        // Each lost credit update costs about one probe timeout; 100 KB must not take
+        // anywhere near the 10 s HTTP/3 write timeout of simulated time.
+        i64 elapsedMillis = (now - start) / 1000000_i64;
+        Assert.True(elapsedMillis < 5000_i64, "transfer finished in bounded simulated time");
+    }
+}
+
+// A Beskid QUIC client and server over UDP on 127.0.0.1: Retry address validation, the
+// handshake, a bidirectional stream echo and connection close, with one driver fiber per
+// endpoint.
+mod UdpLoopbackTests
+{
+    test RetryHandshakeEchoAndClose {
+        Fiber<i64> scenario = spawn RetryScenario();
+        i64 result = match scenario.Join() { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+        Assert.Equal<i64>(result, 0_i64, "loopback scenario");
+    }
+}
+
+// A Beskid QUIC client and server over UDP on 127.0.0.1 with the TLS 1.3 handshake
+// (RFC 9001): handshake, ALPN, a bidirectional stream echo and connection close.
+mod TlsLoopbackTests
+{
+    test HandshakeEchoAndClose {
+        Fiber<i64> scenario = spawn TlsScenario();
+        i64 result = match scenario.Join() { Result::Ok(v) => v, Result::Error(_) => -1_i64, };
+        Assert.Equal<i64>(result, 0_i64, "TLS loopback scenario");
+    }
 }

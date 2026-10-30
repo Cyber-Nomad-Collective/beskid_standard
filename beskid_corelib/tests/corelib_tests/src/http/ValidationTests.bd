@@ -109,199 +109,202 @@ bool IsError<T>(Result<T, HttpError> result, HttpError expected)
     };
 }
 
-test HttpHostIpv6LiteralsFollowRfc3986AddressGrammar
+mod ValidationTests
 {
-    HostCase[] cases = [HostCase
+    test HostIpv6LiteralsFollowRfc3986AddressGrammar
     {
-        value: "[::1]",
-        valid: true,
-    }, HostCase
-    {
-        value: "[2001:db8::1]:8080",
-        valid: true,
-    }, HostCase
-    {
-        value: "[::ffff:192.0.2.1]",
-        valid: true,
-    }, HostCase
-    {
-        value: "[::]",
-        valid: true,
-    }, HostCase
-    {
-        value: "[1::]",
-        valid: true,
-    }, HostCase
-    {
-        value: "[:::::::]",
-        valid: false,
-    }, HostCase
-    {
-        value: "[1:::2]",
-        valid: false,
-    }, HostCase
-    {
-        value: "[:::]",
-        valid: false,
-    }, HostCase
-    {
-        value: "[1::2:]",
-        valid: false,
-    }, HostCase
-    {
-        value: "[::ffff:192.0.2.1.]",
-        valid: false,
-    }, HostCase
-    {
-        value: "[1::2::3]",
-        valid: false,
-    }];
-    mut i64 index = 0_i64;
-    while (index < Array.Len<HostCase>(cases))
-    {
-        HostCase item = Array.Get<HostCase>(cases, index);
-        Result<Request, HttpError> result = Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: " + item.value + "||"), Types.DefaultLimits());
-        bool parsed = match (result)
+        HostCase[] cases = [HostCase
         {
-            Result::Ok(_) => true,
-            Result::Error(_) => false,
-        };
-        Assert.Equal(parsed, item.valid, "IPv6 Host literal follows RFC 3986 grammar");
-        mut Header[] headers = Array.Empty<Header>();
-        Array.Append<Header>(headers, Header
+            value: "[::1]",
+            valid: true,
+        }, HostCase
         {
-            name: "Host",
-            value: item.value,
-        });
-        Result<u8[], HttpError> output = Codec.SerializeRequest(Request
+            value: "[2001:db8::1]:8080",
+            valid: true,
+        }, HostCase
         {
-            method: "GET",
-            target: "/",
-            headers: headers,
-            body: [],
-        }, Types.DefaultLimits());
-        bool serialized = match (output)
+            value: "[::ffff:192.0.2.1]",
+            valid: true,
+        }, HostCase
         {
-            Result::Ok(_) => true,
-            Result::Error(_) => false,
-        };
-        Assert.Equal(serialized, item.valid, "serialized IPv6 Host literal follows RFC 3986 grammar");
-        index = index + 1_i64;
+            value: "[::]",
+            valid: true,
+        }, HostCase
+        {
+            value: "[1::]",
+            valid: true,
+        }, HostCase
+        {
+            value: "[:::::::]",
+            valid: false,
+        }, HostCase
+        {
+            value: "[1:::2]",
+            valid: false,
+        }, HostCase
+        {
+            value: "[:::]",
+            valid: false,
+        }, HostCase
+        {
+            value: "[1::2:]",
+            valid: false,
+        }, HostCase
+        {
+            value: "[::ffff:192.0.2.1.]",
+            valid: false,
+        }, HostCase
+        {
+            value: "[1::2::3]",
+            valid: false,
+        }];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<HostCase>(cases))
+        {
+            HostCase item = Array.Get<HostCase>(cases, index);
+            Result<Request, HttpError> result = Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: " + item.value + "||"), Types.DefaultLimits());
+            bool parsed = match (result)
+            {
+                Result::Ok(_) => true,
+                Result::Error(_) => false,
+            };
+            Assert.Equal(parsed, item.valid, "IPv6 Host literal follows RFC 3986 grammar");
+            mut Header[] headers = Array.Empty<Header>();
+            Array.Append<Header>(headers, Header
+            {
+                name: "Host",
+                value: item.value,
+            });
+            Result<u8[], HttpError> output = Codec.SerializeRequest(Request
+            {
+                method: "GET",
+                target: "/",
+                headers: headers,
+                body: [],
+            }, Types.DefaultLimits());
+            bool serialized = match (output)
+            {
+                Result::Ok(_) => true,
+                Result::Error(_) => false,
+            };
+            Assert.Equal(serialized, item.valid, "serialized IPv6 Host literal follows RFC 3986 grammar");
+            index = index + 1_i64;
+        }
     }
-}
 
-test HttpFieldValuesAllowSpacesAndRejectControlsAndNonAscii
-{
-    FieldCase[] fields = [FieldCase
+    test FieldValuesAllowSpacesAndRejectControlsAndNonAscii
     {
-        raw: "a b",
-        stored: "a b",
-    }, FieldCase
-    {
-        raw: "  a  ",
-        stored: "a",
-    }];
-    mut i64 fieldIndex = 0_i64;
-    while (fieldIndex < Array.Len<FieldCase>(fields))
-    {
-        FieldCase item = Array.Get<FieldCase>(fields, fieldIndex);
-        Result<Request, HttpError> result = Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: example.test|X-Test: " + item.raw + "||"), Types.DefaultLimits());
-        match (result)
+        FieldCase[] fields = [FieldCase
         {
-            Result::Error(_) => Assert.Fail("field value with permitted HTAB parses"),
-            Result::Ok(request) => Assert.Equal(request.headers[1].value, item.stored, "field OWS is not stored"),
-        };
-        fieldIndex = fieldIndex + 1_i64;
-    }
-    mut ByteCase[] cases = Array.Empty<ByteCase>();
-    mut i64 control = 0_i64;
-    while (control <= 31_i64)
-    {
-        mut HttpError expected = HttpError::InvalidHeader;
-        if (control == 10_i64)
+            raw: "a b",
+            stored: "a b",
+        }, FieldCase
         {
-            expected = HttpError::InvalidFraming;
+            raw: "  a  ",
+            stored: "a",
+        }];
+        mut i64 fieldIndex = 0_i64;
+        while (fieldIndex < Array.Len<FieldCase>(fields))
+        {
+            FieldCase item = Array.Get<FieldCase>(fields, fieldIndex);
+            Result<Request, HttpError> result = Codec.ParseRequest(Wire("GET / HTTP/1.1|Host: example.test|X-Test: " + item.raw + "||"), Types.DefaultLimits());
+            match (result)
+            {
+                Result::Error(_) => Assert.Fail("field value with permitted HTAB parses"),
+                Result::Ok(request) => Assert.Equal(request.headers[1].value, item.stored, "field OWS is not stored"),
+            };
+            fieldIndex = fieldIndex + 1_i64;
+        }
+        mut ByteCase[] cases = Array.Empty<ByteCase>();
+        mut i64 control = 0_i64;
+        while (control <= 31_i64)
+        {
+            mut HttpError expected = HttpError::InvalidHeader;
+            if (control == 10_i64)
+            {
+                expected = HttpError::InvalidFraming;
+            }
+            Array.Append<ByteCase>(cases, ByteCase
+            {
+                before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
+                value: u8(control),
+                after: "b||",
+                expected: expected,
+            });
+            control = control + 1_i64;
         }
         Array.Append<ByteCase>(cases, ByteCase
         {
             before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
-            value: u8(control),
+            value: 127_u8,
             after: "b||",
-            expected: expected,
+            expected: HttpError::InvalidHeader,
         });
-        control = control + 1_i64;
+        Array.Append<ByteCase>(cases, ByteCase
+        {
+            before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
+            value: 128_u8,
+            after: "b||",
+            expected: HttpError::InvalidHeader,
+        });
+        Array.Append<ByteCase>(cases, ByteCase
+        {
+            before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
+            value: 255_u8,
+            after: "b||",
+            expected: HttpError::InvalidHeader,
+        });
+        Array.Append<ByteCase>(cases, ByteCase
+        {
+            before: "GET / HTTP/1.1|Host: example.test|X-Test: ",
+            value: 9_u8,
+            after: "a||",
+            expected: HttpError::InvalidHeader,
+        });
+        Array.Append<ByteCase>(cases, ByteCase
+        {
+            before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
+            value: 9_u8,
+            after: "||",
+            expected: HttpError::InvalidHeader,
+        });
+        mut i64 index = 0_i64;
+        while (index < Array.Len<ByteCase>(cases))
+        {
+            ByteCase item = Array.Get<ByteCase>(cases, index);
+            Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "control and non-ASCII field octets are rejected");
+            index = index + 1_i64;
+        }
     }
-    Array.Append<ByteCase>(cases, ByteCase
-    {
-        before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
-        value: 127_u8,
-        after: "b||",
-        expected: HttpError::InvalidHeader,
-    });
-    Array.Append<ByteCase>(cases, ByteCase
-    {
-        before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
-        value: 128_u8,
-        after: "b||",
-        expected: HttpError::InvalidHeader,
-    });
-    Array.Append<ByteCase>(cases, ByteCase
-    {
-        before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
-        value: 255_u8,
-        after: "b||",
-        expected: HttpError::InvalidHeader,
-    });
-    Array.Append<ByteCase>(cases, ByteCase
-    {
-        before: "GET / HTTP/1.1|Host: example.test|X-Test: ",
-        value: 9_u8,
-        after: "a||",
-        expected: HttpError::InvalidHeader,
-    });
-    Array.Append<ByteCase>(cases, ByteCase
-    {
-        before: "GET / HTTP/1.1|Host: example.test|X-Test: a",
-        value: 9_u8,
-        after: "||",
-        expected: HttpError::InvalidHeader,
-    });
-    mut i64 index = 0_i64;
-    while (index < Array.Len<ByteCase>(cases))
-    {
-        ByteCase item = Array.Get<ByteCase>(cases, index);
-        Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "control and non-ASCII field octets are rejected");
-        index = index + 1_i64;
-    }
-}
 
-test HttpStartLineComponentsRejectControlOctets
-{
-    ByteCase[] requestCases = [ByteCase
+    test StartLineComponentsRejectControlOctets
     {
-        before: "GE",
-        value: 9_u8,
-        after: "T / HTTP/1.1|Host: example.test||",
-        expected: HttpError::InvalidMethod,
-    }, ByteCase
-    {
-        before: "GET /a",
-        value: 0_u8,
-        after: "b HTTP/1.1|Host: example.test||",
-        expected: HttpError::InvalidTarget,
-    }, ByteCase
-    {
-        before: "GET / HTTP/1.",
-        value: 127_u8,
-        after: "1|Host: example.test||",
-        expected: HttpError::InvalidStartLine,
-    }];
-    mut i64 index = 0_i64;
-    while (index < Array.Len<ByteCase>(requestCases))
-    {
-        ByteCase item = Array.Get<ByteCase>(requestCases, index);
-        Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "method and target control octets are rejected");
-        index = index + 1_i64;
+        ByteCase[] requestCases = [ByteCase
+        {
+            before: "GE",
+            value: 9_u8,
+            after: "T / HTTP/1.1|Host: example.test||",
+            expected: HttpError::InvalidMethod,
+        }, ByteCase
+        {
+            before: "GET /a",
+            value: 0_u8,
+            after: "b HTTP/1.1|Host: example.test||",
+            expected: HttpError::InvalidTarget,
+        }, ByteCase
+        {
+            before: "GET / HTTP/1.",
+            value: 127_u8,
+            after: "1|Host: example.test||",
+            expected: HttpError::InvalidStartLine,
+        }];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<ByteCase>(requestCases))
+        {
+            ByteCase item = Array.Get<ByteCase>(requestCases, index);
+            Assert.True(IsError<Request>(Codec.ParseRequest(WireWithByte(item.before, item.value, item.after), Types.DefaultLimits()), item.expected), "method and target control octets are rejected");
+            index = index + 1_i64;
+        }
+        Assert.True(IsError<Response>(Codec.ParseResponse(WireWithByte("HTTP/1.1 200 O", 127_u8, "K||"), Types.DefaultLimits(), MessageRole::Response), HttpError::InvalidStatus), "reason control octets are rejected");
     }
-    Assert.True(IsError<Response>(Codec.ParseResponse(WireWithByte("HTTP/1.1 200 O", 127_u8, "K||"), Types.DefaultLimits(), MessageRole::Response), HttpError::InvalidStatus), "reason control octets are rejected");
 }

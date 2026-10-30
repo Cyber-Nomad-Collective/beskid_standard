@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Test cleanup: every Corelib test lives in a topic module (`mod TopicTests { test Name { } }`),
+  so a test's identity is `TopicTests::Name` (for example `CoreSuite` `BytesTests::NewHasLength`,
+  `BsolSuite` `SyntaxTests::OrderedBlocksAssignmentsAndByteSpans`, `ProcessSuite`
+  `LifecycleTests::CloseIsIdempotentThroughAliases`). Large suites have one module per area (the
+  former section headings); a file with one area has one module. The `Tests` suffix keeps a
+  module from taking the name of the API under test: a module named `Encoder` hid the imported
+  type `Encoder` in type positions of the whole file. The domain prefix that the module now
+  names is gone from 882 of 1522 test names (`Bsol`, `Serialization`, `Network`, `Http`, `H3`,
+  `Pk`, `Provider`, `Time`, `Process`, `Dynamic`, `Web`, `Glue` and area names such as
+  `String`, `Ansi`, `Result`). Helpers, types and `use` lines stay at file level, before the
+  modules. Targets and file names are unchanged, except the merges below.
+- Test cleanup: the remaining one-test targets merge, with their helpers renamed where two files
+  used one name for different code. quic `QuicConnectionStress`, `QuicCreditLoss`,
+  `QuicLoopback` and `QuicTlsLoopback` join `QuicConnection` (modules `InMemoryTests`,
+  `RecoveryFlowTests`, `CreditLossTests`, `UdpLoopbackTests`, `TlsLoopbackTests`; `Pump`
+  becomes `PumpDropping` and `PumpLosingCredit`, the loopback `Scenario`/`Talk` become `RetryScenario`/`RetryTalk` and
+  `TlsScenario`/`TlsTalk`). tls `LoopbackPolicy` joins `Loopback` (`Serve`, `Echo`,
+  `RunClient`, `Scenario` of the policy test become `ServeOnce`, `EchoOnce`, `RunPolicyClient`,
+  `PolicyScenario`). websocket `WsTlsTests` joins `WsLoopbackTests` (`WssEchoOnce`,
+  `WssServeEcho`, `WssUrl`). http3 `H3PeerTests` and `H3QuicLoopback` join `H3ExchangeTests`
+  (`PeerGet`, `PeerStartOk`, `QuicLoopbackGet`, `QuicLoopbackConfig`). Package test targets:
+  82 -> 74.
 - Test cleanup: `connect` `ErrorsResolutionFailedForInvalidName` needed a DNS server and failed
   where the resolver answers the AAAA query for a `.invalid` name with `EAI_NODATA` (the native
   resolver reports that as `NetworkDown`, and the preferred IPv6 family's error is the reported

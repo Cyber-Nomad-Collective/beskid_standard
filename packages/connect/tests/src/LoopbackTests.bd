@@ -47,16 +47,6 @@ unit AddressesV4()
     };
 }
 
-test ConnectAddressesIpv4Loopback
-{
-    Fiber<unit> scenario = spawn AddressesV4();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "IPv4 scenario joins");
-}
-
 bool HasOptions(TcpStream stream, bool noDelay, bool keepAlive)
 {
     return match (stream.SocketOptions())
@@ -99,16 +89,6 @@ unit SocketOptionsScenario()
     };
 }
 
-test ConnectAppliesThePolicySocketOptionsToTheWinningStream
-{
-    Fiber<unit> scenario = spawn SocketOptionsScenario();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "socket options scenario joins");
-}
-
 Result<unit, NetworkError> HostLiteralResult()
 {
     TcpListener listener = TcpListener.Bind(Loopback4(0_i64), 8_i64)?;
@@ -132,16 +112,6 @@ unit HostLiteral()
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("literal scenario has no NetworkError"),
     };
-}
-
-test ConnectHostIpv4LiteralResolvesBothFamilies
-{
-    Fiber<unit> scenario = spawn HostLiteral();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "literal scenario joins");
 }
 
 // localhost answers ::1 and 127.0.0.1; only IPv4 listens, so the IPv6 attempt is
@@ -171,16 +141,6 @@ unit LocalhostFallback()
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("localhost scenario has no NetworkError"),
     };
-}
-
-test ConnectHostLocalhostFallsBackToIpv4
-{
-    Fiber<unit> scenario = spawn LocalhostFallback();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "localhost scenario joins");
 }
 
 // The tests that need IPv6 loopback carry the tag `ipv6` and fail when ::1 cannot be bound, so a
@@ -231,36 +191,6 @@ unit DualStack(AddressFamily preferred, bool expectV6)
     };
 }
 
-test ConnectAddressesDualStackPrefersIpv6
-{
-    meta
-    {
-        tags = "ipv6";
-    }
-
-    Fiber<unit> scenario = spawn (() => DualStack(AddressFamily::V6, true));
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "IPv6-preferred scenario joins");
-}
-
-test ConnectAddressesDualStackPrefersIpv4ByPolicy
-{
-    meta
-    {
-        tags = "ipv6";
-    }
-
-    Fiber<unit> scenario = spawn (() => DualStack(AddressFamily::V4, false));
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "IPv4-preferred scenario joins");
-}
-
 Result<unit, NetworkError> Ipv6OnlyResult()
 {
     Result<TcpListener, NetworkError> bound6 = TcpListener.Bind(Loopback6(0_i64), 8_i64);
@@ -296,21 +226,6 @@ unit Ipv6Only()
     };
 }
 
-test ConnectHostIpv6Literal
-{
-    meta
-    {
-        tags = "ipv6";
-    }
-
-    Fiber<unit> scenario = spawn Ipv6Only();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "IPv6 literal scenario joins");
-}
-
 // Refused first, good second: the refusal starts the next attempt at once,
 // so the 2 s attempt delay is never waited for.
 Result<unit, NetworkError> RefusedThenGoodResult()
@@ -340,16 +255,6 @@ unit RefusedThenGood()
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("refused scenario has no NetworkError"),
     };
-}
-
-test FallbackRefusedFirstStartsNextImmediately
-{
-    Fiber<unit> scenario = spawn RefusedThenGood();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "refused scenario joins");
 }
 
 // Hanging first, good second: the second attempt starts after the attempt
@@ -385,16 +290,6 @@ unit HangingThenGood()
     };
 }
 
-test FallbackHangingFirstIsRacedAfterAttemptDelay
-{
-    Fiber<unit> scenario = spawn HangingThenGood();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "hanging scenario joins");
-}
-
 // The attempt delay is clamped to at least 100 ms even when policy asks for less.
 Result<unit, NetworkError> ClampedDelayResult()
 {
@@ -423,16 +318,6 @@ unit ClampedDelay()
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("clamp scenario has no NetworkError"),
     };
-}
-
-test FallbackAttemptDelayHas100msFloor
-{
-    Fiber<unit> scenario = spawn ClampedDelay();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "clamp scenario joins");
 }
 
 pub i64 AttemptCount(ConnectError error)
@@ -491,16 +376,6 @@ unit DeadlineScenario()
     };
 }
 
-test DeadlineExceededKeepsTimedOutAttempts
-{
-    Fiber<unit> scenario = spawn DeadlineScenario();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "deadline scenario joins");
-}
-
 // A deadline shorter than the attempt delay ends the race before a second attempt starts.
 Result<unit, NetworkError> ShortDeadlineResult()
 {
@@ -531,16 +406,6 @@ unit ShortDeadline()
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("short deadline scenario has no NetworkError"),
     };
-}
-
-test DeadlineShorterThanAttemptDelay
-{
-    Fiber<unit> scenario = spawn ShortDeadline();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "short deadline scenario joins");
 }
 
 // Cancelling the calling fiber mid-race. The policy deadline bounds the orphaned
@@ -598,16 +463,6 @@ unit CancelCaller()
     };
 }
 
-test CancelCallerFiberEndsRaceWithoutLeaks
-{
-    Fiber<unit> scenario = spawn CancelCaller();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "cancel scenario joins");
-}
-
 // The runtime socket table has 256 slots. 300 races, each with a refused loser
 // and an accepted winner, would exhaust it if any race leaked a socket; the
 // process-exit leak audit of the test runner reports anything left open.
@@ -642,16 +497,6 @@ unit RefusedCycles()
         Result::Ok(_) => (),
         Result::Error(_) => Assert.Fail("refused cycles have no NetworkError (a leak surfaces as ResourceExhausted)"),
     };
-}
-
-test LeakRefusedLosersOver300Races
-{
-    Fiber<unit> scenario = spawn RefusedCycles();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "refused cycles join");
 }
 
 // Losers still connecting when the winner arrives are cancelled and joined.
@@ -689,16 +534,6 @@ unit CancelledLoserCycles()
     };
 }
 
-test LeakCancelledLosersAreJoined
-{
-    Fiber<unit> scenario = spawn CancelledLoserCycles();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "cancelled-loser cycles join");
-}
-
 // Resolving races (two name queries each) also release every fiber and socket,
 // well past the runtime's 64-entry channel table.
 Result<unit, NetworkError> ResolvingCyclesResult()
@@ -730,12 +565,192 @@ unit ResolvingCycles()
     };
 }
 
-test LeakResolvingRacesPastChannelTable
+mod ConnectTests
 {
-    Fiber<unit> scenario = spawn ResolvingCycles();
-    Assert.True(match (scenario.Join())
+    test AddressesIpv4Loopback
     {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "resolving cycles join");
+        Fiber<unit> scenario = spawn AddressesV4();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "IPv4 scenario joins");
+    }
+
+    test AppliesThePolicySocketOptionsToTheWinningStream
+    {
+        Fiber<unit> scenario = spawn SocketOptionsScenario();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "socket options scenario joins");
+    }
+
+    test HostIpv4LiteralResolvesBothFamilies
+    {
+        Fiber<unit> scenario = spawn HostLiteral();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "literal scenario joins");
+    }
+
+    test HostLocalhostFallsBackToIpv4
+    {
+        Fiber<unit> scenario = spawn LocalhostFallback();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "localhost scenario joins");
+    }
+
+    test AddressesDualStackPrefersIpv6
+    {
+        meta
+        {
+            tags = "ipv6";
+        }
+
+        Fiber<unit> scenario = spawn (() => DualStack(AddressFamily::V6, true));
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "IPv6-preferred scenario joins");
+    }
+
+    test AddressesDualStackPrefersIpv4ByPolicy
+    {
+        meta
+        {
+            tags = "ipv6";
+        }
+
+        Fiber<unit> scenario = spawn (() => DualStack(AddressFamily::V4, false));
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "IPv4-preferred scenario joins");
+    }
+
+    test HostIpv6Literal
+    {
+        meta
+        {
+            tags = "ipv6";
+        }
+
+        Fiber<unit> scenario = spawn Ipv6Only();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "IPv6 literal scenario joins");
+    }
+}
+
+mod FallbackTests
+{
+    test RefusedFirstStartsNextImmediately
+    {
+        Fiber<unit> scenario = spawn RefusedThenGood();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "refused scenario joins");
+    }
+
+    test HangingFirstIsRacedAfterAttemptDelay
+    {
+        Fiber<unit> scenario = spawn HangingThenGood();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "hanging scenario joins");
+    }
+
+    test AttemptDelayHas100msFloor
+    {
+        Fiber<unit> scenario = spawn ClampedDelay();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "clamp scenario joins");
+    }
+}
+
+mod DeadlineTests
+{
+    test ExceededKeepsTimedOutAttempts
+    {
+        Fiber<unit> scenario = spawn DeadlineScenario();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "deadline scenario joins");
+    }
+
+    test ShorterThanAttemptDelay
+    {
+        Fiber<unit> scenario = spawn ShortDeadline();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "short deadline scenario joins");
+    }
+}
+
+mod CancelTests
+{
+    test CallerFiberEndsRaceWithoutLeaks
+    {
+        Fiber<unit> scenario = spawn CancelCaller();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "cancel scenario joins");
+    }
+}
+
+mod LeaksTests
+{
+    test RefusedLosersOver300Races
+    {
+        Fiber<unit> scenario = spawn RefusedCycles();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "refused cycles join");
+    }
+
+    test CancelledLosersAreJoined
+    {
+        Fiber<unit> scenario = spawn CancelledLoserCycles();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "cancelled-loser cycles join");
+    }
+
+    test ResolvingRacesPastChannelTable
+    {
+        Fiber<unit> scenario = spawn ResolvingCycles();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "resolving cycles join");
+    }
 }

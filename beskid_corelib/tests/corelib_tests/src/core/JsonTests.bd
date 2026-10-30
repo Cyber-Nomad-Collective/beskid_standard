@@ -92,101 +92,104 @@ string J(string text)
     return String.Replace(text, "'", "\"");
 }
 
-test JsonParseScalars
+mod JsonTests
 {
-    Assert.True(Json.IsNull(ParsedOrNull(Json.Parse("null"))), "null");
-    Assert.Equal(Json.Stringify(ParsedOrNull(Json.Parse(" true "))), "true", "true with whitespace");
-    Assert.Equal(Json.Stringify(ParsedOrNull(Json.Parse("-12.5e1"))), "-125", "number");
-    Assert.Equal(StringOr(Json.AsText(ParsedOrNull(Json.Parse(J("'hi'")))), "?"), "hi", "string");
-}
+    test ParseScalars
+    {
+        Assert.True(Json.IsNull(ParsedOrNull(Json.Parse("null"))), "null");
+        Assert.Equal(Json.Stringify(ParsedOrNull(Json.Parse(" true "))), "true", "true with whitespace");
+        Assert.Equal(Json.Stringify(ParsedOrNull(Json.Parse("-12.5e1"))), "-125", "number");
+        Assert.Equal(StringOr(Json.AsText(ParsedOrNull(Json.Parse(J("'hi'")))), "?"), "hi", "string");
+    }
 
-test JsonParseObjectAndAccess
-{
-    JsonValue doc = ParsedOrNull(Json.Parse(J("{'name': 'beskid', 'version': 0.5, 'tags': ['a', 'b'], 'meta': {}}")));
-    Assert.Equal(Json.Length(doc), 4, "member count");
-    Assert.Equal(TextOr(Json.Get(doc, "name"), "?"), "beskid", "string member");
-    Assert.True(NumberOr(Json.Get(doc, "version"), 0.0) == 0.5, "number member");
-    JsonValue tags = ValueOr(Json.Get(doc, "tags"));
-    Assert.Equal(Json.Length(tags), 2, "array length");
-    Assert.Equal(TextOr(Json.At(tags, 1), "?"), "b", "array element");
-    Assert.Equal(TextOr(Json.At(tags, 5), "none"), "none", "array out of range");
-    Assert.Equal(TextOr(Json.Get(doc, "missing"), "none"), "none", "missing member");
-    Assert.Equal(Json.Length(ValueOr(Json.Get(doc, "meta"))), 0, "empty object");
-}
+    test ParseObjectAndAccess
+    {
+        JsonValue doc = ParsedOrNull(Json.Parse(J("{'name': 'beskid', 'version': 0.5, 'tags': ['a', 'b'], 'meta': {}}")));
+        Assert.Equal(Json.Length(doc), 4, "member count");
+        Assert.Equal(TextOr(Json.Get(doc, "name"), "?"), "beskid", "string member");
+        Assert.True(NumberOr(Json.Get(doc, "version"), 0.0) == 0.5, "number member");
+        JsonValue tags = ValueOr(Json.Get(doc, "tags"));
+        Assert.Equal(Json.Length(tags), 2, "array length");
+        Assert.Equal(TextOr(Json.At(tags, 1), "?"), "b", "array element");
+        Assert.Equal(TextOr(Json.At(tags, 5), "none"), "none", "array out of range");
+        Assert.Equal(TextOr(Json.Get(doc, "missing"), "none"), "none", "missing member");
+        Assert.Equal(Json.Length(ValueOr(Json.Get(doc, "meta"))), 0, "empty object");
+    }
 
-test JsonEscapesDecode
-{
-    JsonValue value = ParsedOrNull(Json.Parse(J("'a\\'b\\\\c\\/d\\u0041\\u00e9\\ud83d\\ude00'")));
-    string text = StringOr(Json.AsText(value), "?");
-    Assert.True(String.StartsWith(text, "a\"b\\c/dA"), "simple and ASCII escapes");
-    Assert.Equal(String.Len(text), 14, "two-byte and four-byte UTF-8 from escapes");
-    JsonValue newline = ParsedOrNull(Json.Parse(J("'x\\ny'")));
-    Assert.Equal(StringOr(Json.AsText(newline), "?"), "x" + String.Newline() + "y", "newline escape");
-}
+    test EscapesDecode
+    {
+        JsonValue value = ParsedOrNull(Json.Parse(J("'a\\'b\\\\c\\/d\\u0041\\u00e9\\ud83d\\ude00'")));
+        string text = StringOr(Json.AsText(value), "?");
+        Assert.True(String.StartsWith(text, "a\"b\\c/dA"), "simple and ASCII escapes");
+        Assert.Equal(String.Len(text), 14, "two-byte and four-byte UTF-8 from escapes");
+        JsonValue newline = ParsedOrNull(Json.Parse(J("'x\\ny'")));
+        Assert.Equal(StringOr(Json.AsText(newline), "?"), "x" + String.Newline() + "y", "newline escape");
+    }
 
-test JsonStringifyRoundTrip
-{
-    string source = J("{'a':[1,2.5,-3],'b':{'c':null,'d':false},'e':'q\\'t'}");
-    JsonValue doc = ParsedOrNull(Json.Parse(source));
-    Assert.Equal(Json.Stringify(doc), source, "compact round trip");
-    Assert.Equal(Json.Stringify(ParsedOrNull(Json.Parse(Json.Stringify(doc)))), source, "stable");
-}
+    test StringifyRoundTrip
+    {
+        string source = J("{'a':[1,2.5,-3],'b':{'c':null,'d':false},'e':'q\\'t'}");
+        JsonValue doc = ParsedOrNull(Json.Parse(source));
+        Assert.Equal(Json.Stringify(doc), source, "compact round trip");
+        Assert.Equal(Json.Stringify(ParsedOrNull(Json.Parse(Json.Stringify(doc)))), source, "stable");
+    }
 
-test JsonStringifyEscapesControlCharacters
-{
-    string raw = "tab" + String.Tab() + "nl" + String.Newline() + "bell" + String.FromAscii(7);
-    Assert.Equal(Json.Quote(raw), J("'tab\\tnl\\nbell\\u0007'"), "escaped controls");
-    Assert.Equal(Json.Quote("q\"b\\"), J("'q\\'b\\\\'"), "quote and backslash");
-}
+    test StringifyEscapesControlCharacters
+    {
+        string raw = "tab" + String.Tab() + "nl" + String.Newline() + "bell" + String.FromAscii(7);
+        Assert.Equal(Json.Quote(raw), J("'tab\\tnl\\nbell\\u0007'"), "escaped controls");
+        Assert.Equal(Json.Quote("q\"b\\"), J("'q\\'b\\\\'"), "quote and backslash");
+    }
 
-test JsonPretty
-{
-    JsonValue doc = ParsedOrNull(Json.Parse(J("{'a':[1,{}],'b':'x'}")));
-    string nl = String.Newline();
-    string expected = "{" + nl + "  \"a\": [" + nl + "    1," + nl + "    {}" + nl + "  ]," + nl + "  \"b\": \"x\"" + nl + "}";
-    Assert.Equal(Json.Pretty(doc), expected, "two-space indentation");
-    Assert.Equal(Json.Pretty(Json.EmptyList()), "[]", "empty array stays inline");
-}
+    test Pretty
+    {
+        JsonValue doc = ParsedOrNull(Json.Parse(J("{'a':[1,{}],'b':'x'}")));
+        string nl = String.Newline();
+        string expected = "{" + nl + "  \"a\": [" + nl + "    1," + nl + "    {}" + nl + "  ]," + nl + "  \"b\": \"x\"" + nl + "}";
+        Assert.Equal(Json.Pretty(doc), expected, "two-space indentation");
+        Assert.Equal(Json.Pretty(Json.EmptyList()), "[]", "empty array stays inline");
+    }
 
-test JsonBuildWithAndPush
-{
-    mut JsonValue doc = Json.EmptyObject();
-    doc = Json.With(doc, "n", JsonValue::Number(1.0));
-    doc = Json.With(doc, "s", JsonValue::Text("x"));
-    doc = Json.With(doc, "n", JsonValue::Number(2.0));
-    mut JsonValue list = Json.EmptyList();
-    list = Json.Push(list, JsonValue::Bool(true));
-    doc = Json.With(doc, "l", list);
-    Assert.Equal(Json.Stringify(doc), J("{'n':2,'s':'x','l':[true]}"), "replace keeps position");
-    Assert.Equal(String.Join(Json.Keys(doc), ","), "n,s,l", "keys");
-}
+    test BuildWithAndPush
+    {
+        mut JsonValue doc = Json.EmptyObject();
+        doc = Json.With(doc, "n", JsonValue::Number(1.0));
+        doc = Json.With(doc, "s", JsonValue::Text("x"));
+        doc = Json.With(doc, "n", JsonValue::Number(2.0));
+        mut JsonValue list = Json.EmptyList();
+        list = Json.Push(list, JsonValue::Bool(true));
+        doc = Json.With(doc, "l", list);
+        Assert.Equal(Json.Stringify(doc), J("{'n':2,'s':'x','l':[true]}"), "replace keeps position");
+        Assert.Equal(String.Join(Json.Keys(doc), ","), "n,s,l", "keys");
+    }
 
-test JsonNonFiniteNumbersSerializeAsNull
-{
-    f64 zero = 0.0;
-    Assert.Equal(Json.Stringify(JsonValue::Number(1.0 / zero)), "null", "infinity");
-}
+    test NonFiniteNumbersSerializeAsNull
+    {
+        f64 zero = 0.0;
+        Assert.Equal(Json.Stringify(JsonValue::Number(1.0 / zero)), "null", "infinity");
+    }
 
-test JsonErrorOffsets
-{
-    Assert.Equal(ErrorCode(Json.Parse("")), 1000, "empty input");
-    Assert.Equal(ErrorCode(Json.Parse("[1,")), 1003, "unterminated array");
-    Assert.Equal(ErrorCode(Json.Parse("[1 2]")), 2003, "missing comma");
-    Assert.Equal(ErrorCode(Json.Parse(J("{'a' 1}"))), 2005, "missing colon");
-    Assert.Equal(ErrorCode(Json.Parse("[01]")), 2002, "leading zero ends the number");
-    Assert.Equal(ErrorCode(Json.Parse("1.")), 3002, "fraction needs digits");
-    Assert.Equal(ErrorCode(Json.Parse("-")), 3001, "minus needs digits");
-    Assert.Equal(ErrorCode(Json.Parse(J("'\\x'"))), 4001, "unknown escape");
-    Assert.Equal(ErrorCode(Json.Parse(J("'\\udc00'"))), 5001, "lone low surrogate");
-    Assert.Equal(ErrorCode(Json.Parse(J("'a") + String.Tab() + "\"")), 6002, "raw tab in string");
-    Assert.Equal(ErrorCode(Json.Parse("true false")), 7005, "trailing value");
-    Assert.Equal(ErrorCode(Json.Parse("nul")), 2000, "bad literal");
-}
+    test ErrorOffsets
+    {
+        Assert.Equal(ErrorCode(Json.Parse("")), 1000, "empty input");
+        Assert.Equal(ErrorCode(Json.Parse("[1,")), 1003, "unterminated array");
+        Assert.Equal(ErrorCode(Json.Parse("[1 2]")), 2003, "missing comma");
+        Assert.Equal(ErrorCode(Json.Parse(J("{'a' 1}"))), 2005, "missing colon");
+        Assert.Equal(ErrorCode(Json.Parse("[01]")), 2002, "leading zero ends the number");
+        Assert.Equal(ErrorCode(Json.Parse("1.")), 3002, "fraction needs digits");
+        Assert.Equal(ErrorCode(Json.Parse("-")), 3001, "minus needs digits");
+        Assert.Equal(ErrorCode(Json.Parse(J("'\\x'"))), 4001, "unknown escape");
+        Assert.Equal(ErrorCode(Json.Parse(J("'\\udc00'"))), 5001, "lone low surrogate");
+        Assert.Equal(ErrorCode(Json.Parse(J("'a") + String.Tab() + "\"")), 6002, "raw tab in string");
+        Assert.Equal(ErrorCode(Json.Parse("true false")), 7005, "trailing value");
+        Assert.Equal(ErrorCode(Json.Parse("nul")), 2000, "bad literal");
+    }
 
-test JsonDepthLimit
-{
-    string deep = String.Repeat("[", 200) + String.Repeat("]", 200);
-    Assert.Equal(ErrorCode(Json.Parse(deep)), 8128, "nesting limit");
-    string ok = String.Repeat("[", 100) + String.Repeat("]", 100);
-    Assert.Equal(ErrorCode(Json.Parse(ok)), -1, "within limit");
+    test DepthLimit
+    {
+        string deep = String.Repeat("[", 200) + String.Repeat("]", 200);
+        Assert.Equal(ErrorCode(Json.Parse(deep)), 8128, "nesting limit");
+        string ok = String.Repeat("[", 100) + String.Repeat("]", 100);
+        Assert.Equal(ErrorCode(Json.Parse(ok)), -1, "within limit");
+    }
 }

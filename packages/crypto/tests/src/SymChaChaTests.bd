@@ -13,114 +13,123 @@ u8[] Key0()
     return Pattern(32_i64, 1_i64, 0_i64);
 }
 
-test ChaCha20BlockMatchesRfc8439Section232
+mod ChaCha20Tests
 {
-    u8[] out = Unwrap(ChaCha20.Block(Key0(), 1_u32, Hex("000000090000004a00000000")));
-    Assert.True(Same(out, Hex("10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")), "block");
-}
-
-test ChaCha20EncryptionMatchesRfc8439Section242
-{
-    u8[] out = Unwrap(ChaCha20.Apply(Key0(), 1_u32, Hex("000000000000004a00000000"), Ascii(Sunscreen())));
-    Assert.True(Same(out, Hex("6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d")), "ciphertext");
-    u8[] back = Unwrap(ChaCha20.Apply(Key0(), 1_u32, Hex("000000000000004a00000000"), out));
-    Assert.True(Same(back, Ascii(Sunscreen())), "round trip");
-}
-
-test ChaCha20RejectsBadKeyAndNonceLengths
-{
-    bool badKey = match (ChaCha20.Block(Slice.New(31_i64), 0_u32, Slice.New(12_i64)))
+    test BlockMatchesRfc8439Section232
     {
-        Result::Ok(_) => false,
-        Result::Error(e) => match (e)
-        {
-            CryptoError::InvalidKeyLength => true,
-            _ => false,
-        },
-    };
-    Assert.True(badKey, "key length");
-    bool badNonce = match (ChaCha20.Block(Slice.New(32_i64), 0_u32, Slice.New(8_i64)))
-    {
-        Result::Ok(_) => false,
-        Result::Error(e) => match (e)
-        {
-            CryptoError::InvalidNonceLength => true,
-            _ => false,
-        },
-    };
-    Assert.True(badNonce, "nonce length");
-}
-
-test Poly1305MatchesRfc8439Section252
-{
-    u8[] tag = Unwrap(Poly1305.Mac(Hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"), Ascii("Cryptographic Forum Research Group")));
-    Assert.True(Same(tag, Hex("a8061dc1305136c6c22b8baf0c0127a9")), "tag");
-}
-
-test Poly1305ReducesAnAccumulatorJustAboveTheModulus
-{
-    Assert.True(Same(Unwrap(Poly1305.Mac(Hex("0200000000000000000000000000000000000000000000000000000000000000"), Hex("ffffffffffffffffffffffffffffffff"))), Hex("03000000000000000000000000000000")), "edge");
-}
-
-test Poly1305IncrementalUpdatesMatchTheOneShotTag
-{
-    u8[] msg = Pattern(1000_i64, 7_i64, 0_i64);
-    Assert.True(Same(Unwrap(Poly1305.Mac(Pattern(32_i64, 1_i64, 100_i64), msg)), Hex("41e234f6889f83d91e9632dc63bedcd3")), "one shot");
-    match (Poly1305.New(Pattern(32_i64, 1_i64, 100_i64)))
-    {
-        Result::Error(_) => {
-            Assert.Fail("key");
-        },
-        Result::Ok(s) => {
-            Poly1305.UpdateRange(s, msg, 0_i64, 3_i64);
-            Poly1305.UpdateRange(s, msg, 3_i64, 500_i64);
-            Poly1305.UpdateRange(s, msg, 503_i64, 497_i64);
-            Assert.True(Same(Poly1305.Finish(s), Hex("41e234f6889f83d91e9632dc63bedcd3")), "incremental");
-        },
-    };
-}
-
-test ChaCha20Poly1305MatchesRfc8439
-{
-    for v in ChaCha20Poly1305Vectors()
-    {
-        u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(v.key, v.nonce, v.aad, v.plaintext));
-        Assert.True(Same(sealed, Hex(v.sealed)), "sealed " + v.label);
-        Assert.True(Same(Unwrap(ChaCha20Poly1305.Open(v.key, v.nonce, v.aad, sealed)), v.plaintext), "opened " + v.label);
+        u8[] out = Unwrap(ChaCha20.Block(Key0(), 1_u32, Hex("000000090000004a00000000")));
+        Assert.True(Same(out, Hex("10f1e7e4d13b5915500fdd1fa32071c4c7d1f4c733c068030422aa9ac3d46c4ed2826446079faa0914c2d705d98b02a2b5129cd1de164eb9cbd083e8a2503c4e")), "block");
     }
-}
 
-test ChaCha20Poly1305RejectsTamperedInputs
-{
-    u8[] key = Pattern(32_i64, 1_i64, 128_i64);
-    u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Ascii(Sunscreen())));
-    mut i64 position = 0_i64;
-    while (position < Slice.Len(sealed))
+    test EncryptionMatchesRfc8439Section242
     {
-        u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
-        copy[position] = (copy[position] | 1_u8) - (copy[position] & 1_u8);
-        bool failed = match (ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), copy))
+        u8[] out = Unwrap(ChaCha20.Apply(Key0(), 1_u32, Hex("000000000000004a00000000"), Ascii(Sunscreen())));
+        Assert.True(Same(out, Hex("6e2e359a2568f98041ba0728dd0d6981e97e7aec1d4360c20a27afccfd9fae0bf91b65c5524733ab8f593dabcd62b3571639d624e65152ab8f530c359f0861d807ca0dbf500d6a6156a38e088a22b65e52bc514d16ccf806818ce91ab77937365af90bbf74a35be6b40b8eedf2785e42874d")), "ciphertext");
+        u8[] back = Unwrap(ChaCha20.Apply(Key0(), 1_u32, Hex("000000000000004a00000000"), out));
+        Assert.True(Same(back, Ascii(Sunscreen())), "round trip");
+    }
+
+    test RejectsBadKeyAndNonceLengths
+    {
+        bool badKey = match (ChaCha20.Block(Slice.New(31_i64), 0_u32, Slice.New(12_i64)))
         {
             Result::Ok(_) => false,
             Result::Error(e) => match (e)
             {
-                CryptoError::AuthenticationFailed => true,
+                CryptoError::InvalidKeyLength => true,
                 _ => false,
             },
         };
-        Assert.True(failed, "tampered byte rejected");
-        position = position + 17_i64;
+        Assert.True(badKey, "key length");
+        bool badNonce = match (ChaCha20.Block(Slice.New(32_i64), 0_u32, Slice.New(8_i64)))
+        {
+            Result::Ok(_) => false,
+            Result::Error(e) => match (e)
+            {
+                CryptoError::InvalidNonceLength => true,
+                _ => false,
+            },
+        };
+        Assert.True(badNonce, "nonce length");
     }
-    bool wrongAad = match (ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c8"), sealed))
+}
+
+mod Poly1305Tests
+{
+    test MatchesRfc8439Section252
     {
-        Result::Ok(_) => false,
-        Result::Error(_) => true,
-    };
-    Assert.True(wrongAad, "aad bound");
-    bool shortInput = match (ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Slice.New(15_i64)))
+        u8[] tag = Unwrap(Poly1305.Mac(Hex("85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"), Ascii("Cryptographic Forum Research Group")));
+        Assert.True(Same(tag, Hex("a8061dc1305136c6c22b8baf0c0127a9")), "tag");
+    }
+
+    test ReducesAnAccumulatorJustAboveTheModulus
     {
-        Result::Ok(_) => false,
-        Result::Error(_) => true,
-    };
-    Assert.True(shortInput, "short input");
+        Assert.True(Same(Unwrap(Poly1305.Mac(Hex("0200000000000000000000000000000000000000000000000000000000000000"), Hex("ffffffffffffffffffffffffffffffff"))), Hex("03000000000000000000000000000000")), "edge");
+    }
+
+    test IncrementalUpdatesMatchTheOneShotTag
+    {
+        u8[] msg = Pattern(1000_i64, 7_i64, 0_i64);
+        Assert.True(Same(Unwrap(Poly1305.Mac(Pattern(32_i64, 1_i64, 100_i64), msg)), Hex("41e234f6889f83d91e9632dc63bedcd3")), "one shot");
+        match (Poly1305.New(Pattern(32_i64, 1_i64, 100_i64)))
+        {
+            Result::Error(_) => {
+                Assert.Fail("key");
+            },
+            Result::Ok(s) => {
+                Poly1305.UpdateRange(s, msg, 0_i64, 3_i64);
+                Poly1305.UpdateRange(s, msg, 3_i64, 500_i64);
+                Poly1305.UpdateRange(s, msg, 503_i64, 497_i64);
+                Assert.True(Same(Poly1305.Finish(s), Hex("41e234f6889f83d91e9632dc63bedcd3")), "incremental");
+            },
+        };
+    }
+}
+
+mod ChaCha20Poly1305Tests
+{
+    test MatchesRfc8439
+    {
+        for v in ChaCha20Poly1305Vectors()
+        {
+            u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(v.key, v.nonce, v.aad, v.plaintext));
+            Assert.True(Same(sealed, Hex(v.sealed)), "sealed " + v.label);
+            Assert.True(Same(Unwrap(ChaCha20Poly1305.Open(v.key, v.nonce, v.aad, sealed)), v.plaintext), "opened " + v.label);
+        }
+    }
+
+    test RejectsTamperedInputs
+    {
+        u8[] key = Pattern(32_i64, 1_i64, 128_i64);
+        u8[] sealed = Unwrap(ChaCha20Poly1305.Seal(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Ascii(Sunscreen())));
+        mut i64 position = 0_i64;
+        while (position < Slice.Len(sealed))
+        {
+            u8[] copy = Slice.SubSlice(sealed, 0_i64, Slice.Len(sealed));
+            copy[position] = (copy[position] | 1_u8) - (copy[position] & 1_u8);
+            bool failed = match (ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), copy))
+            {
+                Result::Ok(_) => false,
+                Result::Error(e) => match (e)
+                {
+                    CryptoError::AuthenticationFailed => true,
+                    _ => false,
+                },
+            };
+            Assert.True(failed, "tampered byte rejected");
+            position = position + 17_i64;
+        }
+        bool wrongAad = match (ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c8"), sealed))
+        {
+            Result::Ok(_) => false,
+            Result::Error(_) => true,
+        };
+        Assert.True(wrongAad, "aad bound");
+        bool shortInput = match (ChaCha20Poly1305.Open(key, Hex("070000004041424344454647"), Hex("50515253c0c1c2c3c4c5c6c7"), Slice.New(15_i64)))
+        {
+            Result::Ok(_) => false,
+            Result::Error(_) => true,
+        };
+        Assert.True(shortInput, "short input");
+    }
 }

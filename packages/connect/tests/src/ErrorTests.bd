@@ -71,16 +71,6 @@ unit AllRefused()
     };
 }
 
-test ErrorsAllAttemptsFailedKeepsEachAttempt
-{
-    Fiber<unit> scenario = spawn AllRefused();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "refused scenario joins");
-}
-
 Result<unit, NetworkError> MaxAttemptsResult()
 {
     SocketAddress refused = ClosedPort4()?;
@@ -110,53 +100,6 @@ unit MaxAttempts()
     };
 }
 
-test ErrorsMaxAttemptsBoundsTheRace
-{
-    Fiber<unit> scenario = spawn MaxAttempts();
-    Assert.True(match (scenario.Join())
-    {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "max attempts scenario joins");
-}
-
-test ErrorsNoAddressesForEmptyList
-{
-    match (Connect.ConnectAddresses(Array.Empty<SocketAddress>(), Policy.Default()))
-    {
-        Result::Ok(stream) => {
-            stream.Close();
-            Assert.Fail("empty list cannot connect");
-        },
-        Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 3_i64, "NoAddresses"),
-    };
-}
-
-test ErrorsNoAddressesAfterFamilyFilter
-{
-    ConnectPolicy only6 = Policy.WithFamilyFilter(Policy.Default(), AddressFamily::V6);
-    match (Connect.ConnectAddresses(List1(Loopback4(80_i64)), only6))
-    {
-        Result::Ok(stream) => {
-            stream.Close();
-            Assert.Fail("filtered list cannot connect");
-        },
-        Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 3_i64, "NoAddresses"),
-    };
-}
-
-test ErrorsInvalidPolicyFailsClosed
-{
-    match (Connect.ConnectAddresses(List1(Loopback4(80_i64)), Policy.WithMaxAttempts(Policy.Default(), 0_i64)))
-    {
-        Result::Ok(stream) => {
-            stream.Close();
-            Assert.Fail("invalid policy cannot connect");
-        },
-        Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 1_i64, "InvalidPolicy"),
-    };
-}
-
 // Port zero is rejected by the resolver before any name lookup, so this needs no
 // DNS server: both family queries fail with InvalidAddress, the preferred family's
 // error is the reported cause.
@@ -175,12 +118,72 @@ unit ResolverRejection()
     };
 }
 
-test ErrorsResolutionFailureCarriesTheResolverError
+mod ErrorsTests
 {
-    Fiber<unit> scenario = spawn ResolverRejection();
-    Assert.True(match (scenario.Join())
+    test AllAttemptsFailedKeepsEachAttempt
     {
-        Result::Ok(_) => true,
-        _ => false,
-    }, "resolution scenario joins");
+        Fiber<unit> scenario = spawn AllRefused();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "refused scenario joins");
+    }
+
+    test MaxAttemptsBoundsTheRace
+    {
+        Fiber<unit> scenario = spawn MaxAttempts();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "max attempts scenario joins");
+    }
+
+    test NoAddressesForEmptyList
+    {
+        match (Connect.ConnectAddresses(Array.Empty<SocketAddress>(), Policy.Default()))
+        {
+            Result::Ok(stream) => {
+                stream.Close();
+                Assert.Fail("empty list cannot connect");
+            },
+            Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 3_i64, "NoAddresses"),
+        };
+    }
+
+    test NoAddressesAfterFamilyFilter
+    {
+        ConnectPolicy only6 = Policy.WithFamilyFilter(Policy.Default(), AddressFamily::V6);
+        match (Connect.ConnectAddresses(List1(Loopback4(80_i64)), only6))
+        {
+            Result::Ok(stream) => {
+                stream.Close();
+                Assert.Fail("filtered list cannot connect");
+            },
+            Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 3_i64, "NoAddresses"),
+        };
+    }
+
+    test InvalidPolicyFailsClosed
+    {
+        match (Connect.ConnectAddresses(List1(Loopback4(80_i64)), Policy.WithMaxAttempts(Policy.Default(), 0_i64)))
+        {
+            Result::Ok(stream) => {
+                stream.Close();
+                Assert.Fail("invalid policy cannot connect");
+            },
+            Result::Error(error) => Assert.Equal<i64>(ErrorKind(error), 1_i64, "InvalidPolicy"),
+        };
+    }
+
+    test ResolutionFailureCarriesTheResolverError
+    {
+        Fiber<unit> scenario = spawn ResolverRejection();
+        Assert.True(match (scenario.Join())
+        {
+            Result::Ok(_) => true,
+            _ => false,
+        }, "resolution scenario joins");
+    }
 }

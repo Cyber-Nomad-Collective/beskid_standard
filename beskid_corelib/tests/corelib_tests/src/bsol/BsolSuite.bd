@@ -28,409 +28,6 @@ use Core.Serialization.FloatDecimal;
 use Core.Serialization.Metadata;
 use Core.Serialization.Registry;
 
-// ---- Syntax ----
-
-test BsolOrderedBlocksAssignmentsAndByteSpans
-{
-    match (Parser.Parse("config \"root\" { name = \"ż\" count = -12 }", Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("native parser accepts ordered block"),
-
-        Result::Ok(document) => {
-            Assert.Equal(Array.Len<i64>(document.roots), 1_i64, "one root block");
-            Syntax.Node root = document.nodes[document.roots[0]];
-            Assert.Equal(root.name, "config", "block kind retained");
-            Assert.Equal(root.label, "root", "decoded label retained");
-            Assert.Equal(root.span.start, 0_i64, "root byte span starts at zero");
-            Assert.Equal(Array.Len<i64>(root.children), 2_i64, "ordered assignments");
-            Syntax.Node name = document.nodes[root.children[0]];
-            Assert.Equal(name.name, "name", "first assignment retains order");
-            Syntax.Node value = document.nodes[name.children[0]];
-            Assert.True(match (value.kind)
-            {
-                Syntax.NodeKind::String => true,
-
-                _ => false,
-            }, "quoted value distinguished");
-            Assert.Equal(value.text, "ż", "UTF8 value retained");
-            Assert.Equal(value.span.end - value.span.start, 4_i64, "span counts UTF8 bytes and quotes");
-            Syntax.Node count = document.nodes[root.children[1]];
-            Assert.Equal(document.nodes[count.children[0]].raw, "-12", "signed raw precision retained");
-        },
-    };
-}
-
-test BsolIdentifierReferenceAndAssignmentSpansCoverExactlyTheirTokens
-{
-    string source = "cfg { mode = fast  # trailing
-  next = @a/b   
-  flag = true 	
-}";
-    match (Parser.Parse(source, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("native parser accepts identifier, reference and boolean values"),
-
-        Result::Ok(document) => {
-            Syntax.Node root = document.nodes[document.roots[0]];
-            Assert.Equal(Array.Len<i64>(root.children), 3_i64, "three assignments");
-            Syntax.Node mode = document.nodes[root.children[0]];
-            Syntax.Node fast = document.nodes[mode.children[0]];
-            Assert.Equal(fast.raw, "fast", "identifier raw excludes trailing whitespace and comment");
-            Assert.Equal(fast.span.start, String.IndexOf(source, "fast"), "identifier span starts at the token");
-            Assert.Equal(fast.span.end - fast.span.start, 4_i64, "identifier span covers exactly the token");
-            Assert.Equal(String.SubSlice(source, mode.span.start, mode.span.end - mode.span.start), "mode = fast", "assignment span ends at its value token");
-            Syntax.Node next = document.nodes[root.children[1]];
-            Syntax.Node reference = document.nodes[next.children[0]];
-            Assert.Equal(reference.raw, "@a/b", "reference raw excludes trailing whitespace");
-            Syntax.Node flag = document.nodes[root.children[2]];
-            Assert.Equal(document.nodes[flag.children[0]].raw, "true", "boolean raw excludes trailing whitespace");
-            Assert.Equal(String.SubSlice(source, root.span.start, root.span.end - root.span.start), source, "block span still ends at its closing brace");
-        },
-    };
-}
-
-test BsolStrictEscapedUnicodeAndInvalidSurrogates
-{
-    mut Lexer.State plainState = Lexer.Start("\"A\"", Limits.DefaultLimits());
-
-    string plainText = Lexer.Quoted(plainState);
-
-    i64 plainLength = String.Len(plainText);
-
-    Output.WriteLine("BSOL plain quoted length " + plainLength);
-
-    mut Lexer.State unicodeState = Lexer.Start("\"\\u0041\"", Limits.DefaultLimits());
-
-    string unicodeText = Lexer.Quoted(unicodeState);
-
-    i64 unicodeLength = String.Len(unicodeText);
-
-    bool unicodeFailed = unicodeState.failed;
-
-    Output.WriteLine("BSOL ASCII unicode quoted length " + unicodeLength);
-
-    Output.WriteLine("BSOL ASCII unicode failed " + unicodeFailed);
-
-    mut Lexer.State newlineState = Lexer.Start("\"\\n\"", Limits.DefaultLimits());
-
-    string newlineText = Lexer.Quoted(newlineState);
-
-    i64 newlineLength = String.Len(newlineText);
-
-    bool newlineFailed = newlineState.failed;
-
-    Output.WriteLine("BSOL newline quoted length " + newlineLength);
-
-    Output.WriteLine("BSOL newline failed " + newlineFailed);
-
-    mut Lexer.State quoteState = Lexer.Start("\"\\\"\"", Limits.DefaultLimits());
-
-    string quoteText = Lexer.Quoted(quoteState);
-
-    i64 quoteLength = String.Len(quoteText);
-
-    Output.WriteLine("BSOL escaped quote length " + quoteLength);
-
-    string scalarForConcat = Lexer.Scalar(65_i64);
-
-    mut string concatText = "";
-
-    concatText = concatText + scalarForConcat;
-
-    i64 concatLength = String.Len(concatText);
-
-    Output.WriteLine("BSOL assigned empty concat length " + concatLength);
-
-    string directConcat = "" + Lexer.Scalar(65_i64);
-
-    i64 directConcatLength = String.Len(directConcat);
-
-    Output.WriteLine("BSOL direct empty concat length " + directConcatLength);
-
-    string scalarAscii = Lexer.Scalar(65_i64);
-
-    string scalarEmoji = Lexer.Scalar(128512_i64);
-
-    i64 scalarAsciiLength = String.Len(scalarAscii);
-
-    i64 scalarEmojiLength = String.Len(scalarEmoji);
-
-    Output.WriteLine("BSOL Scalar ASCII length " + scalarAsciiLength);
-
-    Output.WriteLine("BSOL Scalar emoji length " + scalarEmojiLength);
-
-    u8[] literalBytes = [65_u8];
-
-    string literalText = String.FromUtf8CodeUnits(literalBytes);
-
-    i64 literalBytesLength = Array.Len<u8>(literalBytes);
-
-    i64 literalTextLength = String.Len(literalText);
-
-    Output.WriteLine("BSOL literal bytes length " + literalBytesLength);
-
-    Output.WriteLine("BSOL literal text length " + literalTextLength);
-
-    mut u8[] appendedBytes = [];
-
-    Array.Append<u8>(appendedBytes, 65_u8);
-
-    i64 appendedBytesLength = Array.Len<u8>(appendedBytes);
-
-    string appendedText = String.FromUtf8CodeUnits(appendedBytes);
-
-    i64 appendedTextLength = String.Len(appendedText);
-
-    Output.WriteLine("BSOL appended bytes length " + appendedBytesLength);
-
-    Output.WriteLine("BSOL appended text length " + appendedTextLength);
-
-    mut Lexer.State directState = Lexer.Start("\"\\uD83D\\uDE00\\n\\\"\\\\\"", Limits.DefaultLimits());
-
-    string directText = Lexer.Quoted(directState);
-
-    i64 directLength = String.Len(directText);
-
-    i64 directPosition = directState.pos;
-
-    Output.WriteLine("BSOL direct quoted length " + directLength);
-
-    Output.WriteLine("BSOL direct cursor position " + directPosition);
-
-    mut i64 directByteIndex = 0_i64;
-
-    while (directByteIndex < directLength)
-    {
-        u8 directByte = String.ByteAt(directText, directByteIndex);
-        Output.WriteLine("BSOL direct byte " + directByte);
-        directByteIndex = directByteIndex + 1_i64;
-    }
-
-    match (Parser.Parse("config { value = \"\\uD83D\\uDE00\\n\\\"\\\\\" }", Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("valid surrogate pair and escapes decode"),
-
-        Result::Ok(document) => {
-            Syntax.Node root = document.nodes[document.roots[0]];
-            Syntax.Node assignment = document.nodes[root.children[0]];
-            i64 nodeCount = Array.Len<Syntax.Node>(document.nodes);
-            i64 rootCount = Array.Len<i64>(document.roots);
-            i64 childCount = Array.Len<i64>(assignment.children);
-            Output.WriteLine("BSOL arena node count " + nodeCount);
-            Output.WriteLine("BSOL arena root count " + rootCount);
-            Output.WriteLine("BSOL assignment child count " + childCount);
-            Syntax.Node published = document.nodes[assignment.children[0]];
-            Output.WriteLine("BSOL published raw: " + published.raw);
-            bool stringKind = match (published.kind)
-            {
-                Syntax.NodeKind::String => true,
-
-                _ => false,
-            };
-            Output.WriteLine("BSOL published string kind " + stringKind);
-            string decoded = published.text;
-            i64 decodedLength = String.Len(decoded);
-            Output.WriteLine("BSOL decoded byte length " + decodedLength);
-            mut i64 byteIndex = 0_i64;
-            while (byteIndex < decodedLength)
-            {
-                u8 decodedByte = String.ByteAt(decoded, byteIndex);
-                Output.WriteLine("BSOL decoded byte " + decodedByte);
-                byteIndex = byteIndex + 1_i64;
-            }
-            Assert.Equal(document.nodes[assignment.children[0]].text, "😀
-\"\\", "strict decoded scalar sequence");
-        },
-    };
-
-    Assert.True(Results.IsError(Parser.Parse("config { value = \"\\uD800\" }", Limits.DefaultLimits())), "unpaired surrogate rejects");
-
-    Assert.True(Results.IsError(Parser.Parse("config { value = \"\\q\" }", Limits.DefaultLimits())), "unknown escape rejects");
-
-    Assert.True(Results.IsError(Parser.Parse("config { value = 1e9999 }", Limits.DefaultLimits())), "nonfinite decimal rejects");
-}
-
-test BsolAttributesReferencesEmptyMapInlineBlocksAndNumbers
-{
-    string source = "@Version(since = \"0.6\") config \"x\" @schemaless { @Secret name = \"ok\" empty = {} numbers = [-12, 18446744073709551615, -0.0, 1.25e+2] ref = @config/x wrapped = value \"record\" { fields = [field \"nested\" { value = \"ok\" }] } }";
-
-    match (Parser.Parse(source, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("full native grammar accepts canonical constructs"),
-
-        Result::Ok(document) => {
-            Assert.True(document.nodes[document.roots[0]].schemaless, "schemaless retained");
-            match (Writer.Write(document, Limits.DefaultLimits()))
-            {
-                Result::Error(_) => Assert.Fail("writer accepts ordered syntax"),
-
-                Result::Ok(canonical) => Assert.True(Results.IsOk(Parser.Parse(canonical, Limits.DefaultLimits())), "canonical writer reparses"),
-            };
-        },
-    };
-
-    Assert.True(Results.IsError(Parser.Parse("config { map = { key = 1, key = 2 } }", Limits.DefaultLimits())), "duplicate map keys reject");
-
-    Assert.True(Results.IsError(Parser.Parse("config { values = [1,", Limits.DefaultLimits())), "truncated list rejects");
-
-    Assert.True(Results.IsError(Parser.Parse("config {} trailing", Limits.DefaultLimits())), "complete body consumption");
-}
-
-test BsolLimitsFailBeforeUnboundedWork
-{
-    Limits.BsolLimits limits = Limits.BsolLimits
-    {
-        maxInputBytes: 8_i64,
-
-        maxDepth: 2_i64,
-
-        maxNodes: 4_i64,
-
-        maxOutputBytes: 8388608_i64,
-
-        maxScalarBytes: 1048576_i64,
-
-        maxImports: 256_i64,
-
-        maxImportDepth: 32_i64,
-
-        maxResolvedSchemaBytes: 8388608_i64,
-    };
-
-    Assert.True(Results.IsError(Parser.Parse("config { value = 1 }", limits)), "input byte limit enforced");
-
-    Limits.BsolLimits depth = Limits.BsolLimits
-    {
-        maxInputBytes: 1024_i64,
-
-        maxDepth: 2_i64,
-
-        maxNodes: 100_i64,
-
-        maxOutputBytes: 8388608_i64,
-
-        maxScalarBytes: 1048576_i64,
-
-        maxImports: 256_i64,
-
-        maxImportDepth: 32_i64,
-
-        maxResolvedSchemaBytes: 8388608_i64,
-    };
-
-    Assert.True(Results.IsError(Parser.Parse("a { b { c {} } }", depth)), "depth limit enforced");
-
-    Limits.BsolLimits nodes = Limits.BsolLimits
-    {
-        maxInputBytes: 1024_i64,
-
-        maxDepth: 64_i64,
-
-        maxNodes: 2_i64,
-
-        maxOutputBytes: 8388608_i64,
-
-        maxScalarBytes: 1048576_i64,
-
-        maxImports: 256_i64,
-
-        maxImportDepth: 32_i64,
-
-        maxResolvedSchemaBytes: 8388608_i64,
-    };
-
-    Assert.True(Results.IsError(Parser.Parse("a { x = 1 y = 2 }", nodes)), "syntax node allocation limit enforced");
-}
-
-test BsolNormativeLimitsDefaultsAreExplicit
-{
-    Limits.BsolLimits limits = Limits.DefaultLimits();
-
-    Assert.Equal(limits.maxInputBytes, 8388608_i64, "8 MiB input");
-
-    Assert.Equal(limits.maxOutputBytes, 8388608_i64, "8 MiB output");
-
-    Assert.Equal(limits.maxDepth, 128_i64, "128 syntax nesting");
-
-    Assert.Equal(limits.maxNodes, 100000_i64, "aggregate node budget");
-
-    Assert.Equal(limits.maxScalarBytes, 1048576_i64, "1 MiB scalar");
-
-    Assert.Equal(limits.maxImports, 256_i64, "bounded import count");
-
-    Assert.Equal(limits.maxImportDepth, 32_i64, "bounded import depth");
-
-    Assert.Equal(limits.maxResolvedSchemaBytes, 8388608_i64, "aggregate schema bytes");
-}
-
-test BsolScalarLimitUsesDecodedUtf8Bytes
-{
-    mut Limits.BsolLimits limits = Limits.DefaultLimits();
-
-    limits.maxScalarBytes = 4_i64;
-
-    Assert.True(Results.IsOk(Parser.Parse("a { x = \"😀\" }", limits)), "astral scalar exact byte boundary");
-
-    limits.maxScalarBytes = 3_i64;
-
-    Assert.True(Results.IsError(Parser.Parse("a { x = \"😀\" }", limits)), "astral scalar boundary plus one rejects");
-
-    limits.maxScalarBytes = 1_i64;
-
-    Assert.True(Results.IsOk(Parser.Parse("a { x = \"\\u0041\" }", limits)), "escaped ASCII counts decoded bytes");
-}
-
-test BsolOutputLimitIsIndependentOfInputLimit
-{
-    mut Limits.BsolLimits limits = Limits.DefaultLimits();
-
-    limits.maxOutputBytes = 3_i64;
-
-    match (Parser.Parse("a {}", limits))
-    {
-        Result::Error(_) => Assert.Fail("input admitted independently"),
-
-        Result::Ok(document) => {
-            Assert.True(Results.IsError(Writer.Write(document, limits)), "canonical output over limit rejects");
-        },
-    };
-}
-
-test BsolAggregateNodesIncludeCommentEntries
-{
-    mut Limits.BsolLimits limits = Limits.DefaultLimits();
-
-    limits.maxNodes = 2_i64;
-
-    Assert.True(Results.IsOk(Parser.Parse("# comment
-a {}", limits)), "one comment and one node exact aggregate boundary");
-
-    limits.maxNodes = 1_i64;
-
-    Assert.True(Results.IsError(Parser.Parse("# comment
-a {}", limits)), "comment plus node exceeds aggregate budget");
-}
-
-test BsolWriterOutputMayExceedOriginalInputCap
-{
-    mut Limits.BsolLimits limits = Limits.DefaultLimits();
-
-    limits.maxInputBytes = 4_i64;
-
-    match (Parser.Parse("a {}", limits))
-    {
-        Result::Error(_) => Assert.Fail("input exact four byte boundary"),
-
-        Result::Ok(document) => {
-            Assert.True(Results.IsOk(Writer.Write(document, limits)), "independent generated-output budget admits canonical expansion");
-        },
-    };
-
-    Assert.True(Results.IsError(Parser.Parse("a {} ", limits)), "input boundary plus one rejects");
-}
-
-// ---- Corpus ----
-
 /// Read the same checked-in corpus files as the Rust bootstrap harness.
 /// The runner supplies an absolute corpus root; no embedded alternate copies.
 unit CheckCorpusFile(string directory, string name)
@@ -462,136 +59,6 @@ unit CheckCorpusFile(string directory, string name)
         },
     };
 }
-
-/// @native-only
-test BsolSharedCorpusValuesAndRuntimeManifest
-{
-    match (Environment.Get("BESKID_BSOL_CORPUS"))
-    {
-        Result::Error(_) => Assert.Fail("BESKID_BSOL_CORPUS must name the shared checked-in corpus"),
-
-        Result::Ok(directory) => {
-            CheckCorpusFile(directory, "v06-values.bsol");
-            CheckCorpusFile(directory, "runtime-manifest-v5.bsol");
-        },
-    };
-}
-
-// ---- Import Materialization ----
-
-test BsolImportPathCannotEscapeControlledRootLexically
-{
-    Assert.True(Imports.RelativePath("schemas/base.bsol"), "root relative schema");
-    Assert.False(Imports.RelativePath("../base.bsol"), "parent escape");
-    Assert.False(Imports.RelativePath("schemas/../base.bsol"), "nested traversal");
-    Assert.False(Imports.RelativePath("/base.bsol"), "absolute path");
-    Assert.False(Imports.RelativePath("C:/base.bsol"), "drive path");
-    Assert.False(Imports.RelativePath("schemas\\base.bsol"), "alternate separator");
-    Assert.False(Imports.RelativePath("schemas//base.bsol"), "ambiguous empty segment");
-}
-
-test BsolImportGitRevisionMustBeImmutable
-{
-    Assert.True(Imports.ImmutableRevision("0123456789abcdef0123456789abcdef01234567"), "full Git object");
-    Assert.False(Imports.ImmutableRevision("main"), "moving branch");
-    Assert.False(Imports.ImmutableRevision("v0.6.0"), "moving tag");
-    Assert.False(Imports.ImmutableRevision("0123456"), "abbreviated object");
-}
-
-test BsolImportRequestsRejectBeforeHostResolution
-{
-    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::File("../escape.bsol"))), "file traversal rejected before host");
-    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Git("https://example.invalid/repo", "main", "schema.bsol"))), "moving revision rejected before host");
-    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Registry("corelib", "", "schema.bsol"))), "missing exact lock version");
-    Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Pckg("", "0.6.0", "schema.bsol"))), "missing package identity");
-}
-
-test BsolPackageShorthandPreservesExactLockedRequest
-{
-    match (Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/schemas/base.bsol"))
-    {
-        Result::Ok(Imports.ImportRequest::Pckg(package, version, path)) => {
-            Assert.Equal(package, "corelib", "package identity");
-            Assert.Equal(version, "0.6.0", "exact version");
-            Assert.Equal(path, "schemas/base.bsol", "remaining path");
-        },
-        _ => Assert.Fail("valid shorthand must produce its locked package request"),
-    };
-    Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib//schema.bsol")), "missing version");
-    Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/../escape.bsol")), "shorthand traversal");
-    Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/")), "missing path");
-}
-
-test BsolImportDeclarationRetainsAliasProfileAndSourceSpan
-{
-    match (Parser.Parse("import_schema \"base.v2\" { from = file path = \"schemas/base.bsol\" alias = base }", Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("import syntax"),
-        Result::Ok(document) => {
-            match (Imports.ParseDeclaration(document, document.roots[0_i64]))
-            {
-                Result::Error(_) => Assert.Fail("valid import declaration"),
-                Result::Ok(declaration) => {
-                    Assert.Equal(declaration.profile, "base.v2", "requested profile identity");
-                    Assert.Equal(declaration.alias, "base", "explicit alias");
-                    Assert.True(declaration.hasAlias, "alias presence retained");
-                    Assert.True(declaration.span.end > declaration.span.start, "owned source span");
-                },
-            };
-        },
-    };
-}
-
-test BsolImportDeclarationRejectsDuplicateAndInapplicableProperties
-{
-    string[] invalid = ["import_schema \"base.v2\" { from = file path = \"a.bsol\" path = \"b.bsol\" }", "import_schema \"base.v2\" { from = file path = \"a.bsol\" rev = \"ignored\" }", "import_schema \"base.v2\" { from = file path = \"a.bsol\" alias = \"\" }", "import_schema \"base.v2\" { from = file path = [\"a.bsol\"] }"];
-    mut i64 index = 0_i64;
-    while (index < Array.Len<string>(invalid))
-    {
-        string source = invalid[index];
-        match (Parser.Parse(source, Limits.DefaultLimits()))
-        {
-            Result::Error(_) => Assert.Fail("invalid property fixture must parse"),
-            Result::Ok(document) => Assert.True(Results.IsError(Imports.ParseDeclaration(document, document.roots[0_i64])), "invalid property rejected before host resolution"),
-        };
-        index = index + 1_i64;
-    }
-}
-
-test BsolImportContentDigestIsCheckedBeforeAdmission
-{
-    string source = "profile \"base.v2\" { version = 2 }";
-    match (Sha256.HashUtf8(source, 1024_i64))
-    {
-        Result::Error(_) => Assert.Fail("bounded fixture hashes"),
-        Result::Ok(digest) => {
-            Imports.MaterializedSource verified = Imports.MaterializedSource
-            {
-                source: source,
-                canonicalIdentity: "file:schemas/base.bsol",
-                sourceSha256: digest,
-            };
-            Assert.True(Results.IsOk(Imports.VerifyMaterialized(verified, 1024_i64)), "exact materialized bytes");
-            Imports.MaterializedSource forged = Imports.MaterializedSource
-            {
-                source: "changed",
-                canonicalIdentity: "file:schemas/base.bsol",
-                sourceSha256: digest,
-            };
-            Assert.True(Results.IsError(Imports.VerifyMaterialized(forged, 1024_i64)), "digest mismatch rejects");
-            Assert.True(Results.IsError(Imports.VerifyMaterialized(verified, 1_i64)), "budget precedes admission");
-            Imports.MaterializedSource absent = Imports.MaterializedSource
-            {
-                source: source,
-                canonicalIdentity: "",
-                sourceSha256: Array.Empty<u8>(),
-            };
-            Assert.True(Results.IsError(Imports.VerifyMaterialized(absent, 1024_i64)), "missing identity and digest reject");
-        },
-    };
-}
-
-// ---- Import Graph ----
 
 Imports.MaterializedSource Materialize(string source, string identity)
 {
@@ -672,24 +139,6 @@ type WriteAdmissionProbe : Typed.BsolBinding<i32>
     }
 }
 
-test BsolTypedWriteReownsProfileBeforeInvokingBinding
-{
-    WriteAdmissionProbe probe = WriteAdmissionProbe
-    {
-        invoked: false,
-    };
-    match (Schema.ParseProfile("profile \"plain.v2\" { version = 2 }", Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("valid source profile"),
-        Result::Ok(original) => {
-            mut Schema.Profile profile = original;
-            profile.source = "invalid profile source";
-            Assert.True(Results.IsError(Typed.Write<i32, WriteAdmissionProbe>(1_i32, profile, probe, SerializationPolicy.DefaultLimits())), "invalid owned source rejects before binding code");
-            Assert.False(probe.invoked, "unadmitted profile never reaches typed writer");
-        },
-    };
-}
-
 type CompositionHost : Imports.Resolver
 {
     pub Result<Imports.MaterializedSource, Imports.ImportFailure> Resolve(Imports.ImportRequest request)
@@ -721,181 +170,6 @@ type CompositionHost : Imports.Resolver
         };
     }
 }
-
-test BsolImportedAliasComposesDefaultsAndRevalidatesOwnedClosure
-{
-    CompositionHost fixtureResolver = CompositionHost { };
-    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"defaults.v2\" { from = file path = \"defaults.bsol\" alias = shared } rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extends = \"shared.base\" } }", "file:root.bsol");
-    match (Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("imported inherited defaults compose"),
-        Result::Ok(profile) => {
-            Assert.Equal(Array.Len<i64>(profile.roots), 1_i64, "only declaring root rules become document roots");
-            mut Schema.Rule rule = profile.rules[profile.roots[0_i64]];
-            Assert.Equal(Array.Len<Schema.Field>(rule.fields), 1_i64, "imported field inherited");
-            Assert.Equal(profile.document.nodes[rule.fields[0_i64].defaultNode].text, "7", "default refers to rebased imported arena");
-            // A caller can mutate public tables, but validation must rebuild
-            // them from the private verified source closure.
-            rule.fields[0_i64].typeIndex = -1_i64;
-            match (Parser.Parse("config { count = 9 }", Limits.DefaultLimits()))
-            {
-                Result::Error(_) => Assert.Fail("document parses"),
-                Result::Ok(document) => Assert.True(Results.IsOk(Schema.Validate(document, profile, Limits.DefaultLimits())), "validation retains source closure without resolving again"),
-            };
-            mut Limits.BsolLimits narrow = Limits.DefaultLimits();
-            narrow.maxImportDepth = 0_i64;
-            Assert.True(Results.IsError(Schema.ReownProfile(profile, narrow)), "reownership reapplies caller depth policy");
-            narrow = Limits.DefaultLimits();
-            narrow.maxImports = 0_i64;
-            Assert.True(Results.IsError(Schema.ReownProfile(profile, narrow)), "reownership reapplies import policy");
-        },
-    };
-}
-
-test BsolImportedPrivateKeysDoNotShadowQuotedLocalRuleNames
-{
-    CompositionHost fixtureResolver = CompositionHost { };
-    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"defaults.v2\" { from = file path = \"defaults.bsol\" alias = shared } rule \"#1:0:defaults.v2:base\" { scope = top match = keyword keyword = local } rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extends = \"shared.base\" } }", "file:collision-root.bsol");
-    match (Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("valid quoted local name cannot collide with imported private identity"),
-        Result::Ok(profile) => {
-            Assert.Equal(Array.Len<i64>(profile.roots), 2_i64, "both local roots retained");
-            Schema.Rule local = profile.rules[profile.roots[0_i64]];
-            Schema.Rule derived = profile.rules[profile.roots[1_i64]];
-            Assert.Equal(local.name, "#1:0:defaults.v2:base", "local identity remains unchanged");
-            Assert.Equal(Array.Len<Schema.Field>(local.fields), 0_i64, "local declaration remains independent");
-            Assert.Equal(Array.Len<Schema.Field>(derived.fields), 1_i64, "alias inheritance selects imported source declaration");
-            Assert.True(derived.extends != local.name, "rebased target has disjoint owned identity");
-        },
-    };
-}
-
-test BsolImportedReferenceAliasesShareOneOwnedTarget
-{
-    CompositionHost fixtureResolver = CompositionHost { };
-    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"nodes.v2\" { from = file path = \"nodes.bsol\" alias = shared } import_schema \"nodes.v2\" { from = file path = \"nodes.bsol\" alias = other } rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"target\" { type = inline(shared.node) required = true } field \"first\" { type = ref(shared.node) required = true } field \"second\" { type = ref(shared.node) required = true } } }", "file:reference-root.bsol");
-    match (Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("qualified imported type profile loads"),
-        Result::Ok(profile) => {
-            match (Parser.Parse("config { target = node \"alpha\" {} first = @shared.node/alpha second = @other.node/alpha }", Limits.DefaultLimits()))
-            {
-                Result::Error(_) => Assert.Fail("qualified reference document parses"),
-                Result::Ok(document) => {
-                    match (Schema.Validate(document, profile, Limits.DefaultLimits()))
-                    {
-                        Result::Error(_) => Assert.Fail("both aliases accept the declared imported type"),
-                        Result::Ok(checked) => {
-                            match (Schema.ResolveReferences(checked, Limits.DefaultLimits()))
-                            {
-                                Result::Error(_) => Assert.Fail("diamond aliases resolve without target ambiguity"),
-                                Result::Ok(resolved) => {
-                                    Assert.Equal(Array.Len<Schema.ReferenceBinding>(resolved.references), 2_i64, "both reference origins bound");
-                                    Assert.Equal(resolved.references[0_i64].target, resolved.references[1_i64].target, "same actual input node");
-                                    Assert.Equal(resolved.references[0_i64].targetRule, resolved.references[1_i64].targetRule, "same owned imported declaration");
-                                },
-                            };
-                        },
-                    };
-                },
-            };
-        },
-    };
-}
-
-test BsolImportedQualifierParserRejectsEmptySegments
-{
-    string[] malformed = ["@shared./alpha", "@shared..node/alpha", "@.node/alpha", "ref(shared..node)", "inline(shared.)"];
-    mut i64 index = 0_i64;
-    while (index < Array.Len<string>(malformed))
-    {
-        string value = malformed[index];
-        Assert.True(Results.IsError(Parser.Parse("config { value = " + value + " }", Limits.DefaultLimits())), "malformed dotted qualifier rejects");
-        index = index + 1_i64;
-    }
-}
-
-test BsolImportGraphDiamondDeduplicatesOwnedSourceAndKeepsNamespaces
-{
-    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" alias = direct } import_schema \"branch.v2\" { from = file path = \"branch.bsol\" alias = branch } }", "file:root.bsol");
-    GraphHost fixtureResolver = GraphHost
-    {
-        cycle: false,
-    };
-    match (ImportGraph.Resolve<GraphHost>(root, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("locked diamond must resolve"),
-        Result::Ok(graph) => {
-            Assert.Equal(Array.Len<ImportGraph.Source>(graph.sources), 3_i64, "shared source stored once");
-            Assert.Equal(Array.Len<ImportGraph.Binding>(graph.bindings), 3_i64, "three namespace edges retained");
-            Assert.Equal(graph.root, 0_i64, "owned root index");
-            mut i64 index = 0_i64;
-            while (index < Array.Len<ImportGraph.Source>(graph.sources))
-            {
-                Assert.False(graph.sources[index].active, "all recursive visits complete before publication");
-                index = index + 1_i64;
-            }
-        },
-    };
-}
-
-test BsolImportGraphCyclesAndMissingCacheNeverPublishPartialGraph
-{
-    GraphHost fixtureResolver = GraphHost
-    {
-        cycle: true,
-    };
-    Imports.MaterializedSource cyclic = Materialize("profile \"root.v2\" { version = 2 import_schema \"root.v2\" { from = file path = \"root.bsol\" } }", "file:root.bsol");
-    match (ImportGraph.Resolve<GraphHost>(cyclic, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Ok(_) => Assert.Fail("cycle rejected"),
-        Result::Error(error) => {
-            Assert.Equal(error.failure.code, "ImportCycle", "canonical source cycle");
-            Assert.True(error.span.end > error.span.start, "import declaration span");
-        },
-    };
-    Imports.MaterializedSource missing = Materialize("profile \"root.v2\" { version = 2 import_schema \"absent.v2\" { from = file path = \"missing.bsol\" } }", "file:missing-root.bsol");
-    match (ImportGraph.Resolve<GraphHost>(missing, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Ok(_) => Assert.Fail("missing cache rejected"),
-        Result::Error(error) => Assert.Equal(error.failure.code, "MissingCache", "host failure retained"),
-    };
-}
-
-test BsolImportGraphLimitsCoverTheWholeClosure
-{
-    GraphHost fixtureResolver = GraphHost
-    {
-        cycle: false,
-    };
-    Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" } }", "file:root.bsol");
-    mut Limits.BsolLimits limits = Limits.DefaultLimits();
-    limits.maxImports = 0_i64;
-    Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "import count checked before resolution");
-    limits = Limits.DefaultLimits();
-    limits.maxImportDepth = 0_i64;
-    Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "child depth checked");
-    limits = Limits.DefaultLimits();
-    limits.maxResolvedSchemaBytes = 1_i64;
-    Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "aggregate source budget");
-}
-
-test BsolImportGraphPreservesSupportedSchemaVersionInOwnedCache
-{
-    GraphHost fixtureResolver = GraphHost
-    {
-        cycle: false,
-    };
-    Imports.MaterializedSource root = Materialize("profile \"legacy.v1\" { version = 1 }", "file:legacy.bsol");
-    match (ImportGraph.Resolve<GraphHost>(root, fixtureResolver, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("existing version one profile remains supported"),
-        Result::Ok(graph) => Assert.Equal(graph.sources[graph.root].version, 1_i64, "version retained with canonical source identity and digest"),
-    };
-}
-
-// ---- Schema Import ----
 
 /// Owned root source with its verified content digest, as a host materializes it.
 Imports.MaterializedSource MaterializeRoot(string source, string identity)
@@ -987,20 +261,6 @@ unit RejectImport(bool missing, bool corrupt, string code)
         },
     };
 }
-
-/// @native-only
-test BsolSchemaImportMissingMaterializedCacheIsSourceSpanned
-{
-    RejectImport(true, false, "MissingCache");
-}
-
-/// @native-only
-test BsolSchemaImportSourceDigestMismatchRejects
-{
-    RejectImport(false, true, "ImportDigestMismatch");
-}
-
-// ---- Syntax distinction, lexical matrix, bounds and floats ----
 
 string KindName(Syntax.NodeKind kind)
 {
@@ -1117,81 +377,6 @@ Syntax.Node AssignedValue(Syntax.Document document, Syntax.Node block, string na
     return document.nodes[node.children[0]];
 }
 
-/// Kinds, labels, attributes and references survive whitespace and comments.
-test BsolParseWriteParseRoundTrips
-{
-    string spaced = "# leading comment
-@Version(since = \"0.6\")
-config   \"primary\"   {
-  // a comment that names the field mode = slow
-  @Secret token = \"s3cr3t\"
-  mode = fast
-  quoted = \"fast\"
-  link = @service/backend
-  local = @primary
-  counts = [ -12 , 0 , 1.25e+2 , ]
-  empty = {}
-  options = { retries = 3, label = \"x\" }
-}
-
-service \"backend\" { enabled = true }
-";
-    string compact = "@Version(since = \"0.6\") config \"primary\" { @Secret token = \"s3cr3t\" mode = fast quoted = \"fast\" link = @service/backend local = @primary counts = [-12, 0, 1.25e+2] empty = {} options = { retries = 3, label = \"x\" } } service \"backend\" { enabled = true }";
-    match (Parser.Parse(spaced, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("commented and spaced document parses"),
-        Result::Ok(first) => {
-            match (Parser.Parse(compact, Limits.DefaultLimits()))
-            {
-                Result::Error(_) => Assert.Fail("compact spelling of the same document parses"),
-                Result::Ok(other) => Assert.True(SameDocument(first, other), "whitespace, comments and the trailing list comma do not change ordered syntax"),
-            };
-            Assert.Equal(Array.Len<i64>(first.roots), 2_i64, "two labeled root blocks in declaration order");
-            Syntax.Node primary = first.nodes[first.roots[0]];
-            Syntax.Node service = first.nodes[first.roots[1]];
-            Assert.Equal(primary.name, "config", "first block kind");
-            Assert.True(primary.hasLabel && primary.label == "primary", "first block label decoded");
-            Assert.Equal(service.name, "service", "second block kind");
-            Assert.True(service.hasLabel && service.label == "backend", "second block label decoded");
-            Assert.Equal(Array.Len<i64>(primary.attributes), 1_i64, "block attribute retained on the block");
-            Assert.Equal(KindName(first.nodes[primary.attributes[0]].kind), "attribute", "block attribute is an attribute node");
-            Syntax.Node token = first.nodes[AssignmentIndex(first, primary, "token")];
-            Assert.Equal(Array.Len<i64>(token.attributes), 1_i64, "assignment attribute retained on the assignment");
-            Syntax.Node mode = AssignedValue(first, primary, "mode");
-            Syntax.Node quoted = AssignedValue(first, primary, "quoted");
-            Assert.Equal(KindName(mode.kind), "identifier", "bare word stays an identifier");
-            Assert.Equal(KindName(quoted.kind), "string", "quoted word stays a string");
-            Assert.Equal(quoted.text, "fast", "string value decoded");
-            Assert.Equal(KindName(AssignedValue(first, primary, "link").kind), "reference", "kind/label reference stays a reference");
-            Assert.Equal(KindName(AssignedValue(first, primary, "local").kind), "reference", "label reference stays a reference");
-            Syntax.Node counts = AssignedValue(first, primary, "counts");
-            Assert.Equal(KindName(counts.kind), "list", "list value");
-            Assert.Equal(Array.Len<i64>(counts.children), 3_i64, "trailing comma adds no list item");
-            Assert.Equal(first.nodes[counts.children[2]].raw, "1.25e+2", "exponent number keeps its exact spelling");
-            Assert.Equal(KindName(AssignedValue(first, primary, "empty").kind), "map", "empty braces are an empty map");
-            Assert.Equal(KindName(AssignedValue(first, service, "enabled").kind), "boolean", "boolean value");
-            match (Writer.Write(first, Limits.DefaultLimits()))
-            {
-                Result::Error(_) => Assert.Fail("canonical writer accepts the parsed document"),
-                Result::Ok(canonical) => {
-                    match (Parser.Parse(canonical, Limits.DefaultLimits()))
-                    {
-                        Result::Error(_) => Assert.Fail("canonical output reparses"),
-                        Result::Ok(second) => {
-                            Assert.True(SameDocument(first, second), "parse, write, parse keeps kinds, labels, attributes, references and value distinctions");
-                            match (Writer.Write(second, Limits.DefaultLimits()))
-                            {
-                                Result::Error(_) => Assert.Fail("reparsed document writes"),
-                                Result::Ok(again) => Assert.Equal(again, canonical, "canonical output is a fixed point"),
-                            };
-                        },
-                    };
-                },
-            };
-        },
-    };
-}
-
 /// The rejection is checked and points inside the input, after the opening of the block body.
 unit RejectLexical(string source, i64 bodyStart)
 {
@@ -1203,47 +388,6 @@ unit RejectLexical(string source, i64 bodyStart)
             Assert.True(error.span.start <= error.span.end && error.span.end <= String.Len(source), "diagnostic byte span lies inside the input: " + source);
         },
     };
-}
-
-/// Bracket attributes, invalid escapes, leading zeros and non-finite numbers are rejected.
-test BsolLexicalMatrixRejectsInvalidTokens
-{
-    match (Parser.Parse("@Secret config { @Note(text = \"a\") values = [-1, 0, 2.5e-3, -7E+2, 18446744073709551615] empty = {} wide = \"\\uD83D\\uDE00\" }", Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("corrected accepted lexical matrix parses"),
-        Result::Ok(document) => {
-            Syntax.Node root = document.nodes[document.roots[0]];
-            Assert.Equal(Array.Len<i64>(root.attributes), 1_i64, "@ attribute before a block");
-            Syntax.Node values = AssignedValue(document, root, "values");
-            Assert.Equal(Array.Len<i64>(values.children), 5_i64, "signed and exponent numbers are list items");
-            Assert.Equal(document.nodes[values.children[0]].raw, "-1", "negative integer spelling");
-            Assert.Equal(document.nodes[values.children[2]].raw, "2.5e-3", "finite negative exponent spelling");
-            Assert.Equal(document.nodes[values.children[3]].raw, "-7E+2", "signed uppercase exponent spelling");
-            Assert.Equal(document.nodes[values.children[4]].raw, "18446744073709551615", "exact integer digits beyond 2^53");
-            Assert.Equal(KindName(AssignedValue(document, root, "empty").kind), "map", "empty map value");
-            Syntax.Node wide = AssignedValue(document, root, "wide");
-            Assert.Equal(wide.text, "😀", "escaped surrogate pair decodes to one non-BMP scalar");
-            Assert.Equal(String.Len(wide.text), 4_i64, "one non-BMP scalar is four UTF-8 bytes");
-        },
-    };
-    RejectLexical("[Secret] config { }", 0_i64);
-    RejectLexical("config { [Secret] value = 1 }", 7_i64);
-    RejectLexical("config { value = \"\\uD800\" }", 7_i64);
-    RejectLexical("config { value = \"\\uDE00\" }", 7_i64);
-    RejectLexical("config { value = \"\\uD83Dx\" }", 7_i64);
-    RejectLexical("config { value = \"\\x41\" }", 7_i64);
-    RejectLexical("config { value = \"\\u12\" }", 7_i64);
-    RejectLexical("config { value = \"a" + Lexer.Scalar(1_i64) + "b\" }", 7_i64);
-    RejectLexical("config { value = 01 }", 7_i64);
-    RejectLexical("config { value = -01 }", 7_i64);
-    RejectLexical("config { value = 00.5 }", 7_i64);
-    RejectLexical("config { value = 1. }", 7_i64);
-    RejectLexical("config { value = .5 }", 7_i64);
-    RejectLexical("config { value = +1 }", 7_i64);
-    RejectLexical("config { value = 1e }", 7_i64);
-    RejectLexical("config { value = 1e9999 }", 7_i64);
-    RejectLexical("config { value = -1e9999 }", 7_i64);
-    RejectLexical("config { values = [1, 1e400] }", 7_i64);
 }
 
 Limits.BsolLimits Bounded(i64 input, i64 output, i64 depth, i64 nodes, i64 scalar)
@@ -1303,62 +447,6 @@ i64 RequiredNodes(string source)
         nodes = nodes + 1_i64;
     }
     return 0_i64;
-}
-
-test BsolEachConfiguredLimitBoundaryAdmitsAndPlusOneRejectsAtomically
-{
-    string source = "# head
-root \"r\" { a = 1 inner { b = \"xy\" deeper { c = [1, 2] } } }";
-    i64 inputBytes = String.Len(source);
-    Assert.True(Results.IsOk(Parser.Parse(source, Bounded(inputBytes, 8388608_i64, 128_i64, 100000_i64, 1048576_i64))), "input exactly at the byte limit is admitted");
-    match (Parser.Parse(source, Bounded(inputBytes - 1_i64, 8388608_i64, 128_i64, 100000_i64, 1048576_i64)))
-    {
-        Result::Ok(_) => Assert.Fail("input one byte over the limit rejects"),
-        Result::Error(error) => Assert.True(LimitKind(error, "input"), "input overflow reports the input limit"),
-    };
-    i64 nodes = RequiredNodes(source);
-    Assert.True(nodes > 0_i64, "fixture fits a bounded aggregate budget");
-    Assert.Equal(RequiredNodes(source + " # tail"), nodes + 1_i64, "one more comment entry costs exactly one aggregate unit");
-    match (Parser.Parse(source + " # tail", Bounded(8388608_i64, 8388608_i64, 128_i64, nodes, 1048576_i64)))
-    {
-        Result::Ok(_) => Assert.Fail("one aggregate entry over the limit rejects"),
-        Result::Error(error) => Assert.True(LimitKind(error, "nodes"), "aggregate overflow reports the node limit"),
-    };
-    Assert.True(Results.IsOk(Parser.Parse("a { x = \"xyz\" }", Bounded(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 3_i64))), "scalar exactly at the byte limit is admitted");
-    match (Parser.Parse("a { x = \"xyz\" }", Bounded(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 2_i64)))
-    {
-        Result::Ok(_) => Assert.Fail("scalar one byte over the limit rejects"),
-        Result::Error(error) => Assert.True(LimitKind(error, "scalar"), "scalar overflow reports the scalar limit"),
-    };
-    i64 depth = RequiredDepth("a { b { c {} } }");
-    Assert.True(depth > 0_i64, "three nested blocks fit a bounded depth budget");
-    Assert.Equal(RequiredDepth("a { b { c { d {} } } }"), depth + 1_i64, "each nesting level costs exactly one depth unit");
-    match (Parser.Parse("a { b { c { d {} } } }", Bounded(8388608_i64, 8388608_i64, depth, 100000_i64, 1048576_i64)))
-    {
-        Result::Ok(_) => Assert.Fail("one level over the depth limit rejects"),
-        Result::Error(error) => Assert.True(LimitKind(error, "depth"), "depth overflow reports the depth limit"),
-    };
-    match (Parser.Parse(source, Limits.DefaultLimits()))
-    {
-        Result::Error(_) => Assert.Fail("output fixture parses"),
-        Result::Ok(document) => match (Writer.Write(document, Limits.DefaultLimits()))
-        {
-            Result::Error(_) => Assert.Fail("canonical output under default limits"),
-            Result::Ok(canonical) => {
-                i64 outputBytes = String.Len(canonical);
-                match (Writer.Write(document, Bounded(8388608_i64, outputBytes, 128_i64, 100000_i64, 1048576_i64)))
-                {
-                    Result::Error(_) => Assert.Fail("output exactly at the byte limit is admitted"),
-                    Result::Ok(bounded) => Assert.Equal(bounded, canonical, "bounded output is the complete canonical text"),
-                };
-                match (Writer.Write(document, Bounded(8388608_i64, outputBytes - 1_i64, 128_i64, 100000_i64, 1048576_i64)))
-                {
-                    Result::Ok(_) => Assert.Fail("output one byte over the limit rejects without partial text"),
-                    Result::Error(error) => Assert.True(LimitKind(error, "output"), "output overflow reports the output limit"),
-                };
-            },
-        },
-    };
 }
 
 ShapeId FloatShape(Registry.ShapeRegistry table, u8 width)
@@ -1427,22 +515,938 @@ string WriteFloatExactly(Registry.ShapeRegistry table, ShapeId shape, u64 bits, 
     return expected;
 }
 
-test BsolFloatOutputIsShortestRoundtripAndKeepsNegativeZeroAtBothWidths
+mod SyntaxTests
 {
-    Registry.ShapeRegistry table = Registry.Create();
-    ShapeId narrow = FloatShape(table, 32_u8);
-    ShapeId wide = FloatShape(table, 64_u8);
-    string singleTenth = WriteFloatExactly(table, narrow, 0x3dcccccd_u64, 32_u8);
-    string doubleTenth = WriteFloatExactly(table, wide, 0x3fb999999999999a_u64, 64_u8);
-    Assert.Equal(singleTenth, doubleTenth, "f32 0.1 is written from its own width, not widened to f64 digits");
-    Assert.True(String.Len(singleTenth) <= 4_i64, "shortest text for one tenth needs at most four bytes");
-    string singleZero = WriteFloatExactly(table, narrow, 0x80000000_u64, 32_u8);
-    string doubleZero = WriteFloatExactly(table, wide, 0x8000000000000000_u64, 64_u8);
-    Assert.Equal<u8>(String.ByteAt(singleZero, 0_i64), 45_u8, "f32 negative zero keeps its sign");
-    Assert.Equal<u8>(String.ByteAt(doubleZero, 0_i64), 45_u8, "f64 negative zero keeps its sign");
-    WriteFloatExactly(table, narrow, 0x7f7fffff_u64, 32_u8);
-    WriteFloatExactly(table, wide, 0x0000000000000001_u64, 64_u8);
-    Assert.True(Results.IsError(Serialization.WriteValue(narrow, DataValue::Float(0x7fc00000_u64, 32_u8), table, SerializationPolicy.DefaultLimits())), "f32 NaN rejects");
-    Assert.True(Results.IsError(Serialization.WriteValue(wide, DataValue::Float(0x7ff0000000000000_u64, 64_u8), table, SerializationPolicy.DefaultLimits())), "f64 infinity rejects");
-    Assert.True(Results.IsError(Serialization.WriteValue(narrow, DataValue::Float(0x3fb999999999999a_u64, 32_u8), table, SerializationPolicy.DefaultLimits())), "f64 bits under an f32 descriptor reject instead of narrowing");
+    test OrderedBlocksAssignmentsAndByteSpans
+    {
+        match (Parser.Parse("config \"root\" { name = \"ż\" count = -12 }", Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("native parser accepts ordered block"),
+
+            Result::Ok(document) => {
+                Assert.Equal(Array.Len<i64>(document.roots), 1_i64, "one root block");
+                Syntax.Node root = document.nodes[document.roots[0]];
+                Assert.Equal(root.name, "config", "block kind retained");
+                Assert.Equal(root.label, "root", "decoded label retained");
+                Assert.Equal(root.span.start, 0_i64, "root byte span starts at zero");
+                Assert.Equal(Array.Len<i64>(root.children), 2_i64, "ordered assignments");
+                Syntax.Node name = document.nodes[root.children[0]];
+                Assert.Equal(name.name, "name", "first assignment retains order");
+                Syntax.Node value = document.nodes[name.children[0]];
+                Assert.True(match (value.kind)
+                {
+                    Syntax.NodeKind::String => true,
+
+                    _ => false,
+                }, "quoted value distinguished");
+                Assert.Equal(value.text, "ż", "UTF8 value retained");
+                Assert.Equal(value.span.end - value.span.start, 4_i64, "span counts UTF8 bytes and quotes");
+                Syntax.Node count = document.nodes[root.children[1]];
+                Assert.Equal(document.nodes[count.children[0]].raw, "-12", "signed raw precision retained");
+            },
+        };
+    }
+
+    test IdentifierReferenceAndAssignmentSpansCoverExactlyTheirTokens
+    {
+        string source = "cfg { mode = fast  # trailing
+  next = @a/b   
+  flag = true 	
+}";
+        match (Parser.Parse(source, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("native parser accepts identifier, reference and boolean values"),
+
+            Result::Ok(document) => {
+                Syntax.Node root = document.nodes[document.roots[0]];
+                Assert.Equal(Array.Len<i64>(root.children), 3_i64, "three assignments");
+                Syntax.Node mode = document.nodes[root.children[0]];
+                Syntax.Node fast = document.nodes[mode.children[0]];
+                Assert.Equal(fast.raw, "fast", "identifier raw excludes trailing whitespace and comment");
+                Assert.Equal(fast.span.start, String.IndexOf(source, "fast"), "identifier span starts at the token");
+                Assert.Equal(fast.span.end - fast.span.start, 4_i64, "identifier span covers exactly the token");
+                Assert.Equal(String.SubSlice(source, mode.span.start, mode.span.end - mode.span.start), "mode = fast", "assignment span ends at its value token");
+                Syntax.Node next = document.nodes[root.children[1]];
+                Syntax.Node reference = document.nodes[next.children[0]];
+                Assert.Equal(reference.raw, "@a/b", "reference raw excludes trailing whitespace");
+                Syntax.Node flag = document.nodes[root.children[2]];
+                Assert.Equal(document.nodes[flag.children[0]].raw, "true", "boolean raw excludes trailing whitespace");
+                Assert.Equal(String.SubSlice(source, root.span.start, root.span.end - root.span.start), source, "block span still ends at its closing brace");
+            },
+        };
+    }
+
+    test StrictEscapedUnicodeAndInvalidSurrogates
+    {
+        mut Lexer.State plainState = Lexer.Start("\"A\"", Limits.DefaultLimits());
+
+        string plainText = Lexer.Quoted(plainState);
+
+        i64 plainLength = String.Len(plainText);
+
+        Output.WriteLine("BSOL plain quoted length " + plainLength);
+
+        mut Lexer.State unicodeState = Lexer.Start("\"\\u0041\"", Limits.DefaultLimits());
+
+        string unicodeText = Lexer.Quoted(unicodeState);
+
+        i64 unicodeLength = String.Len(unicodeText);
+
+        bool unicodeFailed = unicodeState.failed;
+
+        Output.WriteLine("BSOL ASCII unicode quoted length " + unicodeLength);
+
+        Output.WriteLine("BSOL ASCII unicode failed " + unicodeFailed);
+
+        mut Lexer.State newlineState = Lexer.Start("\"\\n\"", Limits.DefaultLimits());
+
+        string newlineText = Lexer.Quoted(newlineState);
+
+        i64 newlineLength = String.Len(newlineText);
+
+        bool newlineFailed = newlineState.failed;
+
+        Output.WriteLine("BSOL newline quoted length " + newlineLength);
+
+        Output.WriteLine("BSOL newline failed " + newlineFailed);
+
+        mut Lexer.State quoteState = Lexer.Start("\"\\\"\"", Limits.DefaultLimits());
+
+        string quoteText = Lexer.Quoted(quoteState);
+
+        i64 quoteLength = String.Len(quoteText);
+
+        Output.WriteLine("BSOL escaped quote length " + quoteLength);
+
+        string scalarForConcat = Lexer.Scalar(65_i64);
+
+        mut string concatText = "";
+
+        concatText = concatText + scalarForConcat;
+
+        i64 concatLength = String.Len(concatText);
+
+        Output.WriteLine("BSOL assigned empty concat length " + concatLength);
+
+        string directConcat = "" + Lexer.Scalar(65_i64);
+
+        i64 directConcatLength = String.Len(directConcat);
+
+        Output.WriteLine("BSOL direct empty concat length " + directConcatLength);
+
+        string scalarAscii = Lexer.Scalar(65_i64);
+
+        string scalarEmoji = Lexer.Scalar(128512_i64);
+
+        i64 scalarAsciiLength = String.Len(scalarAscii);
+
+        i64 scalarEmojiLength = String.Len(scalarEmoji);
+
+        Output.WriteLine("BSOL Scalar ASCII length " + scalarAsciiLength);
+
+        Output.WriteLine("BSOL Scalar emoji length " + scalarEmojiLength);
+
+        u8[] literalBytes = [65_u8];
+
+        string literalText = String.FromUtf8CodeUnits(literalBytes);
+
+        i64 literalBytesLength = Array.Len<u8>(literalBytes);
+
+        i64 literalTextLength = String.Len(literalText);
+
+        Output.WriteLine("BSOL literal bytes length " + literalBytesLength);
+
+        Output.WriteLine("BSOL literal text length " + literalTextLength);
+
+        mut u8[] appendedBytes = [];
+
+        Array.Append<u8>(appendedBytes, 65_u8);
+
+        i64 appendedBytesLength = Array.Len<u8>(appendedBytes);
+
+        string appendedText = String.FromUtf8CodeUnits(appendedBytes);
+
+        i64 appendedTextLength = String.Len(appendedText);
+
+        Output.WriteLine("BSOL appended bytes length " + appendedBytesLength);
+
+        Output.WriteLine("BSOL appended text length " + appendedTextLength);
+
+        mut Lexer.State directState = Lexer.Start("\"\\uD83D\\uDE00\\n\\\"\\\\\"", Limits.DefaultLimits());
+
+        string directText = Lexer.Quoted(directState);
+
+        i64 directLength = String.Len(directText);
+
+        i64 directPosition = directState.pos;
+
+        Output.WriteLine("BSOL direct quoted length " + directLength);
+
+        Output.WriteLine("BSOL direct cursor position " + directPosition);
+
+        mut i64 directByteIndex = 0_i64;
+
+        while (directByteIndex < directLength)
+        {
+            u8 directByte = String.ByteAt(directText, directByteIndex);
+            Output.WriteLine("BSOL direct byte " + directByte);
+            directByteIndex = directByteIndex + 1_i64;
+        }
+
+        match (Parser.Parse("config { value = \"\\uD83D\\uDE00\\n\\\"\\\\\" }", Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("valid surrogate pair and escapes decode"),
+
+            Result::Ok(document) => {
+                Syntax.Node root = document.nodes[document.roots[0]];
+                Syntax.Node assignment = document.nodes[root.children[0]];
+                i64 nodeCount = Array.Len<Syntax.Node>(document.nodes);
+                i64 rootCount = Array.Len<i64>(document.roots);
+                i64 childCount = Array.Len<i64>(assignment.children);
+                Output.WriteLine("BSOL arena node count " + nodeCount);
+                Output.WriteLine("BSOL arena root count " + rootCount);
+                Output.WriteLine("BSOL assignment child count " + childCount);
+                Syntax.Node published = document.nodes[assignment.children[0]];
+                Output.WriteLine("BSOL published raw: " + published.raw);
+                bool stringKind = match (published.kind)
+                {
+                    Syntax.NodeKind::String => true,
+
+                    _ => false,
+                };
+                Output.WriteLine("BSOL published string kind " + stringKind);
+                string decoded = published.text;
+                i64 decodedLength = String.Len(decoded);
+                Output.WriteLine("BSOL decoded byte length " + decodedLength);
+                mut i64 byteIndex = 0_i64;
+                while (byteIndex < decodedLength)
+                {
+                    u8 decodedByte = String.ByteAt(decoded, byteIndex);
+                    Output.WriteLine("BSOL decoded byte " + decodedByte);
+                    byteIndex = byteIndex + 1_i64;
+                }
+                Assert.Equal(document.nodes[assignment.children[0]].text, "😀
+\"\\", "strict decoded scalar sequence");
+            },
+        };
+
+        Assert.True(Results.IsError(Parser.Parse("config { value = \"\\uD800\" }", Limits.DefaultLimits())), "unpaired surrogate rejects");
+
+        Assert.True(Results.IsError(Parser.Parse("config { value = \"\\q\" }", Limits.DefaultLimits())), "unknown escape rejects");
+
+        Assert.True(Results.IsError(Parser.Parse("config { value = 1e9999 }", Limits.DefaultLimits())), "nonfinite decimal rejects");
+    }
+
+    test AttributesReferencesEmptyMapInlineBlocksAndNumbers
+    {
+        string source = "@Version(since = \"0.6\") config \"x\" @schemaless { @Secret name = \"ok\" empty = {} numbers = [-12, 18446744073709551615, -0.0, 1.25e+2] ref = @config/x wrapped = value \"record\" { fields = [field \"nested\" { value = \"ok\" }] } }";
+
+        match (Parser.Parse(source, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("full native grammar accepts canonical constructs"),
+
+            Result::Ok(document) => {
+                Assert.True(document.nodes[document.roots[0]].schemaless, "schemaless retained");
+                match (Writer.Write(document, Limits.DefaultLimits()))
+                {
+                    Result::Error(_) => Assert.Fail("writer accepts ordered syntax"),
+
+                    Result::Ok(canonical) => Assert.True(Results.IsOk(Parser.Parse(canonical, Limits.DefaultLimits())), "canonical writer reparses"),
+                };
+            },
+        };
+
+        Assert.True(Results.IsError(Parser.Parse("config { map = { key = 1, key = 2 } }", Limits.DefaultLimits())), "duplicate map keys reject");
+
+        Assert.True(Results.IsError(Parser.Parse("config { values = [1,", Limits.DefaultLimits())), "truncated list rejects");
+
+        Assert.True(Results.IsError(Parser.Parse("config {} trailing", Limits.DefaultLimits())), "complete body consumption");
+    }
+
+    test LimitsFailBeforeUnboundedWork
+    {
+        Limits.BsolLimits limits = Limits.BsolLimits
+        {
+            maxInputBytes: 8_i64,
+
+            maxDepth: 2_i64,
+
+            maxNodes: 4_i64,
+
+            maxOutputBytes: 8388608_i64,
+
+            maxScalarBytes: 1048576_i64,
+
+            maxImports: 256_i64,
+
+            maxImportDepth: 32_i64,
+
+            maxResolvedSchemaBytes: 8388608_i64,
+        };
+
+        Assert.True(Results.IsError(Parser.Parse("config { value = 1 }", limits)), "input byte limit enforced");
+
+        Limits.BsolLimits depth = Limits.BsolLimits
+        {
+            maxInputBytes: 1024_i64,
+
+            maxDepth: 2_i64,
+
+            maxNodes: 100_i64,
+
+            maxOutputBytes: 8388608_i64,
+
+            maxScalarBytes: 1048576_i64,
+
+            maxImports: 256_i64,
+
+            maxImportDepth: 32_i64,
+
+            maxResolvedSchemaBytes: 8388608_i64,
+        };
+
+        Assert.True(Results.IsError(Parser.Parse("a { b { c {} } }", depth)), "depth limit enforced");
+
+        Limits.BsolLimits nodes = Limits.BsolLimits
+        {
+            maxInputBytes: 1024_i64,
+
+            maxDepth: 64_i64,
+
+            maxNodes: 2_i64,
+
+            maxOutputBytes: 8388608_i64,
+
+            maxScalarBytes: 1048576_i64,
+
+            maxImports: 256_i64,
+
+            maxImportDepth: 32_i64,
+
+            maxResolvedSchemaBytes: 8388608_i64,
+        };
+
+        Assert.True(Results.IsError(Parser.Parse("a { x = 1 y = 2 }", nodes)), "syntax node allocation limit enforced");
+    }
+
+    test NormativeLimitsDefaultsAreExplicit
+    {
+        Limits.BsolLimits limits = Limits.DefaultLimits();
+
+        Assert.Equal(limits.maxInputBytes, 8388608_i64, "8 MiB input");
+
+        Assert.Equal(limits.maxOutputBytes, 8388608_i64, "8 MiB output");
+
+        Assert.Equal(limits.maxDepth, 128_i64, "128 syntax nesting");
+
+        Assert.Equal(limits.maxNodes, 100000_i64, "aggregate node budget");
+
+        Assert.Equal(limits.maxScalarBytes, 1048576_i64, "1 MiB scalar");
+
+        Assert.Equal(limits.maxImports, 256_i64, "bounded import count");
+
+        Assert.Equal(limits.maxImportDepth, 32_i64, "bounded import depth");
+
+        Assert.Equal(limits.maxResolvedSchemaBytes, 8388608_i64, "aggregate schema bytes");
+    }
+
+    test ScalarLimitUsesDecodedUtf8Bytes
+    {
+        mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+        limits.maxScalarBytes = 4_i64;
+
+        Assert.True(Results.IsOk(Parser.Parse("a { x = \"😀\" }", limits)), "astral scalar exact byte boundary");
+
+        limits.maxScalarBytes = 3_i64;
+
+        Assert.True(Results.IsError(Parser.Parse("a { x = \"😀\" }", limits)), "astral scalar boundary plus one rejects");
+
+        limits.maxScalarBytes = 1_i64;
+
+        Assert.True(Results.IsOk(Parser.Parse("a { x = \"\\u0041\" }", limits)), "escaped ASCII counts decoded bytes");
+    }
+
+    test OutputLimitIsIndependentOfInputLimit
+    {
+        mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+        limits.maxOutputBytes = 3_i64;
+
+        match (Parser.Parse("a {}", limits))
+        {
+            Result::Error(_) => Assert.Fail("input admitted independently"),
+
+            Result::Ok(document) => {
+                Assert.True(Results.IsError(Writer.Write(document, limits)), "canonical output over limit rejects");
+            },
+        };
+    }
+
+    test AggregateNodesIncludeCommentEntries
+    {
+        mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+        limits.maxNodes = 2_i64;
+
+        Assert.True(Results.IsOk(Parser.Parse("# comment
+a {}", limits)), "one comment and one node exact aggregate boundary");
+
+        limits.maxNodes = 1_i64;
+
+        Assert.True(Results.IsError(Parser.Parse("# comment
+a {}", limits)), "comment plus node exceeds aggregate budget");
+    }
+
+    test WriterOutputMayExceedOriginalInputCap
+    {
+        mut Limits.BsolLimits limits = Limits.DefaultLimits();
+
+        limits.maxInputBytes = 4_i64;
+
+        match (Parser.Parse("a {}", limits))
+        {
+            Result::Error(_) => Assert.Fail("input exact four byte boundary"),
+
+            Result::Ok(document) => {
+                Assert.True(Results.IsOk(Writer.Write(document, limits)), "independent generated-output budget admits canonical expansion");
+            },
+        };
+
+        Assert.True(Results.IsError(Parser.Parse("a {} ", limits)), "input boundary plus one rejects");
+    }
+
+    /// Kinds, labels, attributes and references survive whitespace and comments.
+    test ParseWriteParseRoundTrips
+    {
+        string spaced = "# leading comment
+@Version(since = \"0.6\")
+config   \"primary\"   {
+  // a comment that names the field mode = slow
+  @Secret token = \"s3cr3t\"
+  mode = fast
+  quoted = \"fast\"
+  link = @service/backend
+  local = @primary
+  counts = [ -12 , 0 , 1.25e+2 , ]
+  empty = {}
+  options = { retries = 3, label = \"x\" }
+}
+
+service \"backend\" { enabled = true }
+";
+        string compact = "@Version(since = \"0.6\") config \"primary\" { @Secret token = \"s3cr3t\" mode = fast quoted = \"fast\" link = @service/backend local = @primary counts = [-12, 0, 1.25e+2] empty = {} options = { retries = 3, label = \"x\" } } service \"backend\" { enabled = true }";
+        match (Parser.Parse(spaced, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("commented and spaced document parses"),
+            Result::Ok(first) => {
+                match (Parser.Parse(compact, Limits.DefaultLimits()))
+                {
+                    Result::Error(_) => Assert.Fail("compact spelling of the same document parses"),
+                    Result::Ok(other) => Assert.True(SameDocument(first, other), "whitespace, comments and the trailing list comma do not change ordered syntax"),
+                };
+                Assert.Equal(Array.Len<i64>(first.roots), 2_i64, "two labeled root blocks in declaration order");
+                Syntax.Node primary = first.nodes[first.roots[0]];
+                Syntax.Node service = first.nodes[first.roots[1]];
+                Assert.Equal(primary.name, "config", "first block kind");
+                Assert.True(primary.hasLabel && primary.label == "primary", "first block label decoded");
+                Assert.Equal(service.name, "service", "second block kind");
+                Assert.True(service.hasLabel && service.label == "backend", "second block label decoded");
+                Assert.Equal(Array.Len<i64>(primary.attributes), 1_i64, "block attribute retained on the block");
+                Assert.Equal(KindName(first.nodes[primary.attributes[0]].kind), "attribute", "block attribute is an attribute node");
+                Syntax.Node token = first.nodes[AssignmentIndex(first, primary, "token")];
+                Assert.Equal(Array.Len<i64>(token.attributes), 1_i64, "assignment attribute retained on the assignment");
+                Syntax.Node mode = AssignedValue(first, primary, "mode");
+                Syntax.Node quoted = AssignedValue(first, primary, "quoted");
+                Assert.Equal(KindName(mode.kind), "identifier", "bare word stays an identifier");
+                Assert.Equal(KindName(quoted.kind), "string", "quoted word stays a string");
+                Assert.Equal(quoted.text, "fast", "string value decoded");
+                Assert.Equal(KindName(AssignedValue(first, primary, "link").kind), "reference", "kind/label reference stays a reference");
+                Assert.Equal(KindName(AssignedValue(first, primary, "local").kind), "reference", "label reference stays a reference");
+                Syntax.Node counts = AssignedValue(first, primary, "counts");
+                Assert.Equal(KindName(counts.kind), "list", "list value");
+                Assert.Equal(Array.Len<i64>(counts.children), 3_i64, "trailing comma adds no list item");
+                Assert.Equal(first.nodes[counts.children[2]].raw, "1.25e+2", "exponent number keeps its exact spelling");
+                Assert.Equal(KindName(AssignedValue(first, primary, "empty").kind), "map", "empty braces are an empty map");
+                Assert.Equal(KindName(AssignedValue(first, service, "enabled").kind), "boolean", "boolean value");
+                match (Writer.Write(first, Limits.DefaultLimits()))
+                {
+                    Result::Error(_) => Assert.Fail("canonical writer accepts the parsed document"),
+                    Result::Ok(canonical) => {
+                        match (Parser.Parse(canonical, Limits.DefaultLimits()))
+                        {
+                            Result::Error(_) => Assert.Fail("canonical output reparses"),
+                            Result::Ok(second) => {
+                                Assert.True(SameDocument(first, second), "parse, write, parse keeps kinds, labels, attributes, references and value distinctions");
+                                match (Writer.Write(second, Limits.DefaultLimits()))
+                                {
+                                    Result::Error(_) => Assert.Fail("reparsed document writes"),
+                                    Result::Ok(again) => Assert.Equal(again, canonical, "canonical output is a fixed point"),
+                                };
+                            },
+                        };
+                    },
+                };
+            },
+        };
+    }
+
+    /// Bracket attributes, invalid escapes, leading zeros and non-finite numbers are rejected.
+    test LexicalMatrixRejectsInvalidTokens
+    {
+        match (Parser.Parse("@Secret config { @Note(text = \"a\") values = [-1, 0, 2.5e-3, -7E+2, 18446744073709551615] empty = {} wide = \"\\uD83D\\uDE00\" }", Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("corrected accepted lexical matrix parses"),
+            Result::Ok(document) => {
+                Syntax.Node root = document.nodes[document.roots[0]];
+                Assert.Equal(Array.Len<i64>(root.attributes), 1_i64, "@ attribute before a block");
+                Syntax.Node values = AssignedValue(document, root, "values");
+                Assert.Equal(Array.Len<i64>(values.children), 5_i64, "signed and exponent numbers are list items");
+                Assert.Equal(document.nodes[values.children[0]].raw, "-1", "negative integer spelling");
+                Assert.Equal(document.nodes[values.children[2]].raw, "2.5e-3", "finite negative exponent spelling");
+                Assert.Equal(document.nodes[values.children[3]].raw, "-7E+2", "signed uppercase exponent spelling");
+                Assert.Equal(document.nodes[values.children[4]].raw, "18446744073709551615", "exact integer digits beyond 2^53");
+                Assert.Equal(KindName(AssignedValue(document, root, "empty").kind), "map", "empty map value");
+                Syntax.Node wide = AssignedValue(document, root, "wide");
+                Assert.Equal(wide.text, "😀", "escaped surrogate pair decodes to one non-BMP scalar");
+                Assert.Equal(String.Len(wide.text), 4_i64, "one non-BMP scalar is four UTF-8 bytes");
+            },
+        };
+        RejectLexical("[Secret] config { }", 0_i64);
+        RejectLexical("config { [Secret] value = 1 }", 7_i64);
+        RejectLexical("config { value = \"\\uD800\" }", 7_i64);
+        RejectLexical("config { value = \"\\uDE00\" }", 7_i64);
+        RejectLexical("config { value = \"\\uD83Dx\" }", 7_i64);
+        RejectLexical("config { value = \"\\x41\" }", 7_i64);
+        RejectLexical("config { value = \"\\u12\" }", 7_i64);
+        RejectLexical("config { value = \"a" + Lexer.Scalar(1_i64) + "b\" }", 7_i64);
+        RejectLexical("config { value = 01 }", 7_i64);
+        RejectLexical("config { value = -01 }", 7_i64);
+        RejectLexical("config { value = 00.5 }", 7_i64);
+        RejectLexical("config { value = 1. }", 7_i64);
+        RejectLexical("config { value = .5 }", 7_i64);
+        RejectLexical("config { value = +1 }", 7_i64);
+        RejectLexical("config { value = 1e }", 7_i64);
+        RejectLexical("config { value = 1e9999 }", 7_i64);
+        RejectLexical("config { value = -1e9999 }", 7_i64);
+        RejectLexical("config { values = [1, 1e400] }", 7_i64);
+    }
+
+    test EachConfiguredLimitBoundaryAdmitsAndPlusOneRejectsAtomically
+    {
+        string source = "# head
+root \"r\" { a = 1 inner { b = \"xy\" deeper { c = [1, 2] } } }";
+        i64 inputBytes = String.Len(source);
+        Assert.True(Results.IsOk(Parser.Parse(source, Bounded(inputBytes, 8388608_i64, 128_i64, 100000_i64, 1048576_i64))), "input exactly at the byte limit is admitted");
+        match (Parser.Parse(source, Bounded(inputBytes - 1_i64, 8388608_i64, 128_i64, 100000_i64, 1048576_i64)))
+        {
+            Result::Ok(_) => Assert.Fail("input one byte over the limit rejects"),
+            Result::Error(error) => Assert.True(LimitKind(error, "input"), "input overflow reports the input limit"),
+        };
+        i64 nodes = RequiredNodes(source);
+        Assert.True(nodes > 0_i64, "fixture fits a bounded aggregate budget");
+        Assert.Equal(RequiredNodes(source + " # tail"), nodes + 1_i64, "one more comment entry costs exactly one aggregate unit");
+        match (Parser.Parse(source + " # tail", Bounded(8388608_i64, 8388608_i64, 128_i64, nodes, 1048576_i64)))
+        {
+            Result::Ok(_) => Assert.Fail("one aggregate entry over the limit rejects"),
+            Result::Error(error) => Assert.True(LimitKind(error, "nodes"), "aggregate overflow reports the node limit"),
+        };
+        Assert.True(Results.IsOk(Parser.Parse("a { x = \"xyz\" }", Bounded(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 3_i64))), "scalar exactly at the byte limit is admitted");
+        match (Parser.Parse("a { x = \"xyz\" }", Bounded(8388608_i64, 8388608_i64, 128_i64, 100000_i64, 2_i64)))
+        {
+            Result::Ok(_) => Assert.Fail("scalar one byte over the limit rejects"),
+            Result::Error(error) => Assert.True(LimitKind(error, "scalar"), "scalar overflow reports the scalar limit"),
+        };
+        i64 depth = RequiredDepth("a { b { c {} } }");
+        Assert.True(depth > 0_i64, "three nested blocks fit a bounded depth budget");
+        Assert.Equal(RequiredDepth("a { b { c { d {} } } }"), depth + 1_i64, "each nesting level costs exactly one depth unit");
+        match (Parser.Parse("a { b { c { d {} } } }", Bounded(8388608_i64, 8388608_i64, depth, 100000_i64, 1048576_i64)))
+        {
+            Result::Ok(_) => Assert.Fail("one level over the depth limit rejects"),
+            Result::Error(error) => Assert.True(LimitKind(error, "depth"), "depth overflow reports the depth limit"),
+        };
+        match (Parser.Parse(source, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("output fixture parses"),
+            Result::Ok(document) => match (Writer.Write(document, Limits.DefaultLimits()))
+            {
+                Result::Error(_) => Assert.Fail("canonical output under default limits"),
+                Result::Ok(canonical) => {
+                    i64 outputBytes = String.Len(canonical);
+                    match (Writer.Write(document, Bounded(8388608_i64, outputBytes, 128_i64, 100000_i64, 1048576_i64)))
+                    {
+                        Result::Error(_) => Assert.Fail("output exactly at the byte limit is admitted"),
+                        Result::Ok(bounded) => Assert.Equal(bounded, canonical, "bounded output is the complete canonical text"),
+                    };
+                    match (Writer.Write(document, Bounded(8388608_i64, outputBytes - 1_i64, 128_i64, 100000_i64, 1048576_i64)))
+                    {
+                        Result::Ok(_) => Assert.Fail("output one byte over the limit rejects without partial text"),
+                        Result::Error(error) => Assert.True(LimitKind(error, "output"), "output overflow reports the output limit"),
+                    };
+                },
+            },
+        };
+    }
+
+    test FloatOutputIsShortestRoundtripAndKeepsNegativeZeroAtBothWidths
+    {
+        Registry.ShapeRegistry table = Registry.Create();
+        ShapeId narrow = FloatShape(table, 32_u8);
+        ShapeId wide = FloatShape(table, 64_u8);
+        string singleTenth = WriteFloatExactly(table, narrow, 0x3dcccccd_u64, 32_u8);
+        string doubleTenth = WriteFloatExactly(table, wide, 0x3fb999999999999a_u64, 64_u8);
+        Assert.Equal(singleTenth, doubleTenth, "f32 0.1 is written from its own width, not widened to f64 digits");
+        Assert.True(String.Len(singleTenth) <= 4_i64, "shortest text for one tenth needs at most four bytes");
+        string singleZero = WriteFloatExactly(table, narrow, 0x80000000_u64, 32_u8);
+        string doubleZero = WriteFloatExactly(table, wide, 0x8000000000000000_u64, 64_u8);
+        Assert.Equal<u8>(String.ByteAt(singleZero, 0_i64), 45_u8, "f32 negative zero keeps its sign");
+        Assert.Equal<u8>(String.ByteAt(doubleZero, 0_i64), 45_u8, "f64 negative zero keeps its sign");
+        WriteFloatExactly(table, narrow, 0x7f7fffff_u64, 32_u8);
+        WriteFloatExactly(table, wide, 0x0000000000000001_u64, 64_u8);
+        Assert.True(Results.IsError(Serialization.WriteValue(narrow, DataValue::Float(0x7fc00000_u64, 32_u8), table, SerializationPolicy.DefaultLimits())), "f32 NaN rejects");
+        Assert.True(Results.IsError(Serialization.WriteValue(wide, DataValue::Float(0x7ff0000000000000_u64, 64_u8), table, SerializationPolicy.DefaultLimits())), "f64 infinity rejects");
+        Assert.True(Results.IsError(Serialization.WriteValue(narrow, DataValue::Float(0x3fb999999999999a_u64, 32_u8), table, SerializationPolicy.DefaultLimits())), "f64 bits under an f32 descriptor reject instead of narrowing");
+    }
+}
+
+mod CorpusTests
+{
+    /// @native-only
+    test SharedCorpusValuesAndRuntimeManifest
+    {
+        match (Environment.Get("BESKID_BSOL_CORPUS"))
+        {
+            Result::Error(_) => Assert.Fail("BESKID_BSOL_CORPUS must name the shared checked-in corpus"),
+
+            Result::Ok(directory) => {
+                CheckCorpusFile(directory, "v06-values.bsol");
+                CheckCorpusFile(directory, "runtime-manifest-v5.bsol");
+            },
+        };
+    }
+}
+
+// Import Materialization
+mod ImportsTests
+{
+    test PathCannotEscapeControlledRootLexically
+    {
+        Assert.True(Imports.RelativePath("schemas/base.bsol"), "root relative schema");
+        Assert.False(Imports.RelativePath("../base.bsol"), "parent escape");
+        Assert.False(Imports.RelativePath("schemas/../base.bsol"), "nested traversal");
+        Assert.False(Imports.RelativePath("/base.bsol"), "absolute path");
+        Assert.False(Imports.RelativePath("C:/base.bsol"), "drive path");
+        Assert.False(Imports.RelativePath("schemas\\base.bsol"), "alternate separator");
+        Assert.False(Imports.RelativePath("schemas//base.bsol"), "ambiguous empty segment");
+    }
+
+    test GitRevisionMustBeImmutable
+    {
+        Assert.True(Imports.ImmutableRevision("0123456789abcdef0123456789abcdef01234567"), "full Git object");
+        Assert.False(Imports.ImmutableRevision("main"), "moving branch");
+        Assert.False(Imports.ImmutableRevision("v0.6.0"), "moving tag");
+        Assert.False(Imports.ImmutableRevision("0123456"), "abbreviated object");
+    }
+
+    test RequestsRejectBeforeHostResolution
+    {
+        Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::File("../escape.bsol"))), "file traversal rejected before host");
+        Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Git("https://example.invalid/repo", "main", "schema.bsol"))), "moving revision rejected before host");
+        Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Registry("corelib", "", "schema.bsol"))), "missing exact lock version");
+        Assert.True(Results.IsError(Imports.ValidateRequest(Imports.ImportRequest::Pckg("", "0.6.0", "schema.bsol"))), "missing package identity");
+    }
+
+    test PackageShorthandPreservesExactLockedRequest
+    {
+        match (Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/schemas/base.bsol"))
+        {
+            Result::Ok(Imports.ImportRequest::Pckg(package, version, path)) => {
+                Assert.Equal(package, "corelib", "package identity");
+                Assert.Equal(version, "0.6.0", "exact version");
+                Assert.Equal(path, "schemas/base.bsol", "remaining path");
+            },
+            _ => Assert.Fail("valid shorthand must produce its locked package request"),
+        };
+        Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib//schema.bsol")), "missing version");
+        Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/../escape.bsol")), "shorthand traversal");
+        Assert.True(Results.IsError(Imports.ParsePckgShorthand("@pckg/corelib/0.6.0/")), "missing path");
+    }
+
+    test DeclarationRetainsAliasProfileAndSourceSpan
+    {
+        match (Parser.Parse("import_schema \"base.v2\" { from = file path = \"schemas/base.bsol\" alias = base }", Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("import syntax"),
+            Result::Ok(document) => {
+                match (Imports.ParseDeclaration(document, document.roots[0_i64]))
+                {
+                    Result::Error(_) => Assert.Fail("valid import declaration"),
+                    Result::Ok(declaration) => {
+                        Assert.Equal(declaration.profile, "base.v2", "requested profile identity");
+                        Assert.Equal(declaration.alias, "base", "explicit alias");
+                        Assert.True(declaration.hasAlias, "alias presence retained");
+                        Assert.True(declaration.span.end > declaration.span.start, "owned source span");
+                    },
+                };
+            },
+        };
+    }
+
+    test DeclarationRejectsDuplicateAndInapplicableProperties
+    {
+        string[] invalid = ["import_schema \"base.v2\" { from = file path = \"a.bsol\" path = \"b.bsol\" }", "import_schema \"base.v2\" { from = file path = \"a.bsol\" rev = \"ignored\" }", "import_schema \"base.v2\" { from = file path = \"a.bsol\" alias = \"\" }", "import_schema \"base.v2\" { from = file path = [\"a.bsol\"] }"];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<string>(invalid))
+        {
+            string source = invalid[index];
+            match (Parser.Parse(source, Limits.DefaultLimits()))
+            {
+                Result::Error(_) => Assert.Fail("invalid property fixture must parse"),
+                Result::Ok(document) => Assert.True(Results.IsError(Imports.ParseDeclaration(document, document.roots[0_i64])), "invalid property rejected before host resolution"),
+            };
+            index = index + 1_i64;
+        }
+    }
+
+    test ContentDigestIsCheckedBeforeAdmission
+    {
+        string source = "profile \"base.v2\" { version = 2 }";
+        match (Sha256.HashUtf8(source, 1024_i64))
+        {
+            Result::Error(_) => Assert.Fail("bounded fixture hashes"),
+            Result::Ok(digest) => {
+                Imports.MaterializedSource verified = Imports.MaterializedSource
+                {
+                    source: source,
+                    canonicalIdentity: "file:schemas/base.bsol",
+                    sourceSha256: digest,
+                };
+                Assert.True(Results.IsOk(Imports.VerifyMaterialized(verified, 1024_i64)), "exact materialized bytes");
+                Imports.MaterializedSource forged = Imports.MaterializedSource
+                {
+                    source: "changed",
+                    canonicalIdentity: "file:schemas/base.bsol",
+                    sourceSha256: digest,
+                };
+                Assert.True(Results.IsError(Imports.VerifyMaterialized(forged, 1024_i64)), "digest mismatch rejects");
+                Assert.True(Results.IsError(Imports.VerifyMaterialized(verified, 1_i64)), "budget precedes admission");
+                Imports.MaterializedSource absent = Imports.MaterializedSource
+                {
+                    source: source,
+                    canonicalIdentity: "",
+                    sourceSha256: Array.Empty<u8>(),
+                };
+                Assert.True(Results.IsError(Imports.VerifyMaterialized(absent, 1024_i64)), "missing identity and digest reject");
+            },
+        };
+    }
+}
+
+mod ImportGraphTests
+{
+    test TypedWriteReownsProfileBeforeInvokingBinding
+    {
+        WriteAdmissionProbe probe = WriteAdmissionProbe
+        {
+            invoked: false,
+        };
+        match (Schema.ParseProfile("profile \"plain.v2\" { version = 2 }", Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("valid source profile"),
+            Result::Ok(original) => {
+                mut Schema.Profile profile = original;
+                profile.source = "invalid profile source";
+                Assert.True(Results.IsError(Typed.Write<i32, WriteAdmissionProbe>(1_i32, profile, probe, SerializationPolicy.DefaultLimits())), "invalid owned source rejects before binding code");
+                Assert.False(probe.invoked, "unadmitted profile never reaches typed writer");
+            },
+        };
+    }
+
+    test ImportedAliasComposesDefaultsAndRevalidatesOwnedClosure
+    {
+        CompositionHost fixtureResolver = CompositionHost { };
+        Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"defaults.v2\" { from = file path = \"defaults.bsol\" alias = shared } rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extends = \"shared.base\" } }", "file:root.bsol");
+        match (Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("imported inherited defaults compose"),
+            Result::Ok(profile) => {
+                Assert.Equal(Array.Len<i64>(profile.roots), 1_i64, "only declaring root rules become document roots");
+                mut Schema.Rule rule = profile.rules[profile.roots[0_i64]];
+                Assert.Equal(Array.Len<Schema.Field>(rule.fields), 1_i64, "imported field inherited");
+                Assert.Equal(profile.document.nodes[rule.fields[0_i64].defaultNode].text, "7", "default refers to rebased imported arena");
+                // A caller can mutate public tables, but validation must rebuild
+                // them from the private verified source closure.
+                rule.fields[0_i64].typeIndex = -1_i64;
+                match (Parser.Parse("config { count = 9 }", Limits.DefaultLimits()))
+                {
+                    Result::Error(_) => Assert.Fail("document parses"),
+                    Result::Ok(document) => Assert.True(Results.IsOk(Schema.Validate(document, profile, Limits.DefaultLimits())), "validation retains source closure without resolving again"),
+                };
+                mut Limits.BsolLimits narrow = Limits.DefaultLimits();
+                narrow.maxImportDepth = 0_i64;
+                Assert.True(Results.IsError(Schema.ReownProfile(profile, narrow)), "reownership reapplies caller depth policy");
+                narrow = Limits.DefaultLimits();
+                narrow.maxImports = 0_i64;
+                Assert.True(Results.IsError(Schema.ReownProfile(profile, narrow)), "reownership reapplies import policy");
+            },
+        };
+    }
+
+    test ImportedPrivateKeysDoNotShadowQuotedLocalRuleNames
+    {
+        CompositionHost fixtureResolver = CompositionHost { };
+        Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"defaults.v2\" { from = file path = \"defaults.bsol\" alias = shared } rule \"#1:0:defaults.v2:base\" { scope = top match = keyword keyword = local } rule \"config\" { scope = top match = keyword keyword = config label = forbidden cardinality = one extends = \"shared.base\" } }", "file:collision-root.bsol");
+        match (Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("valid quoted local name cannot collide with imported private identity"),
+            Result::Ok(profile) => {
+                Assert.Equal(Array.Len<i64>(profile.roots), 2_i64, "both local roots retained");
+                Schema.Rule local = profile.rules[profile.roots[0_i64]];
+                Schema.Rule derived = profile.rules[profile.roots[1_i64]];
+                Assert.Equal(local.name, "#1:0:defaults.v2:base", "local identity remains unchanged");
+                Assert.Equal(Array.Len<Schema.Field>(local.fields), 0_i64, "local declaration remains independent");
+                Assert.Equal(Array.Len<Schema.Field>(derived.fields), 1_i64, "alias inheritance selects imported source declaration");
+                Assert.True(derived.extends != local.name, "rebased target has disjoint owned identity");
+            },
+        };
+    }
+
+    test ImportedReferenceAliasesShareOneOwnedTarget
+    {
+        CompositionHost fixtureResolver = CompositionHost { };
+        Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"nodes.v2\" { from = file path = \"nodes.bsol\" alias = shared } import_schema \"nodes.v2\" { from = file path = \"nodes.bsol\" alias = other } rule \"config\" { match = keyword keyword = config label = forbidden cardinality = one field \"target\" { type = inline(shared.node) required = true } field \"first\" { type = ref(shared.node) required = true } field \"second\" { type = ref(shared.node) required = true } } }", "file:reference-root.bsol");
+        match (Schema.LoadProfile<CompositionHost>(root, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("qualified imported type profile loads"),
+            Result::Ok(profile) => {
+                match (Parser.Parse("config { target = node \"alpha\" {} first = @shared.node/alpha second = @other.node/alpha }", Limits.DefaultLimits()))
+                {
+                    Result::Error(_) => Assert.Fail("qualified reference document parses"),
+                    Result::Ok(document) => {
+                        match (Schema.Validate(document, profile, Limits.DefaultLimits()))
+                        {
+                            Result::Error(_) => Assert.Fail("both aliases accept the declared imported type"),
+                            Result::Ok(checked) => {
+                                match (Schema.ResolveReferences(checked, Limits.DefaultLimits()))
+                                {
+                                    Result::Error(_) => Assert.Fail("diamond aliases resolve without target ambiguity"),
+                                    Result::Ok(resolved) => {
+                                        Assert.Equal(Array.Len<Schema.ReferenceBinding>(resolved.references), 2_i64, "both reference origins bound");
+                                        Assert.Equal(resolved.references[0_i64].target, resolved.references[1_i64].target, "same actual input node");
+                                        Assert.Equal(resolved.references[0_i64].targetRule, resolved.references[1_i64].targetRule, "same owned imported declaration");
+                                    },
+                                };
+                            },
+                        };
+                    },
+                };
+            },
+        };
+    }
+
+    test ImportedQualifierParserRejectsEmptySegments
+    {
+        string[] malformed = ["@shared./alpha", "@shared..node/alpha", "@.node/alpha", "ref(shared..node)", "inline(shared.)"];
+        mut i64 index = 0_i64;
+        while (index < Array.Len<string>(malformed))
+        {
+            string value = malformed[index];
+            Assert.True(Results.IsError(Parser.Parse("config { value = " + value + " }", Limits.DefaultLimits())), "malformed dotted qualifier rejects");
+            index = index + 1_i64;
+        }
+    }
+
+    test DiamondDeduplicatesOwnedSourceAndKeepsNamespaces
+    {
+        Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" alias = direct } import_schema \"branch.v2\" { from = file path = \"branch.bsol\" alias = branch } }", "file:root.bsol");
+        GraphHost fixtureResolver = GraphHost
+        {
+            cycle: false,
+        };
+        match (ImportGraph.Resolve<GraphHost>(root, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("locked diamond must resolve"),
+            Result::Ok(graph) => {
+                Assert.Equal(Array.Len<ImportGraph.Source>(graph.sources), 3_i64, "shared source stored once");
+                Assert.Equal(Array.Len<ImportGraph.Binding>(graph.bindings), 3_i64, "three namespace edges retained");
+                Assert.Equal(graph.root, 0_i64, "owned root index");
+                mut i64 index = 0_i64;
+                while (index < Array.Len<ImportGraph.Source>(graph.sources))
+                {
+                    Assert.False(graph.sources[index].active, "all recursive visits complete before publication");
+                    index = index + 1_i64;
+                }
+            },
+        };
+    }
+
+    test CyclesAndMissingCacheNeverPublishPartialGraph
+    {
+        GraphHost fixtureResolver = GraphHost
+        {
+            cycle: true,
+        };
+        Imports.MaterializedSource cyclic = Materialize("profile \"root.v2\" { version = 2 import_schema \"root.v2\" { from = file path = \"root.bsol\" } }", "file:root.bsol");
+        match (ImportGraph.Resolve<GraphHost>(cyclic, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Ok(_) => Assert.Fail("cycle rejected"),
+            Result::Error(error) => {
+                Assert.Equal(error.failure.code, "ImportCycle", "canonical source cycle");
+                Assert.True(error.span.end > error.span.start, "import declaration span");
+            },
+        };
+        Imports.MaterializedSource missing = Materialize("profile \"root.v2\" { version = 2 import_schema \"absent.v2\" { from = file path = \"missing.bsol\" } }", "file:missing-root.bsol");
+        match (ImportGraph.Resolve<GraphHost>(missing, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Ok(_) => Assert.Fail("missing cache rejected"),
+            Result::Error(error) => Assert.Equal(error.failure.code, "MissingCache", "host failure retained"),
+        };
+    }
+
+    test LimitsCoverTheWholeClosure
+    {
+        GraphHost fixtureResolver = GraphHost
+        {
+            cycle: false,
+        };
+        Imports.MaterializedSource root = Materialize("profile \"root.v2\" { version = 2 import_schema \"base.v2\" { from = file path = \"base.bsol\" } }", "file:root.bsol");
+        mut Limits.BsolLimits limits = Limits.DefaultLimits();
+        limits.maxImports = 0_i64;
+        Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "import count checked before resolution");
+        limits = Limits.DefaultLimits();
+        limits.maxImportDepth = 0_i64;
+        Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "child depth checked");
+        limits = Limits.DefaultLimits();
+        limits.maxResolvedSchemaBytes = 1_i64;
+        Assert.True(Results.IsError(ImportGraph.Resolve<GraphHost>(root, fixtureResolver, limits)), "aggregate source budget");
+    }
+
+    test PreservesSupportedSchemaVersionInOwnedCache
+    {
+        GraphHost fixtureResolver = GraphHost
+        {
+            cycle: false,
+        };
+        Imports.MaterializedSource root = Materialize("profile \"legacy.v1\" { version = 1 }", "file:legacy.bsol");
+        match (ImportGraph.Resolve<GraphHost>(root, fixtureResolver, Limits.DefaultLimits()))
+        {
+            Result::Error(_) => Assert.Fail("existing version one profile remains supported"),
+            Result::Ok(graph) => Assert.Equal(graph.sources[graph.root].version, 1_i64, "version retained with canonical source identity and digest"),
+        };
+    }
+}
+
+mod SchemaImportTests
+{
+    /// @native-only
+    test MissingMaterializedCacheIsSourceSpanned
+    {
+        RejectImport(true, false, "MissingCache");
+    }
+
+    /// @native-only
+    test SourceDigestMismatchRejects
+    {
+        RejectImport(false, true, "ImportDigestMismatch");
+    }
 }

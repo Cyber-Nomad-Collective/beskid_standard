@@ -8,6 +8,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
+- Compiler SDK: `Beskid/Compiler/Diagnostics.bd` is regenerated from the compiler's
+  `SemanticIssueKind` and `Severity` (it had not been regenerated since 0.6.0: removed kinds such as
+  `DuplicateDefinitionName`, `AmbiguousImport` and `DuplicateItemName` are gone, and the kinds added
+  since are present). `regen_mod_sdk_surfaces.sh` writes it again with the syntax and query surfaces.
 - Test cleanup: every Corelib test lives in a topic module (`mod TopicTests { test Name { } }`),
   so a test's identity is `TopicTests::Name` (for example `CoreSuite` `BytesTests::NewHasLength`,
   `BsolSuite` `SyntaxTests::OrderedBlocksAssignmentsAndByteSpans`, `ProcessSuite`

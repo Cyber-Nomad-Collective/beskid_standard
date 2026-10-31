@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Regenerate only generator-owned syntax and query surfaces. Compiler contract,
-# request, semantic, diagnostic, and workspace sources are maintained as source.
+# Regenerate the generator-owned surfaces: syntax nodes, the query facade and the
+# diagnostics mirror (`SemanticIssueKind`, `Severity`). Compiler contract, request,
+# semantic and workspace sources are maintained as source. The beskid_ast_reflect_gen
+# `sdk_surfaces` tests fail while any generated surface here is stale.
 set -euo pipefail
 
 COMPILER_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
@@ -18,4 +20,6 @@ cargo run --locked -p beskid_ast_reflect_gen --quiet -- \
 # truncate the checked-in callback facade.
 mv "$QUERY_STAGE" "$SDK_QUERY"
 trap - EXIT
-printf 'Regenerated syntax and query surfaces under %s/%s\n' "$COMPILER_ROOT" "$SDK_BESKID_DIR"
+cargo run --locked -p beskid_ast_reflect_gen --quiet -- \
+  --workspace "$COMPILER_ROOT" --emit-diagnostics-sdk "$SDK_BESKID_DIR/Compiler/Diagnostics.bd"
+printf 'Regenerated syntax, query and diagnostics surfaces under %s/%s\n' "$COMPILER_ROOT" "$SDK_BESKID_DIR"

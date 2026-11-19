@@ -93,8 +93,9 @@ and native descriptor escape hatches are absent.
 
 ## Evidence
 
-The existing corelib test project registers `NetworkTypesTests`,
-`NetworkDnsTests`, `NetworkTcpTests`, `NetworkUdpTests`, and `NetworkScopeTests`. They cover bounded
+The corelib test project registers one `NetworkSuite` target
+(`network/NetworkSuite.bd`), with one section for each former target: types,
+DNS, TCP, UDP, scope, shutdown leak, and disposable. They cover bounded
 ports, portable errors, DNS family filtering, independent resolver results,
 TCP transfer through Core.IO, EOF, scoped cleanup, datagram truncation, empty
 datagrams, connected UDP, and stale-generation behavior through public APIs.

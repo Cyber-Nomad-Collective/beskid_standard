@@ -12,8 +12,9 @@
 /// one function, on every path.
 ///
 /// The C names are dictated by OpenSSL and libc, so these contracts trigger naming warning W1633.
-[Extern(Abi:"C", Library:"libcrypto.so.3", Optional:true)]
-pub contract LibCrypto {
+[Extern(Abi: "C", Library: "libcrypto.so.3", Optional: true)]
+pub contract LibCrypto
+{
     bool Available();
     i64 SHA256(i64 data, i64 count, i64 digest);
     i64 SHA384(i64 data, i64 count, i64 digest);
@@ -39,8 +40,9 @@ pub contract LibCrypto {
 
 /// libc environment access without allocation (Linux glibc soname; the JIT and an AOT link
 /// reach libSystem on macOS, as for `Crypto.Entropy`).
-[Extern(Abi:"C", Library:"libc.so.6")]
-contract ProviderLibc {
+[Extern(Abi: "C", Library: "libc.so.6")]
+contract ProviderLibc
+{
     i64 getenv(i64 name);
     i32 setenv(i64 name, i64 value, i32 overwrite);
     i32 unsetenv(i64 name);
@@ -49,14 +51,21 @@ contract ProviderLibc {
 }
 
 /// True when `libcrypto.so.3` and every symbol of `LibCrypto` resolved at load time.
-pub bool Available() { return LibCrypto.Available(); }
+pub bool Available()
+{
+    return LibCrypto.Available();
+}
 
 /// Largest input or AAD length passed to one EVP call (EVP lengths are C `int`).
 /// Larger requests take the pure path.
-pub i64 MaxEvpLength() { return 1073741824_i64; }
+pub i64 MaxEvpLength()
+{
+    return 1073741824_i64;
+}
 
 /// SHA-256 of `data` into `digest` (32 bytes).
-pub unit Sha256Into(u8[] data, u8[] digest) {
+pub unit Sha256Into(u8[] data, u8[] digest)
+{
     clif {
         %p = payload %0
         %n = length %0
@@ -67,7 +76,8 @@ pub unit Sha256Into(u8[] data, u8[] digest) {
 }
 
 /// SHA-384 of `data` into `digest` (48 bytes).
-pub unit Sha384Into(u8[] data, u8[] digest) {
+pub unit Sha384Into(u8[] data, u8[] digest)
+{
     clif {
         %p = payload %0
         %n = length %0
@@ -78,7 +88,8 @@ pub unit Sha384Into(u8[] data, u8[] digest) {
 }
 
 /// SHA-512 of `data` into `digest` (64 bytes).
-pub unit Sha512Into(u8[] data, u8[] digest) {
+pub unit Sha512Into(u8[] data, u8[] digest)
+{
     clif {
         %p = payload %0
         %n = length %0
@@ -90,7 +101,8 @@ pub unit Sha512Into(u8[] data, u8[] digest) {
 
 /// HMAC with the EVP digest `md` (from `EVP_sha256`/`EVP_sha384`/`EVP_sha512`) into `digest`.
 /// Returns 0 when OpenSSL fails. Precondition: key length < 2^31.
-pub i64 HmacInto(i64 md, u8[] key, u8[] data, u8[] digest) {
+pub i64 HmacInto(i64 md, u8[] key, u8[] data, u8[] digest)
+{
     return clif {
         %k = payload %1
         %kn = length %1
@@ -104,25 +116,50 @@ pub i64 HmacInto(i64 md, u8[] key, u8[] data, u8[] digest) {
     };
 }
 
-pub i64 Sha256Md() { return LibCrypto.EVP_sha256(); }
-pub i64 Sha384Md() { return LibCrypto.EVP_sha384(); }
-pub i64 Sha512Md() { return LibCrypto.EVP_sha512(); }
+pub i64 Sha256Md()
+{
+    return LibCrypto.EVP_sha256();
+}
+
+pub i64 Sha384Md()
+{
+    return LibCrypto.EVP_sha384();
+}
+
+pub i64 Sha512Md()
+{
+    return LibCrypto.EVP_sha512();
+}
 
 /// EVP AEAD cipher for an AES-GCM key of 16, 24, or 32 bytes (0 for another length).
-pub i64 AesGcmCipher(i64 keyLength) {
-    if keyLength == 16_i64 { return LibCrypto.EVP_aes_128_gcm(); }
-    if keyLength == 24_i64 { return LibCrypto.EVP_aes_192_gcm(); }
-    if keyLength == 32_i64 { return LibCrypto.EVP_aes_256_gcm(); }
+pub i64 AesGcmCipher(i64 keyLength)
+{
+    if (keyLength == 16_i64)
+    {
+        return LibCrypto.EVP_aes_128_gcm();
+    }
+    if (keyLength == 24_i64)
+    {
+        return LibCrypto.EVP_aes_192_gcm();
+    }
+    if (keyLength == 32_i64)
+    {
+        return LibCrypto.EVP_aes_256_gcm();
+    }
     return 0_i64;
 }
 
-pub i64 ChaChaCipher() { return LibCrypto.EVP_chacha20_poly1305(); }
+pub i64 ChaChaCipher()
+{
+    return LibCrypto.EVP_chacha20_poly1305();
+}
 
 /// One AEAD seal in `context`: writes `count` ciphertext bytes at `output[outputOffset]` and
 /// the 16-byte tag after them. Returns 1 when every OpenSSL step succeeded.
 /// Precondition: ranges in bounds, 12-byte nonce, `count` and AAD length below MaxEvpLength,
 /// input and output either the same range or disjoint.
-i64 SealSteps(i64 context, i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset, i64[] scratch) {
+i64 SealSteps(i64 context, i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset, i64[] scratch)
+{
     return clif {
         %kp = payload %2
         %np = payload %3
@@ -171,7 +208,8 @@ i64 SealSteps(i64 context, i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] inpu
 /// Returns 1 when the tag verified, 2 when the setup worked but the tag did not verify,
 /// and 0 when an OpenSSL setup step failed.
 /// The caller wipes the output range unless the result is 1.
-i64 OpenSteps(i64 context, i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 count, u8[] output, i64 outputOffset, i64[] scratch) {
+i64 OpenSteps(i64 context, i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 count, u8[] output, i64 outputOffset, i64[] scratch)
+{
     return clif {
         %kp = payload %2
         %np = payload %3
@@ -221,10 +259,17 @@ i64 OpenSteps(i64 context, i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] seal
 }
 
 /// AEAD seal through EVP. Returns true on success. See SealSteps for preconditions.
-pub bool AeadSeal(i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset) {
-    if cipher == 0_i64 { return false; }
+pub bool AeadSeal(i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] input, i64 inputOffset, i64 count, u8[] output, i64 outputOffset)
+{
+    if (cipher == 0_i64)
+    {
+        return false;
+    }
     i64 context = LibCrypto.EVP_CIPHER_CTX_new();
-    if context == 0_i64 { return false; }
+    if (context == 0_i64)
+    {
+        return false;
+    }
     i64[] scratch = [0_i64, 0_i64];
     i64 result = SealSteps(context, cipher, key, nonce, aad, input, inputOffset, count, output, outputOffset, scratch);
     LibCrypto.EVP_CIPHER_CTX_free(context);
@@ -233,19 +278,30 @@ pub bool AeadSeal(i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] input, i64 in
 
 /// AEAD open through EVP: 1 = verified, 2 = tag mismatch, 0 = OpenSSL failure.
 /// On any result other than 1 the output range is zeroed, so no unverified plaintext stays.
-pub i64 AeadOpen(i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 count, u8[] output, i64 outputOffset) {
-    if cipher == 0_i64 { return 0_i64; }
+pub i64 AeadOpen(i64 cipher, u8[] key, u8[] nonce, u8[] aad, u8[] sealed, i64 sealedOffset, i64 count, u8[] output, i64 outputOffset)
+{
+    if (cipher == 0_i64)
+    {
+        return 0_i64;
+    }
     i64 context = LibCrypto.EVP_CIPHER_CTX_new();
-    if context == 0_i64 { return 0_i64; }
+    if (context == 0_i64)
+    {
+        return 0_i64;
+    }
     i64[] scratch = [0_i64, 0_i64];
     i64 result = OpenSteps(context, cipher, key, nonce, aad, sealed, sealedOffset, count, output, outputOffset, scratch);
     LibCrypto.EVP_CIPHER_CTX_free(context);
-    if result != 1_i64 { Wipe(output, outputOffset, count); }
+    if (result != 1_i64)
+    {
+        Wipe(output, outputOffset, count);
+    }
     return result;
 }
 
 /// Zeroes `buffer[offset, offset + count)` with libc `memset`. Precondition: in bounds.
-pub unit Wipe(u8[] buffer, i64 offset, i64 count) {
+pub unit Wipe(u8[] buffer, i64 offset, i64 count)
+{
     clif {
         %b = payload %0
         %p = iadd %b, %1
@@ -256,18 +312,23 @@ pub unit Wipe(u8[] buffer, i64 offset, i64 count) {
 }
 
 /// True when the environment variable `name` (NUL-terminated) equals `value` (NUL-terminated).
-pub bool EnvEquals(u8[] name, u8[] value) {
+pub bool EnvEquals(u8[] name, u8[] value)
+{
     i64 found = clif {
         %p = payload %0
         %r = call @getenv(%p) -> i64
         return %r
     };
-    if found == 0_i64 { return false; }
+    if (found == 0_i64)
+    {
+        return false;
+    }
     i32 cmp = CompareCString(found, value);
     return cmp == 0_i32;
 }
 
-i32 CompareCString(i64 left, u8[] right) {
+i32 CompareCString(i64 left, u8[] right)
+{
     return clif {
         %p = payload %1
         %r = call @strcmp(%0, %p) -> i32
@@ -277,8 +338,10 @@ i32 CompareCString(i64 left, u8[] right) {
 
 /// Sets (or, with `remove`, removes) an environment variable. Both arrays are
 /// NUL-terminated. Used by `Crypto.Provider` for the switch and the cached selection.
-pub unit SetEnv(u8[] name, u8[] value, bool remove) {
-    if remove {
+pub unit SetEnv(u8[] name, u8[] value, bool remove)
+{
+    if (remove)
+    {
         clif {
             %p = payload %0
             %r = call @unsetenv(%p) -> i32

@@ -9,11 +9,11 @@ sealing and opening on one core, and the runtime network layer (`Network.TcpStre
 Targets (each prints `BENCH` lines):
 
 ```bash
-beskid test --project packages/tls/tests   --target TlsBench        --plain --target-timeout 3000
-beskid test --project packages/tls/tests   --target TlsMicroBench   --plain --target-timeout 3000
-beskid test --project packages/http2/tests --target Http2Bench      --plain --target-timeout 3000
-beskid test --project packages/quic/tests  --target QuicBench       --plain --target-timeout 3000
-beskid test --project packages/crypto/tests --target NativeBench    --plain
+beskid test --project beskid_corelib/bench --target TlsBench       --plain --target-timeout 3000
+beskid test --project beskid_corelib/bench --target TlsRecordBench --plain --target-timeout 3000
+beskid test --project beskid_corelib/bench --target Http2Bench     --plain --target-timeout 3000
+beskid test --project beskid_corelib/bench --target QuicBench      --plain --target-timeout 3000
+beskid test --project beskid_corelib/bench --target CryptoProviderBench --plain
 ```
 
 "Pure" forces `BESKID_CRYPTO_PROVIDER=pure`; "Native" is the OpenSSL 3 provider of ruling R27.

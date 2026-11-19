@@ -1,7 +1,7 @@
 # Crypto benchmarks
 
 Machine: NixOS builder container, AMD Ryzen 7 7700 (aes, pclmulqdq, sha_ni, avx2, avx512f,
-vaes), shared and noisy. Beskid numbers: `beskid test --project packages/crypto/tests
+vaes), shared and noisy. Beskid numbers: `beskid test --project beskid_corelib/bench
 --target CryptoBench` with the 0.5.3 CLI (JIT, Cranelift `opt_level=none`), one run each.
 References are the best of 3 runs: OpenSSL 3.0.20 `openssl speed -seconds 2`
 (SW = `OPENSSL_ia32cap="~0x200000200000000"`, no AES-NI/PCLMULQDQ; for SHA rows the SW
@@ -27,7 +27,7 @@ The ring X25519/P-256 rows include its ephemeral key generation (about 0.3 us).
 
 ## Native provider (`packages/crypto-openssl`, ruling R20)
 
-`beskid test --project packages/crypto-openssl/tests --target NativeBench` (0.5.3 CLI, JIT at
+`beskid test --project beskid_corelib/bench --target CryptoProviderBench` (0.5.3 CLI, JIT at
 `opt_level=speed`, one run, load about 2.7). Each row runs the pure and the native drop-in
 in the same test. Inputs are one-shot 16 KiB buffers: 1 MiB per pure run, 8 MiB per native
 run. OpenSSL HW is the `openssl speed` reference from the table above.

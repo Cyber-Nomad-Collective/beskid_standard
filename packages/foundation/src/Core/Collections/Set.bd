@@ -1,24 +1,31 @@
 /// Unordered set backed by a linear typed-array scan.
 /// @tier(supported)
+/// `Add` and `Remove` change the set in place.
 use Core.Collections.Array;
-use Core.Collections.Storage;
 
-pub type Set<T> {
-    T[] storage,
-    i64 count,
+[Isolated]
+pub type Set<T>
+{
+    T[] storage;
+    i64 count;
 
-    pub i64 Count() {
-        return count;
+    pub i64 Count()
+    {
+        return this.count;
     }
 
-    pub bool IsEmpty() {
-        return count == 0;
+    pub bool IsEmpty()
+    {
+        return this.count == 0;
     }
 
-    pub bool Contains(T value) {
+    pub bool Contains(T value)
+    {
         mut i64 index = 0;
-        while index < count {
-            if Array.Get<T>(storage, index) == value {
+        while (index < this.count)
+        {
+            if (Array.Get<T>(this.storage, index) == value)
+            {
                 return true;
             }
             index = index + 1;
@@ -26,85 +33,134 @@ pub type Set<T> {
         return false;
     }
 
-    pub Set<T> Add(T value) {
-        if Contains(value) {
-            return this;
+    /// Adds `value`; returns false when it is already a member.
+    pub bool Add(mut this, T value)
+    {
+        if (Contains(value))
+        {
+            return false;
         }
-        T[] nextStorage = Storage.AppendAt<T>(storage, count, value);
-        return Set<T> { storage: nextStorage, count: count + 1 };
+        Array.Append<T>(this.storage, value);
+        this.count = this.count + 1;
+        return true;
     }
 
-    pub Set<T> Remove(T value) {
+    /// Removes `value`; returns false when it is not a member.
+    pub bool Remove(mut this, T value)
+    {
         mut i64 index = 0;
-        while index < count {
-            if Array.Get<T>(storage, index) == value {
-                return Set<T> { storage: Storage.CopyWithout<T>(storage, count, index), count: count - 1 };
+        while (index < this.count)
+        {
+            if (Array.Get<T>(this.storage, index) == value)
+            {
+                mut i64 shift = index;
+                while (shift + 1 < this.count)
+                {
+                    Array.Set<T>(this.storage, shift, Array.Get<T>(this.storage, shift + 1));
+                    shift = shift + 1;
+                }
+                Array.RemoveLast<T>(this.storage);
+                this.count = this.count - 1;
+                return true;
             }
             index = index + 1;
         }
-        return this;
+        return false;
     }
 
     /// Copies the members into a new array in insertion order.
-    pub T[] ToArray() {
-        return Storage.CopyRange<T>(this.storage, 0, this.count);
+    pub T[] ToArray()
+    {
+        mut T[] copy = Array.Empty<T>();
+        mut i64 index = 0;
+        while (index < this.count)
+        {
+            Array.Append<T>(copy, Array.Get<T>(this.storage, index));
+            index = index + 1;
+        }
+        return copy;
     }
 
     /// Members of this set followed by members of `other` that are not already present.
-    pub Set<T> Union(Set<T> other) {
+    pub Set<T> Union(Set<T> other)
+    {
         mut T[] merged = Array.Empty<T>();
         mut i64 index = 0;
-        while index < this.count {
-            merged = Array.Append<T>(merged, Array.Get<T>(this.storage, index));
+        while (index < this.count)
+        {
+            Array.Append<T>(merged, Array.Get<T>(this.storage, index));
             index = index + 1;
         }
         mut i64 total = this.count;
         index = 0;
-        while index < other.count {
-            if Storage.IndexOf<T>(this.storage, this.count, Array.Get<T>(other.storage, index)) < 0 {
-                merged = Array.Append<T>(merged, Array.Get<T>(other.storage, index));
+        while (index < other.count)
+        {
+            if (!ContainsIn<T>(this.storage, this.count, Array.Get<T>(other.storage, index)))
+            {
+                Array.Append<T>(merged, Array.Get<T>(other.storage, index));
                 total = total + 1;
             }
             index = index + 1;
         }
-        return Set<T> { storage: merged, count: total };
+        return Set<T>
+        {
+            storage: merged,
+            count: total,
+        };
     }
 
     /// Members of this set that are also in `other`, in this set's order.
-    pub Set<T> Intersect(Set<T> other) {
+    pub Set<T> Intersect(Set<T> other)
+    {
         mut T[] kept = Array.Empty<T>();
         mut i64 total = 0;
         mut i64 index = 0;
-        while index < this.count {
-            if Storage.IndexOf<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) >= 0 {
-                kept = Array.Append<T>(kept, Array.Get<T>(this.storage, index));
+        while (index < this.count)
+        {
+            if (ContainsIn<T>(other.storage, other.count, Array.Get<T>(this.storage, index)))
+            {
+                Array.Append<T>(kept, Array.Get<T>(this.storage, index));
                 total = total + 1;
             }
             index = index + 1;
         }
-        return Set<T> { storage: kept, count: total };
+        return Set<T>
+        {
+            storage: kept,
+            count: total,
+        };
     }
 
     /// Members of this set that are not in `other`, in this set's order.
-    pub Set<T> Difference(Set<T> other) {
+    pub Set<T> Difference(Set<T> other)
+    {
         mut T[] kept = Array.Empty<T>();
         mut i64 total = 0;
         mut i64 index = 0;
-        while index < this.count {
-            if Storage.IndexOf<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) < 0 {
-                kept = Array.Append<T>(kept, Array.Get<T>(this.storage, index));
+        while (index < this.count)
+        {
+            if (!ContainsIn<T>(other.storage, other.count, Array.Get<T>(this.storage, index)))
+            {
+                Array.Append<T>(kept, Array.Get<T>(this.storage, index));
                 total = total + 1;
             }
             index = index + 1;
         }
-        return Set<T> { storage: kept, count: total };
+        return Set<T>
+        {
+            storage: kept,
+            count: total,
+        };
     }
 
     /// Returns true when every member of this set is also in `other`.
-    pub bool IsSubsetOf(Set<T> other) {
+    pub bool IsSubsetOf(Set<T> other)
+    {
         mut i64 index = 0;
-        while index < this.count {
-            if Storage.IndexOf<T>(other.storage, other.count, Array.Get<T>(this.storage, index)) < 0 {
+        while (index < this.count)
+        {
+            if (!ContainsIn<T>(other.storage, other.count, Array.Get<T>(this.storage, index)))
+            {
                 return false;
             }
             index = index + 1;
@@ -113,32 +169,60 @@ pub type Set<T> {
     }
 }
 
-pub Set<T> New<T>() {
-    return Set<T> { storage: Array.Empty<T>(), count: 0 };
+bool ContainsIn<T>(T[] storage, i64 count, T value)
+{
+    mut i64 index = 0;
+    while (index < count)
+    {
+        if (Array.Get<T>(storage, index) == value)
+        {
+            return true;
+        }
+        index = index + 1;
+    }
+    return false;
+}
+
+pub Set<T> New<T>()
+{
+    return Set<T>
+    {
+        storage: Array.Empty<T>(),
+        count: 0,
+    };
 }
 
 /// Builds a set from `values`, keeping the first occurrence of each duplicate.
-pub Set<T> FromArray<T>(T[] values) {
+pub Set<T> FromArray<T>(T[] values)
+{
     mut T[] members = Array.Empty<T>();
     mut i64 total = 0;
     mut i64 index = 0;
-    while index < Array.Len<T>(values) {
-        if Storage.IndexOf<T>(members, total, Array.Get<T>(values, index)) < 0 {
-            members = Array.Append<T>(members, Array.Get<T>(values, index));
+    while (index < Array.Len<T>(values))
+    {
+        if (!ContainsIn<T>(members, total, Array.Get<T>(values, index)))
+        {
+            Array.Append<T>(members, Array.Get<T>(values, index));
             total = total + 1;
         }
         index = index + 1;
     }
-    return Set<T> { storage: members, count: total };
+    return Set<T>
+    {
+        storage: members,
+        count: total,
+    };
 }
 
 /// Bulk constructor: packs call-site scalars into a set.
-/// Iterates the bulk array and inserts each value via `Set.Add`.
-pub Set<T> Of<T>(bulk T[] values) {
-    mut Set<T> result = Set.New<T>();
+/// Iterates the bulk array and inserts each value with `Set.Add`.
+pub Set<T> Of<T>(bulk T[] values)
+{
+    Set<T> result = New<T>();
     mut i64 index = 0;
-    while index < Array.Len<T>(values) {
-        result = result.Add(Array.Get<T>(values, index));
+    while (index < Array.Len<T>(values))
+    {
+        result.Add(Array.Get<T>(values, index));
         index = index + 1;
     }
     return result;

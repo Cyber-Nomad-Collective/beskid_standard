@@ -8,6 +8,233 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Preserve the SemVer, Glob, CSV, URL, and TOML parsers from the main branch, including their reference pages and regression suites.
+- Preserve the query filtering, equality, aggregation, and reordering operators together with the array storage helpers they use.
+- Preserve ANSI display-width and terminal-mode helpers, the Console table control, multi-line panels, and explicit terminal color policy.
+- Include the seeded collection and number tests, JSON corpus, calendar sweep, and compiler canaries from the main branch.
+
+### Changed
+
+- Compiler SDK: `Beskid/Compiler/Diagnostics.bd` is regenerated from the compiler's
+  `SemanticIssueKind` and `Severity` (it had not been regenerated since 0.6.0: removed kinds such as
+  `DuplicateDefinitionName`, `AmbiguousImport` and `DuplicateItemName` are gone, and the kinds added
+  since are present). `regen_mod_sdk_surfaces.sh` writes it again with the syntax and query surfaces.
+- Test cleanup: every Corelib test lives in a topic module (`mod TopicTests { test Name { } }`),
+  so a test's identity is `TopicTests::Name` (for example `CoreSuite` `BytesTests::NewHasLength`,
+  `BsolSuite` `SyntaxTests::OrderedBlocksAssignmentsAndByteSpans`, `ProcessSuite`
+  `LifecycleTests::CloseIsIdempotentThroughAliases`). Large suites have one module per area (the
+  former section headings); a file with one area has one module. The `Tests` suffix keeps a
+  module from taking the name of the API under test: a module named `Encoder` hid the imported
+  type `Encoder` in type positions of the whole file. The domain prefix that the module now
+  names is gone from 882 of 1522 test names (`Bsol`, `Serialization`, `Network`, `Http`, `H3`,
+  `Pk`, `Provider`, `Time`, `Process`, `Dynamic`, `Web`, `Glue` and area names such as
+  `String`, `Ansi`, `Result`). Helpers, types and `use` lines stay at file level, before the
+  modules. Targets and file names are unchanged, except the merges below.
+- Test cleanup: the remaining one-test targets merge, with their helpers renamed where two files
+  used one name for different code. quic `QuicConnectionStress`, `QuicCreditLoss`,
+  `QuicLoopback` and `QuicTlsLoopback` join `QuicConnection` (modules `InMemoryTests`,
+  `RecoveryFlowTests`, `CreditLossTests`, `UdpLoopbackTests`, `TlsLoopbackTests`; `Pump`
+  becomes `PumpDropping` and `PumpLosingCredit`, the loopback `Scenario`/`Talk` become `RetryScenario`/`RetryTalk` and
+  `TlsScenario`/`TlsTalk`). tls `LoopbackPolicy` joins `Loopback` (`Serve`, `Echo`,
+  `RunClient`, `Scenario` of the policy test become `ServeOnce`, `EchoOnce`, `RunPolicyClient`,
+  `PolicyScenario`). websocket `WsTlsTests` joins `WsLoopbackTests` (`WssEchoOnce`,
+  `WssServeEcho`, `WssUrl`). http3 `H3PeerTests` and `H3QuicLoopback` join `H3ExchangeTests`
+  (`PeerGet`, `PeerStartOk`, `QuicLoopbackGet`, `QuicLoopbackConfig`). Package test targets:
+  82 -> 74.
+- Test cleanup: `connect` `ErrorsResolutionFailedForInvalidName` needed a DNS server and failed
+  where the resolver answers the AAAA query for a `.invalid` name with `EAI_NODATA` (the native
+  resolver reports that as `NetworkDown`, and the preferred IPv6 family's error is the reported
+  cause). `ErrorsResolutionFailureCarriesTheResolverError` replaces it and the port-zero test: the
+  resolver rejects port zero before any lookup, so the test needs no network.
+- Test cleanup: the crypto tests share the RFC 6979 A.2.5 P-256 sample through `Vectors.bd`, and
+  the AES-GCM tamper test reads test case 4 from it. `Rfc8448ClientTests` and `MessagesTests`
+  read the RFC 8448 trace from `Rfc8448.bd` instead of restating it.
+- Test cleanup: one-test targets merge. x509 `ChainRsa`, `ChainEc`, `CertReject` and `Bundle`
+  join `Certificates`; `Der` and `Pem` become `Encoding`. connect `Fallback`, `Deadline`, `Cancel`
+  and `Leak` join `ConnectLoopbackTests`. crypto `PkX25519IterTests` joins `PkX25519Tests`.
+  corelib_tests `CoreFormattingTests` and `UnicodeScalarTests` join `TextSuite`. The
+  `ConsoleSuite` section banners name their topic instead of a former target.
+- `Core.Collections.Array.RemoveLast` documents that shrinking one handle never
+  changes what another handle to the same array sees (a shared array is copied
+  and the owner receives the shortened copy; an argument that is not an owner
+  returns a shortened copy and keeps its length). `Array.Clear` documents that
+  it keeps the length.
+- `Codec.Mem.Zeroed`, `Crypto.BigNat.Zeros` and `Crypto.BigNat.ZeroBytes`
+  allocate with `Array.Zeroed` instead of shortening a zero literal (the
+  literal tiers, `Mem.MaxSmall` and the `RemoveLast` trim loops are removed).
+- The bsol `WireEncoder.Abort` no longer shortens its output bytes and frames:
+  it is a non-allocating rollback and a shrink of a shared array copies. It
+  sets `used` to 0; the next `Begin` replaces both arrays.
+- `Core.Collections.Array.Append` documents that growing one handle never
+  changes what another handle to the same array sees: when another handle can
+  see the array, the growth copies it; an array no other handle sees still
+  grows in place. Geometric growth doubles the length (a full array doubles its
+  capacity, as before).
+- `ChaCha20Poly1305.OpenInto` and `AesGcm.OpenInto` follow one contract on every provider: a wrong
+  tag returns `AuthenticationFailed` and zeroes the whole output range, so no unverified plaintext
+  stays in the buffer. The pure provider now zeroes the range as the native one does. The crypto
+  tests check the zeroed output under both providers.
+- `Core.Collections.Array.Append` documents that growth of a `mut` parameter
+  changes only the callee's copy: the first growth through the caller's handle
+  copies the array, so the caller's array never changes, whatever its capacity.
+- `Platform.Terminal.PollResize` stores a new size in the fields of
+  `lastSize` (`lastSize = now;` changed only its own by-value parameter, so
+  `Console.RunTick` sent the same `Resize` on every later tick; the 0.6.7
+  compiler rejects that assignment as E1259).
+- A contract value crosses a port only when its contract embeds a transfer
+  marker: `ParallelSuite`'s `Scored` embeds `Transferable` and its
+  implementations are `[Isolated]`. Compile-fail fixtures
+  `PortOfUnmarkedContract` (E1610) and `LaunderedContractValue` (E1206) cover
+  the rule.
+- `List<T>` lends a view to a call that only borrows it (`Borrow`): the
+  callee copies before it writes, and the caller's list stays the sole owner
+  of its array, so a list built by a function or read by helpers in a loop
+  writes in place. A list sent through a port is `Detached` first and leaves
+  with an array of its own when another list shares it.
+- Functions that keep a Moved parameter (store it, build a value with it or
+  return it) declare it `move` (codec, compiler-sdk, crypto, foundation Bytes,
+  Json, Process and Pest, glue, http, http2, http3, quic, tls, web,
+  websocket). `Connect` engine helpers that spawn fibers capturing the
+  shared `done` flags declare them `move`.
+- `Hub.WaitReceive` returns `HubError::Closed(member)` when every member is
+  closed and drained, also in `Main`. `Hub.MapWaitReceiveError` takes the
+  member index the runtime reports.
+- `Core.IO.Stream` embeds `Reader`, `Writer` and `Closer`; a `Stream` value
+  passes to `IO.Read`, `IO.ReadExact` and `IO.WriteAll` directly.
+- `Testing.Assert.FailureRecord` fields are public.
+- `Glue.Envelope` `Put` and `Copy` return the grown array, and the
+  serialization Mod calls `List.Push` and `Map.Insert` as statements; the
+  Corelib tests check clean across all targets.
+
+- `Process.Run` returns `Ok(ProcessOutput)` whenever the child started, whatever
+  its exit code; the caller checks `exitCode`, and stdout and stderr are kept
+  for a failing child. `ProcessError::ExitCode` is removed.
+- A bare program name passed to `Process.Run` or `Process.Spawn` resolves
+  through the `PATH` of the child's environment, like `execvp`.
+- `Concurrency.Status.FromCode` maps an unknown code to the new
+  `Status::Unexpected(code)`, not `Ok`. `ChannelError` gains
+  `Unexpected(i64 code)`: a status outside the channel contract is no longer
+  reported as `Closed(0)`, and `ChannelError::Closed` carries the channel
+  handle.
+
+- `Testing.Assert.Equal<T>` and `NotEqual<T>` require `T: Formatting` and write the text of the
+  expected and the actual value into the failure record.
+- `Testing.Expect.Equal<T>` (with `T: Formatting`) replaces `EqualI64`, `EqualString` and
+  `EqualBool`.
+
+### Added
+
+- Corelib test targets `TextParserTests` (every `Core.Text.Parser` combinator and
+  term), `TextPestTests` (Pest grammar, expression and emit stages and the generated
+  regex parsers), `TextRegexBoundsTests` (subject cap, limits, depth and work budget of
+  `Core.Text.Regex.Bounded`) and `TextCasingTests` (ASCII byte classes and case
+  conversion edges).
+- `mods/corelib_pest_gen/Tests`: tests for the Pest Generator (grammar copy, collected
+  target, one public cursor parser per rule, failing bodies for unknown rules, parse
+  errors and unrepresentable literals).
+- `Process.Message(error)` returns one readable line for a `ProcessError`.
+- `Console.Hosting`: the `ConsoleHost` base host for console programs
+  (`host AppHost() : ConsoleHost { ... }`) and its `CommandLine` service
+  (arguments, count, `Exit(code)`). `Exit` ends the program through the host:
+  open scopes run their `dispose` hooks innermost first, then the global
+  `dispose` hooks run; `Process.Exit` stays the immediate exit.
+- Collections change in place through `mut this` methods: `List.Push`,
+  `Stack.Push`, `Queue.Enqueue`, `Map.Insert`, `PriorityQueue.Push`,
+  `I64Map.Insert` and `StringMap.Insert` return `unit`; `Pop` and `Dequeue`
+  return the removed value as `Option<T>`; `Remove` and `Set.Add` return
+  `bool`; `List.Set`/`Insert` return `Result<unit, CollectionError>` and
+  `List.RemoveAt` returns the removed element. `HashTable.Insert`/`Remove`
+  take a `mut` table.
+- `List<T>` is `[CopyOnAssign]` with a copy-on-write `Copy` method: assigning a
+  list, passing it to a parameter that is not `mut`, returning, capturing or
+  binding it in a `for` loop gives the new name its own list, which shares the
+  backing array until the first write through either name. The other
+  collections keep sharing between names.
+- `move` is removed from ordinary code across Corelib; it stays only at isolate
+  crossings (`Port.Send`). `ReadOnlyArray.Freeze` copies its array.
+  `ParallelSeq.Collect` accumulates each chunk in a `T[]`, and `Scopes`
+  pushes and inserts in place.
+- Generated `Project.lock` files of package test projects are no longer tracked.
+- `Core.Text.Formatting`: the contract `Formatting` (`string Format()`), implemented for every
+  integer type, `word`, `f32`, `f64`, `bool`, `char` and `string`.
+
+### Removed
+
+- No `Project.lock` is tracked: the 16 generated locks of the Corelib, mod and
+  package projects are removed and `.gitignore` ignores `Project.lock` everywhere.
+- Remove the raw pthread `Core.Threading.Thread.Spawn`/`Join` API, the `Thread`
+  handle type, the `LinuxPthread`/`DarwinPthread` contracts and `ThreadError`.
+  `Spawn` passed `0` as the `pthread_t*` out-parameter and had no callers. Fibers
+  are the concurrency model; `Thread.Yield` remains.
+- Remove the seven string-in/string-out Glue Mod contracts (`TypeMapping`,
+  `SymbolEmission`, `LinkArgs`, `SignatureReader`, `SignatureWriter`,
+  `ToolchainProbe`, `StdioBridge`), the unused `[Glue]`, `[GlueImport]` and
+  `[GlueExport]` attributes and the `GlueBackendKind` enum from `corelib_glue`.
+  The package now holds only the provisional stdio bridge protocol.
+- Remove `PackageVersion()` from the codec, connect, crypto, http2, http3,
+  quic, tls, uri, web, websocket and x509 packages, and the smoke test targets
+  that only called it.
+- Crypto, TLS, QUIC and HTTP/2 benchmarks move from the package test projects
+  to the `beskid_corelib/bench` project, which is not part of the test matrix.
+
+### Fixed
+
+- `Core.Text.Pest` `Expr.StripParens` skips string literals, so a group with a
+  parenthesis inside a literal, such as `( ")" )`, parses; it failed with
+  `invalid group`.
+- `Channel.Receive`, `Channel.Send`, `WaitGroup.Wait`, `Mutex.Lock` and
+  `Hub.WaitReceive` in `Main` park like in any other fiber (Main runs as the
+  root fiber); `Receive` on an empty channel in `Main` returned `Closed(0)`.
+  `Time.Sleep`, `Network` operations, `Dns.Resolve` and `Process.Run` in
+  `Main` park too and let other fibers run.
+- `HubError` and `MutexError` gain `Unexpected(i64 code)`; unknown statuses
+  were `Closed(0)` and `Cancelled(0)`. A failed `Hub.Register` names the
+  member index, and `HubError::Empty` reports an empty or unknown hub.
+- CoreSuite covers concatenating and slicing a `Core.Args` string (storage
+  outside the managed heap) across collections.
+- `String.Join`, `String.Repeat` and `String.Replace` run in time linear in the
+  result length: the result is sized once and every part is copied once. Joining
+  16,000 lines did not finish in 10 minutes and now takes about 4 ms.
+- `String.Trim` removes line feeds. It trims the same ASCII whitespace as
+  `TrimStart`, `TrimEnd` and `IsBlank`: space, tab, line feed and carriage
+  return.
+- `String.CompareOrdinal`, `Search.Compare` and `Search.Less` use the string
+  ordering operator (one runtime call) instead of a loop with a call per byte.
+  `HashTable` lookups index the table arrays directly, and `Hash.String` no
+  longer calls a function per byte for the exclusive or.
+- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
+  when two versions grow from one base. `Array.Append` grows storage in place
+  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
+  only when the version owns the storage tip and copies the prefix otherwise.
+
+### Added
+
+- Add explicit offline BSOL import resolver requests and materialized-source
+  digest verification with portable root-relative path and immutable Git checks.
+
+- Add resolved BSOL profile composition with alias-aware rule/type rebasing,
+  owned imported default and condition arenas, and source-closure reownership
+  during validation and migration.
+
+- Preserve imported rule origins during qualified reference resolution and
+  parse dot-separated import qualifiers in reference and type syntax.
+
+- Add explicit resolver-backed typed BSOL reads and reconstruct profile source
+  ownership before invoking typed writer bindings.
+
+- Add Core.Numeric.FloatBits exact bit projections for f32 and f64 values.
+
+- Provide typed compiler SDK factories for compilation, workspace members,
+  registrations, package catalogs and contract requests for native adapter preparation.
+
+### Added
+
+- Add typed format-independent serialization DataValue representations and
+  canonical 256-bit ShapeId parsing and formatting.
+
+- Add the format-independent serialization package foundation with documented
+  resource limits and exact checked signed/unsigned decimal parsing. Cover
+  integer-width overflow, the full u64 range, and precision beyond 2^53.
 - Add `Core.String.Search`, `Core.String.Transform`, and `Core.String.Builder`
   through the `Core.String` hub: ordinal `Compare`/`Less`, affix and
   occurrence search, `Split`/`Lines`/`Join`, `Replace`, `Repeat`, padding,
@@ -31,31 +258,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
   parents; `Core.Time.Calendar` constant-time date arithmetic, ISO weekdays,
   and RFC 3339 parsing and formatting; and `Testing.Expect` expectations that
   report expected and actual values.
-- Add seeded property and model-based tests (sorting, hash maps against the
-  linear `Map`, an all-collision hash table, the priority queue), a JSON
-  accept/reject conformance corpus with random-tree round trips, UTF-8 and
-  float edge cases, and a full 146097-day Gregorian-cycle calendar sweep
-  checked against Python-generated reference dates.
-- Add `Number.FormatI64`, correct for the minimum `i64` that 0.5.2
-  interpolation prints as `-`; route `StringBuilder.AppendI64` and
-  `Testing.Expect` messages through the same guard.
-- Add `Ansi.Text` (escape stripping, display-width measurement with wide and
-  zero-width code points, ANSI-aware truncation, padding, centering, and word
-  wrap) and `Ansi.Modes` (synchronized output, bracketed paste, focus
-  reporting, cursor shape, hyperlink ids, OSC 52 clipboard, OSC 9
-  notifications).
-- Add `Console.Controls.Table` (display-width columns, alignment, width caps
-  with truncation, Unicode/ASCII/no borders), multi-line `Panel` bodies, and
-  cluster-aware width (flags, ZWJ emoji, skin tones, VS16) in `Ansi.Text`;
-  `Wrap` now re-opens active styles on continuation lines.
-- Add `Capabilities.FromEnvironment` and `TerminalEnvironment` so color policy
-  is a pure, testable function of `TERM`, `COLORTERM`, `NO_COLOR`,
-  `FORCE_COLOR`, and TTY state; `ProbeStdout` now uses it.
-- Add `Sgr.ForegroundArgsFor` and `BackgroundArgsFor` for an explicit color
-  model, and a console reference page.
-- Add runnable compiler-gap canaries (`beskid_corelib/tests/canaries`), a
-  0.5.3 compiler fix list, and a `Time.bd` patch to apply with the compiler
-  rebuild; record the silent method-parameter/field shadowing miscompile.
 - Document the 0.5.2 compiler and runtime limits that shape these APIs, and
   how to test a modified Corelib with a released binary.
 
@@ -96,58 +298,6 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Changed
 
-- `List.Of` builds its list with `List.FromArray`: one sized copy instead of a
-  `Push` per element.
-- Unify helpers with the same behavior so each exists once. `Core.String.Ascii`
-  holds the ASCII byte classes and hex digit values; `Number.DigitsAt` reads
-  fixed-width digit fields; `Search.StartsWithAt` and `Search.SkipWhitespace`
-  back the affix tests, JSON, and TOML; `Encoding.Utf8.AppendCodePoint` is the
-  UTF-8 encoder; and `Core.Collections.Storage` (`CopyRange`, `CopyWithout`,
-  `Concat`, `Reversed`, `IndexOf`) is the only copier for persistent
-  collections, with one sized allocation per copy. Console controls use
-  `String.Repeat`, `Core.Math`, and `Number.DigitsAt`.
-- Remove the duplicates (breaking): `Casing.IsAsciiLower`, `IsAsciiUpper`,
-  `IsAsciiDigit`, `IsSnakePartChar`, `PascalToSnake`, and `CamelToSnake` (use
-  `Ascii.*` and `Casing.ToSnake`), `Pest.Expr.IsIdentChar`,
-  `Encoding.Hex.HexToNibble`, `Encoding.Utf8.RuneByteLen` (use
-  `String.Utf8RuneByteLen`), `Sort.Reverse` (use `Storage.Reversed`),
-  `Console.Controls.Frame.Repeat` (use `String.Repeat`), the
-  `Console.Format.Scan` forwarders, and the `Console.Format.Attributes` digit
-  tables (`ParseHexNibble`, `ParseHexByte`, `ParseU8`, `ParseDecimalDigit`, and
-  their result types).
-- Build `StringBuilder` output by string concatenation instead of per-byte
-  `u8[]` growth, which 0.5.2 performs far more slowly; keep `Join`, `Replace`,
-  and `Repeat` on concatenation for the same reason.
-- Replace the placeholder `Query.Operators.Map` (returned copies of a sample)
-  and `Filter` (returned its second argument) with lambda-free `Where`
-  (mask), `WhereEquals`, `WhereNotEquals`, `Distinct`, `CountOf`, `IndexOf`,
-  `Concat`, `Reverse`, and typed `SumI64`/`SumF64`/`MinI64`/`MaxI64`/
-  `AverageF64`; rename `FoldI64` to `SumI64`; sort `OrderBy` with the stable
-  merge sort instead of bubble sort; rewrite the stale Query docs.
-- Make the free-function forms of the `Ansi` cursor, erase, OSC, screen, and
-  input-mode builders delegate to their methods instead of duplicating every
-  sequence.
-- Add `Core.Text.SemVer` (SemVer 2.0 parsing, precedence, bumps, and
-  npm/Cargo-style requirements), `Core.Text.Glob` (plain and path-aware
-  wildcards), `Core.Text.Csv` (RFC 4180), `Core.Text.Url` (RFC 3986 parsing,
-  percent-encoding, query parameters, reference resolution), and
-  `Core.Text.Toml` (TOML 1.0 into `TomlValue`), with reference pages and a
-  guide for merging this branch with the 0.5.3 line.
-- **Breaking:** `List.Get`, `Map.Get`, `Queue.Peek`, and `Stack.Peek` return
-  `Result<_, CollectionError>` (`IndexOutOfRange(index, count)`,
-  `KeyNotFound`, `Empty`) instead of `Result<_, string>`.
-- Fix color downgrades: `RgbTo256Index` now picks the nearest xterm cube or
-  gray-ramp entry (every gray previously mapped to black), and 16-color
-  mapping picks the nearest palette entry including bright codes (white and
-  black previously both mapped to red). Remove the faulty
-  `ClampChannelBucket` and `DominantChannelIndex` helpers.
-- Detect truecolor only for `COLORTERM=truecolor|24bit`, 256 colors only for
-  `TERM` values containing `256color`, honor `FORCE_COLOR` levels, and treat
-  an empty `NO_COLOR` as unset.
-- Size `Console.Controls.Panel` by visible width so ANSI styling and wide
-  characters no longer misalign its border; `Measure` no longer adds a row
-  for a title drawn inside the top border, and over-wide lines truncate
-  instead of pushing the border out.
 - Correct the `Core.String` reference: `Contains` scans substrings, and the
   page now covers the full search, transform, and builder surface.
 - Regenerate syntax SDK binding, node-kind, and traversal inventories for scoped `use`.
@@ -183,20 +333,9 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Fixed
 
-- `Time.ToUtcDateTime` and the calendar helpers declare their reassigned
-  locals `mut`, matching the `Time.bd` the 0.5.4 compiler embeds. Corelib
-  `main` therefore pairs with compiler 0.5.4 or later.
+- Parse exact decimal magnitudes with leading zeroes without treating total
+  text length as numeric overflow; preserve checked per-digit wire-width ranges.
 
-- Keep persistent `List`, `Stack`, `Queue`, `Set` and `Map` versions independent
-  when two versions grow from one base. `Array.Append` grows storage in place
-  with compiler 0.5.3, so `Core.Collections.Storage.AppendAt` appends in place
-  only when the version owns the storage tip and copies the prefix otherwise.
-- Keep earlier versions intact on removal and overwrite: `List.Pop`,
-  `Stack.Pop`, and `Queue.Dequeue` no longer clear the shared slot, `Map.Remove`
-  and `Set.Remove` copy instead of shifting shared storage, and `Map.Insert`
-  copies before overwriting an existing key, all through the shared
-  `Core.Collections.Storage` copiers. `HashTable`, `StringMap`,
-  `I64Map`, and `PriorityQueue` document that they are single-owner values.
 - Fix QUIC loopback datagram loss (WEB7): the `QuicEndpoint` receiver fiber now
   waits without a deadline, because a timed-out runtime receive can drop a datagram
   that was already read. A PTO probe also carries the in-flight credit frames
@@ -264,4 +403,3 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 - Align Results and Optional tests with their leaf modules and generic construction APIs.
 - Replace stale Time and concurrency test calls with current typed APIs.
 - Type Random byte comparisons explicitly as `u8`.
-

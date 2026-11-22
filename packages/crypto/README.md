@@ -32,6 +32,12 @@ absent, when `BESKID_CRYPTO_PROVIDER=pure` is set, or when the known-answer
 self-test fails. Otherwise it is `Native`. The self-test result is cached in the
 process environment as `BESKID_CRYPTO_PROVIDER_STATE`.
 
+Browser Wasm always selects `Pure`. `NativeAvailable()`, `IsNative()` and
+`SelfTest()` return false because the browser cannot load `libcrypto.so.3`.
+`ForcePure` updates the instance's `Core.Environment` switch. Clearing the
+switch leaves the pure provider selected. Calling an OpenSSL operation
+directly raises `extern_unavailable`.
+
 The native provider serves the one-shot `Sha256.Hash`, `Sha512.Hash512` and
 `Hash384`, `Hmac.Compute` and `Hmac.Digest` (and through them `Hkdf`), and the
 AEADs `AesGcm` and `ChaCha20Poly1305`. An `AesGcmKey` keeps the provider that

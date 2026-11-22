@@ -1,19 +1,6 @@
 use Core.Bytes.Slice;
 use Core.Collections.Array;
-
-/// Bulk byte-buffer primitives for the protocol hot paths.
-///
-/// `Zeroed(n)` allocates `n` zero bytes in one step (`Array.Zeroed`). `Copy` and `Zero` call libc
-/// `memmove`/`memset` on the array payloads through a CLIF block (compiler 0.5.3, ruling R13)
-/// after a bounds check.
-///
-/// The C names are dictated by libc, so this contract triggers naming warning W1633.
-[Extern(Abi: "C", Library: "libc.so.6")]
-contract MemLibc
-{
-    i64 memmove(i64 destination, i64 source, i64 count);
-    i64 memset(i64 pointer, i32 value, i64 count);
-}
+use Codec.MemPlatform;
 
 /// A zero-filled buffer of `count` bytes (`count` <= 0 gives an empty buffer), allocated in one
 /// step.
@@ -24,29 +11,6 @@ pub u8[] Zeroed(i64 count)
         return Array.Empty<u8>();
     }
     return Array.Zeroed<u8>(count);
-}
-
-unit MoveRaw(u8[] destination, i64 destinationOffset, u8[] source, i64 sourceOffset, i64 count)
-{
-    clif {
-        %db = payload %0
-        %dp = iadd %db, %1
-        %sb = payload %2
-        %sp = iadd %sb, %3
-        %r = call @memmove(%dp, %sp, %4) -> i64
-    };
-    return;
-}
-
-unit ZeroRaw(u8[] buffer, i64 offset, i64 count)
-{
-    clif {
-        %b = payload %0
-        %p = iadd %b, %1
-        %z = iconst.i32 0
-        %r = call @memset(%p, %z, %2) -> i64
-    };
-    return;
 }
 
 /// Copies `count` bytes like `Slice.Copy` (overlapping ranges allowed). An out-of-range
@@ -62,7 +26,7 @@ pub unit Copy(u8[] destination, i64 destinationOffset, u8[] source, i64 sourceOf
         Slice.Copy(destination, destinationOffset, source, sourceOffset, count);
         return;
     }
-    MoveRaw(destination, destinationOffset, source, sourceOffset, count);
+    MemPlatform.Move(destination, destinationOffset, source, sourceOffset, count);
     return;
 }
 
@@ -77,7 +41,7 @@ pub bool Zero(u8[] buffer, i64 offset, i64 count)
     {
         return false;
     }
-    ZeroRaw(buffer, offset, count);
+    MemPlatform.Zero(buffer, offset, count);
     return true;
 }
 
@@ -107,7 +71,7 @@ pub u8[] SubSlice(u8[] source, i64 offset, i64 count)
     u8[] out = Zeroed(n);
     if (n > 0_i64)
     {
-        MoveRaw(out, 0_i64, source, from, n);
+        MemPlatform.Move(out, 0_i64, source, from, n);
     }
     return out;
 }

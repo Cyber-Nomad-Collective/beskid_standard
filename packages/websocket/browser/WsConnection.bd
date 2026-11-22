@@ -1,0 +1,360 @@
+use Codec.Buffered;
+use Codec.Errors;
+use WebSocket.WsHandshake;
+use Uri.Types as UriTypes;
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Network.Tcp.TcpStream;
+use Tls.TlsConfig;
+use WebSocket.WsErrors;
+use WebSocket.WsTransport;
+
+/// Connection policy shared by client and server.
+/// - protocols: client: subprotocols offered, in order; server: supported, in preference order.
+/// - origin: client only; "" omits the Origin field.
+/// - maxMessageBytes: largest reassembled message (default 64 KiB, the package buffer limit).
+/// - handshakeTimeoutMillis: deadline for connect plus opening handshake.
+/// - closeTimeoutMillis: how long Close waits for the peer's close frame.
+/// - readTimeoutMillis: deadline for each Receive; 0 waits without a deadline.
+pub type WsOptions
+{
+    pub string[] protocols;
+    pub string origin;
+    pub i64 maxMessageBytes;
+    pub i64 handshakeTimeoutMillis;
+    pub i64 closeTimeoutMillis;
+    pub i64 readTimeoutMillis;
+    // wss client trust; empty means the system bundle (loaded at Open, fail closed).
+    pub Option<CertificateVerification> tls;
+}
+
+pub WsOptions DefaultOptions()
+{
+    return WsOptions
+    {
+        protocols: Array.Empty<string>(),
+        origin: "",
+        maxMessageBytes: 65536_i64,
+        handshakeTimeoutMillis: 10000_i64,
+        closeTimeoutMillis: 5000_i64,
+        readTimeoutMillis: 0_i64,
+        tls: Option.Empty<CertificateVerification>(),
+    };
+}
+
+pub WsOptions WithProtocols(WsOptions o, move string[] protocols)
+{
+    return WsOptions
+    {
+        protocols: protocols,
+        origin: o.origin,
+        maxMessageBytes: o.maxMessageBytes,
+        handshakeTimeoutMillis: o.handshakeTimeoutMillis,
+        closeTimeoutMillis: o.closeTimeoutMillis,
+        readTimeoutMillis: o.readTimeoutMillis,
+        tls: o.tls,
+    };
+}
+
+pub WsOptions WithOrigin(WsOptions o, string origin)
+{
+    return WsOptions
+    {
+        protocols: o.protocols,
+        origin: origin,
+        maxMessageBytes: o.maxMessageBytes,
+        handshakeTimeoutMillis: o.handshakeTimeoutMillis,
+        closeTimeoutMillis: o.closeTimeoutMillis,
+        readTimeoutMillis: o.readTimeoutMillis,
+        tls: o.tls,
+    };
+}
+
+pub WsOptions WithMaxMessageBytes(WsOptions o, i64 limit)
+{
+    return WsOptions
+    {
+        protocols: o.protocols,
+        origin: o.origin,
+        maxMessageBytes: limit,
+        handshakeTimeoutMillis: o.handshakeTimeoutMillis,
+        closeTimeoutMillis: o.closeTimeoutMillis,
+        readTimeoutMillis: o.readTimeoutMillis,
+        tls: o.tls,
+    };
+}
+
+/// Trust policy for wss client connections (for example `TlsConfig.Anchors(...)`).
+pub WsOptions WithTls(WsOptions o, CertificateVerification verification)
+{
+    return WsOptions
+    {
+        protocols: o.protocols,
+        origin: o.origin,
+        maxMessageBytes: o.maxMessageBytes,
+        handshakeTimeoutMillis: o.handshakeTimeoutMillis,
+        closeTimeoutMillis: o.closeTimeoutMillis,
+        readTimeoutMillis: o.readTimeoutMillis,
+        tls: Option.FromValue<CertificateVerification>(verification),
+    };
+}
+
+pub WsOptions WithTimeouts(WsOptions o, i64 handshakeMillis, i64 closeMillis, i64 readMillis)
+{
+    return WsOptions
+    {
+        protocols: o.protocols,
+        origin: o.origin,
+        maxMessageBytes: o.maxMessageBytes,
+        handshakeTimeoutMillis: handshakeMillis,
+        closeTimeoutMillis: closeMillis,
+        readTimeoutMillis: readMillis,
+        tls: o.tls,
+    };
+}
+
+/// One received message. Close carries the peer's status (1005 when it sent none)
+/// and reason; after it the connection is closed.
+pub enum WsMessage
+{
+    Text(string text),
+    Binary(u8[] data),
+    Close(i64 code, string reason),
+}
+
+pub i64 StateOpen()
+{
+    return 0_i64;
+}
+
+pub i64 StateCloseSent()
+{
+    return 1_i64;
+}
+
+pub i64 StateClosed()
+{
+    return 2_i64;
+}
+
+pub i64 ReadBufferBytes()
+{
+    return 8192_i64;
+}
+
+pub type WsConnection {
+    i64 handle;
+
+    pub Result<unit, WsError> SendText(string text) { return SendTextOn(this, text); }
+    pub Result<unit, WsError> SendBinary(u8[] data) { return SendBinaryOn(this, data); }
+    pub Result<unit, WsError> SendFrame(bool fin, i64 opcode, u8[] payload) { return SendFrameOn(this, fin, opcode, payload); }
+    pub Result<unit, WsError> Ping(u8[] payload) { return PingOn(this, payload); }
+    pub Result<WsMessage, WsError> Receive() { return ReceiveOn(this); }
+    pub Result<unit, WsError> Close(i64 code, string reason) { return CloseOn(this, code, reason); }
+    pub i64 State() { return StateOf(this); }
+    pub string Protocol() { return ProtocolOf(this); }
+    pub string Resource() { return ResourceOf(this); }
+    pub string Origin() { return OriginOf(this); }
+    pub i64 PongsReceived() { return PongsOf(this); }
+    pub i64 CloseCodeReceived() { return CloseReceivedOf(this); }
+    pub bool IsServer() { return IsServerOf(this); }
+}
+
+pub i64 StateOf(WsConnection connection) { return __browser_ws_state(connection.handle); }
+pub string ProtocolOf(WsConnection connection) { return __browser_ws_protocol(connection.handle); }
+pub string ResourceOf(WsConnection connection) { return __browser_ws_resource(connection.handle); }
+pub string OriginOf(WsConnection connection) { return __browser_ws_origin(connection.handle); }
+pub i64 PongsOf(WsConnection connection) { return 0_i64; }
+pub i64 CloseReceivedOf(WsConnection connection) { return __browser_ws_close_code(connection.handle); }
+pub bool IsServerOf(WsConnection connection) { return false; }
+
+pub Result<WsConnection, WsError> Open(string url, WsOptions options) {
+    if String.Len(options.origin) != 0_i64 { return Result::Error(WsError::InvalidArgument); }
+    if Option.HasValue<CertificateVerification>(options.tls) { return Result::Error(WsError::InvalidArgument); }
+    mut string protocols = "";
+    mut i64 index = 0_i64;
+    while index < Array.Len<string>(options.protocols) {
+        string protocol = options.protocols[index];
+        if String.Len(protocol) == 0_i64 || String.Contains(protocol, "
+") {
+            return Result::Error(WsError::InvalidArgument);
+        }
+        if index > 0_i64 { protocols = protocols + "
+"; }
+        protocols = protocols + protocol;
+        index = index + 1_i64;
+    }
+    i64 code = __browser_ws_open(url, protocols, options.maxMessageBytes, options.handshakeTimeoutMillis,
+        options.closeTimeoutMillis, options.readTimeoutMillis);
+    if code < 0_i64 { return Result::Error(BrowserError(code)); }
+    return Result::Ok(WsConnection { handle: code });
+}
+
+WsError BrowserError(i64 status) {
+    if status == -1_i64 { return WsError::InvalidUrl; }
+    if status == -2_i64 { return WsError::UnsupportedScheme; }
+    if status == -3_i64 || status == -8_i64 || status == -9_i64 { return WsError::InvalidArgument; }
+    if status == -5_i64 { return WsError::TimedOut; }
+    if status == -6_i64 { return WsError::MessageTooBig; }
+    if status == -7_i64 { return WsError::Closed; }
+    return WsError::Io;
+}
+
+Result<unit,WsError> Status(i64 status) {
+    if status == 0_i64 { return Result::Ok(()); }
+    return Result::Error(BrowserError(status));
+}
+
+pub Result<unit, WsError> SendTextOn(WsConnection connection, string text) {
+    return Status(__browser_ws_send_text(connection.handle, text));
+}
+
+pub Result<unit, WsError> SendBinaryOn(WsConnection connection, u8[] bytes) {
+    return Status(__browser_ws_send_binary(connection.handle, bytes));
+}
+
+pub Result<WsMessage,WsError> ReceiveOn(WsConnection connection) {
+    i64 handle = __browser_ws_receive(connection.handle);
+    if handle < 0_i64 { return Result::Error(BrowserError(handle)); }
+    WsMessage message = ReadMessage(handle);
+    __browser_ws_message_drop(handle);
+    return Result::Ok(message);
+}
+
+WsMessage ReadMessage(i64 handle) {
+    i64 kind = __browser_ws_message_kind(handle);
+    if kind == 1_i64 { return WsMessage::Text(__browser_ws_message_text(handle)); }
+    if kind == 3_i64 { return WsMessage::Close(__browser_ws_message_code(handle), __browser_ws_message_text(handle)); }
+    i64 length = __browser_ws_message_len(handle);
+    u8[] bytes = Slice.New(length);
+    mut i64 index = 0_i64;
+    while index < length {
+        bytes[index] = u8(__browser_ws_message_byte(handle, index));
+        index = index + 1_i64;
+    }
+    return WsMessage::Binary(bytes);
+}
+
+pub Result<unit, WsError> CloseOn(WsConnection connection, i64 code, string reason) {
+    return Status(__browser_ws_close(connection.handle, code, reason));
+}
+
+// These operations need transport-level controls that the browser API withholds.
+pub Result<unit, WsError> SendFrameOn(WsConnection connection, bool fin, i64 opcode, u8[] payload) {
+    return Result::Error(WsError::InvalidArgument);
+}
+pub Result<unit, WsError> PingOn(WsConnection connection, u8[] payload) {
+    return Result::Error(WsError::InvalidArgument);
+}
+pub Result<WsConnection, WsError> Accept(TcpStream stream, WsOptions options) {
+    return Result::Error(WsError::InvalidArgument);
+}
+pub Result<WsConnection, WsError> AcceptTls(TcpStream stream, TlsServerConfig config, WsOptions options) {
+    return Result::Error(WsError::InvalidArgument);
+}
+pub Result<WsConnection, WsError> ClientHandshake(WsTransport transport, string hostHeader, string resource, WsOptions options) {
+    return Result::Error(WsError::InvalidArgument);
+}
+pub Result<WsConnection, WsError> ServerHandshake(WsTransport transport, WsOptions options) {
+    return Result::Error(WsError::InvalidArgument);
+}
+
+/// A request or response head: start line and header fields.
+pub type WsHead
+{
+    pub u8[] startLine;
+    pub WsHeader[] headers;
+}
+
+WsError HeadError(CodecError error)
+{
+    return match (error)
+    {
+        CodecError::LimitExceeded => WsError::HandshakeFailed(WsHandshake.ReasonHeadTooLarge()),
+        CodecError::BufferFull => WsError::HandshakeFailed(WsHandshake.ReasonHeadTooLarge()),
+        CodecError::Truncated => WsError::HandshakeFailed(WsHandshake.ReasonTruncated()),
+        CodecError::InvalidLine => WsError::HandshakeFailed(WsHandshake.ReasonBadHeader()),
+        CodecError::Io(cause) => WsTransport.FromIo(cause),
+        _ => WsError::Io,
+    };
+}
+
+/// Reads a head (start line, fields, empty line) with bounded line length and count.
+pub Result<WsHead, WsError> ReadHead(BufferedReader reader, WsTransport transport)
+{
+    mut u8[] start = Slice.New(0_i64);
+    Result<u8[], CodecError> first = WsTransport.ReadLine(reader, transport, WsHandshake.MaxLineLength());
+    match (first)
+    {
+        Result::Error(error) => {
+            return Result::Error(HeadError(error));
+        },
+        Result::Ok(line) => {
+            start = line;
+        },
+    };
+    mut WsHeader[] headers = Array.Empty<WsHeader>();
+    while (true)
+    {
+        Result<u8[], CodecError> next = WsTransport.ReadLine(reader, transport, WsHandshake.MaxLineLength());
+        mut u8[] line = Slice.New(0_i64);
+        match (next)
+        {
+            Result::Error(error) => {
+                return Result::Error(HeadError(error));
+            },
+            Result::Ok(bytes) => {
+                line = bytes;
+            },
+        };
+        if (Slice.Len(line) == 0_i64)
+        {
+            return Result::Ok(WsHead
+            {
+                startLine: start,
+                headers: headers,
+            });
+        }
+        if (Array.Len<WsHeader>(headers) >= WsHandshake.MaxHeaders())
+        {
+            return Result::Error(WsError::HandshakeFailed(WsHandshake.ReasonHeadTooLarge()));
+        }
+        Result<WsHeader, WsError> parsed = WsHandshake.ParseHeaderLine(line);
+        match (parsed)
+        {
+            Result::Error(error) => {
+                return Result::Error(error);
+            },
+            Result::Ok(h) => {
+                Array.Append<WsHeader>(headers, h);
+            },
+        };
+    }
+    return Result::Error(WsError::Io);
+}
+
+/// Resource name of a ws URI: path ("/" when empty) and query (section 3).
+pub string ResourceName(UriTypes.UriRef u)
+{
+    mut string path = u.path;
+    if (String.Len(path) == 0_i64)
+    {
+        path = "/";
+    }
+    if (u.hasQuery)
+    {
+        return path + "?" + u.query;
+    }
+    return path;
+}
+
+/// One received frame with its unmasked payload.
+pub type WsFrameIn
+{
+    pub bool fin;
+    pub i64 opcode;
+    pub u8[] payload;
+}

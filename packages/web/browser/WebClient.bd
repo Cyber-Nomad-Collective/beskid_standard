@@ -1,0 +1,102 @@
+use Core.Bytes.Slice;
+use Core.Collections.Array;
+use Core.Optional.Option;
+use Core.Results;
+use Core.String;
+use Http.Errors;
+use Http.Types;
+use Tls.TlsConfig;
+use Uri.Types;
+use Web.WebConfig;
+use Web.WebErrors;
+
+pub type WebResponse
+{
+    pub Response response;
+    pub string protocol;
+}
+
+pub Result<Response, WebError> Send(Request request, WebClientConfig config)
+{
+    Result<WebResponse, WebError> exchanged = Exchange(request, config);
+    return match (exchanged)
+    {
+        Result::Ok(w) => Result::Ok(w.response),
+        Result::Error(error) => Result::Error(error),
+    };
+}
+
+pub string OriginForm(UriRef uri) {
+    mut string path = uri.path;
+    if String.Len(path) == 0_i64 { path = "/"; }
+    if uri.hasQuery { return path + "?" + uri.query; }
+    return path;
+}
+
+pub Result<WebResponse,WebError> Exchange(Request request, WebClientConfig config) {
+    if config.h2cPriorKnowledge || WebConfig.UsesHttp3(config.http3) {
+        return Result::Error(WebError::InvalidConfig);
+    }
+    if Option.HasValue<CertificateVerification>(config.trust) { return Result::Error(WebError::InvalidConfig); }
+    // Fetch delegates negotiation to the browser. A custom ALPN policy cannot be applied.
+    if Array.Len<string>(config.alpn) != 2_i64 || config.alpn[0_i64] != "h2" || config.alpn[1_i64] != "http/1.1" {
+        return Result::Error(WebError::InvalidConfig);
+    }
+    mut string lines = "";
+    mut i64 index = 0_i64;
+    while index < Array.Len<Header>(request.headers) {
+        Header header = request.headers[index];
+        if String.Contains(header.name, ":") || String.Contains(header.name, "
+") || String.Contains(header.value, "
+") {
+            return Result::Error(WebError::InvalidConfig);
+        }
+        if index > 0_i64 { lines = lines + "
+"; }
+        lines = lines + header.name + ":" + header.value;
+        index = index + 1_i64;
+    }
+    i64 handle = __browser_http_fetch(request.target, request.method, lines, request.body, config.requestTimeoutMillis,
+        config.limits.maxHeaders, config.limits.maxHeaderBytes, config.limits.maxBodyBytes);
+    if handle < 0_i64 { return Result::Error(FetchError(handle)); }
+    Response response = ReadResponse(handle);
+    __browser_http_drop(handle);
+    // Fetch does not expose the negotiated wire protocol.
+    return Result::Ok(WebResponse { response: response, protocol: "" });
+}
+
+WebError FetchError(i64 status) {
+    if status == -1_i64 { return WebError::InvalidUrl; }
+    if status == -2_i64 { return WebError::UnsupportedScheme; }
+    if status == -3_i64 { return WebError::InvalidConfig; }
+    if status == -6_i64 { return WebError::Http1Failed(HttpError::BodyTooLarge); }
+    if status == -10_i64 { return WebError::Http1Failed(HttpError::TooManyHeaders); }
+    if status == -11_i64 { return WebError::Http1Failed(HttpError::HeaderTooLarge); }
+    return WebError::Http1Failed(HttpError::Network);
+}
+
+Response ReadResponse(i64 handle) {
+    i64 count = __browser_http_header_count(handle);
+    Header[] headers = Array.Zeroed<Header>(count);
+    mut i64 index = 0_i64;
+    while index < count {
+        headers[index] = Header {
+            name: __browser_http_header_name(handle, index),
+            value: __browser_http_header_value(handle, index),
+        };
+        index = index + 1_i64;
+    }
+    i64 length = __browser_http_body_len(handle);
+    u8[] body = Slice.New(length);
+    index = 0_i64;
+    while index < length {
+        body[index] = u8(__browser_http_body_byte(handle, index));
+        index = index + 1_i64;
+    }
+    return Response {
+        status: __browser_http_status(handle),
+        reason: __browser_http_reason(handle),
+        headers: headers,
+        body: body,
+    };
+}
